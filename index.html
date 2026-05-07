@@ -9439,6 +9439,8 @@ function QuickRatesModal({ quickRates, setQuickRates, suppliers, inventory, setI
   const [showImport,  setShowImport]  = useState(false);
   const [delId,       setDelId]       = useState(null);
   const [pendingMove, setPendingMove] = useState(null); // { item, dupes:[] }
+  const [sortCol,     setSortCol]     = useState(null);
+  const [sortDir,     setSortDir]     = useState('asc');
 
   // Merge quick-rates cats + full inventory cat list so add/edit has all options
   const STANDARD_CATS = ['Vinyl','Laminate','Substrates','Ink & Consumables','Aluminium Profiles','Hardware & Fittings','Electrical Components','Fabric & Mesh','Paper & Board','Tools & Equipment','Signage Faces','LED Components','Packaging','Consumables','Other'];
@@ -9448,11 +9450,27 @@ function QuickRatesModal({ quickRates, setQuickRates, suppliers, inventory, setI
     ...(quickRates||[]).map(r=>r.cat).filter(Boolean)
   ])].sort();
 
-  const filtered = (quickRates||[]).filter(r=>{
+  const _searched = (quickRates||[]).filter(r=>{
     if(!search.trim()) return true;
     const q=search.toLowerCase();
-    return (r.name||'').toLowerCase().includes(q)||(r.sku||'').toLowerCase().includes(q)||(r.cat||'').toLowerCase().includes(q);
+    const sup=(suppliers||[]).find(s=>s.id===r.supplierId||s.id===Number(r.supplierId))?.name||'';
+    return (r.name||'').toLowerCase().includes(q)||(r.sku||'').toLowerCase().includes(q)||(r.cat||'').toLowerCase().includes(q)||sup.toLowerCase().includes(q);
   });
+  const _statusRank = x => (Number(x.stock)||0)===0 ? 0 : ((Number(x.reorder)||0)>0 && (Number(x.stock)||0)<=(Number(x.reorder)||0)) ? 1 : 2;
+  const filtered = sortCol ? [..._searched].sort((a,b)=>{
+    let av,bv;
+    if(sortCol==='name')     { av=a.name||''; bv=b.name||''; }
+    else if(sortCol==='sku') { av=a.sku||'';  bv=b.sku||''; }
+    else if(sortCol==='cat') { av=a.cat||'';  bv=b.cat||''; }
+    else if(sortCol==='supplier'){ av=(suppliers||[]).find(s=>s.id===a.supplierId||s.id===Number(a.supplierId))?.name||''; bv=(suppliers||[]).find(s=>s.id===b.supplierId||s.id===Number(b.supplierId))?.name||''; }
+    else if(sortCol==='stock')   { av=Number(a.stock)||0;   bv=Number(b.stock)||0; }
+    else if(sortCol==='reorder') { av=Number(a.reorder)||0; bv=Number(b.reorder)||0; }
+    else if(sortCol==='status')  { av=_statusRank(a); bv=_statusRank(b); }
+    else if(sortCol==='cost')    { av=Number(a.cost)||0;  bv=Number(b.cost)||0; }
+    else if(sortCol==='sell')    { av=Number(a.sell)||0;  bv=Number(b.sell)||0; }
+    if(typeof av==='string') return sortDir==='asc'?av.localeCompare(bv):bv.localeCompare(av);
+    return sortDir==='asc'?av-bv:bv-av;
+  }) : _searched;
 
   function handleSave(item) {
     const stock = Number(item.stock)||0;
@@ -9531,40 +9549,92 @@ function QuickRatesModal({ quickRates, setQuickRates, suppliers, inventory, setI
             <p className="text-xs mt-1">{!search&&'Add items manually or bulk import from Excel.'}</p>
           </div>
         ) : (
-          <div className="border border-gray-200 rounded-2xl overflow-hidden">
+          <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
             <div className="overflow-x-auto max-h-[52vh]">
-              <table className="w-full text-sm min-w-[800px]">
-                <thead className="sticky top-0" style={{background:'#06065c'}}>
-                  <tr>{['Item','SKU','Cat','Stock Level','Reorder At','Cost','Sell Price',''].map(h=>(
-                    <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-white/80 whitespace-nowrap">{h}</th>
-                  ))}</tr>
+              <table className="w-full text-sm min-w-[900px]">
+                <thead className="bg-gray-50 border-b border-gray-200 sticky top-0 z-10">
+                  <tr>
+                    {(()=>{
+                      const thCls="px-4 py-3 text-xs font-semibold text-left cursor-pointer select-none hover:bg-gray-100 transition-colors whitespace-nowrap";
+                      const SortIcon=({col})=>{
+                        if(sortCol!==col) return <span className="ml-1 text-gray-300">⇅</span>;
+                        return <span className="ml-1 text-brand-500">{sortDir==='asc'?'▲':'▼'}</span>;
+                      };
+                      function mkTh(col,label){
+                        const active=sortCol===col;
+                        return(
+                          <th key={col} className={thCls+(active?' text-brand-600':' text-gray-400')}
+                            onClick={()=>{ if(active){setSortDir(d=>d==='asc'?'desc':'asc');}else{setSortCol(col);setSortDir('asc');} }}>
+                            {label}<SortIcon col={col}/>
+                          </th>
+                        );
+                      }
+                      return(<>
+                        {mkTh('name','Item')}
+                        {mkTh('sku','SKU')}
+                        {mkTh('cat','Cat')}
+                        {mkTh('supplier','Supplier')}
+                        {mkTh('stock','Stock Level')}
+                        {mkTh('reorder','Reorder At')}
+                        {mkTh('status','Status')}
+                        {mkTh('cost','Cost')}
+                        {mkTh('sell','Sell Price')}
+                        <th className="px-4 py-3 text-xs font-semibold text-gray-400 text-left"></th>
+                      </>);
+                    })()}
+                  </tr>
                 </thead>
                 <tbody>
-                  {filtered.map((r,i)=>(
-                    <tr key={r.id} className={`border-b border-gray-100 ${i%2===0?'bg-white':'bg-gray-50'} hover:bg-brand-50/30 transition-colors`}>
-                      <td className="px-4 py-3 font-semibold text-gray-800 max-w-[200px] truncate">{r.name}</td>
-                      <td className="px-4 py-3 text-xs font-mono text-gray-500">{r.sku||'—'}</td>
-                      <td className="px-4 py-3 text-gray-500">{r.cat||'—'}</td>
-                      <td className="px-4 py-3">{stockBadge(r)}</td>
-                      <td className="px-4 py-3 text-gray-500">{r.reorder||0}</td>
-                      <td className="px-4 py-3 text-gray-600">{zarFmt(r.cost)}</td>
-                      <td className="px-4 py-3 font-bold text-brand-700">{zarFmt(r.sell)}</td>
-                      <td className="px-4 py-3">
-                        <div className="flex gap-1.5 justify-end">
-                          <button onClick={()=>setEditItem(r)} className="text-xs border border-gray-200 rounded-lg px-2.5 py-1 text-gray-500 hover:bg-gray-100 font-semibold">✏️</button>
-                          <button onClick={()=>setCopyItem({...r,id:null,sku:r.sku+'-COPY'})} className="text-xs border border-gray-200 rounded-lg px-2.5 py-1 text-gray-500 hover:bg-gray-100 font-semibold">⧉</button>
-                          {delId===r.id ? (
-                            <span className="flex gap-1">
-                              <button onClick={()=>handleDelete(r.id)} className="text-xs bg-red-500 hover:bg-red-600 text-white rounded-lg px-2.5 py-1 font-bold">Delete</button>
-                              <button onClick={()=>setDelId(null)} className="text-xs border border-gray-200 rounded-lg px-2.5 py-1 text-gray-500 hover:bg-gray-100">✕</button>
-                            </span>
-                          ) : (
-                            <button onClick={()=>setDelId(r.id)} className="text-xs border border-red-200 text-red-400 rounded-lg px-2.5 py-1 hover:bg-red-50 font-semibold">🗑</button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
+                  {filtered.map(r=>{
+                    const stock   = Number(r.stock)||0;
+                    const reorder = Number(r.reorder)||0;
+                    const out     = stock===0;
+                    const low     = !out && reorder>0 && stock<=reorder;
+                    const pct     = Math.min(100, reorder>0 ? (stock/Math.max(stock*1.5,reorder*2))*100 : (stock>0?100:0));
+                    const mu      = (Number(r.cost)||0)>0 ? (((Number(r.sell)||0)-(Number(r.cost)||0))/(Number(r.cost)||0)*100).toFixed(0) : '—';
+                    const supName = (suppliers||[]).find(s=>s.id===r.supplierId||s.id===Number(r.supplierId))?.name||null;
+                    return(
+                      <tr key={r.id} className={`border-b border-gray-50 hover:bg-gray-50 ${out?'bg-red-50/60':low?'bg-red-50/30':''}`}>
+                        <td className="px-4 py-3 text-xs font-semibold text-gray-700">{r.name}</td>
+                        <td className="px-4 py-3 text-xs font-mono text-gray-400">{r.sku||'—'}</td>
+                        <td className="px-4 py-3"><span className="text-xs bg-gray-100 text-gray-600 rounded-full px-2 py-0.5">{r.cat||'—'}</span></td>
+                        <td className="px-4 py-3 text-xs text-gray-500">{supName ? <span className="flex items-center gap-1">🏭 {supName}</span> : <span className="text-gray-300">—</span>}</td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <div className="w-16 bg-gray-100 rounded-full h-1.5 flex-shrink-0">
+                              <div className={`h-1.5 rounded-full ${out?'bg-red-500':low?'bg-amber-400':'bg-emerald-400'}`} style={{width:`${pct}%`}}/>
+                            </div>
+                            <p className={`text-sm font-black whitespace-nowrap ${out?'text-red-600':low?'text-amber-600':'text-gray-800'}`}>{stock} {r.unit||''}</p>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-gray-500">{reorder} {r.unit||''}</td>
+                        <td className="px-4 py-3">
+                          <span className={`text-xs px-2 py-1 rounded-full font-semibold ${out?'bg-red-100 text-red-700':low?'bg-amber-100 text-amber-700':'bg-emerald-100 text-emerald-700'}`}>
+                            {out?'Out of Stock':low?'Reorder Now':'In Stock'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-gray-600">{zarFmt(r.cost)}</td>
+                        <td className="px-4 py-3">
+                          <p className="text-xs text-gray-700">{zarFmt(r.sell)}</p>
+                          {(Number(r.cost)||0)>0 && <p className="text-xs text-emerald-600">+{mu}%</p>}
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex gap-1.5">
+                            <button onClick={()=>setEditItem(r)} className="text-xs text-blue-400 hover:text-blue-600 font-semibold hover:bg-blue-50 rounded-lg px-2 py-1" title="Edit item">✏️</button>
+                            <button onClick={()=>setCopyItem({...r,id:null,sku:(r.sku||'')+'-COPY'})} className="text-xs text-green-500 hover:text-green-700 font-semibold hover:bg-green-50 rounded-lg px-2 py-1" title="Duplicate item">📋</button>
+                            {delId===r.id ? (
+                              <span className="flex gap-1">
+                                <button onClick={()=>handleDelete(r.id)} className="text-xs bg-red-500 hover:bg-red-600 text-white rounded-lg px-2 py-1 font-bold">Delete</button>
+                                <button onClick={()=>setDelId(null)} className="text-xs border border-gray-200 rounded-lg px-2 py-1 text-gray-500 hover:bg-gray-100">✕</button>
+                              </span>
+                            ) : (
+                              <button onClick={()=>setDelId(r.id)} className="text-xs text-red-400 hover:text-red-600 font-semibold hover:bg-red-50 rounded-lg px-2 py-1" title="Remove item">🗑</button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
