@@ -19,6 +19,37 @@
       theme: { extend: { colors: { brand:{ 50:'#e6e6ff',100:'#ccccff',200:'#9999ff',300:'#6666ff',400:'#3333ff',500:'#0000ff',600:'#0000cc',700:'#000099',800:'#000066',900:'#06065c' } } } }
     }
   </script>
+  <!-- Signacore API URL used by the static dashboard -->
+  <script>
+    window.SIGNACORE_API_URL = "https://signacore-backend-api.onrender.com/api";
+
+    // ── Dashboard ⇄ Backend helpers ───────────────────────────────
+    // These talk to the Signacore backend API which stores JSON state
+    // in PostgreSQL (table: platform_state, single row id = 1).
+    (function(){
+      var API_URL = window.SIGNACORE_API_URL;
+
+      window.loadPlatformStateFromDatabase = async function loadPlatformStateFromDatabase() {
+        var response = await fetch(API_URL + "/platform-state", { method: "GET" });
+        if (!response.ok) {
+          throw new Error("Could not load platform state from database");
+        }
+        return await response.json();
+      };
+
+      window.savePlatformStateToDatabase = async function savePlatformStateToDatabase(data) {
+        var response = await fetch(API_URL + "/platform-state", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ data: data })
+        });
+        if (!response.ok) {
+          throw new Error("Could not save platform state to database");
+        }
+        return await response.json();
+      };
+    })();
+  </script>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,400;0,600;0,700;0,800;1,700;1,800&family=Noto+Sans+SC:wght@300;400;500;700&display=swap');
     *{box-sizing:border-box;}
@@ -12759,10 +12790,83 @@ function App() {
   const [payrollRecords,   setPayrollRecords]   = useState(_saved ? (_saved.payrollRecords||[])    : []);
   const [quickRates,       setQuickRates]       = useState(_saved ? (_saved.quickRates||[])        : INITIAL_QUICK_RATES);
 
-  // Auto-sync both users' changes to localStorage (shared within same browser)
+  // ── DATABASE-BACKED PERSISTENCE ────────────────────────────────
+  // Database (PostgreSQL via backend API) is the main source of truth.
+  // localStorage is kept only as an emergency fallback / backup.
+  // Order on startup: API → embedded defaults if empty → localStorage if API fails.
+  const apiReadyRef = useRef(false);   // true once GET /api/platform-state has been attempted successfully
+  const apiSaveTimerRef = useRef(null);
+  const [apiMsg, setApiMsg] = useState('');
+
+  // 1) Initial load from backend
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await window.loadPlatformStateFromDatabase();
+        const dbData = (result && Object.prototype.hasOwnProperty.call(result, 'data')) ? result.data : result;
+        if (cancelled) return;
+        const hasData = dbData && typeof dbData === 'object' && Object.keys(dbData).length > 0;
+        if (hasData) {
+          if (Array.isArray(dbData.jobs))             setJobs(dbData.jobs);
+          if (Array.isArray(dbData.inventory))        setInventory(dbData.inventory);
+          if (Array.isArray(dbData.quotes))           setQuotes(dbData.quotes);
+          if (Array.isArray(dbData.customers))        setCustomers(dbData.customers);
+          if (Array.isArray(dbData.suppliers))        setSuppliers(dbData.suppliers);
+          if (Array.isArray(dbData.assets))           setAssets(dbData.assets);
+          if (Array.isArray(dbData.employees))        setEmployees(dbData.employees);
+          if (Array.isArray(dbData.leaveRequests))    setLeaveRequests(dbData.leaveRequests);
+          if (Array.isArray(dbData.disciplinary))     setDisciplinary(dbData.disciplinary);
+          if (Array.isArray(dbData.savedCalcs))       setSavedCalcs(dbData.savedCalcs);
+          if (Array.isArray(dbData.purchaseOrders))   setPurchaseOrders(dbData.purchaseOrders);
+          if (Array.isArray(dbData.savedImports))     setSavedImports(dbData.savedImports);
+          if (Array.isArray(dbData.bankTxns))         setBankTxns(dbData.bankTxns);
+          if (Array.isArray(dbData.chartOfAccounts) && dbData.chartOfAccounts.length > 5) setChartOfAccounts(dbData.chartOfAccounts);
+          if (Array.isArray(dbData.accInvoices))      setAccInvoices(dbData.accInvoices);
+          if (Array.isArray(dbData.accBills))         setAccBills(dbData.accBills);
+          if (Array.isArray(dbData.completeProducts)) setCompleteProducts(dbData.completeProducts);
+          if (Array.isArray(dbData.payrollRecords))   setPayrollRecords(dbData.payrollRecords);
+          if (Array.isArray(dbData.quickRates))       setQuickRates(dbData.quickRates);
+          if (typeof dbData.logo === 'string')        setLogoDataUrl(dbData.logo);
+          if (typeof dbData.utLogo === 'string')      setUtLogoDataUrl(dbData.utLogo);
+          if (dbData.sigOTSmit)                       setSigOTSmit(dbData.sigOTSmit);
+          if (dbData.savedAt)                         setLastSaved(dbData.savedAt);
+          setApiMsg('Loaded from database');
+        } else {
+          // Empty DB → keep embedded/default data already in state.
+          setApiMsg('Database empty — using defaults');
+        }
+        apiReadyRef.current = true;   // safe to start pushing changes back to API
+      } catch (e) {
+        // API failed → fall back to whatever loadPersistedData() already provided
+        // (localStorage / sgr-data tag / INITIAL_*). Do NOT push state to API.
+        apiReadyRef.current = false;
+        setApiMsg('Offline — using local backup');
+      }
+      setTimeout(() => setApiMsg(''), 3000);
+    })();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 2) Auto-save: localStorage backup immediately + debounced PUT to backend
   useEffect(()=>{
-    try { localStorage.setItem('sgr_platform_data', JSON.stringify({v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logo:logoDataUrl, utLogo:utLogoDataUrl, sigOTSmit, savedAt:lastSaved})); } catch(e) {}
-  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, payrollRecords, logoDataUrl]);
+    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logo:logoDataUrl, utLogo:utLogoDataUrl, sigOTSmit, savedAt:lastSaved};
+    // Backup to localStorage (safety net only — DB is source of truth)
+    try { localStorage.setItem('sgr_platform_data', JSON.stringify(snapshot)); } catch(e) {}
+    // Debounced push to backend — only after the initial API GET completed
+    if (!apiReadyRef.current) return;
+    if (apiSaveTimerRef.current) clearTimeout(apiSaveTimerRef.current);
+    apiSaveTimerRef.current = setTimeout(async () => {
+      try {
+        await window.savePlatformStateToDatabase(snapshot);
+        setApiMsg('Saved to database');
+      } catch (e) {
+        setApiMsg('Save failed — kept locally');
+      }
+      setTimeout(() => setApiMsg(''), 2500);
+    }, 800);
+  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logoDataUrl, utLogoDataUrl, sigOTSmit]);
 
   function handleLogin(u){ setUser(u); setPage('dashboard'); setEntityFilter(null); }
   function handleLogout(){ setUser(null); setPage('dashboard'); setEntityFilter(null); }
@@ -12833,6 +12937,15 @@ function App() {
   return (
     <div className="flex h-screen overflow-hidden">
       <Sidebar companies={companies} page={safePage} setPage={setPage} open={sidebarOpen} setOpen={setSidebarOpen} user={user} entityFilter={entityFilter} onEntitySelect={handleEntitySelect} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl}/>
+      {apiMsg && (
+        <div style={{
+          position:'fixed', top:'14px', right:'14px', zIndex:1000,
+          padding:'8px 14px', borderRadius:'8px',
+          background: /fail|offline/i.test(apiMsg) ? '#fee2e2' : '#dcfce7',
+          color:      /fail|offline/i.test(apiMsg) ? '#991b1b' : '#166534',
+          fontSize:'0.82rem', fontWeight:600, boxShadow:'0 4px 12px rgba(0,0,0,0.08)'
+        }}>{apiMsg}</div>
+      )}
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
         <Header page={safePage} onMenu={()=>setSidebarOpen(true)} onLogout={handleLogout} user={user} onSave={saveFile} saveMsg={saveMsg} onShare={()=>setShowShare(true)} lastSaved={lastSaved} logoDataUrl={logoDataUrl}/>
         {showShare&&<ShareGuideModal onClose={()=>setShowShare(false)} lastSaved={lastSaved}/>}
