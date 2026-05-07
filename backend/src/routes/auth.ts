@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
+import jwt, { SignOptions } from 'jsonwebtoken';
 import { query } from '../db/pool';
 
 const router = Router();
@@ -28,11 +28,17 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
       return;
     }
     await query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
-    const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role, company_id: user.company_id },
-      process.env.JWT_SECRET || 'secret',
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-    );
+const jwtSecret = process.env.JWT_SECRET || 'fallback-secret';
+
+const jwtOptions: SignOptions = {
+  expiresIn: (process.env.JWT_EXPIRES_IN || '7d') as SignOptions['expiresIn']
+};
+
+const token = jwt.sign(
+  { id: user.id, email: user.email, role: user.role },
+  jwtSecret,
+  jwtOptions
+);
     res.json({
       token,
       user: {
