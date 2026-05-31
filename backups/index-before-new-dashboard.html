@@ -5174,7 +5174,7 @@ section{margin-bottom:14px}
 .footer{border-top:2px solid #06065c;padding-top:8px;margin-top:18px;display:flex;justify-content:space-between;align-items:center}
 .footer-left{font-size:8px;color:#aaa;line-height:1.6}
 .footer-right{font-size:8px;color:#ED0101;font-weight:700;letter-spacing:0.05em}
-@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}.hdr-cell{padding:40mm 12mm 0}.body-cell{padding:4mm 12mm 55mm}.footer{position:fixed;bottom:0;left:0;right:0;background:#fff;padding:6mm 12mm 8mm;margin:0;border-top:2px solid #06065c}}
+@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}.hdr-cell{padding:40mm 12mm 14mm}.body-cell{padding:4mm 12mm 28mm}.ftr-cell{padding:0 12mm 8mm;background:#fff}.footer{border-top:2px solid #06065c;padding:8px 0 0;margin:0}}
 `;
 }
 
@@ -5673,9 +5673,9 @@ ${data.subject ? `<section style="margin-bottom:16px;"><div style="font-size:12p
 </head><body>
 <table class="print-wrap">
   <thead><tr><td class="hdr-cell">${hrLetterhead(logoDataUrl, docTitle, ref)}</td></tr></thead>
+  <tfoot><tr><td class="ftr-cell">${hrFooter()}</td></tr></tfoot>
   <tbody><tr><td class="body-cell">${bodyHtml}</td></tr></tbody>
 </table>
-${hrFooter()}
 <script>window.onload=function(){window.print();}<\/script>
 </body></html>`;
   const w = window.open('','_blank','width=960,height=750');
