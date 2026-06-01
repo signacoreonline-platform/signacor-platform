@@ -12814,6 +12814,12 @@ function App() {
     return ()=>{ active=false; clearInterval(timer); };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Update browser tab title whenever the active page changes ──
+  useEffect(()=>{
+    const PAGE_TITLES={dashboard:'Dashboard',jobs:'Jobs',calculators:'Calculators & Costing',inventory:'Inventory',imports:'Import Costing',reports:'Reports',sales:'Sales',customers:'Customers',suppliers:'Suppliers',assets:'Assets',hr:'HR',purchase_orders:'Purchase Orders',accounting:'Accounting'};
+    document.title = (PAGE_TITLES[page]||page) + ' — Signacore';
+  },[page]);
+
   function handleLogin(u){ setUser(u); setPage(_hashPage||'dashboard'); setEntityFilter(null); }
   function handleLogout(){ setUser(null); setPage('dashboard'); setEntityFilter(null); }
   function handleEntitySelect(coId){ setEntityFilter(coId); setPage('jobs'); }
