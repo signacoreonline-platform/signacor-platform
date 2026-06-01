@@ -2951,8 +2951,6 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
   const [lines,setLines]=useState(eq?.lines||[{id:1,itemId:null,desc:'',qty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]);
   const [showCalcPicker, setShowCalcPicker] = useState(false);
   const [showCPPicker,   setShowCPPicker]   = useState(false);
-  const [expandedCalc,   setExpandedCalc]   = useState(new Set());
-  function toggleCalc(id){ setExpandedCalc(prev=>{ const n=new Set(prev); n.has(id)?n.delete(id):n.add(id); return n; }); }
   const [attachments,    setAttachments]    = useState(eq?.attachments||[]);
   const [poRef,          setPoRef]          = useState(eq?.poRef||'');
   const [openTypeaheadId, setOpenTypeaheadId] = useState(null);
@@ -3004,11 +3002,26 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
         const item=inventory.find(i=>i.id===parseInt(value));
         u.desc=item?item.name:''; u.unit=item?item.unit||'m²':'m²'; u.unitPrice=item?item.sell:0;
       }
-      // auto-calc sqm → qty when L or W changes (inputs are in mm, output in m²)
+      // auto-calc from dimension inputs (mm) → qty
       if(field==='sqmL'||field==='sqmW'){
         const l2=parseFloat(field==='sqmL'?value:u.sqmL)||0;
         const w2=parseFloat(field==='sqmW'?value:u.sqmW)||0;
-        if(l2>0&&w2>0){ u.qty=parseFloat(((l2*w2)/1000000).toFixed(4)); if(!u.unit) u.unit='m²'; }
+        if(u.unit==='m (linear)'){
+          if(l2>0){ u.qty=parseFloat((l2/1000).toFixed(4)); }
+        } else {
+          // m² or fallback
+          if(l2>0&&w2>0){ u.qty=parseFloat(((l2*w2)/1000000).toFixed(4)); if(!u.unit) u.unit='m²'; }
+        }
+      }
+      // if unit changes while calc inputs are filled, recalc qty
+      if(field==='unitSelect'||field==='unit'){
+        const newUnit = field==='unitSelect'?(value==='custom'?'':value):value;
+        if(u.sqmL){
+          const l2=parseFloat(u.sqmL)||0;
+          const w2=parseFloat(u.sqmW)||0;
+          if(newUnit==='m (linear)'&&l2>0){ u.qty=parseFloat((l2/1000).toFixed(4)); }
+          else if(newUnit==='m²'&&l2>0&&w2>0){ u.qty=parseFloat(((l2*w2)/1000000).toFixed(4)); }
+        }
       }
       u.subtotal=(parseFloat(u.qty)||0)*(parseFloat(u.unitPrice)||0);
       return u;
@@ -3200,11 +3213,11 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
                   </div>
                 )}
 
-                {/* ── Single row: Number badge + Description + Qty + Unit + Unit Rate + Line Total + Delete ── */}
-                <div className="flex items-start gap-2 px-4 pt-4 pb-3 flex-wrap">
+                {/* ── Single row: Number badge + Description + Unit + [Inline Calc] + Qty + Unit Rate + Line Total + Delete ── */}
+                <div className="flex items-start gap-2 px-4 pt-4 pb-4 flex-wrap">
                   <span className="w-6 h-6 rounded-full bg-brand-500 text-white text-xs font-black flex items-center justify-center flex-shrink-0 mt-6">{idx+1}</span>
 
-                  {/* Description — grows to fill available space, wraps if long */}
+                  {/* Description — grows to fill available space */}
                   <div className="flex-1 min-w-[160px] relative">
                     {line.cpLinked ? (
                       <div className="border border-brand-200 bg-white rounded-xl px-3 py-2.5 text-sm text-brand-700 font-semibold break-words">
@@ -3261,14 +3274,6 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
                     )}
                   </div>
 
-                  {/* Qty */}
-                  <div className="flex-shrink-0 w-20">
-                    <label className="block text-xs font-semibold text-gray-400 mb-1">Qty</label>
-                    <input type="number" min="0" step="0.0001" value={line.qty}
-                      onChange={e=>updateLine(line.id,'qty',e.target.value)}
-                      className="w-full border border-gray-300 rounded-xl px-2 py-2.5 text-sm text-center bg-white focus:ring-2 focus:ring-brand-400"/>
-                  </div>
-
                   {/* Unit */}
                   <div className="flex-shrink-0 w-28">
                     <label className="block text-xs font-semibold text-gray-400 mb-1">Unit</label>
@@ -3284,6 +3289,50 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
                         placeholder="e.g. roll, panel…"
                         className="w-full border border-gray-300 rounded-xl px-2 py-2 text-sm bg-white focus:ring-2 focus:ring-brand-400 mt-2"/>
                     )}
+                  </div>
+
+                  {/* Inline Calculator — shown only for m² or m (linear) */}
+                  {(line.unit==='m²'||line.unit==='m (linear)')&&(
+                    <div className="flex-shrink-0">
+                      <label className="block text-xs font-semibold text-indigo-500 mb-1">
+                        {line.unit==='m²'?'📐 L × W (mm)':'📏 Length (mm)'}
+                      </label>
+                      <div className="flex items-center gap-1.5 bg-indigo-50 border border-indigo-200 rounded-xl px-3 py-2">
+                        <input type="number" min="0" step="1" value={line.sqmL||''}
+                          onChange={e=>updateLine(line.id,'sqmL',e.target.value)}
+                          placeholder="Length"
+                          className="w-24 border border-indigo-200 rounded-lg px-2 py-1.5 text-xs bg-white focus:ring-1 focus:ring-indigo-400 text-center"/>
+                        {line.unit==='m²'&&(<>
+                          <span className="text-indigo-400 font-black text-sm">×</span>
+                          <input type="number" min="0" step="1" value={line.sqmW||''}
+                            onChange={e=>updateLine(line.id,'sqmW',e.target.value)}
+                            placeholder="Width"
+                            className="w-24 border border-indigo-200 rounded-lg px-2 py-1.5 text-xs bg-white focus:ring-1 focus:ring-indigo-400 text-center"/>
+                        </>)}
+                        {line.unit==='m²'&&line.sqmL&&line.sqmW&&(
+                          <span className="text-xs font-black text-indigo-700 whitespace-nowrap">
+                            ={((parseFloat(line.sqmL)||0)*(parseFloat(line.sqmW)||0)/1000000).toFixed(4)} m²
+                          </span>
+                        )}
+                        {line.unit==='m (linear)'&&line.sqmL&&(
+                          <span className="text-xs font-black text-indigo-700 whitespace-nowrap">
+                            ={(parseFloat(line.sqmL)||0)/1000} m
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Qty */}
+                  <div className="flex-shrink-0 w-20">
+                    <label className="block text-xs font-semibold text-gray-400 mb-1">
+                      {(line.unit==='m²'||line.unit==='m (linear)')&&(line.sqmL)
+                        ? <span className="text-indigo-500">Qty ✓</span>
+                        : 'Qty'}
+                    </label>
+                    <input type="number" min="0" step="0.0001" value={line.qty}
+                      onChange={e=>updateLine(line.id,'qty',e.target.value)}
+                      className={`w-full border rounded-xl px-2 py-2.5 text-sm text-center bg-white focus:ring-2 focus:ring-brand-400 ${(line.unit==='m²'||line.unit==='m (linear)')&&line.sqmL?'border-indigo-300':'border-gray-300'}`}/>
                   </div>
 
                   {/* Unit Rate */}
@@ -3305,39 +3354,6 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
                     <button type="button" onClick={()=>removeLine(line.id)}
                       className="mt-6 w-7 h-7 flex items-center justify-center text-gray-300 hover:text-red-400 hover:bg-red-50 rounded-xl transition-colors flex-shrink-0">✕</button>
                   )}
-                </div>
-
-                {/* ── Row 3: Area Calculator toggle ── */}
-                <div className="px-4 pb-4">
-                  <div className="ml-8">
-                    <button type="button" onClick={()=>toggleCalc(line.id)}
-                      className="text-xs font-semibold text-indigo-400 hover:text-indigo-600 flex items-center gap-1 mb-2 transition-colors">
-                      <span>{expandedCalc.has(line.id)?'▲':'▼'}</span>
-                      <span>📐 Area Calculator (mm → m²)</span>
-                    </button>
-                    {expandedCalc.has(line.id)&&(
-                      <div className="flex items-center gap-3 bg-indigo-50 border border-indigo-100 rounded-xl px-4 py-2.5 flex-wrap">
-                        <div className="flex items-center gap-2">
-                          <input type="number" min="0" step="1" value={line.sqmL||''}
-                            onChange={e=>updateLine(line.id,'sqmL',e.target.value)}
-                            placeholder="Length (mm)"
-                            className="w-32 border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs bg-white focus:ring-1 focus:ring-indigo-400 text-center"/>
-                          <span className="text-indigo-300 font-black text-base">×</span>
-                          <input type="number" min="0" step="1" value={line.sqmW||''}
-                            onChange={e=>updateLine(line.id,'sqmW',e.target.value)}
-                            placeholder="Width (mm)"
-                            className="w-32 border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs bg-white focus:ring-1 focus:ring-indigo-400 text-center"/>
-                        </div>
-                        {(line.sqmL&&line.sqmW) ? (
-                          <span className="text-xs font-black text-indigo-700 bg-white border border-indigo-200 rounded-lg px-3 py-1.5">
-                            = {(((parseFloat(line.sqmL)||0)*(parseFloat(line.sqmW)||0))/1000000).toFixed(4)} m²  ✓ Qty auto-set
-                          </span>
-                        ) : (
-                          <span className="text-xs text-indigo-300 italic">Enter length &amp; width in mm to auto-fill Qty</span>
-                        )}
-                      </div>
-                    )}
-                  </div>
                 </div>
 
               </div>
