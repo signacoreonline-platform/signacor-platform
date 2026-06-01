@@ -6487,12 +6487,28 @@ function Header({ page, onMenu, onLogout, user, onSave, saveMsg, onShare, lastSa
 /* ═══════════════════════════════════════════
    CHARTS
 ═══════════════════════════════════════════ */
-function RevenueChart() {
+function RevenueChart({ jobs=[] }) {
   const ref=useRef(null);
   useEffect(()=>{
-    const chart=new Chart(ref.current,{type:'bar',data:{labels:MONTHLY.map(m=>m.m),datasets:[{label:'Revenue',data:MONTHLY.map(m=>m.rev),backgroundColor:'#0000ffcc',borderRadius:5},{label:'Costs',data:MONTHLY.map(m=>m.cost),backgroundColor:'#94a3b8cc',borderRadius:5}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{font:{size:11},boxWidth:10,padding:12}}},scales:{y:{ticks:{callback:v=>`R${(v/1000).toFixed(0)}k`,font:{size:10}},grid:{color:'#f1f5f9'}},x:{ticks:{font:{size:11}},grid:{display:false}}}}});
+    // Build last-6-months buckets from actual job data
+    const now=new Date();
+    const months=[];
+    for(let i=5;i>=0;i--){
+      const d=new Date(now.getFullYear(),now.getMonth()-i,1);
+      months.push({m:d.toLocaleString('default',{month:'short'}),year:d.getFullYear(),month:d.getMonth(),rev:0,cost:0});
+    }
+    jobs.forEach(j=>{
+      if(!j.value&&!j.breakdown)return;
+      const d=new Date(j.id); // id is Date.now() timestamp
+      const bucket=months.find(b=>b.year===d.getFullYear()&&b.month===d.getMonth());
+      if(!bucket)return;
+      bucket.rev+=(j.value||0);
+      bucket.cost+=breakdownTotal(j.breakdown);
+    });
+    const hasData=months.some(b=>b.rev>0||b.cost>0);
+    const chart=new Chart(ref.current,{type:'bar',data:{labels:months.map(m=>m.m),datasets:[{label:'Revenue',data:months.map(m=>m.rev),backgroundColor:hasData?'#0000ffcc':'#cbd5e133',borderRadius:5},{label:'Costs',data:months.map(m=>m.cost),backgroundColor:hasData?'#94a3b8cc':'#e2e8f033',borderRadius:5}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{font:{size:11},boxWidth:10,padding:12}},tooltip:{callbacks:{label:ctx=>`R${(ctx.raw/1000).toFixed(1)}k`}}},scales:{y:{ticks:{callback:v=>`R${(v/1000).toFixed(0)}k`,font:{size:10}},grid:{color:'#f1f5f9'}},x:{ticks:{font:{size:11}},grid:{display:false}}}}});
     return ()=>chart.destroy();
-  },[]);
+  },[jobs]);
   return <canvas ref={ref}/>;
 }
 
@@ -6579,7 +6595,7 @@ function DashboardPage({ jobs, inventory, companies, user, logoDataUrl }) {
         {isAdmin&&(
           <div className="lg:col-span-3 bg-white rounded-2xl border border-gray-200 p-4">
             <h3 className="text-sm font-bold mb-3" style={{color:'#06065c'}}>Revenue vs Costs — Last 6 Months</h3>
-            <div className="h-52"><RevenueChart/></div>
+            <div className="h-52"><RevenueChart jobs={visibleJobs}/></div>
           </div>
         )}
         <div className={`${isAdmin?'lg:col-span-2':''} bg-white rounded-2xl border border-gray-200 p-4`}>
