@@ -6428,10 +6428,19 @@ function Sidebar({ companies, page, setPage, open, setOpen, user, entityFilter, 
         </div>
         <nav className="flex-1 overflow-y-auto p-3 space-y-0.5">
           {nav.map(n=>(
-            <button key={n.id} onClick={()=>{setPage(n.id);setOpen(false);}}
-              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm text-left transition-all ${page===n.id?'text-white font-semibold':'text-blue-200 hover:bg-white/10 hover:text-white'}`} style={page===n.id?{background:'rgba(0,0,255,0.45)',borderLeft:'3px solid #ED0101'}:{}}>
-              <span className="w-5 text-center">{n.icon}</span><span>{n.label}</span>
-            </button>
+            <div key={n.id} className="flex items-center gap-0.5 group/navrow">
+              <button onClick={()=>{setPage(n.id);setOpen(false);}}
+                className={`flex-1 flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm text-left transition-all ${page===n.id?'text-white font-semibold':'text-blue-200 hover:bg-white/10 hover:text-white'}`} style={page===n.id?{background:'rgba(0,0,255,0.45)',borderLeft:'3px solid #ED0101'}:{}}>
+                <span className="w-5 text-center">{n.icon}</span><span>{n.label}</span>
+              </button>
+              <button
+                title={`Open ${n.label} in new tab`}
+                onClick={e=>{e.stopPropagation();window.open(window.location.href.split('#')[0]+'#page='+n.id,'_blank');}}
+                className="opacity-0 group-hover/navrow:opacity-100 transition-opacity shrink-0 w-6 h-6 flex items-center justify-center rounded-lg text-blue-300 hover:text-white hover:bg-white/20 text-xs"
+                style={{marginRight:'2px'}}>
+                ↗
+              </button>
+            </div>
           ))}
         </nav>
         {/* bottom spacer */}
@@ -8251,12 +8260,13 @@ function SignageCalc({ savedCalcs, setSavedCalcs, completeProducts, setCompleteP
 
                     {/* ── From Stock picker — two-level: category → item ── */}
                     {(()=>{
-                      const invCats = [...new Set((inventory||[]).filter(i=>i.stock>0).map(i=>i.cat))].filter(Boolean).sort();
+                      // Include ALL inventory items regardless of stock level
+                      const invCats = [...new Set((inventory||[]).map(i=>i.cat))].filter(Boolean).sort();
                       if(!invCats.length) return null;
                       const sel       = selStock[cat.id]||{};
                       const chosenCat = sel.invCat||'';
                       const chosenId  = sel.invItemId||'';
-                      const catItems  = chosenCat ? (inventory||[]).filter(i=>i.cat===chosenCat&&i.stock>0) : [];
+                      const catItems  = chosenCat ? (inventory||[]).filter(i=>i.cat===chosenCat) : [];
                       return (
                         <div className="mb-2 p-2 bg-emerald-50 border border-emerald-200 rounded-xl space-y-1.5">
                           <div className="flex items-center gap-1.5">
@@ -8273,7 +8283,7 @@ function SignageCalc({ savedCalcs, setSavedCalcs, completeProducts, setCompleteP
                               <option value="">① Select category…</option>
                               {invCats.map(c=><option key={c} value={c}>{c}</option>)}
                             </select>
-                            {/* Step 2: pick item in that category */}
+                            {/* Step 2: pick item in that category (zero-stock items shown with warning) */}
                             <select
                               className="flex-1 min-w-0 text-xs border border-emerald-300 rounded-lg px-2 py-1.5 bg-white text-gray-700"
                               value={chosenId}
@@ -8281,7 +8291,7 @@ function SignageCalc({ savedCalcs, setSavedCalcs, completeProducts, setCompleteP
                               disabled={!chosenCat}
                             >
                               <option value="">{chosenCat ? '② Select item…' : '— choose category first —'}</option>
-                              {catItems.map(s=><option key={s.id} value={s.id}>{s.name}  ({s.stock} {s.unit})  R {Number(s.cost).toFixed(2)}/{s.unit}</option>)}
+                              {catItems.map(s=><option key={s.id} value={s.id}>{s.name}  {(Number(s.stock)||0)===0?'⚠ NO STOCK':'('+s.stock+' '+s.unit+')'}  R {Number(s.cost).toFixed(2)}/{s.unit}</option>)}
                             </select>
                             <button
                               onClick={()=>addFromStock(cat.id)}
@@ -12664,8 +12674,11 @@ function ReportsPage({ jobs, companies, user }) {
 function App() {
   const _saved = loadPersistedData();
 
+  // Read initial page from URL hash e.g. #page=inventory
+  const _hashPage = (()=>{ try { const h=window.location.hash; const m=h.match(/[#&]page=([^&]+)/); return m?m[1]:null; } catch(e){return null;} })();
+
   const [user,         setUser]         = useState(null);
-  const [page,         setPage]         = useState('dashboard');
+  const [page,         setPage]         = useState(_hashPage||'dashboard');
   const [sidebarOpen,  setSidebarOpen]  = useState(false);
   const [entityFilter, setEntityFilter] = useState(null);
   const [saveMsg,      setSaveMsg]      = useState('');
@@ -12736,7 +12749,55 @@ function App() {
     } catch(e) {}
   }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logoDataUrl, utLogoDataUrl, sigOTSmit, lastSaved]);
 
-  function handleLogin(u){ setUser(u); setPage('dashboard'); setEntityFilter(null); }
+  // ── Auto-sync: poll server every 30s so all users see fresh data ──
+  useEffect(()=>{
+    let active = true;
+    let lastSavedAt = _saved ? _saved.savedAt : null;
+
+    async function poll() {
+      try {
+        const res = await fetch(API_STATE_URL);
+        if (!res.ok) return;
+        const json = await res.json();
+        const d = json && json.data !== undefined ? json.data : json;
+        if (!validState(d)) return;
+        // Only update if server has newer data than what we loaded on boot
+        if (active && d.savedAt && d.savedAt !== lastSavedAt) {
+          lastSavedAt = d.savedAt;
+          setJobs(d.jobs||[]);
+          setInventory(()=>{
+            const saved = d.inventory||[];
+            const savedIds = new Set(saved.map(i=>i.id));
+            const newItems = INITIAL_INVENTORY.filter(i=>!savedIds.has(i.id));
+            return newItems.length ? [...saved,...newItems] : saved;
+          });
+          setQuotes(d.quotes||[]);
+          setCustomers(d.customers||[]);
+          setSuppliers(d.suppliers||[]);
+          setAssets(d.assets||[]);
+          setEmployees(d.employees||[]);
+          setLeaveRequests(d.leaveRequests||[]);
+          setDisciplinary(d.disciplinary||[]);
+          setSavedCalcs(d.savedCalcs||[]);
+          setPurchaseOrders(d.purchaseOrders||[]);
+          setSavedImports(d.savedImports||[]);
+          setBankTxns(d.bankTxns||[]);
+          setChartOfAccounts(d.chartOfAccounts&&d.chartOfAccounts.length>5?d.chartOfAccounts:INITIAL_ACCOUNTS);
+          setAccInvoices(d.accInvoices||[]);
+          setAccBills(d.accBills||[]);
+          setCompleteProducts(d.completeProducts||[]);
+          setPayrollRecords(d.payrollRecords||[]);
+          setQuickRates(d.quickRates||[]);
+          setLastSaved(d.savedAt);
+        }
+      } catch(e) {}
+    }
+
+    const timer = setInterval(poll, 30000);
+    return ()=>{ active=false; clearInterval(timer); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function handleLogin(u){ setUser(u); setPage(_hashPage||'dashboard'); setEntityFilter(null); }
   function handleLogout(){ setUser(null); setPage('dashboard'); setEntityFilter(null); }
   function handleEntitySelect(coId){ setEntityFilter(coId); setPage('jobs'); }
 
