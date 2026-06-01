@@ -110,17 +110,27 @@ function loadServerStateSync() {
 function loadPersistedData() {
   // 1. PostgreSQL/server state — shared across devices
   const serverState = loadServerStateSync();
-  if (serverState) return serverState;
 
-  // 2. localStorage — browser fallback/offline edits
+  // 2. localStorage — browser fallback / may be MORE RECENT than server
+  //    (e.g. user refreshed before the 800ms auto-save debounce reached the server)
+  let localState = null;
   try {
     const ls = localStorage.getItem(STORAGE_KEY);
     if (ls) {
       const d = JSON.parse(ls);
-      if (validState(d)) return d;
-      localStorage.removeItem(STORAGE_KEY);
+      if (validState(d)) localState = d;
+      else localStorage.removeItem(STORAGE_KEY);
     }
   } catch(e) {}
+
+  // Pick whichever state is newer using _autoSavedAt timestamp
+  if (serverState && localState) {
+    const st = serverState._autoSavedAt ? new Date(serverState._autoSavedAt).getTime() : 0;
+    const lt = localState._autoSavedAt  ? new Date(localState._autoSavedAt).getTime()  : 0;
+    return lt > st ? localState : serverState;
+  }
+  if (serverState) return serverState;
+  if (localState)  return localState;
 
   // 3. Embedded data tag — set when the file was last saved
   try {
@@ -3045,13 +3055,15 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
     const q = query.toLowerCase().trim();
     const invItems = inventory.filter(item =>
       item.name.toLowerCase().includes(q) ||
-      (item.cat && item.cat.toLowerCase().includes(q))
-    ).slice(0, 5).map(i=>({...i, _source:'inv'}));
+      (item.cat && item.cat.toLowerCase().includes(q)) ||
+      (item.sku && item.sku.toLowerCase().includes(q))
+    ).map(i=>({...i, _source:'inv'}));
     const qrItems = (quickRates||[]).filter(item =>
       item.name.toLowerCase().includes(q) ||
-      (item.cat && item.cat.toLowerCase().includes(q))
-    ).slice(0, 5).map(i=>({...i, _source:'qr'}));
-    return [...invItems, ...qrItems].slice(0, 9);
+      (item.cat && item.cat.toLowerCase().includes(q)) ||
+      (item.sku && item.sku.toLowerCase().includes(q))
+    ).map(i=>({...i, _source:'qr'}));
+    return [...invItems, ...qrItems].slice(0, 20);
   }
 
   return (
@@ -6412,6 +6424,7 @@ const NAV_ALL=[
 function Sidebar({ companies, page, setPage, open, setOpen, user, entityFilter, onEntitySelect, logoDataUrl, setLogoDataUrl }) {
   const nav = NAV_ALL.filter(n=>n.roles.includes(user.role));
   const isAssistant = user.role === 'assistant';
+  const [hoveredNav, setHoveredNav] = useState(null);
   return (
     <>
       {open&&<div className="fixed inset-0 bg-black/50 z-30 lg:hidden" onClick={()=>setOpen(false)}/>}
@@ -6428,7 +6441,9 @@ function Sidebar({ companies, page, setPage, open, setOpen, user, entityFilter, 
         </div>
         <nav className="flex-1 overflow-y-auto p-3 space-y-0.5">
           {nav.map(n=>(
-            <div key={n.id} className="flex items-center gap-0.5 group/navrow">
+            <div key={n.id} className="flex items-center gap-0.5"
+              onMouseEnter={()=>setHoveredNav(n.id)}
+              onMouseLeave={()=>setHoveredNav(null)}>
               <button onClick={()=>{setPage(n.id);setOpen(false);}}
                 className={`flex-1 flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm text-left transition-all ${page===n.id?'text-white font-semibold':'text-blue-200 hover:bg-white/10 hover:text-white'}`} style={page===n.id?{background:'rgba(0,0,255,0.45)',borderLeft:'3px solid #ED0101'}:{}}>
                 <span className="w-5 text-center">{n.icon}</span><span>{n.label}</span>
@@ -6436,8 +6451,8 @@ function Sidebar({ companies, page, setPage, open, setOpen, user, entityFilter, 
               <button
                 title={`Open ${n.label} in new tab`}
                 onClick={e=>{e.stopPropagation();window.open(window.location.href.split('#')[0]+'#page='+n.id,'_blank');}}
-                className="opacity-0 group-hover/navrow:opacity-100 transition-opacity shrink-0 w-6 h-6 flex items-center justify-center rounded-lg text-blue-300 hover:text-white hover:bg-white/20 text-xs"
-                style={{marginRight:'2px'}}>
+                className="shrink-0 w-6 h-6 flex items-center justify-center rounded-lg text-blue-300 hover:text-white hover:bg-white/20 text-xs transition-opacity"
+                style={{opacity: hoveredNav===n.id ? 1 : 0, marginRight:'2px'}}>
                 ↗
               </button>
             </div>
@@ -12741,7 +12756,8 @@ function App() {
         logo: logoDataUrl,
         utLogo: utLogoDataUrl,
         sigOTSmit,
-        savedAt: lastSaved
+        savedAt: lastSaved,
+        _autoSavedAt: new Date().toISOString()
       };
 
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
@@ -12752,7 +12768,7 @@ function App() {
   // ── Auto-sync: poll server every 30s so all users see fresh data ──
   useEffect(()=>{
     let active = true;
-    let lastSavedAt = _saved ? _saved.savedAt : null;
+    let lastSavedAt = _saved ? (_saved._autoSavedAt || _saved.savedAt) : null;
 
     async function poll() {
       try {
@@ -12762,8 +12778,9 @@ function App() {
         const d = json && json.data !== undefined ? json.data : json;
         if (!validState(d)) return;
         // Only update if server has newer data than what we loaded on boot
-        if (active && d.savedAt && d.savedAt !== lastSavedAt) {
-          lastSavedAt = d.savedAt;
+        const serverStamp = d._autoSavedAt || d.savedAt;
+        if (active && serverStamp && serverStamp !== lastSavedAt) {
+          lastSavedAt = serverStamp;
           setJobs(d.jobs||[]);
           setInventory(()=>{
             const saved = d.inventory||[];
