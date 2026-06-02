@@ -2948,7 +2948,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
   const UNIT_OPTIONS = ['m²','m (linear)','unit','each','set','hour','day','sheet','pack','kg'];
   const [discount,setDiscount]=useState(eq?.discount||'');
   const [setupFee,setSetupFee]=useState(eq?.setupFee||'');
-  const [lines,setLines]=useState(eq?.lines||[{id:1,itemId:null,desc:'',qty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]);
+  const [lines,setLines]=useState(eq?.lines||[{id:1,itemId:null,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]);
   const [showCalcPicker, setShowCalcPicker] = useState(false);
   const [showCPPicker,   setShowCPPicker]   = useState(false);
   const [attachments,    setAttachments]    = useState(eq?.attachments||[]);
@@ -2968,7 +2968,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
     if(c.notes) setNotes(c.notes);
   }
 
-  function addLine(){ setLines(prev=>[...prev,{id:Date.now(),itemId:null,desc:'',qty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]); }
+  function addLine(){ setLines(prev=>[...prev,{id:Date.now(),itemId:null,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]); }
   function removeLine(id){ setLines(prev=>prev.filter(l=>l.id!==id)); }
   function importFromCalc(calc) {
     const newLines = calc.items.map(it=>({
@@ -2976,9 +2976,11 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
       itemId: null,
       desc:      it.desc||'',
       qty:       it.qty||1,
+      pQty:      1,
       unit:      it.unit||'unit',
       unitPrice: it.unitCost||0,
       subtotal:  (it.qty||1)*(it.unitCost||0),
+      sqmL:'', sqmW:'',
     }));
     setLines(prev=>[...prev.filter(l=>l.desc||l.unitPrice), ...newLines]);
     if(!client && calc.clientRef) setClient(calc.clientRef);
@@ -3023,7 +3025,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
           else if(newUnit==='m²'&&l2>0&&w2>0){ u.qty=parseFloat(((l2*w2)/1000000).toFixed(4)); }
         }
       }
-      u.subtotal=(parseFloat(u.qty)||0)*(parseFloat(u.unitPrice)||0);
+      u.subtotal=(parseFloat(u.pQty)||1)*(parseFloat(u.qty)||0)*(parseFloat(u.unitPrice)||0);
       return u;
     }));
   }
@@ -3067,18 +3069,17 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
 
   function getTypeaheadItems(query) {
     if (!query || query.trim().length < 1) return [];
-    const q = query.toLowerCase().trim();
-    const invItems = inventory.filter(item =>
-      item.name.toLowerCase().includes(q) ||
-      (item.cat && item.cat.toLowerCase().includes(q)) ||
-      (item.sku && item.sku.toLowerCase().includes(q))
-    ).map(i=>({...i, _source:'inv'}));
-    const qrItems = (quickRates||[]).filter(item =>
-      item.name.toLowerCase().includes(q) ||
-      (item.cat && item.cat.toLowerCase().includes(q)) ||
-      (item.sku && item.sku.toLowerCase().includes(q))
-    ).map(i=>({...i, _source:'qr'}));
-    return [...invItems, ...qrItems].slice(0, 20);
+    const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    function hay(item){ return [(item.name||''),(item.cat||''),(item.sku||'')].join(' ').toLowerCase(); }
+    function allWords(item){ return words.every(w=>hay(item).includes(w)); }
+    function anyWord(item){ return words.some(w=>hay(item).includes(w)); }
+    const allItems=[
+      ...inventory.map(i=>({...i,_source:'inv'})),
+      ...(quickRates||[]).map(i=>({...i,_source:'qr'}))
+    ];
+    const exact = allItems.filter(allWords);
+    const fuzzy = allItems.filter(i=>!allWords(i)&&anyWord(i));
+    return [...exact,...fuzzy].slice(0,20);
   }
 
   return (
@@ -3226,13 +3227,15 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
                     ) : (
                       <>
                         <label className="block text-xs font-semibold text-gray-400 mb-1">Description</label>
-                        <input
+                        <textarea
                           value={line.desc}
-                          onChange={e=>{ updateLine(line.id,'desc',e.target.value); setOpenTypeaheadId(line.id); }}
-                          onFocus={()=>setOpenTypeaheadId(line.id)}
+                          onChange={e=>{ updateLine(line.id,'desc',e.target.value); setOpenTypeaheadId(line.id); e.target.style.height='auto'; e.target.style.height=e.target.scrollHeight+'px'; }}
+                          onFocus={e=>{ setOpenTypeaheadId(line.id); e.target.style.height='auto'; e.target.style.height=e.target.scrollHeight+'px'; }}
                           onBlur={()=>setTimeout(()=>setOpenTypeaheadId(null),150)}
                           placeholder="Type to search inventory, or describe item freely…"
                           autoComplete="off"
+                          rows={1}
+                          style={{resize:'none',overflow:'hidden',minHeight:'42px'}}
                           className="w-full border border-gray-300 rounded-xl px-3 py-2.5 text-sm bg-white focus:ring-2 focus:ring-brand-400 focus:border-brand-400"
                         />
                         {taItems.length>0&&(
@@ -3323,11 +3326,21 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
                     </div>
                   )}
 
-                  {/* Qty */}
+                  {/* Product Qty — only shown when dimension calculator is active */}
+                  {(line.unit==='m²'||line.unit==='m (linear)')&&(
+                    <div className="flex-shrink-0 w-20">
+                      <label className="block text-xs font-semibold text-amber-600 mb-1">No. Items</label>
+                      <input type="number" min="1" step="1" value={line.pQty||1}
+                        onChange={e=>updateLine(line.id,'pQty',e.target.value)}
+                        className="w-full border border-amber-300 rounded-xl px-2 py-2.5 text-sm text-center bg-amber-50 focus:ring-2 focus:ring-amber-400"/>
+                    </div>
+                  )}
+
+                  {/* Qty — size qty (auto-filled from dimensions) or plain qty for non-size units */}
                   <div className="flex-shrink-0 w-20">
                     <label className="block text-xs font-semibold text-gray-400 mb-1">
-                      {(line.unit==='m²'||line.unit==='m (linear)')&&(line.sqmL)
-                        ? <span className="text-indigo-500">Qty ✓</span>
+                      {(line.unit==='m²'||line.unit==='m (linear)')
+                        ? <span className="text-indigo-500">{line.unit==='m²'?'m² each':'m each'}</span>
                         : 'Qty'}
                     </label>
                     <input type="number" min="0" step="0.0001" value={line.qty}
@@ -3348,6 +3361,11 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
                   <div className="flex-shrink-0 w-32">
                     <label className="block text-xs font-semibold text-gray-400 mb-1">Line Total</label>
                     <div className="w-full border border-brand-200 bg-brand-50 rounded-xl px-3 py-2.5 text-sm font-black text-brand-700 text-right">{zar(line.subtotal||0)}</div>
+                    {(line.unit==='m²'||line.unit==='m (linear)')&&(line.pQty||1)>1&&line.qty>0&&(
+                      <div className="text-xs text-amber-600 font-semibold text-right mt-0.5">
+                        {line.pQty} × {parseFloat(line.qty).toFixed(4)} = {((line.pQty||1)*(parseFloat(line.qty)||0)).toFixed(4)} {line.unit}
+                      </div>
+                    )}
                   </div>
 
                   {lines.length>1&&(
@@ -9829,9 +9847,10 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
   // build visible: category filter → search filter → sort
   const _catFiltered = catFilter==='all' ? inventory : inventory.filter(i=>i.cat===catFilter);
   const _searched = invSearch.trim()==='' ? _catFiltered : _catFiltered.filter(i=>{
-    const q=invSearch.toLowerCase();
     const sup=(suppliers||[]).find(s=>s.id===i.supplierId||s.id===Number(i.supplierId))?.name||'';
-    return (i.name||'').toLowerCase().includes(q)||(i.sku||'').toLowerCase().includes(q)||(i.cat||'').toLowerCase().includes(q)||sup.toLowerCase().includes(q);
+    const haystack=[(i.name||''),(i.sku||''),(i.cat||''),sup].join(' ').toLowerCase();
+    const words=invSearch.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    return words.every(w=>haystack.includes(w));
   });
   const _statusRank = x => x.stock===0?0:x.stock<=x.reorder?1:2;
   const visible = sortCol ? [..._searched].sort((a,b)=>{
