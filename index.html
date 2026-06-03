@@ -1082,7 +1082,8 @@ function printQuoteWindow(q, companies, logoDataUrl) {
   const subAfterDisc = sub-discAmt+setupFeeAmt;
   const vat = subAfterDisc*0.15;
   const total = subAfterDisc+vat;
-  const dep = subAfterDisc*0.80;
+  const depRate = total<=5000 ? 1.0 : 0.80;
+  const dep = subAfterDisc*depRate;
   const fmt = n=>'R\u00a0'+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const rows = q.lines.map((l,i)=>`
     <tr>
@@ -1225,7 +1226,7 @@ table.ln tfoot tr td{background:#06065c;color:#fff;font-size:8px;text-transform:
   ${setupFeeAmt>0?`<tr class="setup"><td>Design &amp; Setup Fee</td><td>+ ${fmt(setupFeeAmt)}</td></tr>`:''}
   <tr class="vat"><td>VAT (15%)</td><td>${fmt(vat)}</td></tr>
   <tr class="total-row"><td>TOTAL DUE</td><td>${fmt(total)}</td></tr>
-  <tr class="dep-row"><td>80% Deposit Required</td><td>${fmt(dep)}</td></tr>
+  <tr class="dep-row"><td>${depRate===1?'100%':'80%'} Deposit Required</td><td>${fmt(dep)}</td></tr>
 </table></div></div>
 
 ${q.notes?(`<div class="notes"><div class="lbl">Notes</div><p>${q.notes}</p></div>`):''}
@@ -1235,8 +1236,8 @@ ${q.notes?(`<div class="notes"><div class="lbl">Notes</div><p>${q.notes}</p></di
   <div class="lbl">Terms &amp; Conditions</div>
   <ol>
     <li>This quotation is valid for 14 days from the date of issue unless otherwise stated above.</li>
-    <li>An 80% deposit is required upon acceptance of this quotation before any production or procurement commences.</li>
-    <li>The remaining 20% balance is payable on completion, prior to delivery or installation.</li>
+    <li>A ${depRate===1?'100%':'80%'} deposit is required upon acceptance of this quotation before any production or procurement commences.${depRate===1?' (Full deposit applies as the total value is R5,000 or less.)':''}</li>
+    ${depRate===1?'':`<li>The remaining 20% balance is payable on completion, prior to delivery or installation.</li>`}
     <li>All prices are quoted in South African Rand (ZAR). VAT is charged at 15% where applicable.</li>
     <li>Alterations to approved artwork or specifications after production has commenced may result in additional charges.</li>
     <li>Artwork/design files supplied by the client must be in PDF, AI or EPS format at 100% scale. Signacore accepts no responsibility for print quality from substandard files.</li>
@@ -1249,7 +1250,7 @@ ${q.notes?(`<div class="notes"><div class="lbl">Notes</div><p>${q.notes}</p></di
 
 <!-- BANK DETAILS -->
 <div class="bank no-break">
-  <div class="lbl">Banking Details — 80% Deposit: ${fmt(dep)}</div>
+  <div class="lbl">Banking Details — ${depRate===1?'100%':'80%'} Deposit: ${fmt(dep)}</div>
   <table><tbody>
     <tr><td>Bank:</td><td>Standard Bank</td></tr>
     <tr><td>Account Name:</td><td>Signacore</td></tr>
@@ -1309,6 +1310,13 @@ function printCoverLetter(data, companies, logoDataUrl, type) {
   const contact = data.contact||client;
   const today   = new Date().toLocaleDateString('en-ZA',{day:'numeric',month:'long',year:'numeric'});
   const validity= isQuote ? (data.validUntil||'14 days from date of issue') : (data.invoiceDue||'30 days from invoice date');
+  // Deposit rate: 100% for totals ≤ R5,000, else 80%
+  const _clSub = (data.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
+  const _clDisc = parseFloat(data.discount)||0;
+  const _clSetup = parseFloat(data.setupFee)||0;
+  const _clAfter = _clSub - _clSub*(_clDisc/100) + _clSetup;
+  const _clTotal = _clAfter * 1.15;
+  const depRate = _clTotal <= 5000 ? 1.0 : 0.80;
   const qrUrl   = 'https://api.qrserver.com/v1/create-qr-code/?size=110x110&format=png&data='+encodeURIComponent(GOOGLE_REVIEW_URL);
 
   const html =
@@ -1383,8 +1391,8 @@ function printCoverLetter(data, companies, logoDataUrl, type) {
 '<div class="terms">'+
 '<strong>Key Terms</strong><br/>'+
 (isQuote
-? '&bull; An <strong>80% deposit</strong> is required upon acceptance before production commences.<br/>'
-+ '&bull; The balance of 20% is due on completion, prior to delivery or installation.<br/>'
+? '&bull; A <strong>'+(depRate===1?'100%':'80%')+' deposit</strong> is required upon acceptance before production commences.'+(depRate===1?' <em>(Full deposit required — quoted value is R5,000 or less.)</em>':'')+'<br/>'
++ (depRate===1?'':'&bull; The balance of 20% is due on completion, prior to delivery or installation.<br/>')
 + '&bull; This quotation is valid for <strong>'+validity+'</strong>.<br/>'
 + '&bull; All pricing includes VAT at 15% where applicable.'
 : '&bull; Payment is due by <strong>'+validity+'</strong>.<br/>'
@@ -1838,6 +1846,10 @@ async function generateCoverLetterPdf(data, companies, logoDataUrl, type) {
   const contact  = data.contact||data.client||'Sir/Madam';
   const today    = new Date().toLocaleDateString('en-ZA',{day:'numeric',month:'long',year:'numeric'});
   const validity = isQuote ? (data.validUntil||'14 days from date of issue') : (data.invoiceDue||'30 days from invoice date');
+  // Deposit rate: 100% for totals ≤ R5,000, else 80%
+  const _gpSub = (data.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
+  const _gpAfter = _gpSub - _gpSub*((parseFloat(data.discount)||0)/100) + (parseFloat(data.setupFee)||0);
+  const depRate = _gpAfter*1.15 <= 5000 ? 1.0 : 0.80;
   const W=210, LM=20, RM=190, CW=170;
   let y = 20;
 
@@ -1890,7 +1902,7 @@ async function generateCoverLetterPdf(data, companies, logoDataUrl, type) {
   const paras = isQuote ? [
     'Thank you for the opportunity to provide you with our services. We are pleased to submit Quotation '+refNum+' for your consideration. Our team has carefully prepared this proposal to address your specific requirements and deliver a solution that meets both your expectations and budget.',
     'At '+co.name+', we pride ourselves on quality craftsmanship, attention to detail, and reliable project delivery. Our experienced team uses only premium materials and proven processes to ensure every project reflects the high standard you deserve.',
-    'Please review the enclosed quotation at your convenience. An 80% deposit is required upon acceptance, with the balance payable on completion. This quotation is valid for 14 days from the date of issue. Should you have any questions or wish to discuss any aspect of our proposal, please do not hesitate to contact us — we are happy to assist.'
+    'Please review the enclosed quotation at your convenience. A '+(depRate===1?'100%':'80%')+' deposit is required upon acceptance'+(depRate===1?' (full deposit applies as the quoted value is R5,000 or less)':', with the balance payable on completion')+'. This quotation is valid for 14 days from the date of issue. Should you have any questions or wish to discuss any aspect of our proposal, please do not hesitate to contact us — we are happy to assist.'
   ] : [
     'We trust this letter finds you well. It is with great pleasure that we write to you today, as we bring your recent project to a successful close. Enclosed please find Tax Invoice '+refNum+', which represents the final account for the work completed on your behalf.',
     'It has been a genuine privilege working with you and your team. From the initial brief through to final delivery, your trust in our expertise made this a rewarding project for everyone involved. We sincerely hope the finished work exceeds your expectations and serves your business well for many years to come.',
@@ -1910,7 +1922,7 @@ async function generateCoverLetterPdf(data, companies, logoDataUrl, type) {
   doc.setFont('helvetica','bold'); doc.setFontSize(7); sc(C_RED);
   doc.text('KEY TERMS', sideX+5, sideY+7);
   const terms = isQuote ? [
-    ['Deposit','80% on acceptance'],['Balance','20% on completion'],
+    ['Deposit',(depRate===1?'100%':'80%')+' on acceptance'],...(depRate===1?[]:[['Balance','20% on completion']]),
     ['Currency','ZAR incl. VAT 15%'],['Valid For','14 days from issue'],
     ['Ownership','On full payment'],['Lead Time','Subject to material\navailability']
   ] : [
@@ -1975,7 +1987,8 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   const after   = sub-discAmt;
   const vat     = after*0.15;
   const total   = after+vat;
-  const dep     = total*0.8;
+  const depRate = total<=5000 ? 1.0 : 0.80;
+  const dep     = total*depRate;
   const today   = new Date().toLocaleDateString('en-ZA',{day:'2-digit',month:'2-digit',year:'numeric'});
   const W=210, LM=20, RM=190, CW=170;
   let y = 20;
@@ -2090,7 +2103,7 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   sf(C_LGREEN); sd(C_BGREEN); doc.setLineWidth(0.3);
   doc.roundedRect(LM,y,CW/2-4,bankH,2,2,'FD');
   doc.setFont('helvetica','bold'); doc.setFontSize(7.5); sc(C_GREEN);
-  doc.text(isQuote?'PAYMENT DETAILS — 80% DEPOSIT: '+fmt(dep):'PAYMENT DETAILS', LM+3,y+6);
+  doc.text(isQuote?'PAYMENT DETAILS — '+(depRate===1?'100%':'80%')+' DEPOSIT: '+fmt(dep):'PAYMENT DETAILS', LM+3,y+6);
   const bRows=[['Bank:','Standard Bank'],['Account Name:','Signacore'],['Account No:','2-825-229-72'],['Branch Code:','051001'],['Reference:',refNum+' / '+(data.client||'')]];
   let bY=y+11;
   bRows.forEach(([k,v])=>{
@@ -2102,7 +2115,13 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   const tcX=LM+CW/2+4;
   doc.setFont('helvetica','bold'); doc.setFontSize(7.5); sc(C_DARK);
   doc.text('Terms & Conditions', tcX, y+6);
-  const tcItems=['· 80% deposit required before production commences.','· 20% balance payable on completion prior to delivery.','· Ownership remains with Signacore until full payment.','· All prices in ZAR; VAT at 15% where applicable.','· Installation excluded unless listed as a line item.'];
+  const tcItems=[
+    '· '+(depRate===1?'100%':'80%')+' deposit required before production commences.'+(depRate===1?' (Full — total ≤ R5,000)':''),
+    ...(depRate===1?[]:['· 20% balance payable on completion prior to delivery.']),
+    '· Ownership remains with Signacore until full payment.',
+    '· All prices in ZAR; VAT at 15% where applicable.',
+    '· Installation excluded unless listed as a line item.',
+  ];
   doc.setFont('helvetica','normal'); doc.setFontSize(7); sc(C_GREY);
   tcItems.forEach((t,i)=>{ doc.text(t, tcX, y+12+i*4.5); });
   y += bankH+8;
@@ -2974,6 +2993,24 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   const [poRef,          setPoRef]          = useState(eq?.poRef||'');
   const [openTypeaheadId, setOpenTypeaheadId] = useState(null);
 
+  // ── Active line tracking: controls which line shows the calculator + save button ──
+  const [activeLineId, setActiveLineId] = useState(()=>{
+    const ls = eq?.lines||[];
+    return ls.length ? ls[ls.length-1].id : 1;
+  });
+
+  // ── Auto-save quote draft to localStorage after every field change ──
+  const _draftKey = 'sgr_quote_draft_' + (eq?.num || nextNum);
+  useEffect(()=>{
+    const t = setTimeout(()=>{
+      try {
+        const draft = { client, contact, email, tel, address, vatNum, co, date, valid, notes, salesperson, discount, setupFee, lines, poRef, _draftAt: new Date().toISOString() };
+        localStorage.setItem(_draftKey, JSON.stringify(draft));
+      } catch(e){}
+    }, 1200);
+    return ()=>clearTimeout(t);
+  }, [lines, client, contact, email, tel, address, vatNum, co, date, valid, notes, salesperson, discount, setupFee, poRef]);
+
   function loadCustomer(id) {
     // IDs can be integers or floats (Date.now()+Math.random()), so compare as strings
     const c = customers.find(x=>String(x.id)===String(id));
@@ -2987,7 +3024,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
     if(c.notes) setNotes(c.notes);
   }
 
-  function addLine(){ setLines(prev=>[...prev,{id:Date.now(),itemId:null,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]); }
+  function addLine(){ const nid=Date.now(); setLines(prev=>[...prev,{id:nid,itemId:null,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]); setActiveLineId(nid); }
   function removeLine(id){ setLines(prev=>prev.filter(l=>l.id!==id)); }
 
   // ── Save a custom quote line as a standard inventory item ──
@@ -3101,6 +3138,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       convertedJobId: eq?.convertedJobId||null,
       poRef, attachments,
     });
+    try { localStorage.removeItem(_draftKey); } catch(e){}
     onClose();
   }
   const iCls="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 bg-white";
@@ -3269,7 +3307,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                         <textarea
                           value={line.desc}
                           onChange={e=>{ updateLine(line.id,'desc',e.target.value); setOpenTypeaheadId(line.id); e.target.style.height='auto'; e.target.style.height=e.target.scrollHeight+'px'; }}
-                          onFocus={e=>{ setOpenTypeaheadId(line.id); e.target.style.height='auto'; e.target.style.height=e.target.scrollHeight+'px'; }}
+                          onFocus={e=>{ setActiveLineId(line.id); setOpenTypeaheadId(line.id); e.target.style.height='auto'; e.target.style.height=e.target.scrollHeight+'px'; }}
                           onBlur={()=>setTimeout(()=>setOpenTypeaheadId(null),150)}
                           placeholder="Type to search inventory, or describe item freely…"
                           autoComplete="off"
@@ -3312,8 +3350,8 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                             </div>
                           </div>
                         )}
-                        {/* ── Save as standard item button ── */}
-                        {!line.itemId && !line.cpLinked && line.desc && line.desc.trim().length>2 && Number(line.unitPrice)>0 && setInventory && (
+                        {/* ── Save as standard item button — only on active line ── */}
+                        {activeLineId===line.id && !line.itemId && !line.cpLinked && line.desc && line.desc.trim().length>2 && Number(line.unitPrice)>0 && setInventory && (
                           savedLineIds[line.id]
                             ? <div className="mt-1.5 flex items-center gap-1 text-xs text-green-600 font-semibold px-1">
                                 ✅ Saved to inventory
@@ -3333,6 +3371,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                     <label className="block text-xs font-semibold text-gray-400 mb-1">Unit</label>
                     <select value={unitDropVal}
                       onChange={e=>updateLine(line.id,'unitSelect',e.target.value)}
+                      onFocus={()=>setActiveLineId(line.id)}
                       className="w-full border border-gray-300 rounded-xl px-2 py-2.5 text-sm bg-white focus:ring-2 focus:ring-brand-400">
                       <option value="">— Unit —</option>
                       {UNIT_OPTIONS.map(u=><option key={u} value={u}>{u}</option>)}
@@ -3345,11 +3384,11 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                     )}
                   </div>
 
-                  {/* Inline Calculator — shown only for m² or m (linear) */}
-                  {(line.unit==='m²'||line.unit==='m (linear)')&&(
+                  {/* Inline Calculator — shown only for m² or m (linear), and only on the active line */}
+                  {activeLineId===line.id && (line.unit==='m²'||line.unit==='m (linear)')&&(
                     <div className="flex-shrink-0">
                       <label className="block text-xs font-semibold text-indigo-500 mb-1">
-                        {line.unit==='m²'?'📐 L × W (mm)':'📏 Length (mm)'}
+                        {line.unit==='m²'?'📐 L x H (mm)':'📏 Length (mm)'}
                       </label>
                       <div className="flex items-center gap-1.5 bg-indigo-50 border border-indigo-200 rounded-xl px-3 py-2">
                         <input type="number" min="0" step="1" value={line.sqmL||''}
@@ -3377,8 +3416,8 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                     </div>
                   )}
 
-                  {/* Product Qty — only shown when dimension calculator is active */}
-                  {(line.unit==='m²'||line.unit==='m (linear)')&&(
+                  {/* Product Qty — only shown when dimension calculator is active (active line only) */}
+                  {activeLineId===line.id && (line.unit==='m²'||line.unit==='m (linear)')&&(
                     <div className="flex-shrink-0 w-20">
                       <label className="block text-xs font-semibold text-amber-600 mb-1">No. Items</label>
                       <input type="number" min="1" step="1" value={line.pQty||1}
@@ -3390,7 +3429,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                   {/* Qty — size qty (auto-filled from dimensions) or plain qty for non-size units */}
                   <div className="flex-shrink-0 w-20">
                     <label className="block text-xs font-semibold text-gray-400 mb-1">
-                      {(line.unit==='m²'||line.unit==='m (linear)')
+                      {activeLineId===line.id && (line.unit==='m²'||line.unit==='m (linear)')
                         ? <span className="text-indigo-500">{line.unit==='m²'?'m² each':'m each'}</span>
                         : 'Qty'}
                     </label>
@@ -3522,7 +3561,8 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
   const subAfterDisc = sub - discAmt + setupFeeAmt;
   const vat = subAfterDisc*0.15;
   const total = subAfterDisc+vat;
-  const dep = subAfterDisc*0.80;
+  const depRate = total<=5000 ? 1.0 : 0.80;
+  const dep = subAfterDisc*depRate;
   return (
     <Modal onClose={onClose} wide>
       <ModalHeader title={`${quote.num} — ${quote.client}`} onClose={onClose}/>
@@ -3609,7 +3649,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
             {setupFeeAmt>0&&<div className="flex justify-between text-xs text-indigo-600"><span>Design &amp; Setup Fee</span><span>+ {zar(setupFeeAmt)}</span></div>}
             <div className="flex justify-between text-xs text-gray-500"><span>VAT (15%)</span><span className="font-medium text-gray-700">{zar(vat)}</span></div>
             <div className="flex justify-between text-sm font-black border-t border-gray-200 pt-2 mt-1"><span>Total Due</span><span className="text-blue-700">{zar(total)}</span></div>
-            <div className="flex justify-between text-xs text-emerald-600 font-semibold border-t border-gray-100 pt-1.5"><span>80% Deposit</span><span>{zar(dep)}</span></div>
+            <div className="flex justify-between text-xs text-emerald-600 font-semibold border-t border-gray-100 pt-1.5"><span>{depRate===1?'100%':'80%'} Deposit</span><span>{zar(dep)}</span></div>
           </div>
         </div>
 
