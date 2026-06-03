@@ -1104,7 +1104,7 @@ function printQuoteWindow(q, companies, logoDataUrl) {
     ? `<img src="${logoDataUrl}" style="max-height:112px;max-width:322px;object-fit:contain;display:block;">`
     : `<div style="font-family:'Barlow Condensed',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.08em;">SIGNACORE</div>`;
 
-  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Quotation ${q.num}</title>
+  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title></title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,600;0,700;0,800;1,700;1,800&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
@@ -1258,7 +1258,7 @@ ${q.notes?(`<div class="notes"><div class="lbl">Notes</div><p>${q.notes}</p></di
   <div class="lbl">Banking Details — ${depRate===1?'100%':'80%'} Deposit: ${fmt(dep)}</div>
   <table><tbody>
     <tr><td>Bank:</td><td>Standard Bank</td></tr>
-    <tr><td>Account Name:</td><td>Signacore</td></tr>
+    <tr><td>Account Name:</td><td>Hornet Honey trading as Signacore</td></tr>
     <tr><td>Account No:</td><td>2-825-229-72</td></tr>
     <tr><td>Branch Code:</td><td>051001</td></tr>
     <tr><td>Reference:</td><td>${q.num} / ${q.client||''}</td></tr>
@@ -1278,10 +1278,6 @@ ${q.notes?(`<div class="notes"><div class="lbl">Notes</div><p>${q.notes}</p></di
   </div>
 </div>
 
-<div class="foot">
-  <div class="foot-line"></div>
-  <p>Hornet Honey (Pty) Ltd t/a Signacore &bull; 21 Voortrekker St, Mossdustria, Mossel Bay &bull; orders@snsg.co.za &bull; 040-940-5555 &bull; Directors: O T Smit | R O Smit</p>
-</div>
 <script>window.onload=function(){window.print();}<\/script>
 </body></html>`;
   const w = window.open('', '_blank', 'width=960,height=750');
@@ -1639,7 +1635,7 @@ function printInvoice(job, companies, logoDataUrl) {
 '@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}.no-break{page-break-inside:avoid}}';
 
   const html =
-'<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Tax Invoice '+invNum+'</title>'+
+'<!DOCTYPE html><html><head><meta charset="UTF-8"><title></title>'+
 '<link rel="preconnect" href="https://fonts.googleapis.com">'+
 '<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,600;0,700;0,800;1,700;1,800&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">'+
 '<style>'+css+'</style></head><body>'+
@@ -1706,17 +1702,13 @@ function printInvoice(job, companies, logoDataUrl) {
 '<div class="lbl">Banking Details</div>'+
 '<table><tbody>'+
 '<tr><td>Bank:</td><td>Standard Bank</td></tr>'+
-'<tr><td>Account Name:</td><td>Signacore</td></tr>'+
+'<tr><td>Account Name:</td><td>Hornet Honey trading as Signacore</td></tr>'+
 '<tr><td>Account No:</td><td>2-825-229-72</td></tr>'+
 '<tr><td>Branch Code:</td><td>051001</td></tr>'+
 '<tr><td>Reference:</td><td>'+invNum+' / '+job.client+'</td></tr>'+
 '</tbody></table>'+
 '</div>'+
 
-'<div class="foot">'+
-'<div class="foot-line"></div>'+
-'<p>Hornet Honey (Pty) Ltd t/a Signacore &bull; 21 Voortrekker St, Mossdustria, Mossel Bay &bull; orders@snsg.co.za &bull; 040-940-5555 &bull; Directors: O T Smit | R O Smit</p>'+
-'</div>'+
 '<script>window.onload=function(){window.print();}<\/script>'+
 '</body></html>';
 
@@ -1932,7 +1924,7 @@ async function generateCoverLetterPdf(data, companies, logoDataUrl, type) {
     ['Ownership','On full payment'],['Lead Time','Subject to material\navailability']
   ] : [
     ['Payment','On invoice due date'],['Currency','ZAR incl. VAT 15%'],
-    ['Bank','Standard Bank'],['Acc Name','Signacore'],
+    ['Bank','Standard Bank'],['Acc Name','Hornet Honey t/a Signacore'],
     ['Acc No','2-825-229-72'],['Branch','051001'],['Ref',refNum]
   ];
   let ty = sideY+14;
@@ -2109,7 +2101,7 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   doc.roundedRect(LM,y,CW/2-4,bankH,2,2,'FD');
   doc.setFont('helvetica','bold'); doc.setFontSize(7.5); sc(C_GREEN);
   doc.text(isQuote?'PAYMENT DETAILS — '+(depRate===1?'100%':'80%')+' DEPOSIT: '+fmt(dep):'PAYMENT DETAILS', LM+3,y+6);
-  const bRows=[['Bank:','Standard Bank'],['Account Name:','Signacore'],['Account No:','2-825-229-72'],['Branch Code:','051001'],['Reference:',refNum+' / '+(data.client||'')]];
+  const bRows=[['Bank:','Standard Bank'],['Account Name:','Hornet Honey trading as Signacore'],['Account No:','2-825-229-72'],['Branch Code:','051001'],['Reference:',refNum+' / '+(data.client||'')]];
   let bY=y+11;
   bRows.forEach(([k,v])=>{
     doc.setFont('helvetica','normal'); doc.setFontSize(7.5); sc(C_GREY);
@@ -2130,16 +2122,6 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   doc.setFont('helvetica','normal'); doc.setFontSize(7); sc(C_GREY);
   tcItems.forEach((t,i)=>{ doc.text(t, tcX, y+12+i*4.5); });
   y += bankH+8;
-
-  // Footer — draw on every page
-  const totalPages = doc.getNumberOfPages();
-  for (let pg=1; pg<=totalPages; pg++) {
-    doc.setPage(pg);
-    const footY = 281;
-    sd(C_RED); doc.setLineWidth(0.6); doc.line(LM,footY,RM,footY);
-    doc.setFont('helvetica','normal'); doc.setFontSize(7.5); sc(C_GREY);
-    doc.text('Hornet Honey (Pty) Ltd t/a '+(co.short||co.name)+'  ·  21 Voortrekker St, Mossdustria, Mossel Bay  ·  orders@snsg.co.za  ·  040-940-5555     Directors: O T Smit  |  R O Smit', W/2, footY+5, {align:'center'});
-  }
 
   return doc.output('datauristring').split(',')[1];
 }
