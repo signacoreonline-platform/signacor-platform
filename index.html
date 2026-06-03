@@ -1085,15 +1085,21 @@ function printQuoteWindow(q, companies, logoDataUrl) {
   const depRate = total<=5000 ? 1.0 : 0.80;
   const dep = total*depRate;
   const fmt = n=>'R\u00a0'+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
-  const rows = q.lines.map((l,i)=>`
+  const rows = q.lines.map((l,i)=>{
+    const hasDim = l.sqmL && (l.unit==='m²'||l.unit==='m (linear)');
+    const lxhCell = hasDim
+      ? (l.unit==='m²'&&l.sqmW ? `${l.sqmL}&nbsp;&times;&nbsp;${l.sqmW}&nbsp;mm` : `${l.sqmL}&nbsp;mm`)
+      : (l.qty ? `${l.qty}${l.unit?' '+l.unit:''}` : '');
+    const noItemsCell = hasDim ? (l.pQty||1) : (l.qty||'');
+    return `
     <tr>
       <td style="width:26px;color:#4b5563;font-size:10px;">${i+1}</td>
       <td style="font-size:11px;">${l.desc||'—'}</td>
-      <td style="width:60px;text-align:center;font-size:10.5px;color:#555;">${l.qty||''}</td>
-      <td style="width:60px;text-align:center;font-size:10px;color:#555;">${l.unit||''}</td>
-      <td style="width:90px;text-align:right;font-size:10.5px;">${l.unitPrice?fmt(l.unitPrice):''}</td>
+      <td style="width:110px;text-align:center;font-size:10px;color:#555;">${lxhCell}</td>
+      <td style="width:70px;text-align:center;font-size:10.5px;color:#555;">${noItemsCell}</td>
       <td style="width:100px;text-align:right;font-size:10.5px;font-weight:600;">${fmt(l.subtotal||0)}</td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
   const logoHtml = logoDataUrl
     ? `<img src="${logoDataUrl}" style="max-height:112px;max-width:322px;object-fit:contain;display:block;">`
     : `<div style="font-family:'Barlow Condensed',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.08em;">SIGNACORE</div>`;
@@ -1213,9 +1219,8 @@ table.ln tfoot tr td{background:#06065c;color:#fff;font-size:8px;text-transform:
 <table class="ln"><thead><tr>
   <th style="width:26px">#</th>
   <th>Description</th>
-  <th style="width:55px;text-align:center">Qty</th>
-  <th style="width:60px;text-align:center">Unit</th>
-  <th style="width:90px;text-align:right">Rate</th>
+  <th style="width:110px;text-align:center">L &times; H</th>
+  <th style="width:70px;text-align:center">No. Items</th>
   <th style="width:100px;text-align:right">Total</th>
 </tr></thead><tbody>${rows}</tbody></table>
 
@@ -3384,6 +3389,28 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                     )}
                   </div>
 
+                  {/* L×H summary — read-only display on inactive lines that have dimension data */}
+                  {activeLineId!==line.id && line.sqmL && (line.unit==='m²'||line.unit==='m (linear)') && (
+                    <div className="flex-shrink-0">
+                      <label className="block text-xs font-semibold text-indigo-400 mb-1">
+                        {line.unit==='m²'?'📐 L × H':'📏 Length'}
+                      </label>
+                      <div className="bg-indigo-50 border border-indigo-100 rounded-xl px-3 py-2.5 text-xs font-semibold text-indigo-700 whitespace-nowrap">
+                        {line.unit==='m²'&&line.sqmW ? `${line.sqmL} × ${line.sqmW} mm` : `${line.sqmL} mm`}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* No. Items summary — read-only display on inactive lines that have dimension data */}
+                  {activeLineId!==line.id && line.sqmL && (line.unit==='m²'||line.unit==='m (linear)') && (
+                    <div className="flex-shrink-0 w-20">
+                      <label className="block text-xs font-semibold text-amber-500 mb-1">No. Items</label>
+                      <div className="w-full border border-amber-200 bg-amber-50 rounded-xl px-2 py-2.5 text-sm text-center text-amber-700 font-semibold">
+                        {line.pQty||1}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Inline Calculator — shown only for m² or m (linear), and only on the active line */}
                   {activeLineId===line.id && (line.unit==='m²'||line.unit==='m (linear)')&&(
                     <div className="flex-shrink-0">
@@ -3742,27 +3769,46 @@ function EditInvoiceForm({ job, onSave, onClose }) {
   const [notes,        setNotes]        = useState(job.notes||'');
   const [invoiceStatus,setInvoiceStatus]= useState(job.invoiceStatus||'pending');
   const [paidAt,       setPaidAt]       = useState(job.paidAt||'');
+  const [lines,        setLines]        = useState(job.lines ? job.lines.map(l=>({...l})) : []);
+  const [activeLineId, setActiveLineId] = useState(null);
 
-  // If lines exist, allow editing them too
-  const [lines, setLines] = useState(job.lines ? job.lines.map(l=>({...l})) : []);
-  const linesTotal = lines.length>0 ? lines.reduce((s,l)=>s+(l.subtotal||0),0)*1.15 : null;
+  const linesSubtotal = lines.reduce((s,l)=>s+(l.subtotal||0),0);
+  const linesVat      = linesSubtotal*0.15;
+  const linesTotal    = linesSubtotal+linesVat;
+  const hasLines      = lines.length>0;
 
   function updateLine(id,field,v){
     setLines(prev=>prev.map(l=>{
       if(l.id!==id) return l;
       const u={...l,[field]:v};
-      u.subtotal=(parseFloat(field==='qty'?v:u.qty)||0)*(parseFloat(field==='unitPrice'?v:u.unitPrice)||0);
+      if(field==='sqmL'||field==='sqmW'){
+        const ll=parseFloat(field==='sqmL'?v:u.sqmL)||0;
+        const w=parseFloat(field==='sqmW'?v:u.sqmW)||0;
+        if(u.unit==='m²') u.qty=parseFloat(((ll*w/1000000)*(parseFloat(u.pQty)||1)).toFixed(4));
+        if(u.unit==='m (linear)') u.qty=parseFloat((ll/1000*(parseFloat(u.pQty)||1)).toFixed(4));
+      }
+      if(field==='pQty'){
+        if(u.unit==='m²'&&u.sqmL&&u.sqmW) u.qty=parseFloat(((parseFloat(u.sqmL)||0)*(parseFloat(u.sqmW)||0)/1000000*(parseFloat(v)||1)).toFixed(4));
+        if(u.unit==='m (linear)'&&u.sqmL) u.qty=parseFloat(((parseFloat(u.sqmL)||0)/1000*(parseFloat(v)||1)).toFixed(4));
+      }
+      u.subtotal=(parseFloat(u.qty)||0)*(parseFloat(u.unitPrice)||0);
       return u;
     }));
   }
 
+  function addLine(){ const nid=Date.now(); setLines(prev=>[...prev,{id:nid,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]); setActiveLineId(nid); }
+  function removeLine(id){ setLines(prev=>prev.filter(l=>l.id!==id)); }
+
+  const UNIT_OPT = ['unit','m²','m (linear)','set','day','hour','sheet','roll','panel','item'];
+
   function save(){
-    const finalValue = linesTotal!==null ? linesTotal : parseFloat(value)||0;
-    onSave({...job, client, invoiceNum, invoiceDate, invoiceDue, value:finalValue, notes, invoiceStatus, paidAt, lines:lines.length>0?lines:job.lines});
+    const finalValue = hasLines ? linesTotal : parseFloat(value)||0;
+    onSave({...job, client, invoiceNum, invoiceDate, invoiceDue, value:finalValue, notes, invoiceStatus, paidAt, lines:hasLines?lines:job.lines});
   }
 
   return (
     <div className="p-5 space-y-4 max-h-[80vh] overflow-y-auto">
+      {/* Header fields */}
       <div className="grid grid-cols-2 gap-3">
         <div className="col-span-2"><label className="text-xs font-bold text-gray-500 block mb-1">Client / Customer</label><input value={client} onChange={e=>setClient(e.target.value)} className={iCls}/></div>
         <div><label className="text-xs font-bold text-gray-500 block mb-1">Invoice Number</label><input value={invoiceNum} onChange={e=>setInvoiceNum(e.target.value)} className={iCls}/></div>
@@ -3775,38 +3821,145 @@ function EditInvoiceForm({ job, onSave, onClose }) {
         <div><label className="text-xs font-bold text-gray-500 block mb-1">Invoice Date</label><input type="date" value={invoiceDate} onChange={e=>setInvoiceDate(e.target.value)} className={iCls}/></div>
         <div><label className="text-xs font-bold text-gray-500 block mb-1">Due Date</label><input type="date" value={invoiceDue} onChange={e=>setInvoiceDue(e.target.value)} className={iCls}/></div>
         {invoiceStatus==='paid'&&<div className="col-span-2"><label className="text-xs font-bold text-gray-500 block mb-1">Date Paid</label><input type="date" value={paidAt} onChange={e=>setPaidAt(e.target.value)} className={iCls}/></div>}
-        {linesTotal===null&&<div className="col-span-2"><label className="text-xs font-bold text-gray-500 block mb-1">Invoice Value (incl. VAT)</label><input type="number" value={value} onChange={e=>setValue(e.target.value)} className={iCls} min="0"/></div>}
+        {!hasLines&&<div className="col-span-2"><label className="text-xs font-bold text-gray-500 block mb-1">Invoice Value (incl. VAT)</label><input type="number" value={value} onChange={e=>setValue(e.target.value)} className={iCls} min="0"/></div>}
       </div>
-      {lines.length>0&&(
-        <div>
-          <p className="text-xs font-black text-gray-500 uppercase tracking-wide mb-2">Line Items</p>
-          <div className="border border-gray-200 rounded-xl overflow-hidden">
-            <table className="w-full text-xs">
-              <thead className="bg-gray-50"><tr>
-                <th className="px-3 py-2 text-left text-gray-400 font-bold">Description</th>
-                <th className="px-3 py-2 text-center text-gray-400 font-bold w-16">Qty</th>
-                <th className="px-3 py-2 text-right text-gray-400 font-bold w-28">Unit Price</th>
-                <th className="px-3 py-2 text-right text-gray-400 font-bold w-24">Subtotal</th>
-              </tr></thead>
-              <tbody>
-                {lines.map(l=>(
-                  <tr key={l.id} className="border-t border-gray-100">
-                    <td className="px-2 py-1"><input value={l.desc} onChange={e=>updateLine(l.id,'desc',e.target.value)} className="w-full border-0 text-xs rounded px-1 py-0.5 focus:ring-1 focus:ring-blue-300"/></td>
-                    <td className="px-2 py-1"><input type="number" value={l.qty} onChange={e=>updateLine(l.id,'qty',e.target.value)} className="w-full border-0 text-xs text-center rounded px-1 py-0.5 focus:ring-1 focus:ring-blue-300" min="0"/></td>
-                    <td className="px-2 py-1"><input type="number" value={l.unitPrice} onChange={e=>updateLine(l.id,'unitPrice',e.target.value)} className="w-full border-0 text-xs text-right rounded px-1 py-0.5 focus:ring-1 focus:ring-blue-300" min="0"/></td>
-                    <td className="px-3 py-2 text-right font-semibold text-gray-700">{zar(l.subtotal||0)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            <div className="bg-gray-50 border-t border-gray-200 px-4 py-2 flex justify-end gap-6 text-xs">
-              <span className="text-gray-500">Subtotal: <strong>{zar(lines.reduce((s,l)=>s+(l.subtotal||0),0))}</strong></span>
-              <span className="text-gray-500">VAT 15%: <strong>{zar(lines.reduce((s,l)=>s+(l.subtotal||0),0)*0.15)}</strong></span>
-              <span className="font-black text-gray-800">Total: <span style={{color:'#06065c'}}>{zar(linesTotal||0)}</span></span>
+
+      {/* Line items — card panel matching quotation editor */}
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <p className="text-xs font-black text-gray-500 uppercase tracking-wide">Line Items</p>
+          <button type="button" onClick={addLine} className="text-xs font-bold px-3 py-1.5 rounded-lg text-white" style={{background:'#06065c'}}>+ Add Line</button>
+        </div>
+        {lines.length===0 ? (
+          <div className="border border-dashed border-gray-200 rounded-xl p-4 text-center text-xs text-gray-400">No line items — click Add Line to start.</div>
+        ) : (
+          <div className="space-y-3">
+            {lines.map((line,idx)=>(
+              <div key={line.id} className="rounded-2xl border-2 border-gray-100 bg-white shadow-sm overflow-visible">
+                <div className="flex items-start gap-2 px-4 pt-4 pb-4 flex-wrap">
+                  <span className="w-6 h-6 rounded-full text-white text-xs font-black flex items-center justify-center flex-shrink-0 mt-6" style={{background:'#06065c'}}>{idx+1}</span>
+
+                  {/* Description */}
+                  <div className="flex-1 min-w-[160px]">
+                    <label className="block text-xs font-semibold text-gray-400 mb-1">Description</label>
+                    <textarea value={line.desc}
+                      onChange={e=>{ updateLine(line.id,'desc',e.target.value); e.target.style.height='auto'; e.target.style.height=e.target.scrollHeight+'px'; }}
+                      onFocus={e=>{ setActiveLineId(line.id); e.target.style.height='auto'; e.target.style.height=e.target.scrollHeight+'px'; }}
+                      rows={1} style={{resize:'none',overflow:'hidden',minHeight:'42px'}}
+                      className="w-full border border-gray-300 rounded-xl px-3 py-2.5 text-sm bg-white focus:ring-2 focus:border-blue-400"/>
+                  </div>
+
+                  {/* Unit */}
+                  <div className="flex-shrink-0 w-28">
+                    <label className="block text-xs font-semibold text-gray-400 mb-1">Unit</label>
+                    <select value={UNIT_OPT.includes(line.unit)?line.unit:(line.unit?'custom':'')}
+                      onChange={e=>{ const v=e.target.value; if(v!=='custom') updateLine(line.id,'unit',v); }}
+                      onFocus={()=>setActiveLineId(line.id)}
+                      className="w-full border border-gray-300 rounded-xl px-2 py-2.5 text-sm bg-white focus:ring-2">
+                      <option value="">— Unit —</option>
+                      {UNIT_OPT.map(u=><option key={u} value={u}>{u}</option>)}
+                      <option value="custom">✏️ Custom…</option>
+                    </select>
+                    {!UNIT_OPT.includes(line.unit)&&line.unit&&(
+                      <input value={line.unit} onChange={e=>updateLine(line.id,'unit',e.target.value)}
+                        className="w-full border border-gray-300 rounded-xl px-2 py-2 text-sm bg-white focus:ring-2 mt-2"/>
+                    )}
+                  </div>
+
+                  {/* L×H summary (inactive lines with dimensions) */}
+                  {activeLineId!==line.id && line.sqmL && (line.unit==='m²'||line.unit==='m (linear)') && (
+                    <div className="flex-shrink-0">
+                      <label className="block text-xs font-semibold text-indigo-400 mb-1">{line.unit==='m²'?'📐 L × H':'📏 Length'}</label>
+                      <div className="bg-indigo-50 border border-indigo-100 rounded-xl px-3 py-2.5 text-xs font-semibold text-indigo-700 whitespace-nowrap">
+                        {line.unit==='m²'&&line.sqmW ? `${line.sqmL} × ${line.sqmW} mm` : `${line.sqmL} mm`}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* No. Items summary (inactive) */}
+                  {activeLineId!==line.id && line.sqmL && (line.unit==='m²'||line.unit==='m (linear)') && (
+                    <div className="flex-shrink-0 w-20">
+                      <label className="block text-xs font-semibold text-amber-500 mb-1">No. Items</label>
+                      <div className="w-full border border-amber-200 bg-amber-50 rounded-xl px-2 py-2.5 text-sm text-center text-amber-700 font-semibold">{line.pQty||1}</div>
+                    </div>
+                  )}
+
+                  {/* Inline L×H Calculator (active line, m²/m linear) */}
+                  {activeLineId===line.id && (line.unit==='m²'||line.unit==='m (linear)') && (
+                    <div className="flex-shrink-0">
+                      <label className="block text-xs font-semibold text-indigo-500 mb-1">{line.unit==='m²'?'📐 L × H (mm)':'📏 Length (mm)'}</label>
+                      <div className="flex items-center gap-1.5 bg-indigo-50 border border-indigo-200 rounded-xl px-3 py-2">
+                        <input type="number" min="0" step="1" value={line.sqmL||''} onChange={e=>updateLine(line.id,'sqmL',e.target.value)} placeholder="Length"
+                          className="w-24 border border-indigo-200 rounded-lg px-2 py-1.5 text-xs bg-white focus:ring-1 focus:ring-indigo-400 text-center"/>
+                        {line.unit==='m²'&&(<>
+                          <span className="text-indigo-400 font-black text-sm">×</span>
+                          <input type="number" min="0" step="1" value={line.sqmW||''} onChange={e=>updateLine(line.id,'sqmW',e.target.value)} placeholder="Width"
+                            className="w-24 border border-indigo-200 rounded-lg px-2 py-1.5 text-xs bg-white focus:ring-1 focus:ring-indigo-400 text-center"/>
+                        </>)}
+                        {line.unit==='m²'&&line.sqmL&&line.sqmW&&(
+                          <span className="text-xs font-black text-indigo-700 whitespace-nowrap">={((parseFloat(line.sqmL)||0)*(parseFloat(line.sqmW)||0)/1000000).toFixed(4)} m²</span>
+                        )}
+                        {line.unit==='m (linear)'&&line.sqmL&&(
+                          <span className="text-xs font-black text-indigo-700 whitespace-nowrap">={(parseFloat(line.sqmL)||0)/1000} m</span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* No. Items (active, m²/m linear) */}
+                  {activeLineId===line.id && (line.unit==='m²'||line.unit==='m (linear)') && (
+                    <div className="flex-shrink-0 w-20">
+                      <label className="block text-xs font-semibold text-amber-600 mb-1">No. Items</label>
+                      <input type="number" min="1" step="1" value={line.pQty||1} onChange={e=>updateLine(line.id,'pQty',e.target.value)}
+                        className="w-full border border-amber-300 rounded-xl px-2 py-2.5 text-sm text-center bg-amber-50 focus:ring-2 focus:ring-amber-400"/>
+                    </div>
+                  )}
+
+                  {/* Qty */}
+                  <div className="flex-shrink-0 w-20">
+                    <label className="block text-xs font-semibold text-gray-400 mb-1">
+                      {activeLineId===line.id && (line.unit==='m²'||line.unit==='m (linear)')
+                        ? <span className="text-indigo-500">{line.unit==='m²'?'m² each':'m each'}</span>
+                        : 'Qty'}
+                    </label>
+                    <input type="number" min="0" step="0.0001" value={line.qty} onChange={e=>updateLine(line.id,'qty',e.target.value)} onFocus={()=>setActiveLineId(line.id)}
+                      className={`w-full border rounded-xl px-2 py-2.5 text-sm text-center bg-white focus:ring-2 ${(line.unit==='m²'||line.unit==='m (linear)')&&line.sqmL?'border-indigo-300':'border-gray-300'}`}/>
+                  </div>
+
+                  {/* Unit Rate */}
+                  <div className="flex-shrink-0 w-28">
+                    <label className="block text-xs font-semibold text-gray-400 mb-1">Unit Rate (R)</label>
+                    <input type="number" min="0" step="0.01" value={line.unitPrice} onChange={e=>updateLine(line.id,'unitPrice',e.target.value)} onFocus={()=>setActiveLineId(line.id)} placeholder="0.00"
+                      className="w-full border border-gray-300 rounded-xl px-2 py-2.5 text-sm text-right bg-white focus:ring-2"/>
+                  </div>
+
+                  {/* Line Total */}
+                  <div className="flex-shrink-0 w-32">
+                    <label className="block text-xs font-semibold text-gray-400 mb-1">Line Total</label>
+                    <div className="w-full border rounded-xl px-3 py-2.5 text-sm font-black text-right" style={{borderColor:'#c7d2fe',background:'#eef2ff',color:'#06065c'}}>{zar(line.subtotal||0)}</div>
+                  </div>
+
+                  {lines.length>1&&(
+                    <button type="button" onClick={()=>removeLine(line.id)}
+                      className="mt-6 w-7 h-7 flex items-center justify-center text-gray-300 hover:text-red-400 hover:bg-red-50 rounded-xl transition-colors flex-shrink-0">✕</button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        {/* Totals */}
+        {hasLines&&(
+          <div className="flex justify-end mt-3">
+            <div className="w-64 space-y-1 border-t border-gray-200 pt-3">
+              <div className="flex justify-between text-xs text-gray-500"><span>Subtotal (excl. VAT)</span><span className="font-semibold">{zar(linesSubtotal)}</span></div>
+              <div className="flex justify-between text-xs text-gray-500"><span>VAT (15%)</span><span className="font-semibold">{zar(linesVat)}</span></div>
+              <div className="flex justify-between text-sm font-black border-t border-gray-200 pt-1.5"><span>Total Due</span><span style={{color:'#06065c'}}>{zar(linesTotal)}</span></div>
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
+
       <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes</label><textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} className={iCls+' resize-none'}/></div>
       <div className="flex gap-3 pt-2">
         <button onClick={save} className="flex-1 text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#06065c'}}>💾 Save Changes</button>
