@@ -2951,7 +2951,7 @@ function QuoteBadge({ status }) {
 /* ═══════════════════════════════════════════
    CREATE QUOTE MODAL
 ═══════════════════════════════════════════ */
-function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, preparedBy, customers, savedCalcs, completeProducts, existingQuote, quickRates }) {
+function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies, nextNum, preparedBy, customers, savedCalcs, completeProducts, existingQuote, quickRates }) {
   const eq = existingQuote;
   const today = new Date().toISOString().slice(0,10);
   const validDef = new Date(Date.now()+14*24*3600*1000).toISOString().slice(0,10);
@@ -2989,6 +2989,26 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
 
   function addLine(){ setLines(prev=>[...prev,{id:Date.now(),itemId:null,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]); }
   function removeLine(id){ setLines(prev=>prev.filter(l=>l.id!==id)); }
+
+  // ── Save a custom quote line as a standard inventory item ──
+  const [savedLineIds, setSavedLineIds] = useState({});
+  function saveLineAsStandardItem(line) {
+    if (!setInventory) return;
+    const newItem = {
+      id: 'inv_' + Date.now(),
+      name: line.desc.trim(),
+      cat: 'General',
+      unit: line.unit || 'each',
+      cost: 0,
+      sell: Number(line.unitPrice) || 0,
+      stock: 0,
+      minStock: 0,
+      supplier: '',
+      notes: 'Added from quotation',
+    };
+    setInventory(prev => [...prev, newItem]);
+    setSavedLineIds(prev => ({...prev, [line.id]: true}));
+  }
   function importFromCalc(calc) {
     const newLines = calc.items.map(it=>({
       id: Date.now()+Math.random(),
@@ -3291,6 +3311,18 @@ function CreateQuoteModal({ onClose, onSave, inventory, companies, nextNum, prep
                               💡 Select to auto-fill price &amp; unit — or keep typing for a custom line
                             </div>
                           </div>
+                        )}
+                        {/* ── Save as standard item button ── */}
+                        {!line.itemId && !line.cpLinked && line.desc && line.desc.trim().length>2 && Number(line.unitPrice)>0 && setInventory && (
+                          savedLineIds[line.id]
+                            ? <div className="mt-1.5 flex items-center gap-1 text-xs text-green-600 font-semibold px-1">
+                                ✅ Saved to inventory
+                              </div>
+                            : <button type="button"
+                                onClick={()=>saveLineAsStandardItem(line)}
+                                className="mt-1.5 flex items-center gap-1 text-xs font-semibold px-2 py-1 rounded-lg border border-dashed border-brand-300 text-brand-600 hover:bg-brand-50 transition-colors">
+                                💾 Save as standard item
+                              </button>
                         )}
                       </>
                     )}
@@ -3991,7 +4023,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       {/* ── New Quote modal ── */}
       {showCreate&&<CreateQuoteModal
         onClose={()=>setShowCreate(false)} onSave={handleSave}
-        inventory={inventory} companies={nonUtech}
+        inventory={inventory} setInventory={setInventory} companies={nonUtech}
         nextNum={getNextQuoteNum(quotes)} preparedBy={user.name}
         customers={customers||[]} savedCalcs={savedCalcs||[]}
         completeProducts={completeProducts||[]}
@@ -4000,7 +4032,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       {/* ── Edit Quote modal ── */}
       {editQuote&&<CreateQuoteModal
         onClose={()=>setEditQuote(null)} onSave={handleSave}
-        inventory={inventory} companies={nonUtech}
+        inventory={inventory} setInventory={setInventory} companies={nonUtech}
         nextNum={editQuote.num} preparedBy={user.name}
         customers={customers||[]} savedCalcs={savedCalcs||[]}
         completeProducts={completeProducts||[]}
@@ -12758,7 +12790,10 @@ function App() {
   // Read initial page from URL hash e.g. #page=inventory
   const _hashPage = (()=>{ try { const h=window.location.hash; const m=h.match(/[#&]page=([^&]+)/); return m?m[1]:null; } catch(e){return null;} })();
 
-  const [user,         setUser]         = useState(null);
+  // Restore session from sessionStorage so page refreshes don't kick the user out.
+  // Each browser tab holds its own session independently (admin + assistant can work simultaneously).
+  const _sessionUser = (()=>{ try { const s=sessionStorage.getItem('sgr-user'); return s?JSON.parse(s):null; } catch(e){return null;} })();
+  const [user,         setUser]         = useState(_sessionUser);
   const [page,         setPage]         = useState(_hashPage||'dashboard');
   const [sidebarOpen,  setSidebarOpen]  = useState(false);
   const [entityFilter, setEntityFilter] = useState(null);
@@ -12889,8 +12924,8 @@ function App() {
     document.title = (PAGE_TITLES[page]||page) + ' — Signacore';
   },[page]);
 
-  function handleLogin(u){ setUser(u); setPage(_hashPage||'dashboard'); setEntityFilter(null); }
-  function handleLogout(){ setUser(null); setPage('dashboard'); setEntityFilter(null); }
+  function handleLogin(u){ try{sessionStorage.setItem('sgr-user',JSON.stringify(u));}catch(e){} setUser(u); setPage(_hashPage||'dashboard'); setEntityFilter(null); }
+  function handleLogout(){ try{sessionStorage.removeItem('sgr-user');}catch(e){} setUser(null); setPage('dashboard'); setEntityFilter(null); }
   function handleEntitySelect(coId){ setEntityFilter(coId); setPage('jobs'); }
 
   // ── Save file ──────────────────────────────────────────────
