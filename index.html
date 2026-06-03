@@ -1083,7 +1083,7 @@ function printQuoteWindow(q, companies, logoDataUrl) {
   const vat = subAfterDisc*0.15;
   const total = subAfterDisc+vat;
   const depRate = total<=5000 ? 1.0 : 0.80;
-  const dep = subAfterDisc*depRate;
+  const dep = total*depRate;
   const fmt = n=>'R\u00a0'+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const rows = q.lines.map((l,i)=>`
     <tr>
@@ -3562,7 +3562,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
   const vat = subAfterDisc*0.15;
   const total = subAfterDisc+vat;
   const depRate = total<=5000 ? 1.0 : 0.80;
-  const dep = subAfterDisc*depRate;
+  const dep = total*depRate;
   return (
     <Modal onClose={onClose} wide>
       <ModalHeader title={`${quote.num} — ${quote.client}`} onClose={onClose}/>
@@ -3703,7 +3703,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
             className="flex items-center gap-1.5 text-xs bg-blue-700 hover:bg-blue-800 text-white rounded-xl px-4 py-2.5 font-bold">
             📧 Email to Customer
           </button>
-          {quote.status!=='converted'&&onEdit&&(
+          {onEdit&&(
             <button onClick={()=>onEdit(quote)}
               className="flex items-center gap-1.5 text-xs bg-amber-500 hover:bg-amber-600 text-white rounded-xl px-4 py-2.5 font-bold">
               ✏️ Edit Quote
@@ -4044,10 +4044,12 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                         ✓ Mark Paid
                       </button>
                     )}
-                    <button onClick={()=>setEditInvoice(j)}
-                      className="text-xs bg-amber-500 hover:bg-amber-600 text-white font-bold px-3 py-1.5 rounded-xl">
-                      ✏️ Edit
-                    </button>
+                    {isAdmin&&(
+                      <button onClick={()=>setEditInvoice(j)}
+                        className="text-xs bg-amber-500 hover:bg-amber-600 text-white font-bold px-3 py-1.5 rounded-xl">
+                        ✏️ Edit
+                      </button>
+                    )}
                     <button onClick={()=>printInvoice(j,companies,logoDataUrl)}
                       className="text-xs bg-gray-800 hover:bg-gray-900 text-white font-bold px-3 py-1.5 rounded-xl">
                       🧾 Print
