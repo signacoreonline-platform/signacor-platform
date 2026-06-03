@@ -1447,7 +1447,7 @@ function emailQuoteViaOutlook(q, companies) {
 'Signacore | Applied Graphics and Visual Displays\r\n'+
 'Tel: 040-940-5555 | orders@snsg.co.za';
   const subject = 'Quotation '+q.num+' \u2014 '+co.name;
-  const mailto = 'mailto:'+encodeURIComponent(q.email||'')+'?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body);
+  const mailto = 'mailto:'+encodeURIComponent(q.email||'')+'?subject='+encodeURIComponent(subject)+'&cc='+encodeURIComponent('logistics@snsg.co.za')+'&body='+encodeURIComponent(body);
   window.location.href = mailto;
 }
 
@@ -1730,7 +1730,7 @@ function emailInvoiceViaOutlook(job, companies) {
 'Signacore | Applied Graphics and Visual Displays\r\n'+
 'Tel: 040-940-5555 | orders@snsg.co.za';
   const subject = 'Tax Invoice '+invNum+' \u2014 '+job.client;
-  const mailto = 'mailto:?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body);
+  const mailto = 'mailto:?subject='+encodeURIComponent(subject)+'&cc='+encodeURIComponent('logistics@snsg.co.za')+'&body='+encodeURIComponent(body);
   window.location.href = mailto;
 }
 
@@ -6004,7 +6004,7 @@ Kind regards,
 Signacore
 orders@snsg.co.za`
     );
-    window.location.href = `mailto:${recip}?subject=${subj}&body=${body}`;
+    window.location.href = `mailto:${recip}?subject=${subj}&cc=${encodeURIComponent('logistics@snsg.co.za')}&body=${body}`;
   }
 
   // Render form fields based on formId
