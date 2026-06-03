@@ -145,8 +145,16 @@ function loadPersistedData() {
 }
 
 let __sgrSaveTimer = null;
+// Tracks the _autoSavedAt stamp of the last payload WE sent to the server.
+// The poll loop checks this so it never overwrites local state with data we
+// already know about (which would discard edits made since the last debounce).
+let __lastSentAt = null;
+
 function persistStateToServer(payload) {
   try {
+    // Record the stamp immediately so the poll can compare against it even
+    // before the debounced fetch fires.
+    __lastSentAt = payload._autoSavedAt || null;
     clearTimeout(__sgrSaveTimer);
     __sgrSaveTimer = setTimeout(function(){
       fetch(API_STATE_URL, {
@@ -157,6 +165,17 @@ function persistStateToServer(payload) {
     }, 800);
   } catch(e) {}
 }
+
+// ── Select-on-focus for all numeric inputs ──────────────────────────────────
+// When the user clicks into any number input the existing value is highlighted,
+// so typing immediately overwrites it instead of appending.
+document.addEventListener('focusin', function(e) {
+  var t = e.target;
+  if (t && t.tagName === 'INPUT' && t.type === 'number') {
+    // Use setTimeout to let React's synthetic event settle first
+    setTimeout(function(){ try { t.select(); } catch(_){} }, 0);
+  }
+});
 /* ═══════════════════════════════════════════════════════════
    COST CATEGORIES  (job breakdown — 9 line items)
 ═══════════════════════════════════════════════════════════ */
@@ -12824,9 +12843,12 @@ function App() {
         const json = await res.json();
         const d = json && json.data !== undefined ? json.data : json;
         if (!validState(d)) return;
-        // Only update if server has newer data than what we loaded on boot
+        // Only pull server data if it is genuinely newer than:
+        //  (a) what we loaded at boot, AND
+        //  (b) what we last sent ourselves (avoid clobbering in-flight edits)
         const serverStamp = d._autoSavedAt || d.savedAt;
-        if (active && serverStamp && serverStamp !== lastSavedAt) {
+        const alreadyKnown = serverStamp === lastSavedAt || serverStamp === __lastSentAt;
+        if (active && serverStamp && !alreadyKnown) {
           lastSavedAt = serverStamp;
           setJobs(d.jobs||[]);
           setInventory(()=>{
