@@ -1104,7 +1104,7 @@ function printQuoteWindow(q, companies, logoDataUrl) {
     ? `<img src="${logoDataUrl}" style="max-height:112px;max-width:322px;object-fit:contain;display:block;">`
     : `<div style="font-family:'Barlow Condensed',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.08em;">SIGNACORE</div>`;
 
-  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title></title>
+  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Quotation_${q.num}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,600;0,700;0,800;1,700;1,800&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
@@ -1573,7 +1573,11 @@ function printInvoice(job, companies, logoDataUrl) {
   const co = companies.find(c=>c.id===job.co)||{name:'Signacore',short:'SGR'};
   const lines = job.lines||[];
   const sub = lines.reduce((s,l)=>s+(l.subtotal||0),0);
-  const vat = sub*0.15; const total = sub+vat;
+  const discPct = parseFloat(job.discount)||0;
+  const discAmt = sub*(discPct/100);
+  const setupFeeAmt = parseFloat(job.setupFee)||0;
+  const afterDisc = sub - discAmt + setupFeeAmt;
+  const vat = afterDisc*0.15; const total = afterDisc+vat;
   const fmt = n=>'R\u00a0'+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const rows = lines.map((l,i)=>(
     '<tr><td style="width:26px;color:#4b5563;font-size:10px;">'+(i+1)+'</td>'+
@@ -1635,7 +1639,7 @@ function printInvoice(job, companies, logoDataUrl) {
 '@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}.no-break{page-break-inside:avoid}}';
 
   const html =
-'<!DOCTYPE html><html><head><meta charset="UTF-8"><title></title>'+
+'<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Invoice_'+invNum+'</title>'+
 '<link rel="preconnect" href="https://fonts.googleapis.com">'+
 '<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,600;0,700;0,800;1,700;1,800&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">'+
 '<style>'+css+'</style></head><body>'+
@@ -1692,6 +1696,8 @@ function printInvoice(job, companies, logoDataUrl) {
 
 '<div class="tots-wrap no-break"><div class="tots"><table>'+
 '<tr><td>Subtotal (excl. VAT)</td><td>'+fmt(sub)+'</td></tr>'+
+(discAmt>0?'<tr class="vat-row"><td>Discount ('+discPct+'%)</td><td>- '+fmt(discAmt)+'</td></tr>':'')+
+(setupFeeAmt>0?'<tr style="color:#4f46e5"><td>Design &amp; Setup Fee</td><td>+ '+fmt(setupFeeAmt)+'</td></tr>':'')+
 '<tr class="vat-row"><td>VAT (15%)</td><td>'+fmt(vat)+'</td></tr>'+
 '<tr class="total-row"><td>TOTAL DUE</td><td>'+fmt(total)+'</td></tr>'+
 '</table></div></div>'+
@@ -1978,12 +1984,13 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   const fmt     = n => 'R '+Number(n||0).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,',');
   const refNum  = isQuote ? data.num : (data.invoiceNum||data.num);
   const lines   = data.lines||[];
-  const sub     = lines.reduce((s,l)=>s+(l.subtotal||0),0);
-  const disc    = data.discount||0;
-  const discAmt = sub*disc/100;
-  const after   = sub-discAmt;
-  const vat     = after*0.15;
-  const total   = after+vat;
+  const sub         = lines.reduce((s,l)=>s+(l.subtotal||0),0);
+  const disc        = data.discount||0;
+  const discAmt     = sub*disc/100;
+  const setupFeeAmt = parseFloat(data.setupFee)||0;
+  const after       = sub-discAmt+setupFeeAmt;
+  const vat         = after*0.15;
+  const total       = after+vat;
   const depRate = total<=5000 ? 1.0 : 0.80;
   const dep     = total*depRate;
   const today   = new Date().toLocaleDateString('en-ZA',{day:'2-digit',month:'2-digit',year:'numeric'});
@@ -2089,6 +2096,7 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   };
   totRow('Subtotal:', fmt(sub));
   if (disc>0) totRow('Discount ('+disc+'%):', '- '+fmt(discAmt));
+  if (setupFeeAmt>0) totRow('Design & Setup Fee:', '+ '+fmt(setupFeeAmt));
   totRow('VAT (15%):', fmt(vat));
   sd(C_RED); doc.setLineWidth(0.4); doc.line(tX,y,RM,y); y+=1;
   totRow('TOTAL (incl. VAT):', fmt(total), true, true);
@@ -2961,33 +2969,45 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   const eq = existingQuote;
   const today = new Date().toISOString().slice(0,10);
   const validDef = new Date(Date.now()+14*24*3600*1000).toISOString().slice(0,10);
-  const [client,setClient]=useState(eq?.client||''); const [contact,setContact]=useState(eq?.contact||'');
-  const [email,setEmail]=useState(eq?.email||''); const [tel,setTel]=useState(eq?.tel||'');
-  const [address,setAddress]=useState(eq?.address||''); const [vatNum,setVatNum]=useState(eq?.vatNum||'');
-  const [co,setCo]=useState(String(eq?.co||companies[0]?.id||3));
-  const [date,setDate]=useState(eq?.date||today); const [valid,setValid]=useState(eq?.validUntil||validDef);
-  const [notes,setNotes]=useState(eq?.notes||'');
-  const [salesperson,setSalesperson]=useState(eq?.salesperson||'');
+
+  // ── Load saved draft from localStorage (restores unsaved work after logout/reload) ──
+  const _draftKey = 'sgr_quote_draft_' + (eq?.num || nextNum);
+  const _draft = (()=>{
+    try {
+      const raw = localStorage.getItem(_draftKey);
+      if (!raw) return null;
+      const d = JSON.parse(raw);
+      // Only use draft if it has content and (no existing quote, OR draft is newer than eq was last saved)
+      if (!d || !d._draftAt) return null;
+      if (eq && eq._savedAt && new Date(d._draftAt) <= new Date(eq._savedAt)) return null;
+      return d;
+    } catch(e) { return null; }
+  })();
+
+  const [client,setClient]=useState(_draft?.client??eq?.client??''); const [contact,setContact]=useState(_draft?.contact??eq?.contact??'');
+  const [email,setEmail]=useState(_draft?.email??eq?.email??''); const [tel,setTel]=useState(_draft?.tel??eq?.tel??'');
+  const [address,setAddress]=useState(_draft?.address??eq?.address??''); const [vatNum,setVatNum]=useState(_draft?.vatNum??eq?.vatNum??'');
+  const [co,setCo]=useState(String(_draft?.co||eq?.co||companies[0]?.id||3));
+  const [date,setDate]=useState(_draft?.date||eq?.date||today); const [valid,setValid]=useState(_draft?.valid||eq?.validUntil||validDef);
+  const [notes,setNotes]=useState(_draft?.notes??eq?.notes??'');
+  const [salesperson,setSalesperson]=useState(_draft?.salesperson??eq?.salesperson??'');
   const SALESPEOPLE = ['Ockert Smit','Reinhart Smit','Janique Bettini'];
   const spDropVal = SALESPEOPLE.includes(salesperson) ? salesperson : (salesperson ? 'custom' : '');
   const UNIT_OPTIONS = ['m²','m (linear)','unit','each','set','hour','day','sheet','pack','kg'];
-  const [discount,setDiscount]=useState(eq?.discount||'');
-  const [setupFee,setSetupFee]=useState(eq?.setupFee||'');
-  const [lines,setLines]=useState(eq?.lines||[{id:1,itemId:null,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]);
+  const [discount,setDiscount]=useState(_draft?.discount??eq?.discount??'');
+  const [setupFee,setSetupFee]=useState(_draft?.setupFee??eq?.setupFee??'');
+  const [lines,setLines]=useState(_draft?.lines||eq?.lines||[{id:1,itemId:null,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]);
   const [showCalcPicker, setShowCalcPicker] = useState(false);
   const [showCPPicker,   setShowCPPicker]   = useState(false);
   const [attachments,    setAttachments]    = useState(eq?.attachments||[]);
-  const [poRef,          setPoRef]          = useState(eq?.poRef||'');
+  const [poRef,          setPoRef]          = useState(_draft?.poRef??eq?.poRef??'');
   const [openTypeaheadId, setOpenTypeaheadId] = useState(null);
 
   // ── Active line tracking: controls which line shows the calculator + save button ──
   const [activeLineId, setActiveLineId] = useState(()=>{
-    const ls = eq?.lines||[];
+    const ls = (_draft?.lines||eq?.lines)||[];
     return ls.length ? ls[ls.length-1].id : 1;
   });
-
-  // ── Auto-save quote draft to localStorage after every field change ──
-  const _draftKey = 'sgr_quote_draft_' + (eq?.num || nextNum);
   useEffect(()=>{
     const t = setTimeout(()=>{
       try {
@@ -3124,6 +3144,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       lines, preparedBy, salesperson, discount, setupFee,
       convertedJobId: eq?.convertedJobId||null,
       poRef, attachments,
+      _savedAt: new Date().toISOString(),
     });
     try { localStorage.removeItem(_draftKey); } catch(e){}
     onClose();
@@ -3743,21 +3764,46 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
 ═══════════════════════════════════════════ */
 function EditInvoiceForm({ job, onSave, onClose }) {
   const iCls = "w-full border border-gray-200 rounded-xl px-3 py-2 text-sm";
-  const [client,       setClient]       = useState(job.client||'');
-  const [invoiceNum,   setInvoiceNum]   = useState(job.invoiceNum||'');
-  const [invoiceDate,  setInvoiceDate]  = useState(job.invoiceDate||'');
-  const [invoiceDue,   setInvoiceDue]   = useState(job.invoiceDue||'');
-  const [value,        setValue]        = useState(job.value||0);
-  const [notes,        setNotes]        = useState(job.notes||'');
-  const [invoiceStatus,setInvoiceStatus]= useState(job.invoiceStatus||'pending');
-  const [paidAt,       setPaidAt]       = useState(job.paidAt||'');
-  const [lines,        setLines]        = useState(job.lines ? job.lines.map(l=>({...l})) : []);
+  // ── Restore unsaved draft if one exists ──
+  const _invDraftKey0 = 'sgr_inv_draft_' + (job.invoiceNum||job.id);
+  const _invDraft = (()=>{
+    try {
+      const raw = localStorage.getItem(_invDraftKey0);
+      if (!raw) return null;
+      const d = JSON.parse(raw);
+      if (!d || !d._draftAt) return null;
+      return d;
+    } catch(e){ return null; }
+  })();
+  const [client,       setClient]       = useState(_invDraft?.client       ?? job.client||'');
+  const [invoiceNum,   setInvoiceNum]   = useState(_invDraft?.invoiceNum   ?? job.invoiceNum||'');
+  const [invoiceDate,  setInvoiceDate]  = useState(_invDraft?.invoiceDate  ?? job.invoiceDate||'');
+  const [invoiceDue,   setInvoiceDue]   = useState(_invDraft?.invoiceDue   ?? job.invoiceDue||'');
+  const [value,        setValue]        = useState(_invDraft?.value        ?? job.value||0);
+  const [notes,        setNotes]        = useState(_invDraft?.notes        ?? job.notes||'');
+  const [invoiceStatus,setInvoiceStatus]= useState(_invDraft?.invoiceStatus?? job.invoiceStatus||'pending');
+  const [paidAt,       setPaidAt]       = useState(_invDraft?.paidAt       ?? job.paidAt||'');
+  const [lines,        setLines]        = useState(_invDraft?.lines || (job.lines ? job.lines.map(l=>({...l})) : []));
   const [activeLineId, setActiveLineId] = useState(null);
 
   const linesSubtotal = lines.reduce((s,l)=>s+(l.subtotal||0),0);
   const linesVat      = linesSubtotal*0.15;
   const linesTotal    = linesSubtotal+linesVat;
   const hasLines      = lines.length>0;
+
+  // ── Auto-save invoice draft to localStorage after every line change ──
+  const _invDraftKey = 'sgr_inv_draft_' + (job.invoiceNum||job.id);
+  useEffect(()=>{
+    const t = setTimeout(()=>{
+      try {
+        localStorage.setItem(_invDraftKey, JSON.stringify({
+          client, invoiceNum, invoiceDate, invoiceDue, value, notes, invoiceStatus, paidAt, lines,
+          _draftAt: new Date().toISOString()
+        }));
+      } catch(e){}
+    }, 1000);
+    return ()=>clearTimeout(t);
+  }, [lines, client, invoiceNum, invoiceDate, invoiceDue, value, notes, invoiceStatus, paidAt]);
 
   function updateLine(id,field,v){
     setLines(prev=>prev.map(l=>{
@@ -3786,6 +3832,7 @@ function EditInvoiceForm({ job, onSave, onClose }) {
   function save(){
     const finalValue = hasLines ? linesTotal : parseFloat(value)||0;
     onSave({...job, client, invoiceNum, invoiceDate, invoiceDue, value:finalValue, notes, invoiceStatus, paidAt, lines:hasLines?lines:job.lines});
+    try { localStorage.removeItem(_invDraftKey); } catch(e){}
   }
 
   return (
@@ -3988,13 +4035,23 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const invNum = getNextInvoiceNum(jobs);
     const today  = new Date().toISOString().slice(0,10);
     const dueDate= new Date(Date.now()+30*864e5).toISOString().slice(0,10);
+    const _qSub      = q.lines.reduce(function(s,l){return s+(l.subtotal||0);},0);
+    const _qDiscPct  = parseFloat(q.discount)||0;
+    const _qDiscAmt  = _qSub*(_qDiscPct/100);
+    const _qSetupFee = parseFloat(q.setupFee)||0;
+    const _qAfterDisc= _qSub - _qDiscAmt + _qSetupFee;
     const newJob = {
       id:Date.now(), num:jobNum, client:q.client,
+      contact: q.contact||'', email: q.email||'', tel: q.tel||'',
+      address: q.address||'', vatNum: q.vatNum||'',
       desc:'From Quote '+q.num+' \u2014 '+q.lines.map(function(l){return l.desc;}).filter(Boolean).slice(0,2).join(', '),
       status:'quote_approved', co:q.co,
-      value:q.lines.reduce(function(s,l){return s+(l.subtotal||0);},0)*1.15,
+      value: _qAfterDisc*1.15,
       stage:STATUS_TO_STAGE['quote_approved']||4, breakdown:null,
       lines: q.lines, quoteNum: q.num, notes: q.notes||'',
+      setupFee: q.setupFee||'', discount: q.discount||'',
+      salesperson: q.salesperson||'', preparedBy: q.preparedBy||'',
+      poRef: q.poRef||'',
       invoiceNum: invNum, invoiceDate: today, invoiceDue: dueDate, invoiceStatus: 'pending',
     };
     setJobs(prev=>[newJob,...prev]);
