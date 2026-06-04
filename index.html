@@ -2979,7 +2979,12 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       const d = JSON.parse(raw);
       // Only use draft if it has content and (no existing quote, OR draft is newer than eq was last saved)
       if (!d || !d._draftAt) return null;
-      if (eq && eq._savedAt && new Date(d._draftAt) <= new Date(eq._savedAt)) return null;
+      // If editing an existing quote, only use the draft if it is genuinely newer.
+      // For old quotes that have no _savedAt, discard any draft to avoid stale data.
+      if (eq) {
+        if (!eq._savedAt) return null; // old quote — never load a draft over it
+        if (new Date(d._draftAt) <= new Date(eq._savedAt)) return null;
+      }
       return d;
     } catch(e) { return null; }
   })();
@@ -3285,8 +3290,9 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
           <div className="space-y-3">
             {lines.map((line,idx)=>{
               const unitDropVal = UNIT_OPTIONS.includes(line.unit) ? line.unit : (line.unit ? 'custom' : '');
-              const taItems = (openTypeaheadId===line.id && !line.cpLinked && line.desc && line.desc.length>=1)
-                ? getTypeaheadItems(line.desc) : [];
+              const _taFirstWord = (line.desc||'').trim().split(/\s+/)[0];
+              const taItems = (openTypeaheadId===line.id && !line.cpLinked && _taFirstWord && _taFirstWord.length>=1)
+                ? getTypeaheadItems(_taFirstWord) : [];
               return (
               <div key={line.id} className={`rounded-2xl border-2 ${line.cpLinked?'border-brand-300 bg-brand-50/20':'border-gray-100 bg-white'} shadow-sm overflow-visible`}>
 
@@ -3786,10 +3792,14 @@ function EditInvoiceForm({ job, onSave, onClose }) {
   const [lines,        setLines]        = useState(_invDraft?.lines || (job.lines ? job.lines.map(l=>({...l})) : []));
   const [activeLineId, setActiveLineId] = useState(null);
 
-  const linesSubtotal = lines.reduce((s,l)=>s+(l.subtotal||0),0);
-  const linesVat      = linesSubtotal*0.15;
-  const linesTotal    = linesSubtotal+linesVat;
-  const hasLines      = lines.length>0;
+  const linesSubtotal  = lines.reduce((s,l)=>s+(l.subtotal||0),0);
+  const linesDiscPct   = parseFloat(job.discount)||0;
+  const linesDiscAmt   = linesSubtotal*(linesDiscPct/100);
+  const linesSetupFee  = parseFloat(job.setupFee)||0;
+  const linesAfterDisc = linesSubtotal - linesDiscAmt + linesSetupFee;
+  const linesVat       = linesAfterDisc*0.15;
+  const linesTotal     = linesAfterDisc+linesVat;
+  const hasLines       = lines.length>0;
 
   // ── Auto-save invoice draft to localStorage after every line change ──
   const _invDraftKey = 'sgr_inv_draft_' + (job.invoiceNum||job.id);
