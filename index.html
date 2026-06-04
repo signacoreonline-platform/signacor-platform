@@ -108,11 +108,8 @@ function loadServerStateSync() {
 }
 
 function loadPersistedData() {
-  // 1. PostgreSQL/server state — loaded asynchronously after render via the poll loop.
-  // Synchronous XHR removed: it blocked the main thread on Render cold-start (free tier),
-  // keeping the blue splash screen frozen for up to 30 s. The 30 s poll useEffect below
-  // handles server sync immediately after the app mounts, with no UI freeze.
-  const serverState = null;
+  // 1. PostgreSQL/server state — shared across devices
+  const serverState = loadServerStateSync();
 
   // 2. localStorage — browser fallback / may be MORE RECENT than server
   //    (e.g. user refreshed before the 800ms auto-save debounce reached the server)
@@ -3288,9 +3285,8 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
           <div className="space-y-3">
             {lines.map((line,idx)=>{
               const unitDropVal = UNIT_OPTIONS.includes(line.unit) ? line.unit : (line.unit ? 'custom' : '');
-              const _taFirstWord = (line.desc||'').trim().split(/\s+/)[0];
-              const taItems = (openTypeaheadId===line.id && !line.cpLinked && _taFirstWord && _taFirstWord.length>=1)
-                ? getTypeaheadItems(_taFirstWord) : [];
+              const taItems = (openTypeaheadId===line.id && !line.cpLinked && line.desc && line.desc.length>=1)
+                ? getTypeaheadItems(line.desc) : [];
               return (
               <div key={line.id} className={`rounded-2xl border-2 ${line.cpLinked?'border-brand-300 bg-brand-50/20':'border-gray-100 bg-white'} shadow-sm overflow-visible`}>
 
