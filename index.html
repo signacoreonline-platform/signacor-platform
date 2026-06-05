@@ -2515,13 +2515,17 @@ function BulkImportModal({ inventory, onClose, onImport }) {
     setPreview(rows);
   }
   function confirmImport() {
-    if (mode==='replace') { onImport(preview); }
-    else {
-      const ex=[...inventory];
-      preview.forEach(row=>{ const idx=ex.findIndex(i=>i.sku.toLowerCase()===row.sku.toLowerCase()); if(idx>=0){ex[idx]={...ex[idx],...row};}else{ex.push(row);} });
-      onImport(ex);
-    }
-    onClose();
+    try {
+      if (!preview || preview.length === 0) { alert('Nothing to import — please preview first.'); return; }
+      if (mode==='replace') { onImport(preview); }
+      else {
+        const ex=[...inventory];
+        preview.forEach(row=>{ const idx=ex.findIndex(i=>i.sku.toLowerCase()===row.sku.toLowerCase()); if(idx>=0){ex[idx]={...ex[idx],...row};}else{ex.push(row);} });
+        onImport(ex);
+      }
+      onClose();
+      alert(`✅ ${preview.length} item${preview.length!==1?'s':''} imported successfully into Inventory.`);
+    } catch(e) { alert('Import failed: ' + e.message); }
   }
   return (
     <Modal onClose={onClose} wide>
@@ -2559,7 +2563,7 @@ function BulkImportModal({ inventory, onClose, onImport }) {
               </div>
               <div className="flex gap-3">
                 <button onClick={()=>setPreview(null)} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Back</button>
-                <button onClick={confirmImport} className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl py-2.5 text-sm font-bold">Confirm Import</button>
+                <button type="button" onClick={confirmImport} className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl py-2.5 text-sm font-bold">Confirm Import</button>
               </div>
             </div>
         }
@@ -10171,6 +10175,262 @@ function QuickRatesModal({ quickRates, setQuickRates, suppliers, inventory, setI
   );
 }
 
+/* ═════════════════════════════════════════════
+   QUICK RATES PANEL (inline warehouse tab)
+═════════════════════════════════════════════ */
+function QuickRatesPanel({ quickRates, setQuickRates, suppliers, inventory, setInventory, inventoryCats }) {
+  const [search,      setSearch]      = useState('');
+  const [showAdd,     setShowAdd]     = useState(false);
+  const [editItem,    setEditItem]    = useState(null);
+  const [copyItem,    setCopyItem]    = useState(null);
+  const [showImport,  setShowImport]  = useState(false);
+  const [delId,       setDelId]       = useState(null);
+  const [pendingMove, setPendingMove] = useState(null);
+  const [sortCol,     setSortCol]     = useState(null);
+  const [sortDir,     setSortDir]     = useState('asc');
+
+  const STANDARD_CATS = ['Vinyl','Laminate','Substrates','Ink & Consumables','Aluminium Profiles','Hardware & Fittings','Electrical Components','Fabric & Mesh','Paper & Board','Tools & Equipment','Signage Faces','LED Components','Packaging','Consumables','Other'];
+  const allCats = [...new Set([...STANDARD_CATS,...(inventoryCats||[]),...(quickRates||[]).map(r=>r.cat).filter(Boolean)])].sort();
+
+  const _searched = (quickRates||[]).filter(r=>{
+    if(!search.trim()) return true;
+    const q=search.toLowerCase();
+    const sup=(suppliers||[]).find(s=>s.id===r.supplierId||s.id===Number(r.supplierId))?.name||'';
+    return (r.name||'').toLowerCase().includes(q)||(r.sku||'').toLowerCase().includes(q)||(r.cat||'').toLowerCase().includes(q)||sup.toLowerCase().includes(q);
+  });
+  const _statusRank = x => (Number(x.stock)||0)===0?0:((Number(x.reorder)||0)>0&&(Number(x.stock)||0)<=(Number(x.reorder)||0))?1:2;
+  const filtered = sortCol ? [..._searched].sort((a,b)=>{
+    let av,bv;
+    if(sortCol==='name')         { av=a.name||''; bv=b.name||''; }
+    else if(sortCol==='sku')     { av=a.sku||'';  bv=b.sku||''; }
+    else if(sortCol==='cat')     { av=a.cat||'';  bv=b.cat||''; }
+    else if(sortCol==='supplier'){ av=(suppliers||[]).find(s=>s.id===a.supplierId||s.id===Number(a.supplierId))?.name||''; bv=(suppliers||[]).find(s=>s.id===b.supplierId||s.id===Number(b.supplierId))?.name||''; }
+    else if(sortCol==='stock')   { av=Number(a.stock)||0;   bv=Number(b.stock)||0; }
+    else if(sortCol==='reorder') { av=Number(a.reorder)||0; bv=Number(b.reorder)||0; }
+    else if(sortCol==='status')  { av=_statusRank(a); bv=_statusRank(b); }
+    else if(sortCol==='cost')    { av=Number(a.cost)||0;  bv=Number(b.cost)||0; }
+    else if(sortCol==='sell')    { av=Number(a.sell)||0;  bv=Number(b.sell)||0; }
+    if(typeof av==='string') return sortDir==='asc'?av.localeCompare(bv):bv.localeCompare(av);
+    return sortDir==='asc'?av-bv:bv-av;
+  }) : _searched;
+
+  const qrStockValue = (quickRates||[]).reduce((s,i)=>s+(Number(i.stock)||0)*(Number(i.cost)||0),0);
+  const qrSellValue  = (quickRates||[]).reduce((s,i)=>s+(Number(i.stock)||0)*(Number(i.sell)||0),0);
+  const qrLowStock   = (quickRates||[]).filter(i=>{const s=Number(i.stock)||0;const r=Number(i.reorder)||0;return s>0&&r>0&&s<=r;}).length;
+  const zarFmt = n => 'R '+Number(n||0).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+
+  function handleSave(item) {
+    const stock = Number(item.stock)||0;
+    if (stock > 0) {
+      const dupes = (inventory||[]).filter(i=>
+        i.name.toLowerCase().trim()===(item.name||'').toLowerCase().trim()||
+        (item.sku&&i.sku&&i.sku.toLowerCase().trim()===item.sku.toLowerCase().trim())
+      );
+      setPendingMove({ item, dupes });
+      return;
+    }
+    setQuickRates(prev=>prev.find(x=>x.id===item.id)?prev.map(x=>x.id===item.id?item:x):[...prev,item]);
+  }
+  function moveToInventory(item) {
+    setInventory(prev=>[...prev,{...item,id:Date.now(),supplierId:item.supplierId||null}]);
+    setQuickRates(prev=>prev.filter(x=>x.id!==item.id));
+    setPendingMove(null);
+  }
+  function mergeIntoInventory(qrItem, invTargetId) {
+    setInventory(prev=>prev.map(i=>i.id!==invTargetId?i:{...i,stock:(Number(i.stock)||0)+(Number(qrItem.stock)||0)}));
+    setQuickRates(prev=>prev.filter(x=>x.id!==qrItem.id));
+    setPendingMove(null);
+  }
+  function keepInQR(item) {
+    setQuickRates(prev=>prev.find(x=>x.id===item.id)?prev.map(x=>x.id===item.id?item:x):[...prev,item]);
+    setPendingMove(null);
+  }
+  function handleDelete(id){ setQuickRates(prev=>prev.filter(x=>x.id!==id)); setDelId(null); }
+  function handleBulkImport(items){ setQuickRates(prev=>[...prev,...items]); }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h3 className="text-base font-black text-gray-900">⚡ Quick Rates Warehouse</h3>
+          <p className="text-xs text-gray-400 mt-0.5">Rate-only items used in quoting. Add stock to promote an item to your main Inventory.</p>
+        </div>
+        <p className="text-xs text-gray-400 flex-shrink-0">{(quickRates||[]).length} item{(quickRates||[]).length!==1?'s':''} total</p>
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <KpiCard icon="⚡" label="Total Items"  value={(quickRates||[]).length} accent="text-gray-800"/>
+        <KpiCard icon="⚠️" label="Low Stock"   value={qrLowStock}              accent="text-red-600"/>
+        <KpiCard icon="💰" label="Stock Cost"  value={zarK(qrStockValue)}      accent="text-blue-700"/>
+        <KpiCard icon="📉" label="Sell Value"  value={zarK(qrSellValue)}       accent="text-emerald-600"/>
+      </div>
+
+      <div className="flex gap-2 flex-wrap items-center justify-between border-t border-gray-100 pt-3">
+        <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest">Actions</p>
+        <div className="flex gap-2 flex-wrap">
+          <button type="button" onClick={()=>setShowImport(true)} className="flex items-center gap-1.5 bg-gray-700 hover:bg-gray-800 text-white rounded-xl px-3.5 py-2 text-xs font-bold whitespace-nowrap">⬆ Bulk Import</button>
+          <button type="button" onClick={()=>setShowAdd(true)} className="flex items-center gap-1.5 bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-3.5 py-2 text-xs font-bold whitespace-nowrap">＋ Add Item</button>
+        </div>
+      </div>
+
+      <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-2.5 text-xs text-amber-800">
+        💡 <strong>Tip:</strong> When you add a Stock Qty to any item here, you will be prompted to move it into your main Inventory automatically.
+      </div>
+
+      <div className="relative">
+        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm pointer-events-none">🔍</span>
+        <input value={search} onChange={e=>setSearch(e.target.value)}
+          placeholder="Search by name, SKU or category…"
+          className="w-full border border-gray-300 rounded-xl pl-9 pr-10 py-2.5 text-sm bg-white focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/>
+        {search&&<button type="button" onClick={()=>setSearch('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-300 hover:text-gray-500 text-base font-black">×</button>}
+      </div>
+
+      {filtered.length===0 ? (
+        <div className="text-center py-12 text-gray-400">
+          <div className="text-4xl mb-2">⚡</div>
+          <p className="font-semibold text-sm">{search?'No items match your search.':'No Quick Rate items yet.'}</p>
+          <p className="text-xs mt-1">{!search&&'Add items manually or bulk import from Excel.'}</p>
+        </div>
+      ) : (
+        <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm min-w-[900px]">
+              <thead className="bg-gray-50 border-b border-gray-200 sticky top-0 z-10">
+                <tr>
+                  {(()=>{
+                    const thCls="px-4 py-3 text-xs font-semibold text-left cursor-pointer select-none hover:bg-gray-100 transition-colors whitespace-nowrap";
+                    const SortIcon=({col})=>{
+                      if(sortCol!==col) return <span className="ml-1 text-gray-300">⇅</span>;
+                      return <span className="ml-1 text-brand-500">{sortDir==='asc'?'▲':'▼'}</span>;
+                    };
+                    function mkTh(col,label){
+                      const active=sortCol===col;
+                      return(<th key={col} className={thCls+(active?' text-brand-600':' text-gray-400')}
+                        onClick={()=>{ if(active){setSortDir(d=>d==='asc'?'desc':'asc');}else{setSortCol(col);setSortDir('asc');} }}>
+                        {label}<SortIcon col={col}/>
+                      </th>);
+                    }
+                    return(<>
+                      {mkTh('name','Item')}
+                      {mkTh('sku','SKU')}
+                      {mkTh('cat','Cat')}
+                      {mkTh('supplier','Supplier')}
+                      {mkTh('stock','Stock Level')}
+                      {mkTh('reorder','Reorder At')}
+                      {mkTh('status','Status')}
+                      {mkTh('cost','Cost')}
+                      {mkTh('sell','Sell Price')}
+                      <th className="px-4 py-3 text-xs font-semibold text-gray-400 text-left"></th>
+                    </>);
+                  })()}
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map(r=>{
+                  const stock   = Number(r.stock)||0;
+                  const reorder = Number(r.reorder)||0;
+                  const out     = stock===0;
+                  const low     = !out && reorder>0 && stock<=reorder;
+                  const pct     = Math.min(100, reorder>0?(stock/Math.max(stock*1.5,reorder*2))*100:(stock>0?100:0));
+                  const mu      = (Number(r.cost)||0)>0?(((Number(r.sell)||0)-(Number(r.cost)||0))/(Number(r.cost)||0)*100).toFixed(0):'—';
+                  const supName = (suppliers||[]).find(s=>s.id===r.supplierId||s.id===Number(r.supplierId))?.name||null;
+                  return(
+                    <tr key={r.id} className={`border-b border-gray-50 hover:bg-gray-50 ${out?'bg-red-50/60':low?'bg-red-50/30':''}`}>
+                      <td className="px-4 py-3 text-xs font-semibold text-gray-700">{r.name}</td>
+                      <td className="px-4 py-3 text-xs font-mono text-gray-400">{r.sku||'—'}</td>
+                      <td className="px-4 py-3"><span className="text-xs bg-gray-100 text-gray-600 rounded-full px-2 py-0.5">{r.cat||'—'}</span></td>
+                      <td className="px-4 py-3 text-xs text-gray-500">{supName?<span className="flex items-center gap-1">🏭 {supName}</span>:<span className="text-gray-300">—</span>}</td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2">
+                          <div className="w-16 bg-gray-100 rounded-full h-1.5 flex-shrink-0">
+                            <div className={`h-1.5 rounded-full ${out?'bg-red-500':low?'bg-amber-400':'bg-emerald-400'}`} style={{width:`${pct}%`}}/>
+                          </div>
+                          <p className={`text-sm font-black whitespace-nowrap ${out?'text-red-600':low?'text-amber-600':'text-gray-800'}`}>{stock} {r.unit||''}</p>
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 text-xs text-gray-500">{reorder} {r.unit||''}</td>
+                      <td className="px-4 py-3">
+                        <span className={`text-xs px-2 py-1 rounded-full font-semibold ${out?'bg-red-100 text-red-700':low?'bg-amber-100 text-amber-700':'bg-emerald-100 text-emerald-700'}`}>
+                          {out?'No stock':low?'Reorder Now':'In Stock'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-xs text-gray-600">{zarFmt(r.cost)}</td>
+                      <td className="px-4 py-3">
+                        <p className="text-xs text-gray-700">{zarFmt(r.sell)}</p>
+                        {(Number(r.cost)||0)>0&&<p className="text-xs text-emerald-600">+{mu}%</p>}
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex gap-1.5">
+                          <button type="button" onClick={()=>setEditItem(r)} className="text-xs text-blue-400 hover:text-blue-600 font-semibold hover:bg-blue-50 rounded-lg px-2 py-1">✏️</button>
+                          <button type="button" onClick={()=>setCopyItem({...r,id:null,sku:(r.sku||'')+'-COPY'})} className="text-xs text-green-500 hover:text-green-700 font-semibold hover:bg-green-50 rounded-lg px-2 py-1">📋</button>
+                          {delId===r.id?(
+                            <span className="flex gap-1">
+                              <button type="button" onClick={()=>handleDelete(r.id)} className="text-xs bg-red-500 hover:bg-red-600 text-white rounded-lg px-2 py-1 font-bold">Delete</button>
+                              <button type="button" onClick={()=>setDelId(null)} className="text-xs border border-gray-200 rounded-lg px-2 py-1 text-gray-500 hover:bg-gray-100">✕</button>
+                            </span>
+                          ):(
+                            <button type="button" onClick={()=>setDelId(r.id)} className="text-xs text-red-400 hover:text-red-600 font-semibold hover:bg-red-50 rounded-lg px-2 py-1">🗑</button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {(showAdd||editItem||copyItem)&&<AddEditQuickRateModal item={copyItem||editItem} suppliers={suppliers||[]} allCats={allCats} onClose={()=>{setShowAdd(false);setEditItem(null);setCopyItem(null);}} onSave={it=>{handleSave({...it,id:it.id||Date.now()});setCopyItem(null);}}/>}
+      {showImport&&<BulkImportQuickRatesModal existingRates={quickRates||[]} onImport={handleBulkImport} onClose={()=>setShowImport(false)}/>}
+
+      {pendingMove&&(
+        <div className="fixed inset-0 bg-black/60 z-[60] flex items-center justify-center p-4" onClick={e=>e.target===e.currentTarget&&setPendingMove(null)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg">
+            <div className="px-6 py-4 border-b flex items-center gap-3">
+              <span className="text-2xl">📦</span>
+              <div>
+                <h3 className="text-base font-black text-gray-800">Move to Inventory?</h3>
+                <p className="text-xs text-gray-500 mt-0.5">Stock has been entered — this item can now live in your real Inventory.</p>
+              </div>
+            </div>
+            <div className="px-6 py-4 space-y-4">
+              <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 grid grid-cols-2 gap-2 text-xs">
+                <div><span className="text-gray-400">Name</span><p className="font-bold text-gray-800">{pendingMove.item.name}</p></div>
+                <div><span className="text-gray-400">SKU</span><p className="font-bold text-gray-800">{pendingMove.item.sku||'—'}</p></div>
+                <div><span className="text-gray-400">Category</span><p className="font-bold text-gray-800">{pendingMove.item.cat||'—'}</p></div>
+                <div><span className="text-gray-400">Stock Qty</span><p className="font-bold text-emerald-700">{pendingMove.item.stock} {pendingMove.item.unit}</p></div>
+                <div><span className="text-gray-400">Cost</span><p className="font-bold text-gray-800">{zarFmt(pendingMove.item.cost)}</p></div>
+                <div><span className="text-gray-400">Sell Price</span><p className="font-bold text-brand-700">{zarFmt(pendingMove.item.sell)}</p></div>
+              </div>
+              {pendingMove.dupes.length>0&&(
+                <div className="bg-amber-50 border border-amber-300 rounded-xl p-4 space-y-3">
+                  <p className="text-xs font-black text-amber-800">⚠️ Similar item{pendingMove.dupes.length>1?'s':''} already exist{pendingMove.dupes.length===1?'s':''} in Inventory:</p>
+                  {pendingMove.dupes.map(d=>(
+                    <div key={d.id} className="flex items-center justify-between bg-white border border-amber-200 rounded-lg px-3 py-2">
+                      <div className="text-xs">
+                        <p className="font-bold text-gray-800">{d.name} <span className="font-normal text-gray-400">({d.sku})</span></p>
+                        <p className="text-gray-500">Stock: {d.stock} {d.unit} · Sell: {zarFmt(d.sell)}</p>
+                      </div>
+                      <button type="button" onClick={()=>mergeIntoInventory(pendingMove.item,d.id)} className="ml-3 flex-shrink-0 bg-amber-500 hover:bg-amber-600 text-white rounded-lg px-3 py-1.5 text-xs font-bold">Merge stock (+{pendingMove.item.stock})</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="flex flex-col gap-2 pt-1">
+                <button type="button" onClick={()=>moveToInventory(pendingMove.item)} className="w-full bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold">📦 Move to Inventory as new item</button>
+                <button type="button" onClick={()=>keepInQR(pendingMove.item)} className="w-full border border-gray-200 text-gray-600 hover:bg-gray-50 rounded-xl py-2.5 text-sm font-semibold">⚡ Keep in Quick Rates with stock</button>
+                <button type="button" onClick={()=>setPendingMove(null)} className="w-full text-gray-400 hover:text-gray-600 text-xs py-1">Cancel — discard changes</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function InventoryPage({ inventory, setInventory, suppliers, user, completeProducts, setCompleteProducts, setQuotes, companies, logoDataUrl, quickRates, setQuickRates }) {
   const isAdmin = user.role !== 'assistant';
   const [invSubTab,     setInvSubTab]     = useState('stock'); // 'stock' | 'products'
@@ -10562,7 +10822,7 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
 
       {/* Sub-tab toggle */}
       <div className="flex gap-1 bg-gray-100 rounded-2xl p-1 w-fit">
-        {[{k:'stock',label:'📦 Stock Items'},{k:'products',label:'🏷 Complete Products'}].map(({k,label})=>(
+        {[{k:'stock',label:'📦 Stock Items'},{k:'products',label:'🏷 Complete Products'},{k:'quickrates',label:'⚡ Quick Rates'}].map(({k,label})=>(
           <button key={k} onClick={()=>setInvSubTab(k)}
             className={`text-xs font-bold px-4 py-2 rounded-xl transition-all ${invSubTab===k?'bg-white text-gray-900 shadow-sm':'text-gray-500 hover:text-gray-700'}`}>
             {label}
@@ -10655,10 +10915,10 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
                 📋 Wholesale List
               </button>
             )}
-            <button onClick={()=>setShowQuickRates(true)}
+            <button onClick={()=>setInvSubTab('quickrates')}
               className="flex items-center gap-1.5 text-white rounded-xl px-3.5 py-2 text-xs font-bold whitespace-nowrap"
               style={{background:'#7c3aed'}}
-              title="Quick Rates — description-only items from your other work">
+              title="Quick Rates Warehouse — open as a full tab">
               ⚡ Quick Rates
             </button>
           </div>
@@ -10856,6 +11116,18 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
           </div>
         )}
       </>)}
+
+      {/* ═══════════════ QUICK RATES TAB ═══════════════ */}
+      {invSubTab==='quickrates'&&(
+        <QuickRatesPanel
+          quickRates={quickRates||[]}
+          setQuickRates={setQuickRates}
+          suppliers={suppliers||[]}
+          inventory={inventory}
+          setInventory={setInventory}
+          inventoryCats={cats}
+        />
+      )}
     </div>
   );
 }
