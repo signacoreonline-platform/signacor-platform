@@ -3785,14 +3785,14 @@ function EditInvoiceForm({ job, onSave, onClose }) {
       return d;
     } catch(e){ return null; }
   })();
-  const [client,       setClient]       = useState(_invDraft?.client       ?? job.client||'');
-  const [invoiceNum,   setInvoiceNum]   = useState(_invDraft?.invoiceNum   ?? job.invoiceNum||'');
-  const [invoiceDate,  setInvoiceDate]  = useState(_invDraft?.invoiceDate  ?? job.invoiceDate||'');
-  const [invoiceDue,   setInvoiceDue]   = useState(_invDraft?.invoiceDue   ?? job.invoiceDue||'');
-  const [value,        setValue]        = useState(_invDraft?.value        ?? job.value||0);
-  const [notes,        setNotes]        = useState(_invDraft?.notes        ?? job.notes||'');
-  const [invoiceStatus,setInvoiceStatus]= useState(_invDraft?.invoiceStatus?? job.invoiceStatus||'pending');
-  const [paidAt,       setPaidAt]       = useState(_invDraft?.paidAt       ?? job.paidAt||'');
+  const [client,       setClient]       = useState(_invDraft?.client       ?? (job.client||''));
+  const [invoiceNum,   setInvoiceNum]   = useState(_invDraft?.invoiceNum   ?? (job.invoiceNum||''));
+  const [invoiceDate,  setInvoiceDate]  = useState(_invDraft?.invoiceDate  ?? (job.invoiceDate||''));
+  const [invoiceDue,   setInvoiceDue]   = useState(_invDraft?.invoiceDue   ?? (job.invoiceDue||''));
+  const [value,        setValue]        = useState(_invDraft?.value        ?? (job.value||0));
+  const [notes,        setNotes]        = useState(_invDraft?.notes        ?? (job.notes||''));
+  const [invoiceStatus,setInvoiceStatus]= useState(_invDraft?.invoiceStatus?? (job.invoiceStatus||'pending'));
+  const [paidAt,       setPaidAt]       = useState(_invDraft?.paidAt       ?? (job.paidAt||''));
   const [lines,        setLines]        = useState(_invDraft?.lines || (job.lines ? job.lines.map(l=>({...l})) : []));
   const [activeLineId, setActiveLineId] = useState(null);
 
