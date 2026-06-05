@@ -112,6 +112,7 @@ function loadPersistedData() {
   // Synchronous XHR removed: it blocked the main thread on Render cold-start (free tier),
   // keeping the blue splash screen frozen for up to 30 s. The 30 s poll useEffect below
   // handles server sync immediately after the app mounts, with no UI freeze.
+  // File restored 2026-06-05 — truncation fix.
   const serverState = null;
 
   // 2. localStorage — browser fallback / may be MORE RECENT than server
