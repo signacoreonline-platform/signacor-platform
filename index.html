@@ -2293,96 +2293,6 @@ function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSen
 }
 
 /* ═══════════════════════════════════════════
-   SHARE GUIDE MODAL
-═══════════════════════════════════════════ */
-function ShareGuideModal({ onClose, lastSaved }) {
-  const [copied, setCopied] = React.useState('');
-  function copy(text, key) {
-    navigator.clipboard.writeText(text).then(() => { setCopied(key); setTimeout(() => setCopied(''), 2000); });
-  }
-  const step = (n, title, body) => (
-    <div key={n} className="flex gap-3">
-      <div className="w-7 h-7 rounded-full bg-brand-500 text-white text-xs font-black flex items-center justify-center flex-shrink-0 mt-0.5">{n}</div>
-      <div className="flex-1">
-        <p className="text-sm font-bold text-gray-800 mb-0.5">{title}</p>
-        <div className="text-xs text-gray-500 leading-relaxed">{body}</div>
-      </div>
-    </div>
-  );
-  return (
-    <Modal onClose={onClose} wide>
-      <ModalHeader title="📤 Share via OneDrive" onClose={onClose} />
-      <div className="px-6 py-5 space-y-5">
-
-        {/* Intro banner */}
-        <div className="bg-blue-50 border border-blue-100 rounded-xl p-4">
-          <p className="text-xs text-blue-700 leading-relaxed">
-            This platform is a <strong>single HTML file</strong> — no server needed. Both users work on the same file and share data through a <strong>OneDrive shared folder</strong>. After any session, the active user saves the file and uploads it to OneDrive so the other can download the latest version.
-          </p>
-          {lastSaved && <p className="text-xs text-blue-500 mt-1.5">📅 File last saved: <strong>{lastSaved}</strong></p>}
-        </div>
-
-        {/* Admin steps */}
-        <div>
-          <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-3">🔑 Admin Setup (once only)</p>
-          <div className="space-y-4">
-            {step(1, 'Create a shared OneDrive folder',
-              <span>Go to <a href="https://onedrive.live.com" target="_blank" rel="noreferrer" className="text-brand-600 underline font-semibold">onedrive.live.com</a> → New → Folder → name it <strong>Signacore Platform</strong>. Right-click the folder → Share → add the assistant's email.</span>
-            )}
-            {step(2, 'Upload this file to the shared folder',
-              <span>Click <strong>💾 Save</strong> (top right) — the file downloads to your computer. Then drag it into the OneDrive folder. The filename includes today's date so versions are easy to spot.</span>
-            )}
-            {step(3, 'Send the folder link to the assistant',
-              <span>Right-click the folder → Share → Copy link. Paste that link to the assistant. She'll bookmark it for easy access.</span>
-            )}
-          </div>
-        </div>
-
-        <hr className="border-gray-100"/>
-
-        {/* Daily workflow */}
-        <div>
-          <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-3">🔄 Daily Workflow</p>
-          <div className="space-y-4">
-            {step(1, 'Always download the latest file first',
-              <span>Before starting work, open the shared OneDrive folder and download the most recent file (check the date in the filename).</span>
-            )}
-            {step(2, 'Work, then Save',
-              <span>Add jobs, update statuses, edit inventory. When done, click <strong>💾 Save</strong>. The updated file downloads to your computer.</span>
-            )}
-            {step(3, 'Upload the new file to OneDrive',
-              <span>Drag the freshly saved file into the shared OneDrive folder. You can delete the old version to keep things tidy.</span>
-            )}
-          </div>
-        </div>
-
-        <hr className="border-gray-100"/>
-
-        {/* Assistant credentials */}
-        <div>
-          <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-3">👤 Assistant Login Credentials</p>
-          <div className="bg-gray-50 border border-gray-200 rounded-xl p-4 space-y-2">
-            <div className="flex items-center justify-between">
-              <div><p className="text-xs text-gray-400 font-semibold">Email</p><p className="text-sm font-bold text-gray-800">assist@signacore.co.za</p></div>
-              <button onClick={()=>copy('assist@signacore.co.za','email')} className="text-xs border border-gray-200 rounded-lg px-2.5 py-1 text-gray-500 hover:bg-gray-100 font-semibold">{copied==='email'?'✅ Copied':'Copy'}</button>
-            </div>
-            <div className="flex items-center justify-between">
-              <div><p className="text-xs text-gray-400 font-semibold">Password</p><p className="text-sm font-bold text-gray-800">Assist2024!</p></div>
-              <button onClick={()=>copy('Assist2024!','pw')} className="text-xs border border-gray-200 rounded-lg px-2.5 py-1 text-gray-500 hover:bg-gray-100 font-semibold">{copied==='pw'?'✅ Copied':'Copy'}</button>
-            </div>
-            <p className="text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-1.5 mt-1">⚠️ The assistant can view jobs, quotes, inventory levels and reports — but not financial data or Uniontech.</p>
-          </div>
-        </div>
-
-        <div className="flex justify-end pt-1">
-          <button onClick={onClose} className="bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-5 py-2 text-sm font-bold">Got it</button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-/* ═══════════════════════════════════════════
    SHARED UI COMPONENTS
 ═══════════════════════════════════════════ */
 function KpiCard({ label, value, sub, icon, accent }) {
@@ -6827,7 +6737,7 @@ function Sidebar({ companies, page, setPage, open, setOpen, user, entityFilter, 
 /* ═══════════════════════════════════════════
    HEADER
 ═══════════════════════════════════════════ */
-function Header({ page, onMenu, onLogout, user, onSave, saveMsg, onShare, lastSaved, logoDataUrl }) {
+function Header({ page, onMenu, onLogout, user, onSave, saveMsg, lastSaved, logoDataUrl }) {
   const titles={dashboard:'Dashboard',jobs:'Jobs',calculators:'Calculators & Costing',inventory:'Inventory',imports:'Import Costing',reports:'Reports',sales:'Sales',quotes:'Sales',customers:'Customers',suppliers:'Suppliers',assets:'Assets',hr:'HR',purchase_orders:'Purchase Orders',accounting:'Accounting'};
   const today=new Date().toLocaleDateString('en-ZA',{weekday:'short',day:'numeric',month:'short',year:'numeric'});
   const isAssistant = user.role === 'assistant';
@@ -6841,11 +6751,6 @@ function Header({ page, onMenu, onLogout, user, onSave, saveMsg, onShare, lastSa
       {lastSaved&&<span className="text-xs text-gray-400 hidden md:block">💾 {lastSaved}</span>}
       <span className="text-xs text-gray-400 hidden sm:block">{today}</span>
       {isAssistant&&<span className="hidden sm:inline-flex items-center gap-1 text-xs rounded-lg px-2 py-1 font-semibold" style={{background:'#e6e6ff',border:'1px solid #9999ff',color:'#06065c'}}>👤 {user.title}</span>}
-      {/* Share guide button */}
-      <button onClick={onShare}
-        className="flex items-center gap-1.5 text-xs font-bold rounded-lg px-3 py-1.5 border border-gray-200 bg-white text-gray-600 hover:border-blue-400 hover:text-blue-600 transition-all">
-        📤 Share
-      </button>
       {/* Save file button — available to all users */}
       <button onClick={onSave}
         className={`flex items-center gap-1.5 text-xs font-bold rounded-lg px-3 py-1.5 border transition-all`}
@@ -6871,15 +6776,15 @@ function RevenueChart({ jobs=[] }) {
       months.push({m:d.toLocaleString('default',{month:'short'}),year:d.getFullYear(),month:d.getMonth(),rev:0,cost:0});
     }
     jobs.forEach(j=>{
-      if(!j.value&&!j.breakdown)return;
+      if(!j.value)return;
+      if(!['invoiced'].includes(j.status))return;
       const d=new Date(j.id); // id is Date.now() timestamp
       const bucket=months.find(b=>b.year===d.getFullYear()&&b.month===d.getMonth());
       if(!bucket)return;
       bucket.rev+=(j.value||0);
-      bucket.cost+=breakdownTotal(j.breakdown);
     });
-    const hasData=months.some(b=>b.rev>0||b.cost>0);
-    const chart=new Chart(ref.current,{type:'bar',data:{labels:months.map(m=>m.m),datasets:[{label:'Revenue',data:months.map(m=>m.rev),backgroundColor:hasData?'#0000ffcc':'#cbd5e133',borderRadius:5},{label:'Costs',data:months.map(m=>m.cost),backgroundColor:hasData?'#94a3b8cc':'#e2e8f033',borderRadius:5}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{font:{size:11},boxWidth:10,padding:12}},tooltip:{callbacks:{label:ctx=>`R${(ctx.raw/1000).toFixed(1)}k`}}},scales:{y:{ticks:{callback:v=>`R${(v/1000).toFixed(0)}k`,font:{size:10}},grid:{color:'#f1f5f9'}},x:{ticks:{font:{size:11}},grid:{display:false}}}}});
+    const hasData=months.some(b=>b.rev>0);
+    const chart=new Chart(ref.current,{type:'bar',data:{labels:months.map(m=>m.m),datasets:[{label:'Revenue',data:months.map(m=>m.rev),backgroundColor:hasData?'#0000ffcc':'#cbd5e133',borderRadius:5}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`R ${ctx.raw.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2})}`}}},scales:{y:{ticks:{callback:v=>`R${(v/1000).toFixed(0)}k`,font:{size:10}},grid:{color:'#f1f5f9'}},x:{ticks:{font:{size:11}},grid:{display:false}}}}});
     return ()=>chart.destroy();
   },[jobs]);
   return <canvas ref={ref}/>;
@@ -6912,9 +6817,6 @@ function DashboardPage({ jobs, inventory, companies, user, logoDataUrl }) {
   const lowStock=inventory.filter(i=>i.reorder>0&&i.stock<=i.reorder).length;
   const totalJobs=visibleJobs.length;
   const quoteJobs=visibleJobs.filter(j=>['lead','brief','design','quote_sent','quote_approved'].includes(j.status)).length;
-  // Quote pipeline metrics
-  const quotesMadeVal=visibleJobs.filter(j=>j.status==='quote_sent').reduce((s,j)=>s+(j.value||0),0);
-  const quotesAcceptedVal=visibleJobs.filter(j=>j.status==='quote_approved').reduce((s,j)=>s+(j.value||0),0);
 
   return (
     <div className="p-4 space-y-4">
@@ -6937,14 +6839,6 @@ function DashboardPage({ jobs, inventory, companies, user, logoDataUrl }) {
           <div>
             <p style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'1.8rem',fontWeight:800,fontStyle:'italic',color:'white',letterSpacing:'0.06em',lineHeight:1.1}}>SNSG Holdings</p>
             <p style={{color:'rgba(200,210,255,0.8)',fontSize:'0.78rem',marginTop:'4px',letterSpacing:'0.03em'}}>Applied Graphics and Visual Displays &nbsp;·&nbsp; Reg. No. 2022/4307/44/07</p>
-            <div style={{marginTop:'10px',display:'flex',gap:'8px',flexWrap:'wrap'}}>
-              <span style={{background:'rgba(255,255,255,0.15)',color:'white',fontSize:'0.65rem',fontWeight:700,padding:'3px 12px',borderRadius:'20px',letterSpacing:'0.06em',border:'1px solid rgba(255,255,255,0.25)'}}>
-                📋 QUOTES MADE &nbsp;·&nbsp; {zarK(quotesMadeVal)}
-              </span>
-              <span style={{background:'rgba(0,200,100,0.25)',color:'#a8ffd4',fontSize:'0.65rem',fontWeight:700,padding:'3px 12px',borderRadius:'20px',letterSpacing:'0.06em',border:'1px solid rgba(0,220,110,0.35)'}}>
-                ✅ QUOTES ACCEPTED &nbsp;·&nbsp; {zarK(quotesAcceptedVal)}
-              </span>
-            </div>
           </div>
         </div>
       </div>
@@ -6958,9 +6852,7 @@ function DashboardPage({ jobs, inventory, companies, user, logoDataUrl }) {
               const d = new Date(j.id);
               return j.status === 'invoiced' && d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
             }).reduce((s,j) => s + (j.value||0), 0);
-            return rev >= 1000000 ? 'R '+( rev/1000000).toFixed(2)+'M'
-                 : rev >= 1000    ? 'R '+( rev/1000).toFixed(1)+'k'
-                 : 'R '+rev.toFixed(0);
+            return 'R ' + rev.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
           })()}
           sub="Invoiced this month" accent="text-brand-500"/>}
         <KpiCard       icon="💼" label="Active Jobs"       value={active}     sub="In pipeline"     accent="text-brand-500"/>
@@ -6974,7 +6866,7 @@ function DashboardPage({ jobs, inventory, companies, user, logoDataUrl }) {
       <div className={`grid gap-4 ${isAdmin?'grid-cols-1 lg:grid-cols-5':'grid-cols-1'}`}>
         {isAdmin&&(
           <div className="lg:col-span-3 bg-white rounded-2xl border border-gray-200 p-4">
-            <h3 className="text-sm font-bold mb-3" style={{color:'#06065c'}}>Revenue vs Costs — Last 6 Months</h3>
+            <h3 className="text-sm font-bold mb-3" style={{color:'#06065c'}}>Total Revenue — Last 6 Months</h3>
             <div className="h-52"><RevenueChart jobs={visibleJobs}/></div>
           </div>
         )}
@@ -6984,61 +6876,34 @@ function DashboardPage({ jobs, inventory, companies, user, logoDataUrl }) {
         </div>
       </div>
 
-      {/* Company cards — Uniontech excluded */}
-      <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
-        {visibleCompanies.map(c=>{
-          const cj=visibleJobs.filter(j=>j.co===c.id);
-          return(
-            <div key={c.id} className="bg-white rounded-2xl border border-gray-200 p-4" style={{borderTop:`3px solid ${c.color}`}}>
-              <div className="w-3 h-3 rounded-full mb-2" style={{background:c.color}}/>
-              <p className="text-xs font-bold text-gray-600">{c.short}</p>
-              {isAdmin
-                ? <p className="text-xl font-black text-gray-900 mt-1">{zarK(cj.reduce((s,j)=>s+j.value,0))}</p>
-                : <p className="text-xl font-black text-gray-900 mt-1">{cj.length}</p>
-              }
-              <p className="text-xs text-gray-400">{cj.length} job{cj.length!==1?'s':''}</p>
+      {/* Quotes Made / Quotes Accepted metric cards */}
+      {isAdmin&&(()=>{
+        const now = new Date();
+        const thisYear = now.getFullYear(); const thisMon = now.getMonth();
+        const quotesAllTime    = visibleJobs.filter(j=>j.status==='quote_sent');
+        const acceptedAllTime  = visibleJobs.filter(j=>j.status==='quote_approved');
+        const quotesMadeTotal    = quotesAllTime.reduce((s,j)=>s+(j.value||0),0);
+        const quotesAcceptedTotal= acceptedAllTime.reduce((s,j)=>s+(j.value||0),0);
+        const fmt = v => 'R ' + v.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+        const MonthName = now.toLocaleString('default',{month:'long'});
+        return (
+          <div className="grid grid-cols-2 gap-3">
+            <div className="bg-white rounded-2xl border border-gray-200 p-4" style={{borderTop:'3px solid #0000ff'}}>
+              <div className="w-3 h-3 rounded-full mb-2" style={{background:'#0000ff'}}/>
+              <p className="text-xs font-bold text-gray-500 uppercase tracking-wide">📋 Quotes Made</p>
+              <p className="text-xs text-gray-400 mb-1">Total in system</p>
+              <p className="text-xl font-black text-gray-900">{fmt(quotesMadeTotal)}</p>
+              <p className="text-xs text-gray-400 mt-0.5">{quotesAllTime.length} quote{quotesAllTime.length!==1?'s':''}</p>
             </div>
-          );
-        })}
-      </div>
-
-      {/* Quotes pipeline table */}
-      {(()=>{
-        const qJobs=visibleJobs.filter(j=>['quote_sent','quote_approved'].includes(j.status));
-        const qTotal=qJobs.reduce((s,j)=>s+(j.value||0),0);
-        return qJobs.length>0?(
-          <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
-            <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between" style={{background:'linear-gradient(90deg,#06065c,#1a1a9e)'}}>
-              <h3 className="text-sm font-bold text-white" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'0.95rem'}}>📋 QUOTES IN PIPELINE</h3>
-              <span className="text-xs font-bold text-blue-200">Total: {zarK(qTotal)}</span>
-            </div>
-            <div className="overflow-x-auto p-4">
-              <table className="w-full text-sm min-w-[480px]">
-                <thead>
-                  <tr className="border-b border-gray-100">
-                    {['Job #','Client','Company','Status','Value'].map(h=>(
-                      <th key={h} className={`py-2 text-xs font-semibold text-gray-400 ${h==='Value'?'text-right':''}`}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {qJobs.map(j=>{
-                    const co=visibleCompanies.find(c=>c.id===j.co);
-                    return(
-                      <tr key={j.id} className="border-b border-gray-50 hover:bg-blue-50">
-                        <td className="py-2.5 text-xs font-mono text-gray-500">{j.num}</td>
-                        <td className="py-2.5 text-xs font-medium text-gray-700">{j.client}</td>
-                        <td className="py-2.5 text-xs text-gray-500">{co?co.short:'-'}</td>
-                        <td className="py-2.5"><Badge status={j.status}/></td>
-                        <td className="py-2.5 text-xs font-bold text-gray-800 text-right">{zar(j.value)}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+            <div className="bg-white rounded-2xl border border-gray-200 p-4" style={{borderTop:'3px solid #10b981'}}>
+              <div className="w-3 h-3 rounded-full mb-2" style={{background:'#10b981'}}/>
+              <p className="text-xs font-bold text-gray-500 uppercase tracking-wide">✅ Quotes Accepted</p>
+              <p className="text-xs text-gray-400 mb-1">Total converted to jobs</p>
+              <p className="text-xl font-black text-gray-900">{fmt(quotesAcceptedTotal)}</p>
+              <p className="text-xs text-gray-400 mt-0.5">{acceptedAllTime.length} quote{acceptedAllTime.length!==1?'s':''} approved</p>
             </div>
           </div>
-        ):null;
+        );
       })()}
 
       {/* Recent jobs table */}
@@ -7056,7 +6921,7 @@ function DashboardPage({ jobs, inventory, companies, user, logoDataUrl }) {
               </tr>
             </thead>
             <tbody>
-              {visibleJobs.slice(0,6).map(j=>(
+              {visibleJobs.slice(0,15).map(j=>(
                 <tr key={j.id} className="border-b border-gray-50 hover:bg-blue-50">
                   <td className="py-2.5 text-xs font-mono text-gray-500">{j.num}</td>
                   <td className="py-2.5 text-xs font-medium text-gray-700">{j.client}</td>
@@ -13364,7 +13229,7 @@ function App() {
   const [sidebarOpen,  setSidebarOpen]  = useState(false);
   const [entityFilter, setEntityFilter] = useState(null);
   const [saveMsg,      setSaveMsg]      = useState('');
-  const [showShare,    setShowShare]    = useState(false);
+
   const [lastSaved,    setLastSaved]    = useState(_saved ? _saved.savedAt : null);
   const [companies]                     = useState(INITIAL_COMPANIES);
   const [jobs,         setJobs]         = useState(_saved ? _saved.jobs      : INITIAL_JOBS);
@@ -13560,8 +13425,7 @@ function App() {
     <div className="flex h-screen overflow-hidden">
       <Sidebar companies={companies} page={safePage} setPage={setPage} open={sidebarOpen} setOpen={setSidebarOpen} user={user} entityFilter={entityFilter} onEntitySelect={handleEntitySelect} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl}/>
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
-        <Header page={safePage} onMenu={()=>setSidebarOpen(true)} onLogout={handleLogout} user={user} onSave={saveFile} saveMsg={saveMsg} onShare={()=>setShowShare(true)} lastSaved={lastSaved} logoDataUrl={logoDataUrl}/>
-        {showShare&&<ShareGuideModal onClose={()=>setShowShare(false)} lastSaved={lastSaved}/>}
+        <Header page={safePage} onMenu={()=>setSidebarOpen(true)} onLogout={handleLogout} user={user} onSave={saveFile} saveMsg={saveMsg} lastSaved={lastSaved} logoDataUrl={logoDataUrl}/>
         <main className="flex-1 overflow-y-auto bg-gray-50 relative">
           {safePage!=='dashboard'&&(
             <div style={{
@@ -13589,3 +13453,4 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
 
 </script>
 </body></html>
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
