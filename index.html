@@ -11711,7 +11711,7 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 /* ═══════════════════════════════════════════
    ACCOUNTING PAGE
 ═══════════════════════════════════════════ */
-function AccountingPage({ bankTxns, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices, setAccInvoices, accBills, setAccBills, suppliers, customers, companies, user }) {
+function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices, setAccInvoices, accBills, setAccBills, suppliers, customers, companies, user }) {
   const [accTab, setAccTab] = useState('dashboard');
   const [showImport, setShowImport] = useState(false);
   const [showAddAccount, setShowAddAccount] = useState(false);
@@ -12009,10 +12009,12 @@ function AccountingPage({ bankTxns, setBankTxns, chartOfAccounts, setChartOfAcco
 
   // ── P&L from all sources ──
   function getFullPL() {
-    // From invoices
+    // From manual accounting invoices (paid)
     const invIncome = accInvoices.filter(i=>i.status==='paid').reduce((s,i)=>{
       return s + (i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
     },0);
+    // From job invoices (paid — jobs with paidDate or paid=true)
+    const jobIncome = (jobs||[]).filter(j=>(j.paidDate||j.paid)&&[7,8,9].includes(j.stage)).reduce((s,j)=>s+(parseFloat(j.value)||0),0);
     // From bank txns
     const allocated = bankTxns.filter(t=>t.accountId);
     const bankIncome  = allocated.filter(t=>chartOfAccounts.find(a=>a.id===t.accountId)?.type==='Income').reduce((s,t)=>s+t.credit,0);
@@ -12022,7 +12024,7 @@ function AccountingPage({ bankTxns, setBankTxns, chartOfAccounts, setChartOfAcco
     const billExp = accBills.filter(b=>b.status==='paid').reduce((s,b)=>{
       return s + (b.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
     },0);
-    const income = invIncome + bankIncome;
+    const income = invIncome + jobIncome + bankIncome;
     const cos    = bankCOS;
     const expense = billExp + bankExpense;
     return { income, cos, expense, grossProfit: income-cos, netProfit: income-cos-expense };
@@ -12030,6 +12032,8 @@ function AccountingPage({ bankTxns, setBankTxns, chartOfAccounts, setChartOfAcco
 
   // ── Aged Debtors ──
   function getAgedDebtors() {
+    // allInvoices is computed below this function call — use accInvoices + jobInvsFiltered placeholder
+    // We compute debtors after allInvoices is built; this function uses accInvoices only (called before allInvoices)
     const today = new Date();
     return accInvoices.filter(i=>i.status!=='paid'&&i.status!=='void').map(i=>{
       const due = new Date(i.dueDate||i.date);
@@ -12298,11 +12302,55 @@ function AccountingPage({ bankTxns, setBankTxns, chartOfAccounts, setChartOfAcco
     );
   }
 
+  // ── Convert jobs (invoiced/completed stage) into invoice-format objects ──
+  function getJobInvoices() {
+    const STAGE_INVOICE = [7,8,9]; // Installation, Completed, Invoiced
+    return (jobs||[]).filter(j=>STAGE_INVOICE.includes(j.stage)||j.invoiceNum).map(j=>{
+      const val = parseFloat(j.value)||0;
+      // Determine status from job stage/status
+      let status = 'sent';
+      if(j.stage===9||j.status==='invoiced') status = 'sent';
+      if(j.stage===8||j.status==='completed') status = 'sent';
+      if(j.paidDate||j.paid) status = 'paid';
+      const invNum = j.invoiceNum || ('INV-' + String(j.num||'').replace(/\D/g,'').padStart(5,'0'));
+      const invDate = j.invoiceDate || j.date || new Date().toISOString().slice(0,10);
+      const dueDate = j.invoiceDue || new Date(new Date(invDate).getTime()+30*864e5).toISOString().slice(0,10);
+      const vatAmt = val * 0.15;
+      return {
+        id: 'job-'+j.id,
+        number: invNum,
+        date: invDate,
+        dueDate: dueDate,
+        contactName: j.client || j.customer || '—',
+        reference: j.num || '',
+        status: status,
+        source: 'job',
+        jobNum: j.num,
+        paidDate: j.paidDate||null,
+        lineItems: [{
+          description: j.desc || 'Signage / Production Job',
+          qty: 1,
+          unitAmount: val,
+          accountCode: '4000',
+          taxType: '15%'
+        }]
+      };
+    });
+  }
+
+  const jobInvoices = getJobInvoices();
+  // Merge: manual accInvoices take precedence; skip job invoices already linked by reference
+  const manualRefs = new Set(accInvoices.map(i=>i.reference).filter(Boolean));
+  const jobInvsFiltered = jobInvoices.filter(j=>!manualRefs.has(j.jobNum));
+  const allInvoices = [...accInvoices.map(i=>({...i,source:i.source||'manual'})), ...jobInvsFiltered];
+  // Sort by date descending
+  allInvoices.sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
+
   const fullPL = getFullPL();
   const debtors = getAgedDebtors();
   const totalDebtors = debtors.reduce((s,d)=>s+d.total,0);
   const totalCreditors = accBills.filter(b=>b.status!=='paid'&&b.status!=='void').reduce((s,b)=>s+(b.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0),0);
-  const invStats = { total: accInvoices.length, paid: accInvoices.filter(i=>i.status==='paid').length, outstanding: accInvoices.filter(i=>['sent','overdue'].includes(i.status)).length, draft: accInvoices.filter(i=>i.status==='draft').length };
+  const invStats = { total: allInvoices.length, paid: allInvoices.filter(i=>i.status==='paid').length, outstanding: allInvoices.filter(i=>['sent','overdue'].includes(i.status)).length, draft: allInvoices.filter(i=>i.status==='draft').length };
   const billStats = { total: accBills.length, paid: accBills.filter(b=>b.status==='paid').length, outstanding: accBills.filter(b=>['approved','overdue'].includes(b.status)).length };
 
   const STATUS_COLORS = { draft:'#6b7280', sent:'#2563eb', paid:'#059669', overdue:'#dc2626', void:'#9ca3af', approved:'#d97706' };
@@ -12340,50 +12388,103 @@ function AccountingPage({ bankTxns, setBankTxns, chartOfAccounts, setChartOfAcco
       {/* ── DASHBOARD ── */}
       {accTab==='dashboard'&&(
         <div className="space-y-4">
-          {/* KPI cards */}
+          {/* KPI row 1 — financials */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
-              <p className="text-xs text-gray-400 mb-1">Total Income (paid invoices)</p>
-              <p className="text-2xl font-black text-green-600">{fmtAmt(fullPL.income)}</p>
+              <p className="text-xs text-gray-400 mb-1">Total Invoiced</p>
+              <p className="text-2xl font-black" style={{color:'#06065c'}}>{fmtAmt(allInvoices.reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);return s+sub*(1+(i.lineItems||[]).some(l=>l.taxType==='15%')?0.15:0);},0))}</p>
+              <p className="text-xs text-gray-400 mt-1">{invStats.total} invoices total</p>
+            </div>
+            <div className="bg-white rounded-2xl border border-gray-200 p-4">
+              <p className="text-xs text-gray-400 mb-1">Outstanding (Receivable)</p>
+              <p className="text-2xl font-black text-blue-700">{fmtAmt(allInvoices.filter(i=>['sent','overdue'].includes(i.status)).reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</p>
+              <p className="text-xs text-gray-400 mt-1">{invStats.outstanding} awaiting payment</p>
             </div>
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
               <p className="text-xs text-gray-400 mb-1">Total Expenses (paid bills)</p>
               <p className="text-2xl font-black text-red-600">{fmtAmt(fullPL.expense)}</p>
+              <p className="text-xs text-gray-400 mt-1">{billStats.total} bills · {billStats.outstanding} outstanding</p>
             </div>
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
               <p className="text-xs text-gray-400 mb-1">Net Profit / (Loss)</p>
               <p className={`text-2xl font-black ${fullPL.netProfit>=0?'text-green-600':'text-red-600'}`}>{fmtAmt(fullPL.netProfit)}</p>
-            </div>
-            <div className="bg-white rounded-2xl border border-gray-200 p-4">
-              <p className="text-xs text-gray-400 mb-1">Unallocated Bank Txns</p>
-              <p className="text-2xl font-black text-amber-600">{unallocatedCount}</p>
+              <p className="text-xs text-gray-400 mt-1">{unallocatedCount>0?`${unallocatedCount} bank txns unallocated`:'Bank reconciled ✓'}</p>
             </div>
           </div>
+
+          {/* KPI row 2 — invoice breakdown */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            {[
+              {label:'Total Invoices',   val:invStats.total,       color:'#06065c', sub:'all sources'},
+              {label:'Paid',             val:invStats.paid,        color:'#059669', sub:'income confirmed'},
+              {label:'Outstanding',      val:invStats.outstanding, color:'#2563eb', sub:'awaiting payment'},
+              {label:'Draft',            val:invStats.draft,       color:'#6b7280', sub:'not yet sent'},
+            ].map((k,i)=>(
+              <div key={i} className="bg-white rounded-2xl border border-gray-200 p-4 flex items-center gap-3 cursor-pointer hover:shadow-md transition-shadow" onClick={()=>setAccTab('invoices')}>
+                <div className="w-10 h-10 rounded-xl flex items-center justify-center text-white text-lg font-black" style={{background:k.color}}>{k.val}</div>
+                <div>
+                  <p className="text-xs font-bold text-gray-700">{k.label}</p>
+                  <p className="text-xs text-gray-400">{k.sub}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
-            {/* Debtors */}
+            {/* Aged Debtors */}
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
-              <p className="text-xs font-black text-gray-500 uppercase tracking-wide mb-3">Aged Debtors (Receivable)</p>
-              <p className="text-2xl font-black text-blue-700 mb-2">{fmtAmt(totalDebtors)}</p>
-              <div className="space-y-1">
-                {debtors.slice(0,5).map(d=>(
-                  <div key={d.id} className="flex justify-between text-xs">
-                    <span className="text-gray-600 truncate max-w-[140px]">{d.contactName}</span>
-                    <span className={`font-bold ${d.daysOverdue>0?'text-red-600':'text-blue-600'}`}>{fmtAmt(d.total)}</span>
-                  </div>
-                ))}
-                {debtors.length===0&&<p className="text-xs text-gray-400 italic">No outstanding invoices</p>}
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-xs font-black text-gray-500 uppercase tracking-wide">Aged Debtors (Receivable)</p>
+                <button onClick={()=>setAccTab('reports')} className="text-xs text-blue-500 hover:underline">Reports →</button>
+              </div>
+              <p className="text-2xl font-black text-blue-700 mb-3">{fmtAmt(allInvoices.filter(i=>['sent','overdue'].includes(i.status)).reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</p>
+              <div className="space-y-1.5">
+                {allInvoices.filter(i=>['sent','overdue'].includes(i.status)).slice(0,5).map(i=>{
+                  const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+                  const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
+                  const due=new Date(i.dueDate||i.date); const days=Math.floor((new Date()-due)/(1000*60*60*24));
+                  return <div key={i.id} className="flex justify-between items-center text-xs">
+                    <div>
+                      <span className="text-gray-700 font-semibold truncate max-w-[110px] block">{i.contactName}</span>
+                      <span className="text-gray-400">{i.number}</span>
+                    </div>
+                    <div className="text-right">
+                      <span className={`font-bold block ${days>0?'text-red-600':'text-blue-600'}`}>{fmtAmt(sub+vat)}</span>
+                      {days>0&&<span className="text-red-400 text-xs">{days}d overdue</span>}
+                    </div>
+                  </div>;
+                })}
+                {allInvoices.filter(i=>['sent','overdue'].includes(i.status)).length===0&&<p className="text-xs text-gray-400 italic">No outstanding invoices</p>}
               </div>
             </div>
-            {/* Creditors */}
+            {/* Aged Creditors */}
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
-              <p className="text-xs font-black text-gray-500 uppercase tracking-wide mb-3">Aged Creditors (Payable)</p>
-              <p className="text-2xl font-black text-red-700 mb-2">{fmtAmt(totalCreditors)}</p>
-              <div className="space-y-1">
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-xs font-black text-gray-500 uppercase tracking-wide">Aged Creditors (Payable)</p>
+                <button onClick={()=>setAccTab('bills')} className="text-xs text-red-500 hover:underline">Bills →</button>
+              </div>
+              <p className="text-2xl font-black text-red-700 mb-3">{fmtAmt(totalCreditors)}</p>
+              <div className="space-y-1.5">
                 {accBills.filter(b=>b.status!=='paid'&&b.status!=='void').slice(0,5).map(b=>{
                   const tot=(b.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-                  return <div key={b.id} className="flex justify-between text-xs"><span className="text-gray-600 truncate max-w-[140px]">{b.supplierName}</span><span className="font-bold text-red-600">{fmtAmt(tot)}</span></div>;
+                  const due=new Date(b.dueDate||b.date); const days=Math.floor((new Date()-due)/(1000*60*60*24));
+                  return <div key={b.id} className="flex justify-between items-center text-xs">
+                    <div>
+                      <span className="text-gray-700 font-semibold truncate max-w-[110px] block">{b.supplierName}</span>
+                      <span className="text-gray-400">{b.number}</span>
+                    </div>
+                    <div className="text-right">
+                      <span className="font-bold block text-red-600">{fmtAmt(tot)}</span>
+                      {days>0&&<span className="text-red-400 text-xs">{days}d overdue</span>}
+                    </div>
+                  </div>;
                 })}
-                {accBills.filter(b=>b.status!=='paid'&&b.status!=='void').length===0&&<p className="text-xs text-gray-400 italic">No outstanding bills</p>}
+                {accBills.filter(b=>b.status!=='paid'&&b.status!=='void').length===0&&(
+                  <div className="text-center py-3">
+                    <p className="text-xs text-gray-400 italic mb-2">No outstanding bills</p>
+                    <button onClick={()=>{setAccTab('bills');setShowBillModal(true);}} className="text-xs font-bold px-3 py-1.5 rounded-lg text-white" style={{background:'#ED0101'}}>＋ Add Expense</button>
+                  </div>
+                )}
               </div>
             </div>
             {/* Quick actions */}
@@ -12397,35 +12498,95 @@ function AccountingPage({ bankTxns, setBankTxns, chartOfAccounts, setChartOfAcco
               </div>
             </div>
           </div>
-          {/* Recent invoices */}
+
+          {/* Recent invoices — all sources */}
           <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
             <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between" style={{background:'#f8f9ff'}}>
-              <p className="text-xs font-black text-gray-600 uppercase tracking-wide">Recent Invoices</p>
+              <div className="flex items-center gap-3">
+                <p className="text-xs font-black text-gray-600 uppercase tracking-wide">Recent Invoices</p>
+                <span className="text-xs bg-blue-100 text-blue-700 rounded-full px-2 py-0.5 font-bold">{allInvoices.length} total</span>
+                {jobInvsFiltered.length>0&&<span className="text-xs bg-purple-100 text-purple-700 rounded-full px-2 py-0.5 font-bold">{jobInvsFiltered.length} from jobs</span>}
+              </div>
               <button onClick={()=>setAccTab('invoices')} className="text-xs font-bold text-blue-600 hover:underline">View all →</button>
             </div>
-            <table className="w-full text-xs">
-              <thead><tr className="border-b border-gray-100 bg-gray-50">
-                <th className="px-4 py-2 text-left text-gray-400 font-bold">Number</th>
-                <th className="px-4 py-2 text-left text-gray-400 font-bold">Contact</th>
-                <th className="px-4 py-2 text-left text-gray-400 font-bold">Date</th>
-                <th className="px-4 py-2 text-right text-gray-400 font-bold">Amount</th>
-                <th className="px-4 py-2 text-center text-gray-400 font-bold">Status</th>
-              </tr></thead>
-              <tbody>
-                {accInvoices.slice(0,8).map(inv=>{
-                  const tot=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-                  const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
-                  return <tr key={inv.id} className="border-b border-gray-50 hover:bg-blue-50">
-                    <td className="px-4 py-2 font-mono text-gray-600">{inv.number}</td>
-                    <td className="px-4 py-2 text-gray-700 font-semibold">{inv.contactName}</td>
-                    <td className="px-4 py-2 text-gray-400">{fmtDate(inv.date)}</td>
-                    <td className="px-4 py-2 text-right font-bold text-gray-800">{fmtAmt(tot+vat)}</td>
-                    <td className="px-4 py-2 text-center"><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status}</span></td>
-                  </tr>;
-                })}
-                {accInvoices.length===0&&<tr><td colSpan="5" className="px-4 py-6 text-center text-gray-400">No invoices yet — create your first one above.</td></tr>}
-              </tbody>
-            </table>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs min-w-[600px]">
+                <thead><tr className="border-b border-gray-100 bg-gray-50">
+                  <th className="px-4 py-2 text-left text-gray-400 font-bold">Number</th>
+                  <th className="px-4 py-2 text-left text-gray-400 font-bold">Contact</th>
+                  <th className="px-4 py-2 text-left text-gray-400 font-bold">Date</th>
+                  <th className="px-4 py-2 text-left text-gray-400 font-bold">Source</th>
+                  <th className="px-4 py-2 text-right text-gray-400 font-bold">Amount (incl VAT)</th>
+                  <th className="px-4 py-2 text-center text-gray-400 font-bold">Status</th>
+                </tr></thead>
+                <tbody>
+                  {allInvoices.slice(0,10).map(inv=>{
+                    const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+                    const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+                    return <tr key={inv.id} className="border-b border-gray-50 hover:bg-blue-50 cursor-pointer" onClick={()=>setAccTab('invoices')}>
+                      <td className="px-4 py-2 font-mono text-gray-600">{inv.number}</td>
+                      <td className="px-4 py-2 text-gray-700 font-semibold">{inv.contactName}</td>
+                      <td className="px-4 py-2 text-gray-400">{fmtDate(inv.date)}</td>
+                      <td className="px-4 py-2">
+                        {inv.source==='job'
+                          ? <span className="text-xs bg-purple-100 text-purple-700 rounded-full px-2 py-0.5 font-bold">Job</span>
+                          : <span className="text-xs bg-blue-100 text-blue-700 rounded-full px-2 py-0.5 font-bold">Manual</span>}
+                      </td>
+                      <td className="px-4 py-2 text-right font-bold text-gray-800">{fmtAmt(sub+vat)}</td>
+                      <td className="px-4 py-2 text-center"><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status}</span></td>
+                    </tr>;
+                  })}
+                  {allInvoices.length===0&&<tr><td colSpan="6" className="px-4 py-8 text-center">
+                    <p className="text-gray-400 mb-2">No invoices yet.</p>
+                    <p className="text-xs text-gray-400">Invoices from completed jobs will appear here automatically, or create one manually.</p>
+                    <button onClick={()=>{setAccTab('invoices');setShowInvModal(true);}} className="mt-3 text-xs font-bold px-3 py-1.5 rounded-lg text-white" style={{background:'#06065c'}}>＋ Create Invoice</button>
+                  </td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Recent Expenses */}
+          <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+            <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between" style={{background:'#fff5f5'}}>
+              <div className="flex items-center gap-3">
+                <p className="text-xs font-black text-gray-600 uppercase tracking-wide">Recent Expenses / Bills</p>
+                <span className="text-xs bg-red-100 text-red-700 rounded-full px-2 py-0.5 font-bold">{accBills.length} total</span>
+              </div>
+              <button onClick={()=>setAccTab('bills')} className="text-xs font-bold text-red-600 hover:underline">View all →</button>
+            </div>
+            {accBills.length===0?(
+              <div className="px-4 py-8 text-center">
+                <p className="text-gray-400 text-sm mb-1">No expenses recorded yet</p>
+                <p className="text-xs text-gray-400 mb-3">Record supplier invoices, rent, fuel, salaries and any other business expenses here to track your costs and get accurate P&amp;L reports.</p>
+                <button onClick={()=>{setAccTab('bills');setShowBillModal(true);}} className="text-xs font-bold px-4 py-2 rounded-xl text-white" style={{background:'#ED0101'}}>＋ Add First Expense</button>
+              </div>
+            ):(
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs min-w-[500px]">
+                  <thead><tr className="border-b border-gray-100 bg-gray-50">
+                    <th className="px-4 py-2 text-left text-gray-400 font-bold">Bill #</th>
+                    <th className="px-4 py-2 text-left text-gray-400 font-bold">Supplier</th>
+                    <th className="px-4 py-2 text-left text-gray-400 font-bold">Date</th>
+                    <th className="px-4 py-2 text-right text-gray-400 font-bold">Amount</th>
+                    <th className="px-4 py-2 text-center text-gray-400 font-bold">Status</th>
+                  </tr></thead>
+                  <tbody>
+                    {accBills.slice(0,6).map(bill=>{
+                      const sub=(bill.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+                      const vat=(bill.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+                      return <tr key={bill.id} className="border-b border-gray-50 hover:bg-red-50">
+                        <td className="px-4 py-2 font-mono text-gray-500">{bill.number}</td>
+                        <td className="px-4 py-2 text-gray-700 font-semibold">{bill.supplierName}</td>
+                        <td className="px-4 py-2 text-gray-400">{fmtDate(bill.date)}</td>
+                        <td className="px-4 py-2 text-right font-bold text-red-700">{fmtAmt(sub+vat)}</td>
+                        <td className="px-4 py-2 text-center"><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[bill.status]||'#6b7280'}}>{bill.status}</span></td>
+                      </tr>;
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -12435,24 +12596,31 @@ function AccountingPage({ bankTxns, setBankTxns, chartOfAccounts, setChartOfAcco
         <div className="space-y-3">
           <div className="flex flex-wrap gap-2 items-center">
             <button onClick={()=>{setEditInv(null);setShowInvModal(true);}} className="flex items-center gap-2 text-white font-bold text-sm px-4 py-2.5 rounded-xl" style={{background:'#06065c'}}>＋ New Invoice</button>
-            <div className="flex gap-2 ml-auto text-xs">
+            <div className="flex gap-2 ml-auto flex-wrap text-xs">
               {['draft','sent','paid','overdue'].map(s=>(
                 <span key={s} className="px-2 py-1 rounded-full font-bold" style={{background:STATUS_COLORS[s]+'22',color:STATUS_COLORS[s]}}>
-                  {s}: {accInvoices.filter(i=>i.status===s).length}
+                  {s}: {allInvoices.filter(i=>i.status===s).length}
                 </span>
               ))}
+              <span className="px-2 py-1 rounded-full font-bold bg-purple-100 text-purple-700">{jobInvsFiltered.length} from jobs</span>
+              <span className="px-2 py-1 rounded-full font-bold bg-blue-100 text-blue-700">{accInvoices.length} manual</span>
             </div>
           </div>
+          {jobInvsFiltered.length>0&&(
+            <div className="bg-purple-50 border border-purple-200 rounded-xl px-4 py-2.5 text-xs text-purple-800">
+              <strong>💡 {jobInvsFiltered.length} job invoice{jobInvsFiltered.length>1?'s':''} pulled from your Jobs module.</strong> These are read-only here — update them in the Jobs section. To record payment or add notes, create a matching manual invoice and link it via the Reference field (use the job number).
+            </div>
+          )}
           <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
             <div className="overflow-x-auto">
-              <table className="w-full text-sm min-w-[750px]">
+              <table className="w-full text-sm min-w-[850px]">
                 <thead>
                   <tr className="border-b border-gray-100" style={{background:'#f8f9ff'}}>
                     <th className="px-4 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">Invoice #</th>
                     <th className="px-4 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">Contact</th>
                     <th className="px-4 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">Date</th>
                     <th className="px-4 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">Due</th>
-                    <th className="px-4 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">Reference</th>
+                    <th className="px-4 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">Source</th>
                     <th className="px-4 py-2.5 text-right text-xs font-bold text-gray-500 uppercase">Subtotal</th>
                     <th className="px-4 py-2.5 text-right text-xs font-bold text-gray-500 uppercase">VAT</th>
                     <th className="px-4 py-2.5 text-right text-xs font-bold text-gray-500 uppercase">Total</th>
@@ -12461,18 +12629,23 @@ function AccountingPage({ bankTxns, setBankTxns, chartOfAccounts, setChartOfAcco
                   </tr>
                 </thead>
                 <tbody>
-                  {accInvoices.map(inv=>{
+                  {allInvoices.map(inv=>{
                     const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
                     const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
                     const today=new Date(); const due=new Date(inv.dueDate||inv.date);
                     const overdue=inv.status!=='paid'&&inv.status!=='void'&&today>due;
+                    const isJob = inv.source==='job';
                     return(
-                      <tr key={inv.id} className="border-b border-gray-50 hover:bg-blue-50 transition-colors">
+                      <tr key={inv.id} className={`border-b border-gray-50 transition-colors ${isJob?'hover:bg-purple-50 bg-purple-50/30':'hover:bg-blue-50'}`}>
                         <td className="px-4 py-2.5 text-xs font-mono text-gray-600">{inv.number}</td>
                         <td className="px-4 py-2.5 text-xs font-semibold text-gray-800">{inv.contactName}</td>
                         <td className="px-4 py-2.5 text-xs text-gray-500">{fmtDate(inv.date)}</td>
-                        <td className={`px-4 py-2.5 text-xs ${overdue?'text-red-600 font-bold':' text-gray-500'}`}>{fmtDate(inv.dueDate)}{overdue?' ⚠':''}</td>
-                        <td className="px-4 py-2.5 text-xs text-gray-400">{inv.reference||'—'}</td>
+                        <td className={`px-4 py-2.5 text-xs ${overdue?'text-red-600 font-bold':'text-gray-500'}`}>{fmtDate(inv.dueDate)}{overdue?' ⚠':''}</td>
+                        <td className="px-4 py-2.5 text-xs">
+                          {isJob
+                            ? <span className="bg-purple-100 text-purple-700 rounded-full px-2 py-0.5 font-bold text-xs">Job {inv.jobNum}</span>
+                            : <span className="bg-blue-100 text-blue-700 rounded-full px-2 py-0.5 font-bold text-xs">Manual</span>}
+                        </td>
                         <td className="px-4 py-2.5 text-xs text-right text-gray-700">{fmtAmt(sub)}</td>
                         <td className="px-4 py-2.5 text-xs text-right text-blue-600">{fmtAmt(vat)}</td>
                         <td className="px-4 py-2.5 text-xs text-right font-black text-gray-800">{fmtAmt(sub+vat)}</td>
@@ -12480,25 +12653,32 @@ function AccountingPage({ bankTxns, setBankTxns, chartOfAccounts, setChartOfAcco
                           <span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status}</span>
                         </td>
                         <td className="px-4 py-2.5 text-center">
-                          <div className="flex items-center justify-center gap-1">
-                            <button onClick={()=>{setEditInv(inv);setShowInvModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#e6e6ff',color:'#06065c'}}>Edit</button>
-                            {inv.status!=='paid'&&<button onClick={()=>markInvPaid(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dcfce7',color:'#059669'}}>✓ Paid</button>}
-                            <button onClick={()=>deleteInvoice(inv.id)} className="text-xs text-gray-300 hover:text-red-400">✕</button>
-                          </div>
+                          {isJob?(
+                            <span className="text-xs text-gray-400 italic">Job record</span>
+                          ):(
+                            <div className="flex items-center justify-center gap-1">
+                              <button onClick={()=>{setEditInv(inv);setShowInvModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#e6e6ff',color:'#06065c'}}>Edit</button>
+                              {inv.status!=='paid'&&<button onClick={()=>markInvPaid(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dcfce7',color:'#059669'}}>✓ Paid</button>}
+                              <button onClick={()=>deleteInvoice(inv.id)} className="text-xs text-gray-300 hover:text-red-400">✕</button>
+                            </div>
+                          )}
                         </td>
                       </tr>
                     );
                   })}
-                  {accInvoices.length===0&&(
-                    <tr><td colSpan="10" className="px-4 py-10 text-center text-gray-400">No invoices yet. Click <strong>+ New Invoice</strong> to create one.</td></tr>
+                  {allInvoices.length===0&&(
+                    <tr><td colSpan="10" className="px-4 py-10 text-center">
+                      <p className="text-gray-400 mb-1">No invoices yet.</p>
+                      <p className="text-xs text-gray-400 mb-3">Completed jobs will appear here automatically. Or create a manual invoice above.</p>
+                    </td></tr>
                   )}
                 </tbody>
               </table>
             </div>
             <div className="px-4 py-2 border-t border-gray-100 bg-gray-50 flex justify-end gap-6 text-xs text-gray-500">
-              <span>Subtotal: <strong className="text-gray-800">{fmtAmt(accInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),s),0))}</strong></span>
-              <span>VAT: <strong className="text-blue-600">{fmtAmt(accInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,s),0))}</strong></span>
-              <span>Total invoiced: <strong style={{color:'#06065c'}}>{fmtAmt(accInvoices.reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</strong></span>
+              <span>Subtotal: <strong className="text-gray-800">{fmtAmt(allInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),s),0))}</strong></span>
+              <span>VAT: <strong className="text-blue-600">{fmtAmt(allInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,s),0))}</strong></span>
+              <span>Total invoiced: <strong style={{color:'#06065c'}}>{fmtAmt(allInvoices.reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</strong></span>
             </div>
           </div>
         </div>
@@ -12566,7 +12746,12 @@ function AccountingPage({ bankTxns, setBankTxns, chartOfAccounts, setChartOfAcco
                     );
                   })}
                   {accBills.length===0&&(
-                    <tr><td colSpan="11" className="px-4 py-10 text-center text-gray-400">No bills yet. Click <strong>+ New Bill / Expense</strong> to record one.</td></tr>
+                    <tr><td colSpan="11" className="px-4 py-10 text-center">
+                      <p className="text-3xl mb-3">📂</p>
+                      <p className="font-bold text-gray-700 mb-1">No expenses recorded yet</p>
+                      <p className="text-xs text-gray-400 mb-3 max-w-xs mx-auto">Add supplier invoices, rent, fuel, phone bills, salaries and any other business costs to get an accurate Profit &amp; Loss report.</p>
+                      <button onClick={()=>setShowBillModal(true)} className="text-sm font-bold px-4 py-2 rounded-xl text-white" style={{background:'#ED0101'}}>＋ Add First Expense</button>
+                    </td></tr>
                   )}
                 </tbody>
               </table>
@@ -13426,7 +13611,7 @@ function App() {
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={logoDataUrl} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
     reports:     <ReportsPage     jobs={jobs} companies={companies} user={user}/>,
-    accounting:  <AccountingPage  bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} suppliers={suppliers} customers={customers} companies={companies} user={user}/>,
+    accounting:  <AccountingPage  jobs={jobs} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} suppliers={suppliers} customers={customers} companies={companies} user={user}/>,
     hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={logoDataUrl} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
   };
 
