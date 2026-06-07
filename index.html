@@ -6778,7 +6778,7 @@ function RevenueChart({ jobs=[] }) {
     jobs.forEach(j=>{
       if(!j.value)return;
       if(!['invoiced'].includes(j.status))return;
-      const d=new Date(j.id); // id is Date.now() timestamp
+      const d=j.invoiceDate?new Date(j.invoiceDate):new Date(j.id); // prefer actual invoiceDate over creation timestamp
       const bucket=months.find(b=>b.year===d.getFullYear()&&b.month===d.getMonth());
       if(!bucket)return;
       bucket.rev+=(j.value||0);
@@ -6849,7 +6849,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl }
           value={(() => {
             const now = new Date();
             const rev = jobs.filter(j => {
-              const d = new Date(j.id);
+              const d = j.invoiceDate ? new Date(j.invoiceDate) : new Date(j.id);
               return j.status === 'invoiced' && d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
             }).reduce((s,j) => s + (j.value||0), 0);
             return 'R ' + rev.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
@@ -6916,7 +6916,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl }
             <table className="w-full text-sm min-w-[480px]">
               <thead>
                 <tr className="border-b border-gray-100">
-                  {['Quote #','Client','Status','Value (incl. VAT)'].map(h=>(
+                  {['Quote #','Client','Date','Status','Value (incl. VAT)'].map(h=>(
                     <th key={h} className={`py-2 text-xs font-semibold text-gray-400 ${h==='Value (incl. VAT)'?'text-right':''}`}>{h}</th>
                   ))}
                 </tr>
@@ -6931,6 +6931,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl }
                     <tr key={q.id} className="border-b border-gray-50 hover:bg-blue-50">
                       <td className="py-2.5 text-xs font-mono text-gray-500">{q.num}</td>
                       <td className="py-2.5 text-xs font-medium text-gray-700">{q.client}</td>
+                      <td className="py-2.5 text-xs text-gray-400">{q.date||'—'}</td>
                       <td className="py-2.5"><QuoteBadge status={q.status}/></td>
                       <td className="py-2.5 text-xs font-bold text-gray-800 text-right">{zar(total)}</td>
                     </tr>
