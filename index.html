@@ -203,7 +203,7 @@ function breakdownTotal(bd){ return bd ? Object.values(bd).reduce((s,v)=>s+(pars
    EDITABLE DATA — change in Notepad if needed
 ═══════════════════════════════════════════════════════════ */
 const INITIAL_COMPANIES = [
-  { id:1, name:'Uniontech Holdings SA',      short:'Uniontech',  color:'#6366f1', bg:'bg-indigo-100', text:'text-indigo-700' },
+  { id:1, name:'Signacore Holdings SA',      short:'SGR Holdings',  color:'#6366f1', bg:'bg-indigo-100', text:'text-indigo-700' },
   { id:2, name:'Signacore',                  short:'Signacore',  color:'#0000ff', bg:'bg-blue-100',   text:'text-blue-700'  },
   { id:4, name:'Cover X Transform',          short:'Cover X',    color:'#8b5cf6', bg:'bg-violet-100', text:'text-violet-700'},
 ];
@@ -386,7 +386,7 @@ const USERS = [
   { email:'accounts@signacore.co.za', pw:'Accounts2024!',  role:'accounts',  name:'Accountant',     initials:'AC', title:'Accounts'        },
   { email:'assist@signacore.co.za',   pw:'Assist2024!',    role:'assistant', name:'Sales Assistant', initials:'SA', title:'Sales / Quoting' },
 ];
-// Uniontech company ID — blocked for assistant role
+// Signacore Holdings company ID — blocked for assistant role
 const UNIONTECH_ID = 1;
 
 /* ═══════════════════════════════════════════
@@ -2356,12 +2356,12 @@ function NumInput({ value, onChange, placeholder, disabled, small }) {
 function AddJobModal({ companies, onClose, onAdd, nextNum }) {
   const [client,setClient]=useState(''); const [desc,setDesc]=useState('');
   const [status,setStatus]=useState('lead'); const [co,setCo]=useState('3');
-  const [value,setValue]=useState('');
+  const [value,setValue]=useState(''); const [notes,setNotes]=useState('');
   function submit(e) {
     e.preventDefault();
     if (!client.trim()) return;
     onAdd({ id:Date.now(), num:nextNum, client:client.trim(), desc:desc.trim(), status, co:parseInt(co),
-             value:parseFloat(value)||0, stage:STATUS_TO_STAGE[status]||0, breakdown:null });
+             value:parseFloat(value)||0, stage:STATUS_TO_STAGE[status]||0, breakdown:null, notes:notes.trim() });
     onClose();
   }
   const inputCls = "w-full border border-gray-300 rounded-xl px-3 py-2.5 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 bg-white";
@@ -2388,6 +2388,7 @@ function AddJobModal({ companies, onClose, onAdd, nextNum }) {
           </select>
         </div>
         <div><label className="block text-xs font-semibold text-gray-500 mb-1.5">Job Value (R)</label><input type="number" value={value} onChange={e=>setValue(e.target.value)} className={inputCls} placeholder="0.00"/></div>
+        <div><label className="block text-xs font-semibold text-gray-500 mb-1.5">📝 Special Notes <span className="font-normal text-gray-400">(optional)</span></label><textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} className={inputCls+' resize-none'} placeholder="Internal notes, special requirements, reminders…"/></div>
         <div className="bg-blue-50 border border-blue-100 rounded-xl p-3"><p className="text-xs text-blue-600">💡 Add cost breakdown after creating the job by opening it and clicking <strong>Edit Cost Breakdown</strong>.</p></div>
         <div className="flex gap-3 pt-2">
           <button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Cancel</button>
@@ -6821,7 +6822,7 @@ function StatusDonut({ jobs }) {
 ═══════════════════════════════════════════ */
 function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl }) {
   const isAdmin = true; // All roles see full dashboard
-  // Always exclude Uniontech from Dashboard
+  // Always exclude SGR Holdings from Dashboard
   const visibleCompanies = companies.filter(c=>c.id!==UNIONTECH_ID);
   const visibleJobs      = jobs.filter(j=>j.co!==UNIONTECH_ID);
   const active=visibleJobs.filter(j=>!['completed','invoiced'].includes(j.status)).length;
@@ -6969,6 +6970,8 @@ function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl 
   const job=jobs.find(j=>j.id===jobId);
   const [editingCosts, setEditingCosts]=useState(false);
   const [bd, setBd]=useState(null); // local copy of breakdown being edited
+  const [editingNotes, setEditingNotes]=useState(false);
+  const [noteDraft, setNoteDraft]=useState('');
 
   useEffect(()=>{
     if (job) setBd(job.breakdown ? {...job.breakdown} : emptyBreakdown());
@@ -7005,6 +7008,9 @@ function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl 
     setBd(job.breakdown?{...job.breakdown}:emptyBreakdown());
     setEditingCosts(false);
   }
+  function startEditNotes(){ setNoteDraft(job.notes||''); setEditingNotes(true); }
+  function saveNotes(){ setJobs(prev=>prev.map(j=>j.id===job.id?{...j,notes:noteDraft.trim()}:j)); setEditingNotes(false); }
+  function cancelNotes(){ setEditingNotes(false); }
 
   const editTotal = bd ? breakdownTotal(bd) : 0;
 
@@ -7200,6 +7206,43 @@ function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl 
         </div>
       </div>
 
+      {/* ─── SPECIAL NOTES ─── */}
+      <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+          <div>
+            <h3 className="text-sm font-bold text-gray-700">📝 Special Notes</h3>
+            <p className="text-xs text-gray-400 mt-0.5">Internal notes, special instructions, reminders</p>
+          </div>
+          {!editingNotes
+            ? <button onClick={startEditNotes} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
+                {job.notes ? '✏️ Edit' : '+ Add Note'}
+              </button>
+            : <div className="flex gap-2">
+                <button onClick={cancelNotes} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-3 py-2 font-semibold hover:bg-gray-50">Cancel</button>
+                <button onClick={saveNotes}   className="text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">✓ Save</button>
+              </div>
+          }
+        </div>
+        <div className="p-5">
+          {editingNotes ? (
+            <textarea
+              value={noteDraft}
+              onChange={e=>setNoteDraft(e.target.value)}
+              rows={4}
+              autoFocus
+              placeholder="Type your notes here — internal only, not printed on job card or invoice…"
+              className="w-full border border-gray-300 rounded-xl px-3 py-2.5 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 resize-none"/>
+          ) : job.notes ? (
+            <p className="text-sm text-gray-700 whitespace-pre-wrap">{job.notes}</p>
+          ) : (
+            <div className="text-center py-4">
+              <p className="text-gray-400 text-sm">No notes yet.</p>
+              <button onClick={startEditNotes} className="mt-2 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Add a note</button>
+            </div>
+          )}
+        </div>
+      </div>
+
       {showInvoiceEmail&&job&&(
         <EmailFlowModal
           type="invoice" data={job} companies={companies} logoDataUrl={logoDataUrl}
@@ -7224,7 +7267,7 @@ function JobsPage({ jobs, setJobs, companies, user, entityFilter, setEntityFilte
   const [showAdd,      setShowAdd]      = useState(false);
 
   const isAdmin = user.role !== 'assistant';
-  // Always exclude Uniontech from Jobs view
+  // Always exclude SGR Holdings from Jobs view
   const visibleJobs     = jobs.filter(j=>j.co!==UNIONTECH_ID);
   const filterCompanies = companies.filter(c=>c.id!==UNIONTECH_ID);
   const addableCompanies = filterCompanies;
@@ -7320,6 +7363,7 @@ function JobsPage({ jobs, setJobs, companies, user, entityFilter, setEntityFilte
                     <span className="text-xs font-mono text-gray-400">{job.num}</span>
                     <Badge status={job.status}/>
                     <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${co.bg} ${co.text}`}>{co.short}</span>
+                    {job.notes&&<span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-600 font-semibold border border-amber-200" title={job.notes}>📝</span>}
                   </div>
                   <p className="font-bold text-gray-800 text-sm">{job.client}</p>
                   <p className="text-xs text-gray-500 mt-0.5 truncate">{job.desc}</p>
@@ -11170,7 +11214,7 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
     reader.readAsDataURL(file);
   }
 
-  // SVG fallback for Uniontech logo
+  // SVG fallback for Signacore Holdings logo
   const UtLogoSVG = () => (
     <svg width="160" height="52" viewBox="0 0 160 52" xmlns="http://www.w3.org/2000/svg">
       <circle cx="26" cy="26" r="22" fill="#0d6e6e" opacity="0.15"/>
@@ -11178,8 +11222,8 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
       <ellipse cx="26" cy="26" rx="8" ry="17" fill="none" stroke="#0d6e6e" strokeWidth="1.5"/>
       <line x1="9" y1="26" x2="43" y2="26" stroke="#0d6e6e" strokeWidth="1.5"/>
       <line x1="26" y1="9" x2="26" y2="43" stroke="#0d6e6e" strokeWidth="1.5"/>
-      <text x="54" y="24" fontFamily="Arial,sans-serif" fontWeight="900" fontSize="14" fill="#0d6e6e" letterSpacing="1">UNIONTECH</text>
-      <text x="54" y="38" fontFamily="Arial,sans-serif" fontWeight="400" fontSize="8.5" fill="#6b7280" letterSpacing="0.5">S.A. HOLDINGS PTY LTD</text>
+      <text x="54" y="24" fontFamily="Arial,sans-serif" fontWeight="900" fontSize="14" fill="#0d6e6e" letterSpacing="1">SIGNACORE</text>
+      <text x="54" y="38" fontFamily="Arial,sans-serif" fontWeight="400" fontSize="8.5" fill="#6b7280" letterSpacing="0.5">HOLDINGS SA PTY LTD</text>
     </svg>
   );
 
@@ -11342,15 +11386,15 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 
       {importTab==='calc' && (<div className="space-y-4">
 
-      {/* Uniontech logo banner */}
+      {/* Signacore Holdings logo banner */}
       <div className="bg-white rounded-2xl border border-gray-200 px-5 py-4 flex items-center justify-between gap-4">
         <div className="flex items-center gap-4">
           {utLogoDataUrl
-            ? <img src={utLogoDataUrl} alt="Uniontech Holdings SA" style={{maxHeight:'52px',maxWidth:'200px',objectFit:'contain'}}/>
+            ? <img src={utLogoDataUrl} alt="Signacore Holdings SA" style={{maxHeight:'52px',maxWidth:'200px',objectFit:'contain'}}/>
             : <UtLogoSVG/>}
           <div>
             <p className="text-xs font-bold text-gray-700">Import Company</p>
-            <p className="text-xs text-gray-400">Uniontech Holdings SA · All landed cost calculations</p>
+            <p className="text-xs text-gray-400">Signacore Holdings SA · All landed cost calculations</p>
           </div>
         </div>
         <label className="cursor-pointer text-xs font-semibold text-indigo-600 hover:text-indigo-800 underline underline-offset-2">
@@ -11363,7 +11407,7 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-sm font-black text-gray-700">Landed Cost Calculator</h2>
-          <p className="text-xs text-gray-400">Uniontech Holdings SA · Live updates</p>
+          <p className="text-xs text-gray-400">Signacore Holdings SA · Live updates</p>
         </div>
         <div className="flex items-center gap-2">
           {saveMsg&&<span className="text-xs bg-emerald-100 text-emerald-700 font-bold px-3 py-1.5 rounded-lg">✅ Saved as {saveMsg}</span>}
@@ -13178,7 +13222,7 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
 ═══════════════════════════════════════════ */
 function ReportsPage({ jobs, companies, user }) {
   const isAdmin = user.role !== 'assistant';
-  // Always exclude Uniontech from Reports — only Signacore and Cover X shown
+  // Always exclude SGR Holdings from Reports — only Signacore and Cover X shown
   const visibleCompanies = companies.filter(c=>c.id!==UNIONTECH_ID);
   const visibleJobs      = jobs.filter(j=>j.co!==UNIONTECH_ID);
 
@@ -13241,7 +13285,7 @@ function ReportsPage({ jobs, companies, user }) {
       {reportTab==='overview'&&(<>
         <div className="bg-blue-50 border border-blue-200 rounded-2xl p-3 flex items-center gap-3">
           <span className="text-lg">📊</span>
-          <p className="text-xs text-blue-700 font-semibold">Showing Signacore and Cover X — Uniontech excluded from reports.</p>
+          <p className="text-xs text-blue-700 font-semibold">Showing Signacore and Cover X — SGR Holdings excluded from reports.</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <button onClick={()=>setActive(0)} className={`text-xs px-3 py-2 rounded-xl border font-semibold transition-all ${active===0?'bg-gray-900 text-white border-gray-900':'bg-white border-gray-200 text-gray-600'}`}>All Entities</button>
@@ -13385,263 +13429,4 @@ function ReportsPage({ jobs, companies, user }) {
                 </tr>
               </thead>
               <tbody>
-                {pendingJobs.map(j=>(
-                  <tr key={j.id} className="border-t border-gray-50 hover:bg-gray-50">
-                    <td className="px-4 py-2.5 font-black text-brand-600">{j.invoiceNum}</td>
-                    <td className="px-4 py-2.5 font-semibold text-gray-700">{j.client}</td>
-                    <td className="px-4 py-2.5 text-gray-500">{j.invoiceDate||'—'}</td>
-                    <td className="px-4 py-2.5 text-amber-600 font-semibold">{j.invoiceDue||'—'}</td>
-                    <td className="px-4 py-2.5 text-right font-black text-amber-700">{zar(j.value||0)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </>)}
-    </div>
-  );
-}
-
-/* ═══════════════════════════════════════════
-   ROOT APP
-═══════════════════════════════════════════ */
-function App() {
-  const _saved = loadPersistedData();
-
-  // Read initial page from URL hash e.g. #page=inventory
-  const _hashPage = (()=>{ try { const h=window.location.hash; const m=h.match(/[#&]page=([^&]+)/); return m?m[1]:null; } catch(e){return null;} })();
-
-  // Restore session from sessionStorage so page refreshes don't kick the user out.
-  // Each browser tab holds its own session independently (admin + assistant can work simultaneously).
-  const _sessionUser = (()=>{ try { const s=sessionStorage.getItem('sgr-user'); return s?JSON.parse(s):null; } catch(e){return null;} })();
-  const [user,         setUser]         = useState(_sessionUser);
-  const [page,         setPage]         = useState(_hashPage||'dashboard');
-  const [sidebarOpen,  setSidebarOpen]  = useState(false);
-  const [entityFilter, setEntityFilter] = useState(null);
-  const [saveMsg,      setSaveMsg]      = useState('');
-
-  const [lastSaved,    setLastSaved]    = useState(_saved ? _saved.savedAt : null);
-  const [companies]                     = useState(INITIAL_COMPANIES);
-  const [jobs,         setJobs]         = useState(_saved ? _saved.jobs      : INITIAL_JOBS);
-  const [inventory,    setInventory]    = useState(()=>{
-    if(!_saved) return INITIAL_INVENTORY;
-    const saved = _saved.inventory || [];
-    const savedIds = new Set(saved.map(i=>i.id));
-    const newItems = INITIAL_INVENTORY.filter(i=>!savedIds.has(i.id));
-    return newItems.length ? [...saved, ...newItems] : saved;
-  });
-  const [quotes,       setQuotes]       = useState(_saved ? (_saved.quotes||[])    : INITIAL_QUOTES);
-  const [customers,    setCustomers]    = useState(_saved ? (_saved.customers||[]) : INITIAL_CUSTOMERS);
-  const [assets,       setAssets]       = useState(_saved ? (_saved.assets||[])      : INITIAL_ASSETS);
-  const [suppliers,    setSuppliers]    = useState(_saved ? (_saved.suppliers||[])    : INITIAL_SUPPLIERS);
-  const [employees,    setEmployees]    = useState(_saved ? (_saved.employees||[])    : INITIAL_EMPLOYEES);
-  const [leaveRequests,setLeaveRequests]= useState(_saved ? (_saved.leaveRequests||[]) : INITIAL_LEAVE);
-  const [disciplinary,   setDisciplinary]   = useState(_saved ? (_saved.disciplinary||[])    : INITIAL_DISCIPLINARY);
-  const [savedCalcs,     setSavedCalcs]     = useState(_saved ? (_saved.savedCalcs||[])      : INITIAL_SAVED_CALCS);
-  const [purchaseOrders, setPurchaseOrders] = useState(_saved ? (_saved.purchaseOrders||[])  : INITIAL_PURCHASE_ORDERS);
-  const [savedImports,   setSavedImports]   = useState(_saved ? (_saved.savedImports||[])    : INITIAL_SAVED_IMPORTS);
-  const [logoDataUrl,    setLogoDataUrl]    = useState(_saved ? (_saved.logo||INITIAL_LOGO)   : INITIAL_LOGO);
-  const [utLogoDataUrl,  setUtLogoDataUrl]  = useState(_saved ? (_saved.utLogo||null)         : null);
-  const [sigOTSmit,      setSigOTSmit]      = useState(_saved ? (_saved.sigOTSmit||null)    : null);
-  const [bankTxns,         setBankTxns]         = useState(_saved ? (_saved.bankTxns||[])           : []);
-  const [chartOfAccounts,  setChartOfAccounts]  = useState(_saved ? (_saved.chartOfAccounts&&_saved.chartOfAccounts.length>5?_saved.chartOfAccounts:INITIAL_ACCOUNTS) : INITIAL_ACCOUNTS);
-  const [accInvoices,      setAccInvoices]      = useState(_saved ? (_saved.accInvoices||[])        : []);
-  const [accBills,         setAccBills]         = useState(_saved ? (_saved.accBills||[])           : []);
-  const [completeProducts, setCompleteProducts] = useState(_saved ? (_saved.completeProducts||[])  : []);
-  const [payrollRecords,   setPayrollRecords]   = useState(_saved ? (_saved.payrollRecords||[])    : []);
-  const [quickRates,       setQuickRates]       = useState(_saved ? (_saved.quickRates||[])        : INITIAL_QUICK_RATES);
-
-  // Auto-sync changes to localStorage and PostgreSQL/server state
-  useEffect(()=>{
-    try {
-      const payload = {
-        v: DATA_VERSION,
-        jobs,
-        inventory,
-        quotes,
-        customers,
-        suppliers,
-        assets,
-        employees,
-        leaveRequests,
-        disciplinary,
-        savedCalcs,
-        purchaseOrders,
-        savedImports,
-        bankTxns,
-        chartOfAccounts,
-        accInvoices,
-        accBills,
-        completeProducts,
-        payrollRecords,
-        quickRates,
-        logo: logoDataUrl,
-        utLogo: utLogoDataUrl,
-        sigOTSmit,
-        savedAt: lastSaved,
-        _autoSavedAt: new Date().toISOString()
-      };
-
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-      persistStateToServer(payload);
-    } catch(e) {}
-  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logoDataUrl, utLogoDataUrl, sigOTSmit, lastSaved]);
-
-  // ── Auto-sync: poll server every 30s so all users see fresh data ──
-  useEffect(()=>{
-    let active = true;
-    let lastSavedAt = _saved ? (_saved._autoSavedAt || _saved.savedAt) : null;
-
-    async function poll() {
-      try {
-        const res = await fetch(API_STATE_URL);
-        if (!res.ok) return;
-        const json = await res.json();
-        const d = json && json.data !== undefined ? json.data : json;
-        if (!validState(d)) return;
-        // Only pull server data if it is genuinely newer than:
-        //  (a) what we loaded at boot, AND
-        //  (b) what we last sent ourselves (avoid clobbering in-flight edits)
-        const serverStamp = d._autoSavedAt || d.savedAt;
-        const alreadyKnown = serverStamp === lastSavedAt || serverStamp === __lastSentAt;
-        if (active && serverStamp && !alreadyKnown) {
-          lastSavedAt = serverStamp;
-          setJobs(d.jobs||[]);
-          setInventory(()=>{
-            const saved = d.inventory||[];
-            const savedIds = new Set(saved.map(i=>i.id));
-            const newItems = INITIAL_INVENTORY.filter(i=>!savedIds.has(i.id));
-            return newItems.length ? [...saved,...newItems] : saved;
-          });
-          setQuotes(d.quotes||[]);
-          setCustomers(d.customers||[]);
-          setSuppliers(d.suppliers||[]);
-          setAssets(d.assets||[]);
-          setEmployees(d.employees||[]);
-          setLeaveRequests(d.leaveRequests||[]);
-          setDisciplinary(d.disciplinary||[]);
-          setSavedCalcs(d.savedCalcs||[]);
-          setPurchaseOrders(d.purchaseOrders||[]);
-          setSavedImports(d.savedImports||[]);
-          setBankTxns(d.bankTxns||[]);
-          setChartOfAccounts(d.chartOfAccounts&&d.chartOfAccounts.length>5?d.chartOfAccounts:INITIAL_ACCOUNTS);
-          setAccInvoices(d.accInvoices||[]);
-          setAccBills(d.accBills||[]);
-          setCompleteProducts(d.completeProducts||[]);
-          setPayrollRecords(d.payrollRecords||[]);
-          setQuickRates(d.quickRates||[]);
-          setLastSaved(d.savedAt);
-        }
-      } catch(e) {}
-    }
-
-    const timer = setInterval(poll, 30000);
-    return ()=>{ active=false; clearInterval(timer); };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Update browser tab title whenever the active page changes ──
-  useEffect(()=>{
-    const PAGE_TITLES={dashboard:'Dashboard',jobs:'Jobs',calculators:'Calculators & Costing',inventory:'Inventory',imports:'Import Costing',reports:'Reports',sales:'Sales',customers:'Customers',suppliers:'Suppliers',assets:'Assets',hr:'HR',purchase_orders:'Purchase Orders',accounting:'Accounting'};
-    document.title = (PAGE_TITLES[page]||page) + ' — Signacore';
-  },[page]);
-
-  function handleLogin(u){ try{sessionStorage.setItem('sgr-user',JSON.stringify(u));}catch(e){} setUser(u); setPage(_hashPage||'dashboard'); setEntityFilter(null); }
-  function handleLogout(){ try{sessionStorage.removeItem('sgr-user');}catch(e){} setUser(null); setPage('dashboard'); setEntityFilter(null); }
-  function handleEntitySelect(coId){ setEntityFilter(coId); setPage('jobs'); }
-
-  // ── Save file ──────────────────────────────────────────────
-  // Rewrites the sgr-data tag in the current HTML and downloads
-  // a new copy of this file with all current data baked in.
-  function saveFile() {
-    try {
-      const now = new Date();
-      const stamp = now.toLocaleString('en-ZA', {
-        day:'2-digit', month:'short', year:'numeric',
-        hour:'2-digit', minute:'2-digit', hour12:false
-      });
-      // Date-stamped filename so Drive folder shows version order clearly
-      const dateTag = now.toISOString().slice(0,10); // e.g. 2026-04-10
-      const payload = JSON.stringify({v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logo:logoDataUrl, utLogo:utLogoDataUrl, savedAt: stamp});
-      // outerHTML preserves the original <script type="text/babel"> source intact
-      let html = document.documentElement.outerHTML;
-      // Update (or insert) the sgr-data tag
-      if (html.includes('id="sgr-data"')) {
-        html = html.replace(
-          /<script id="sgr-data"[^>]*>[\s\S]*?<\/script>/,
-          `<script id="sgr-data" type="application\/json">${payload}<\/script>`
-        );
-      } else {
-        html = html.replace('</head>', `<script id="sgr-data" type="application\/json">${payload}<\/script>\n</head>`);
-      }
-      const blob = new Blob([html], {type:'text/html;charset=utf-8'});
-      const url  = URL.createObjectURL(blob);
-      const a    = document.createElement('a');
-      a.href     = url;
-      a.download = `signacore-dashboard-${dateTag}.html`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      setLastSaved(stamp);
-      setSaveMsg('saved');
-      setTimeout(()=>setSaveMsg(''), 2500);
-    } catch(e) {
-      alert('Save failed: ' + e.message);
-    }
-  }
-
-  if (!user) return <LoginPage onLogin={handleLogin}/>;
-
-  const assistantBlocked = []; // imports removed from nav; assets & hr open to all roles
-  const safePage = (user.role==='assistant' && assistantBlocked.includes(page)) ? 'dashboard' : page;
-
-  const pageMap = {
-    dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={logoDataUrl}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates}/>,
-    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers}/>,
-    assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
-    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl}/>,
-    calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
-    purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>,
-    suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
-    inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={logoDataUrl} quickRates={quickRates} setQuickRates={setQuickRates}/>,
-    imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
-    reports:     <ReportsPage     jobs={jobs} companies={companies} user={user}/>,
-    accounting:  <AccountingPage  jobs={jobs} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} suppliers={suppliers} customers={customers} companies={companies} user={user}/>,
-    hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={logoDataUrl} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
-  };
-
-  return (
-    <div className="flex h-screen overflow-hidden">
-      <Sidebar companies={companies} page={safePage} setPage={setPage} open={sidebarOpen} setOpen={setSidebarOpen} user={user} entityFilter={entityFilter} onEntitySelect={handleEntitySelect} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl}/>
-      <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
-        <Header page={safePage} onMenu={()=>setSidebarOpen(true)} onLogout={handleLogout} user={user} onSave={saveFile} saveMsg={saveMsg} lastSaved={lastSaved} logoDataUrl={logoDataUrl}/>
-        <main className="flex-1 overflow-y-auto bg-gray-50 relative">
-          {safePage!=='dashboard'&&(
-            <div style={{
-              position:'fixed',bottom:'16px',right:'20px',
-              fontFamily:'Barlow Condensed,sans-serif',fontSize:'4rem',fontWeight:900,fontStyle:'italic',
-              color:'#06065c',opacity:0.035,userSelect:'none',pointerEvents:'none',
-              letterSpacing:'0.05em',lineHeight:1,zIndex:0,whiteSpace:'nowrap'
-            }}>SIGNACORE</div>
-          )}
-          {pageMap[safePage]}
-        </main>
-      </div>
-    </div>
-  );
-}
-
-// Remove loading screen as soon as React mounts
-(function() {
-  var el = document.getElementById('sgr-loading');
-  if (el) el.remove();
-  document.body.classList.remove('loading');
-})();
-
-ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
-
-</script>
-</body></html>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
+                {pendingJobs.map(j
