@@ -6972,6 +6972,7 @@ function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl 
   const [bd, setBd]=useState(null); // local copy of breakdown being edited
   const [editingNotes, setEditingNotes]=useState(false);
   const [noteDraft, setNoteDraft]=useState('');
+  const [costBreakdownOpen, setCostBreakdownOpen]=useState(false);
 
   useEffect(()=>{
     if (job) setBd(job.breakdown ? {...job.breakdown} : emptyBreakdown());
@@ -7071,84 +7072,128 @@ function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl 
         )}
       </div>
 
-      {/* ─── COST BREAKDOWN SECTION — admin only ─── */}
-      {isAdmin&&(
+      {/* ─── SPECIAL NOTES ─── */}
       <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+          <div>
+            <h3 className="text-sm font-bold text-gray-700">📝 Special Notes</h3>
+            <p className="text-xs text-gray-400 mt-0.5">Internal notes, special instructions, reminders</p>
+          </div>
+          {!editingNotes
+            ? <button onClick={startEditNotes} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
+                {job.notes ? '✏️ Edit' : '+ Add Note'}
+              </button>
+            : <div className="flex gap-2">
+                <button onClick={cancelNotes} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-3 py-2 font-semibold hover:bg-gray-50">Cancel</button>
+                <button onClick={saveNotes}   className="text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">✓ Save</button>
+              </div>
+          }
+        </div>
+        <div className="p-5">
+          {editingNotes ? (
+            <textarea
+              value={noteDraft}
+              onChange={e=>setNoteDraft(e.target.value)}
+              rows={4}
+              autoFocus
+              placeholder="Type your notes here — internal only, not printed on job card or invoice…"
+              className="w-full border border-gray-300 rounded-xl px-3 py-2.5 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 resize-none"/>
+          ) : job.notes ? (
+            <p className="text-sm text-gray-700 whitespace-pre-wrap">{job.notes}</p>
+          ) : (
+            <div className="text-center py-4">
+              <p className="text-gray-400 text-sm">No notes yet.</p>
+              <button onClick={startEditNotes} className="mt-2 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Add a note</button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ─── COST BREAKDOWN SECTION — admin only, collapsible ─── */}
+      {isAdmin&&(
+      <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+        <button onClick={()=>setCostBreakdownOpen(o=>!o)} className="w-full flex items-center justify-between px-5 py-4 border-b border-gray-100 hover:bg-gray-50 transition-colors text-left">
           <div>
             <h3 className="text-sm font-bold text-gray-700">💰 Cost Breakdown</h3>
             <p className="text-xs text-gray-400 mt-0.5">Enter actual costs per category — total updates live</p>
           </div>
-          {!editingCosts
-            ? <button onClick={()=>setEditingCosts(true)} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
-                ✏️ Edit Costs
-              </button>
-            : <div className="flex gap-2">
-                <button onClick={cancelCosts} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-3 py-2 font-semibold hover:bg-gray-50">Cancel</button>
-                <button onClick={saveCosts}   className="text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">✓ Save</button>
-              </div>
-          }
-        </div>
+          <span className={`text-gray-400 text-xs font-bold transition-transform duration-200 ${costBreakdownOpen?'rotate-180':''}`} style={{display:'inline-block'}}>▼</span>
+        </button>
 
-        <div className="p-5">
-          {editingCosts && bd ? (
-            <div className="space-y-3">
-              {/* Franchise royalty auto helper */}
-              <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 flex items-center justify-between">
-                <p className="text-xs text-blue-700">Franchise Royalty = 6% of R {job.value.toLocaleString()} = <strong>R {Math.round(job.value*0.06).toLocaleString()}</strong></p>
-                <button onClick={autoRoyalty} className="text-xs text-blue-600 font-bold hover:underline ml-2">Auto-fill →</button>
-              </div>
-              {COST_CATS.map(cat=>(
-                <div key={cat.key} className="flex items-center gap-3">
-                  <span className="text-lg w-7 flex-shrink-0 text-center">{cat.icon}</span>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs font-semibold text-gray-700">{cat.label}</p>
-                    <p className="text-xs text-gray-400">{cat.sub}</p>
-                  </div>
-                  <div className="flex items-center gap-1.5 flex-shrink-0">
-                    <span className="text-xs text-gray-400">R</span>
-                    <input type="number" value={bd[cat.key]||''} onChange={e=>updateBd(cat.key,e.target.value)}
-                      placeholder="0"
-                      className="w-28 border border-gray-300 rounded-xl px-3 py-2 text-sm text-right focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/>
-                  </div>
+        {costBreakdownOpen&&(
+        <div>
+          <div className="flex items-center justify-end px-5 py-3 border-b border-gray-50">
+            {!editingCosts
+              ? <button onClick={()=>setEditingCosts(true)} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
+                  ✏️ Edit Costs
+                </button>
+              : <div className="flex gap-2">
+                  <button onClick={cancelCosts} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-3 py-2 font-semibold hover:bg-gray-50">Cancel</button>
+                  <button onClick={saveCosts}   className="text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">✓ Save</button>
                 </div>
-              ))}
-              <div className="border-t border-gray-200 pt-3 flex items-center justify-between">
-                <p className="text-sm font-bold text-gray-700">Total Costs</p>
-                <p className={`text-lg font-black ${editTotal>job.value?'text-red-600':editTotal>0?'text-gray-900':'text-gray-400'}`}>{zar(editTotal)}</p>
-              </div>
-              {editTotal>job.value&&<p className="text-xs text-red-500 bg-red-50 rounded-lg p-2">⚠️ Total costs exceed job value — margin will be negative.</p>}
-            </div>
-          ) : (
-            job.breakdown && totalCost>0 ? (
-              <div className="space-y-2.5">
-                {COST_CATS.map(cat=>{
-                  const val=job.breakdown[cat.key]||0;
-                  const pct=totalCost>0?val/totalCost*100:0;
-                  return (
-                    <div key={cat.key} className="flex items-center gap-3">
-                      <span className="text-sm w-6 text-center">{cat.icon}</span>
-                      <span className="text-xs text-gray-600 w-36 flex-shrink-0">{cat.label}</span>
-                      <div className="flex-1 bg-gray-100 rounded-full h-2">
-                        <div className={`h-2 rounded-full ${cat.bar}`} style={{width:`${pct}%`}}/>
-                      </div>
-                      <span className="text-xs font-semibold text-gray-700 w-24 text-right">{zar(val)}</span>
+            }
+          </div>
+          <div className="p-5">
+            {editingCosts && bd ? (
+              <div className="space-y-3">
+                {/* Franchise royalty auto helper */}
+                <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 flex items-center justify-between">
+                  <p className="text-xs text-blue-700">Franchise Royalty = 6% of R {job.value.toLocaleString()} = <strong>R {Math.round(job.value*0.06).toLocaleString()}</strong></p>
+                  <button onClick={autoRoyalty} className="text-xs text-blue-600 font-bold hover:underline ml-2">Auto-fill →</button>
+                </div>
+                {COST_CATS.map(cat=>(
+                  <div key={cat.key} className="flex items-center gap-3">
+                    <span className="text-lg w-7 flex-shrink-0 text-center">{cat.icon}</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-semibold text-gray-700">{cat.label}</p>
+                      <p className="text-xs text-gray-400">{cat.sub}</p>
                     </div>
-                  );
-                })}
-                <div className="border-t border-gray-100 pt-2 flex justify-between">
-                  <p className="text-sm font-bold text-gray-700">Total</p>
-                  <p className="text-sm font-black text-gray-900">{zar(totalCost)}</p>
+                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                      <span className="text-xs text-gray-400">R</span>
+                      <input type="number" value={bd[cat.key]||''} onChange={e=>updateBd(cat.key,e.target.value)}
+                        placeholder="0"
+                        className="w-28 border border-gray-300 rounded-xl px-3 py-2 text-sm text-right focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/>
+                    </div>
+                  </div>
+                ))}
+                <div className="border-t border-gray-200 pt-3 flex items-center justify-between">
+                  <p className="text-sm font-bold text-gray-700">Total Costs</p>
+                  <p className={`text-lg font-black ${editTotal>job.value?'text-red-600':editTotal>0?'text-gray-900':'text-gray-400'}`}>{zar(editTotal)}</p>
                 </div>
+                {editTotal>job.value&&<p className="text-xs text-red-500 bg-red-50 rounded-lg p-2">⚠️ Total costs exceed job value — margin will be negative.</p>}
               </div>
             ) : (
-              <div className="text-center py-6">
-                <p className="text-gray-400 text-sm">No cost breakdown entered yet.</p>
-                <button onClick={()=>setEditingCosts(true)} className="mt-3 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Enter cost breakdown</button>
-              </div>
-            )
-          )}
+              job.breakdown && totalCost>0 ? (
+                <div className="space-y-2.5">
+                  {COST_CATS.map(cat=>{
+                    const val=job.breakdown[cat.key]||0;
+                    const pct=totalCost>0?val/totalCost*100:0;
+                    return (
+                      <div key={cat.key} className="flex items-center gap-3">
+                        <span className="text-sm w-6 text-center">{cat.icon}</span>
+                        <span className="text-xs text-gray-600 w-36 flex-shrink-0">{cat.label}</span>
+                        <div className="flex-1 bg-gray-100 rounded-full h-2">
+                          <div className={`h-2 rounded-full ${cat.bar}`} style={{width:`${pct}%`}}/>
+                        </div>
+                        <span className="text-xs font-semibold text-gray-700 w-24 text-right">{zar(val)}</span>
+                      </div>
+                    );
+                  })}
+                  <div className="border-t border-gray-100 pt-2 flex justify-between">
+                    <p className="text-sm font-bold text-gray-700">Total</p>
+                    <p className="text-sm font-black text-gray-900">{zar(totalCost)}</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-center py-6">
+                  <p className="text-gray-400 text-sm">No cost breakdown entered yet.</p>
+                  <button onClick={()=>setEditingCosts(true)} className="mt-3 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Enter cost breakdown</button>
+                </div>
+              )
+            )}
+          </div>
         </div>
+        )}
       </div>
       )}
 
@@ -7202,43 +7247,6 @@ function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl 
           )}
           {!job.invoiceNum&&(
             <div className="text-xs text-gray-400 italic py-2">Convert a quote to this job to generate an invoice automatically.</div>
-          )}
-        </div>
-      </div>
-
-      {/* ─── SPECIAL NOTES ─── */}
-      <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
-        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
-          <div>
-            <h3 className="text-sm font-bold text-gray-700">📝 Special Notes</h3>
-            <p className="text-xs text-gray-400 mt-0.5">Internal notes, special instructions, reminders</p>
-          </div>
-          {!editingNotes
-            ? <button onClick={startEditNotes} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
-                {job.notes ? '✏️ Edit' : '+ Add Note'}
-              </button>
-            : <div className="flex gap-2">
-                <button onClick={cancelNotes} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-3 py-2 font-semibold hover:bg-gray-50">Cancel</button>
-                <button onClick={saveNotes}   className="text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">✓ Save</button>
-              </div>
-          }
-        </div>
-        <div className="p-5">
-          {editingNotes ? (
-            <textarea
-              value={noteDraft}
-              onChange={e=>setNoteDraft(e.target.value)}
-              rows={4}
-              autoFocus
-              placeholder="Type your notes here — internal only, not printed on job card or invoice…"
-              className="w-full border border-gray-300 rounded-xl px-3 py-2.5 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 resize-none"/>
-          ) : job.notes ? (
-            <p className="text-sm text-gray-700 whitespace-pre-wrap">{job.notes}</p>
-          ) : (
-            <div className="text-center py-4">
-              <p className="text-gray-400 text-sm">No notes yet.</p>
-              <button onClick={startEditNotes} className="mt-2 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Add a note</button>
-            </div>
           )}
         </div>
       </div>
