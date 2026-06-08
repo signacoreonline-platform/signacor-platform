@@ -3629,19 +3629,41 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
         </div>}
 
         {/* Status update */}
-        {quote.status!=='converted'&&(
-          <div>
-            <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Update Status</p>
-            <div className="flex flex-wrap gap-2">
-              {['draft','sent','approved','declined'].map(s=>(
-                <button key={s} onClick={()=>onUpdate({...quote,status:s})}
-                  className={`text-xs rounded-lg px-3 py-1.5 border font-semibold transition-all ${quote.status===s?'bg-gray-800 text-white border-gray-800':'bg-white border-gray-200 text-gray-600 hover:border-gray-400'}`}>
-                  {QUOTE_STATUS_META[s]?.label||s}
-                </button>
-              ))}
+        {quote.status==='converted' ? null :
+          (quote.status==='approved'||quote.status==='declined') ? (
+            <div>
+              <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Status</p>
+              <div className="flex items-center gap-3 bg-gray-50 border border-gray-200 rounded-xl px-4 py-3">
+                <QuoteBadge status={quote.status}/>
+                <span className="text-xs text-gray-500">🔒 This status is <strong>permanent</strong> and cannot be changed.</span>
+              </div>
             </div>
-          </div>
-        )}
+          ) : (
+            <div>
+              <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Update Status</p>
+              <div className="flex flex-wrap gap-2">
+                {['draft','sent','approved','declined'].map(s=>{
+                  const activeColors = {draft:'bg-gray-800 text-white border-gray-800',sent:'bg-blue-600 text-white border-blue-600',approved:'bg-green-600 text-white border-green-600',declined:'bg-red-600 text-white border-red-600'};
+                  return (
+                    <button key={s} onClick={()=>{
+                      if(s==='approved'){
+                        if(!window.confirm('Set this quote to APPROVED? This is permanent — once approved it cannot be reversed (it will be converted to a job).')) return;
+                      }
+                      if(s==='declined'){
+                        if(!window.confirm('Set this quote to DECLINED? This is permanent and cannot be reversed.')) return;
+                      }
+                      onUpdate({...quote,status:s});
+                    }}
+                      className={`text-xs rounded-lg px-3 py-1.5 border font-semibold transition-all ${quote.status===s?(activeColors[s]||'bg-gray-800 text-white border-gray-800'):'bg-white border-gray-200 text-gray-600 hover:border-gray-400'}`}>
+                      {QUOTE_STATUS_META[s]?.label||s}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-xs text-gray-400 mt-1.5">⚠️ Approved and Declined are permanent — confirm before selecting.</p>
+            </div>
+          )
+        }
 
         {/* Attachments */}
         {(quote.attachments||[]).length>0&&(
@@ -3692,7 +3714,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
         <EmailFlowModal
           type="quote" data={quote} companies={companies} logoDataUrl={logoDataUrl}
           onClose={()=>setShowEmailFlow(false)}
-          onMarkSent={()=>{ if(quote.status==='draft') onUpdate({...quote,status:'sent'}); }}
+          onMarkSent={()=>{ if(!['approved','declined','converted'].includes(quote.status)) onUpdate({...quote,status:'sent'}); }}
         />
       )}
     </Modal>
@@ -6820,7 +6842,7 @@ function StatusDonut({ jobs }) {
 /* ═══════════════════════════════════════════
    DASHBOARD
 ═══════════════════════════════════════════ */
-function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl }) {
+function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, accInvoices }) {
   const isAdmin = true; // All roles see full dashboard
   // Always exclude SGR Holdings from Dashboard
   const visibleCompanies = companies.filter(c=>c.id!==UNIONTECH_ID);
@@ -6864,13 +6886,24 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl }
         {isAdmin&&<KpiCard icon="💰" label="Monthly Revenue"
           value={(() => {
             const now = new Date();
-            const rev = jobs.filter(j => {
-              const d = j.invoiceDate ? new Date(j.invoiceDate) : new Date(j.id);
-              return j.status === 'invoiced' && d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
+            // From jobs invoiced this month
+            const jobRev = jobs.filter(j => {
+              const d = j.paidAt ? new Date(j.paidAt) : j.invoiceDate ? new Date(j.invoiceDate) : new Date(j.id);
+              return (j.status==='invoiced'||j.paidAt) && d.getFullYear()===now.getFullYear() && d.getMonth()===now.getMonth();
             }).reduce((s,j) => s + (j.value||0), 0);
-            return 'R ' + rev.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
+            // From accounting invoices paid this month
+            const accRev = (accInvoices||[]).filter(i=>i.status==='paid'&&i.paidDate).filter(i=>{
+              const d=new Date(i.paidDate);
+              return d.getFullYear()===now.getFullYear()&&d.getMonth()===now.getMonth();
+            }).reduce((s,i)=>{
+              const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+              const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
+              return s+sub+vat;
+            },0);
+            const total = jobRev + accRev;
+            return 'R ' + total.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
           })()}
-          sub="Invoiced this month" accent="text-brand-500"/>}
+          sub="Paid invoices this month" accent="text-brand-500"/>}
         <KpiCard       icon="💼" label="Active Jobs"       value={active}     sub="In pipeline"     accent="text-brand-500"/>
         {isAdmin&&<KpiCard icon="📈" label="Gross Margin"   value={margin+'%'} sub="Invoiced jobs"   accent="text-emerald-600"/>}
         {isAdmin&&<KpiCard icon="⚠️" label="Low Stock"     value={lowStock}   sub="Need reordering" accent="text-red-600"/>}
@@ -12033,6 +12066,10 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
   const [editInv,       setEditInv]       = useState(null);
   const [showBillModal, setShowBillModal] = useState(false);
   const [editBill,      setEditBill]      = useState(null);
+  // Payment history modal state
+  const [showPayModal,  setShowPayModal]  = useState(false);
+  const [payModalInv,   setPayModalInv]   = useState(null);
+  const isAdmin = user?.role !== 'assistant';
 
   function nextInvNum() {
     const nums = accInvoices.map(i=>parseInt((i.number||'').replace(/\D/g,''))||0);
@@ -12053,7 +12090,14 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
   }
   function deleteInvoice(id){ if(window.confirm('Delete this invoice?')) setAccInvoices(prev=>prev.filter(i=>i.id!==id)); }
   function deleteBill(id){ if(window.confirm('Delete this bill?')) setAccBills(prev=>prev.filter(b=>b.id!==id)); }
-  function markInvPaid(inv){ saveInvoice({...inv, status:'paid', paidDate: new Date().toISOString().slice(0,10)}); }
+  function markInvPaid(inv){
+    const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
+    const alreadyPaid=(inv.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+    const remaining=Math.max(0,invTotal-alreadyPaid);
+    const today=new Date().toISOString().slice(0,10);
+    const newPayments=remaining>0?[...(inv.payments||[]),{id:Date.now(),date:today,method:'EFT',amount:remaining,notes:'Quick mark paid'}]:(inv.payments||[]);
+    saveInvoice({...inv, status:'paid', paidDate:today, payments:newPayments});
+  }
   function markBillPaid(bill){ saveBill({...bill, status:'paid', paidDate: new Date().toISOString().slice(0,10)}); }
 
   // ── P&L from all sources ──
@@ -12079,16 +12123,18 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
     return { income, cos, expense, grossProfit: income-cos, netProfit: income-cos-expense };
   }
 
-  // ── Aged Debtors ──
-  function getAgedDebtors() {
-    // allInvoices is computed below this function call — use accInvoices + jobInvsFiltered placeholder
-    // We compute debtors after allInvoices is built; this function uses accInvoices only (called before allInvoices)
+  // ── Aged Debtors — accepts full allInvoices list (including job invoices) ──
+  function getAgedDebtors(invoiceList) {
     const today = new Date();
-    return accInvoices.filter(i=>i.status!=='paid'&&i.status!=='void').map(i=>{
+    return (invoiceList||accInvoices).filter(i=>!['paid','void'].includes(i.status)).map(i=>{
       const due = new Date(i.dueDate||i.date);
       const days = Math.floor((today-due)/(1000*60*60*24));
-      const total = (i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-      return {...i, daysOverdue: days, total};
+      const subtotal = (i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+      const vat = (i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+      const total = subtotal+vat;
+      const paid = (i.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+      const balance = total-paid;
+      return {...i, daysOverdue: days, total, paid, balance};
     });
   }
 
@@ -12396,13 +12442,165 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
   allInvoices.sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
 
   const fullPL = getFullPL();
-  const debtors = getAgedDebtors();
+  const debtors = getAgedDebtors(allInvoices);
   const totalDebtors = debtors.reduce((s,d)=>s+d.total,0);
   const totalCreditors = accBills.filter(b=>b.status!=='paid'&&b.status!=='void').reduce((s,b)=>s+(b.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0),0);
-  const invStats = { total: allInvoices.length, paid: allInvoices.filter(i=>i.status==='paid').length, outstanding: allInvoices.filter(i=>['sent','overdue'].includes(i.status)).length, draft: allInvoices.filter(i=>i.status==='draft').length };
+  const invStats = { total: allInvoices.length, paid: allInvoices.filter(i=>i.status==='paid').length, partial: allInvoices.filter(i=>i.status==='partial').length, outstanding: allInvoices.filter(i=>['sent','overdue','partial'].includes(i.status)).length, draft: allInvoices.filter(i=>i.status==='draft').length };
   const billStats = { total: accBills.length, paid: accBills.filter(b=>b.status==='paid').length, outstanding: accBills.filter(b=>['approved','overdue'].includes(b.status)).length };
 
-  const STATUS_COLORS = { draft:'#6b7280', sent:'#2563eb', paid:'#059669', overdue:'#dc2626', void:'#9ca3af', approved:'#d97706' };
+  const STATUS_COLORS = { draft:'#6b7280', sent:'#2563eb', paid:'#059669', partial:'#f59e0b', overdue:'#dc2626', void:'#9ca3af', approved:'#d97706' };
+
+  // ── Payment History Modal ──
+  function PaymentHistoryModal({ inv, onClose }) {
+    const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
+    const [payments, setPayments] = useState(inv.payments||[]);
+    const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+    const balance = invTotal-totalPaid;
+    const overpayment = totalPaid>invTotal ? totalPaid-invTotal : 0;
+    const [date,   setDate]   = useState(new Date().toISOString().slice(0,10));
+    const [method, setMethod] = useState('EFT');
+    const [amount, setAmount] = useState('');
+    const [notes,  setNotes]  = useState('');
+
+    function addPayment() {
+      if(!amount||parseFloat(amount)<=0){alert('Enter a valid amount');return;}
+      const newP={id:Date.now(),date,method,amount:parseFloat(amount),notes:notes.trim()};
+      const updated=[...payments,newP];
+      const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':inv.status;
+      const paidDate=newTotal>=invTotal?(date||new Date().toISOString().slice(0,10)):inv.paidDate||null;
+      const saved={...inv,payments:updated,status:newStatus,paidDate};
+      setAccInvoices(prev=>prev.find(i=>i.id===saved.id)?prev.map(i=>i.id===saved.id?saved:i):[saved,...prev]);
+      setPayments(updated);
+      setPayModalInv(saved);
+      setAmount(''); setNotes('');
+    }
+
+    function deletePayment(pid) {
+      if(!isAdmin){alert('Only admins can delete payments.');return;}
+      if(!window.confirm('Delete this payment? This may change the invoice status.'))return;
+      const updated=payments.filter(p=>p.id!==pid);
+      const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'sent';
+      const saved={...inv,payments:updated,status:newStatus,paidDate:newTotal>=invTotal?inv.paidDate:null};
+      setAccInvoices(prev=>prev.map(i=>i.id===saved.id?saved:i));
+      setPayments(updated);
+      setPayModalInv(saved);
+    }
+
+    const iCls="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
+    return (
+      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[92vh] overflow-y-auto">
+          <div className="px-5 py-4 flex items-center justify-between" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
+            <div>
+              <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>PAYMENT HISTORY — {inv.number}</p>
+              <p className="text-blue-200 text-xs mt-0.5">{inv.contactName} · Due: {fmtDate(inv.dueDate)}</p>
+            </div>
+            <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
+          </div>
+          <div className="p-5 space-y-4">
+            {/* Summary cards */}
+            <div className="grid grid-cols-3 gap-3">
+              <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 text-center">
+                <p className="text-xs text-gray-400 mb-1">Invoice Total (incl. VAT)</p>
+                <p className="text-lg font-black" style={{color:'#06065c'}}>{fmtAmt(invTotal)}</p>
+                <p className="text-xs text-gray-400 mt-0.5">Due: {fmtDate(inv.dueDate)}</p>
+              </div>
+              <div className="bg-green-50 border border-green-200 rounded-xl p-3 text-center">
+                <p className="text-xs text-green-600 mb-1">Total Paid</p>
+                <p className="text-lg font-black text-green-700">{fmtAmt(totalPaid)}</p>
+                <p className="text-xs text-green-500 mt-0.5">{payments.length} payment{payments.length!==1?'s':''}</p>
+              </div>
+              {overpayment>0?(
+                <div className="bg-orange-50 border border-orange-200 rounded-xl p-3 text-center">
+                  <p className="text-xs text-orange-600 mb-1">Overpayment</p>
+                  <p className="text-lg font-black text-orange-700">{fmtAmt(overpayment)}</p>
+                  <p className="text-xs text-orange-400 mt-0.5">Refund to client</p>
+                </div>
+              ):balance>0?(
+                <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-center">
+                  <p className="text-xs text-amber-600 mb-1">Balance Due</p>
+                  <p className="text-lg font-black text-amber-700">{fmtAmt(balance)}</p>
+                  <p className="text-xs text-amber-500 mt-0.5">Remaining</p>
+                </div>
+              ):(
+                <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center">
+                  <p className="text-xs text-emerald-600 mb-1">Fully Paid ✓</p>
+                  <p className="text-lg font-black text-emerald-700">{fmtAmt(0)}</p>
+                  <p className="text-xs text-emerald-500 mt-0.5">Balance clear</p>
+                </div>
+              )}
+            </div>
+
+            {/* Payment history */}
+            <div>
+              <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Payment History</p>
+              {payments.length===0?(
+                <p className="text-xs text-gray-400 italic text-center py-5 bg-gray-50 rounded-xl">No payments recorded yet.</p>
+              ):(
+                <div className="border border-gray-200 rounded-xl overflow-hidden">
+                  <table className="w-full text-xs">
+                    <thead className="bg-gray-50 border-b border-gray-100">
+                      <tr>
+                        <th className="px-3 py-2 text-left text-gray-500 font-bold">Date</th>
+                        <th className="px-3 py-2 text-left text-gray-500 font-bold">Method</th>
+                        <th className="px-3 py-2 text-right text-gray-500 font-bold">Amount</th>
+                        <th className="px-3 py-2 text-left text-gray-500 font-bold">Notes</th>
+                        <th className="w-8"/>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {payments.map((p,idx)=>(
+                        <tr key={p.id} className="border-t border-gray-100">
+                          <td className="px-3 py-2 text-gray-700">{fmtDate(p.date)}</td>
+                          <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold text-xs">{p.method}</span></td>
+                          <td className="px-3 py-2 text-right font-bold text-green-700">{fmtAmt(p.amount)}</td>
+                          <td className="px-3 py-2 text-gray-400">{p.notes||'—'}</td>
+                          <td className="px-1 text-center">
+                            {isAdmin
+                              ? <button onClick={()=>deletePayment(p.id)} className="text-gray-300 hover:text-red-400 text-sm">✕</button>
+                              : <span className="text-gray-200 text-xs">🔒</span>}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot className="bg-gray-50 border-t border-gray-200">
+                      <tr>
+                        <td colSpan="2" className="px-3 py-2 font-black text-gray-600 text-right text-xs">Total Paid:</td>
+                        <td className="px-3 py-2 text-right font-black text-green-700">{fmtAmt(totalPaid)}</td>
+                        <td colSpan="2"/>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* Record payment form */}
+            <div className="border border-dashed border-green-300 rounded-xl p-4 bg-green-50/40">
+              <p className="text-xs font-black text-green-700 uppercase tracking-widest mb-3">Record New Payment</p>
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
+                <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
+                  <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>
+                    {['EFT','Cash','Card','Cheque','Other'].map(m=><option key={m}>{m}</option>)}
+                  </select>
+                </div>
+                <div><label className="text-xs font-bold text-gray-500 block mb-1">Amount (R)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} placeholder={balance>0?balance.toFixed(2):'0.00'} min="0.01" step="0.01"/></div>
+                <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes (optional)</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="Reference, partial, etc."/></div>
+              </div>
+              <button onClick={addPayment} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#059669'}}>＋ Record Payment</button>
+            </div>
+
+            <div className="flex justify-end pt-1">
+              <button onClick={onClose} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-4 py-2 font-semibold hover:bg-gray-50">Close</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const TABS = [
     {id:'dashboard', label:'🏠 Dashboard'},
@@ -12420,6 +12618,7 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
       {showAddAccount&&<AddAccountModal onClose={()=>setShowAddAccount(false)}/>}
       {showInvModal&&<InvoiceModal inv={editInv} onSave={saveInvoice} onClose={()=>{setShowInvModal(false);setEditInv(null);}}/>}
       {showBillModal&&<BillModal bill={editBill} onSave={saveBill} onClose={()=>{setShowBillModal(false);setEditBill(null);}}/>}
+      {showPayModal&&payModalInv&&<PaymentHistoryModal inv={payModalInv} onClose={()=>{setShowPayModal(false);setPayModalInv(null);}}/>}
 
       {/* Tab bar */}
       <div className="flex flex-wrap gap-2">
@@ -12646,7 +12845,7 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
           <div className="flex flex-wrap gap-2 items-center">
             <button onClick={()=>{setEditInv(null);setShowInvModal(true);}} className="flex items-center gap-2 text-white font-bold text-sm px-4 py-2.5 rounded-xl" style={{background:'#06065c'}}>＋ New Invoice</button>
             <div className="flex gap-2 ml-auto flex-wrap text-xs">
-              {['draft','sent','paid','overdue'].map(s=>(
+              {['draft','sent','partial','paid','overdue'].map(s=>(
                 <span key={s} className="px-2 py-1 rounded-full font-bold" style={{background:STATUS_COLORS[s]+'22',color:STATUS_COLORS[s]}}>
                   {s}: {allInvoices.filter(i=>i.status===s).length}
                 </span>
@@ -12705,10 +12904,11 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
                           {isJob?(
                             <span className="text-xs text-gray-400 italic">Job record</span>
                           ):(
-                            <div className="flex items-center justify-center gap-1">
+                            <div className="flex items-center justify-center gap-1 flex-wrap">
+                              <button onClick={()=>{setPayModalInv(inv);setShowPayModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#ecfdf5',color:'#059669'}}>💳 Payments</button>
                               <button onClick={()=>{setEditInv(inv);setShowInvModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#e6e6ff',color:'#06065c'}}>Edit</button>
                               {inv.status!=='paid'&&<button onClick={()=>markInvPaid(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dcfce7',color:'#059669'}}>✓ Paid</button>}
-                              <button onClick={()=>deleteInvoice(inv.id)} className="text-xs text-gray-300 hover:text-red-400">✕</button>
+                              {isAdmin&&<button onClick={()=>deleteInvoice(inv.id)} className="text-xs text-gray-300 hover:text-red-400">✕</button>}
                             </div>
                           )}
                         </td>
@@ -13054,28 +13254,36 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
             <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
               <div className="px-5 py-3 bg-blue-700">
                 <p className="text-white font-bold" style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'1.1rem',letterSpacing:'0.06em'}}>AGED DEBTORS</p>
-                <p className="text-blue-200 text-xs">Outstanding customer invoices</p>
+                <p className="text-blue-200 text-xs">Outstanding customer invoices (all sources incl. jobs)</p>
               </div>
               <table className="w-full text-xs">
                 <thead><tr className="border-b border-gray-100 bg-gray-50">
                   <th className="px-4 py-2 text-left text-gray-400 font-bold">Customer</th>
                   <th className="px-4 py-2 text-left text-gray-400 font-bold">Invoice</th>
+                  <th className="px-4 py-2 text-left text-gray-400 font-bold">Source</th>
                   <th className="px-4 py-2 text-left text-gray-400 font-bold">Due</th>
                   <th className="px-4 py-2 text-right text-gray-400 font-bold">Days</th>
-                  <th className="px-4 py-2 text-right text-gray-400 font-bold">Amount</th>
+                  <th className="px-4 py-2 text-center text-gray-400 font-bold">Status</th>
+                  <th className="px-4 py-2 text-right text-gray-400 font-bold">Invoice Total</th>
+                  <th className="px-4 py-2 text-right text-gray-400 font-bold">Paid</th>
+                  <th className="px-4 py-2 text-right text-gray-400 font-bold">Balance Due</th>
                 </tr></thead>
                 <tbody>
                   {debtors.map(d=>(
                     <tr key={d.id} className="border-b border-gray-50">
-                      <td className="px-4 py-2 text-gray-700 font-semibold truncate max-w-[120px]">{d.contactName}</td>
+                      <td className="px-4 py-2 text-gray-700 font-semibold truncate max-w-[110px]">{d.contactName}</td>
                       <td className="px-4 py-2 font-mono text-gray-500">{d.number}</td>
+                      <td className="px-4 py-2">{d.source==='job'?<span className="bg-purple-100 text-purple-700 rounded-full px-2 py-0.5 font-bold text-xs">Job</span>:<span className="bg-blue-100 text-blue-700 rounded-full px-2 py-0.5 font-bold text-xs">Manual</span>}</td>
                       <td className="px-4 py-2 text-gray-400">{fmtDate(d.dueDate)}</td>
                       <td className={`px-4 py-2 text-right font-bold ${d.daysOverdue>0?'text-red-600':'text-green-600'}`}>{d.daysOverdue>0?'+'+d.daysOverdue:'Current'}</td>
-                      <td className="px-4 py-2 text-right font-bold text-gray-800">{fmtAmt(d.total)}</td>
+                      <td className="px-4 py-2 text-center"><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[d.status]||'#6b7280'}}>{d.status}</span></td>
+                      <td className="px-4 py-2 text-right text-gray-500">{fmtAmt(d.total)}</td>
+                      <td className="px-4 py-2 text-right text-green-600">{d.paid>0?fmtAmt(d.paid):'—'}</td>
+                      <td className="px-4 py-2 text-right font-bold text-blue-800">{fmtAmt(d.balance)}</td>
                     </tr>
                   ))}
-                  {debtors.length===0&&<tr><td colSpan="5" className="px-4 py-6 text-center text-gray-400">No outstanding invoices</td></tr>}
-                  {debtors.length>0&&<tr className="bg-blue-50"><td colSpan="4" className="px-4 py-2 font-black text-blue-800 text-right">Total Outstanding:</td><td className="px-4 py-2 text-right font-black text-blue-800">{fmtAmt(totalDebtors)}</td></tr>}
+                  {debtors.length===0&&<tr><td colSpan="9" className="px-4 py-6 text-center text-gray-400">No outstanding invoices</td></tr>}
+                  {debtors.length>0&&<tr className="bg-blue-50"><td colSpan="8" className="px-4 py-2 font-black text-blue-800 text-right">Total Balance Outstanding:</td><td className="px-4 py-2 text-right font-black text-blue-800">{fmtAmt(debtors.reduce((s,d)=>s+d.balance,0))}</td></tr>}
                 </tbody>
               </table>
             </div>
@@ -13467,7 +13675,6 @@ function App() {
   const [entityFilter, setEntityFilter] = useState(null);
   const [saveMsg,      setSaveMsg]      = useState('');
   const [showShare,    setShowShare]    = useState(false);
-  const [lastSaved,    setLastSaved]    = useState(_saved ? _saved.savedAt : null);
   const [companies]                     = useState(INITIAL_COMPANIES);
   const [jobs,         setJobs]         = useState(_saved ? _saved.jobs      : INITIAL_JOBS);
   const [inventory,    setInventory]    = useState(()=>{
@@ -13725,7 +13932,7 @@ function App() {
   const safePage = (user.role==='assistant' && assistantBlocked.includes(page)) ? 'dashboard' : page;
 
   const pageMap = {
-    dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={logoDataUrl}/>,
+    dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices}/>,
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
