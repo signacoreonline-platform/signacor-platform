@@ -2956,6 +2956,8 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
 
   function addLine(){ const nid=Date.now(); setLines(prev=>[...prev,{id:nid,itemId:null,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]); setActiveLineId(nid); }
   function removeLine(id){ setLines(prev=>prev.filter(l=>l.id!==id)); }
+  function moveLine(id,dir){ setLines(prev=>{ const a=[...prev]; const i=a.findIndex(l=>l.id===id); const j=i+dir; if(j<0||j>=a.length) return a; [a[i],a[j]]=[a[j],a[i]]; return a; }); }
+  function copyLine(id){ setLines(prev=>{ const src=prev.find(x=>x.id===id); if(!src) return prev; const copy={...src,id:Date.now()+Math.random(),cpLinked:false,cpId:undefined}; const i=prev.findIndex(x=>x.id===id); return [...prev.slice(0,i+1),copy,...prev.slice(i+1)]; }); }
 
   // ── Save a custom quote line as a standard inventory item ──
   const [savedLineIds, setSavedLineIds] = useState({});
@@ -3412,10 +3414,23 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                     )}
                   </div>
 
-                  {lines.length>1&&(
-                    <button type="button" onClick={()=>removeLine(line.id)}
-                      className="mt-6 w-7 h-7 flex items-center justify-center text-gray-300 hover:text-red-400 hover:bg-red-50 rounded-xl transition-colors flex-shrink-0">✕</button>
-                  )}
+                  {/* Line actions: move up/down, copy, delete */}
+                  <div className="flex flex-col gap-0.5 flex-shrink-0 mt-5">
+                    <button type="button" onClick={()=>moveLine(line.id,-1)} disabled={idx===0}
+                      title="Move up"
+                      className="w-7 h-7 flex items-center justify-center text-gray-300 hover:text-brand-500 hover:bg-brand-50 rounded-xl transition-colors disabled:opacity-20 disabled:cursor-not-allowed text-xs">▲</button>
+                    <button type="button" onClick={()=>copyLine(line.id)}
+                      title="Copy line"
+                      className="w-7 h-7 flex items-center justify-center text-gray-300 hover:text-green-600 hover:bg-green-50 rounded-xl transition-colors text-xs">⧉</button>
+                    <button type="button" onClick={()=>moveLine(line.id,1)} disabled={idx===lines.length-1}
+                      title="Move down"
+                      className="w-7 h-7 flex items-center justify-center text-gray-300 hover:text-brand-500 hover:bg-brand-50 rounded-xl transition-colors disabled:opacity-20 disabled:cursor-not-allowed text-xs">▼</button>
+                    {lines.length>1&&(
+                      <button type="button" onClick={()=>removeLine(line.id)}
+                        title="Delete line"
+                        className="w-7 h-7 flex items-center justify-center text-gray-300 hover:text-red-400 hover:bg-red-50 rounded-xl transition-colors">✕</button>
+                    )}
+                  </div>
                 </div>
 
               </div>
