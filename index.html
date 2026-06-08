@@ -13429,4 +13429,250 @@ function ReportsPage({ jobs, companies, user }) {
                 </tr>
               </thead>
               <tbody>
-                {pendingJobs.map(j
+                {pendingJobs.map(j=>(
+                  <tr key={j.id} className="border-t border-gray-50 hover:bg-gray-50">
+                    <td className="px-4 py-2.5 font-black text-brand-600">{j.invoiceNum}</td>
+                    <td className="px-4 py-2.5 font-semibold text-gray-700">{j.client}</td>
+                    <td className="px-4 py-2.5 text-gray-500">{j.invoiceDate||'—'}</td>
+                    <td className="px-4 py-2.5 text-amber-600 font-semibold">{j.invoiceDue||'—'}</td>
+                    <td className="px-4 py-2.5 text-right font-black text-amber-700">{zar(j.value||0)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </>)}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════
+   ROOT APP
+═══════════════════════════════════════════ */
+function App() {
+  const _saved = loadPersistedData();
+
+  const [user,         setUser]         = useState(null);
+  const [page,         setPage]         = useState('dashboard');
+  const [sidebarOpen,  setSidebarOpen]  = useState(false);
+  const [entityFilter, setEntityFilter] = useState(null);
+  const [saveMsg,      setSaveMsg]      = useState('');
+  const [showShare,    setShowShare]    = useState(false);
+  const [lastSaved,    setLastSaved]    = useState(_saved ? _saved.savedAt : null);
+  const [companies]                     = useState(INITIAL_COMPANIES);
+  const [jobs,         setJobs]         = useState(_saved ? _saved.jobs      : INITIAL_JOBS);
+  const [inventory,    setInventory]    = useState(()=>{
+    if(!_saved) return INITIAL_INVENTORY;
+    const saved = _saved.inventory || [];
+    const savedIds = new Set(saved.map(i=>i.id));
+    const newItems = INITIAL_INVENTORY.filter(i=>!savedIds.has(i.id));
+    return newItems.length ? [...saved, ...newItems] : saved;
+  });
+  const [quotes,       setQuotes]       = useState(_saved ? (_saved.quotes||[])    : INITIAL_QUOTES);
+  const [customers,    setCustomers]    = useState(_saved ? (_saved.customers||[]) : INITIAL_CUSTOMERS);
+  const [assets,       setAssets]       = useState(_saved ? (_saved.assets||[])      : INITIAL_ASSETS);
+  const [suppliers,    setSuppliers]    = useState(_saved ? (_saved.suppliers||[])    : INITIAL_SUPPLIERS);
+  const [employees,    setEmployees]    = useState(_saved ? (_saved.employees||[])    : INITIAL_EMPLOYEES);
+  const [leaveRequests,setLeaveRequests]= useState(_saved ? (_saved.leaveRequests||[]) : INITIAL_LEAVE);
+  const [disciplinary,   setDisciplinary]   = useState(_saved ? (_saved.disciplinary||[])    : INITIAL_DISCIPLINARY);
+  const [savedCalcs,     setSavedCalcs]     = useState(_saved ? (_saved.savedCalcs||[])      : INITIAL_SAVED_CALCS);
+  const [purchaseOrders, setPurchaseOrders] = useState(_saved ? (_saved.purchaseOrders||[])  : INITIAL_PURCHASE_ORDERS);
+  const [savedImports,   setSavedImports]   = useState(_saved ? (_saved.savedImports||[])    : INITIAL_SAVED_IMPORTS);
+  const [logoDataUrl,    setLogoDataUrl]    = useState(_saved ? (_saved.logo||INITIAL_LOGO)   : INITIAL_LOGO);
+  const [utLogoDataUrl,  setUtLogoDataUrl]  = useState(_saved ? (_saved.utLogo||null)         : null);
+  const [sigOTSmit,      setSigOTSmit]      = useState(_saved ? (_saved.sigOTSmit||null)    : null);
+  const [bankTxns,         setBankTxns]         = useState(_saved ? (_saved.bankTxns||[])           : []);
+  const [chartOfAccounts,  setChartOfAccounts]  = useState(_saved ? (_saved.chartOfAccounts&&_saved.chartOfAccounts.length>5?_saved.chartOfAccounts:INITIAL_ACCOUNTS) : INITIAL_ACCOUNTS);
+  const [accInvoices,      setAccInvoices]      = useState(_saved ? (_saved.accInvoices||[])        : []);
+  const [accBills,         setAccBills]         = useState(_saved ? (_saved.accBills||[])           : []);
+  const [completeProducts, setCompleteProducts] = useState(_saved ? (_saved.completeProducts||[])  : []);
+  const [payrollRecords,   setPayrollRecords]   = useState(_saved ? (_saved.payrollRecords||[])    : []);
+  const [quickRates,       setQuickRates]       = useState(_saved ? (_saved.quickRates||[])        : INITIAL_QUICK_RATES);
+
+  // ── DATABASE-BACKED PERSISTENCE ────────────────────────────────
+  // Database (PostgreSQL via backend API) is the main source of truth.
+  // localStorage is kept only as an emergency fallback / backup.
+  // Order on startup: API → embedded defaults if empty → localStorage if API fails.
+  const apiReadyRef = useRef(false);   // true once GET /api/platform-state has been attempted successfully
+  const apiSaveTimerRef = useRef(null);
+  const [apiMsg, setApiMsg] = useState('');
+
+  // 1) Initial load from backend
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await window.loadPlatformStateFromDatabase();
+        const dbData = (result && Object.prototype.hasOwnProperty.call(result, 'data')) ? result.data : result;
+        if (cancelled) return;
+        const hasData = dbData && typeof dbData === 'object' && Object.keys(dbData).length > 0;
+        if (hasData) {
+          if (Array.isArray(dbData.jobs))             setJobs(dbData.jobs);
+          if (Array.isArray(dbData.inventory))        setInventory(dbData.inventory);
+          if (Array.isArray(dbData.quotes))           setQuotes(dbData.quotes);
+          if (Array.isArray(dbData.customers))        setCustomers(dbData.customers);
+          if (Array.isArray(dbData.suppliers))        setSuppliers(dbData.suppliers);
+          if (Array.isArray(dbData.assets))           setAssets(dbData.assets);
+          if (Array.isArray(dbData.employees))        setEmployees(dbData.employees);
+          if (Array.isArray(dbData.leaveRequests))    setLeaveRequests(dbData.leaveRequests);
+          if (Array.isArray(dbData.disciplinary))     setDisciplinary(dbData.disciplinary);
+          if (Array.isArray(dbData.savedCalcs))       setSavedCalcs(dbData.savedCalcs);
+          if (Array.isArray(dbData.purchaseOrders))   setPurchaseOrders(dbData.purchaseOrders);
+          if (Array.isArray(dbData.savedImports))     setSavedImports(dbData.savedImports);
+          if (Array.isArray(dbData.bankTxns))         setBankTxns(dbData.bankTxns);
+          if (Array.isArray(dbData.chartOfAccounts) && dbData.chartOfAccounts.length > 5) setChartOfAccounts(dbData.chartOfAccounts);
+          if (Array.isArray(dbData.accInvoices))      setAccInvoices(dbData.accInvoices);
+          if (Array.isArray(dbData.accBills))         setAccBills(dbData.accBills);
+          if (Array.isArray(dbData.completeProducts)) setCompleteProducts(dbData.completeProducts);
+          if (Array.isArray(dbData.payrollRecords))   setPayrollRecords(dbData.payrollRecords);
+          if (Array.isArray(dbData.quickRates))       setQuickRates(dbData.quickRates);
+          if (typeof dbData.logo === 'string')        setLogoDataUrl(dbData.logo);
+          if (typeof dbData.utLogo === 'string')      setUtLogoDataUrl(dbData.utLogo);
+          if (dbData.sigOTSmit)                       setSigOTSmit(dbData.sigOTSmit);
+          if (dbData.savedAt)                         setLastSaved(dbData.savedAt);
+          setApiMsg('Loaded from database');
+        } else {
+          // Empty DB → keep embedded/default data already in state.
+          setApiMsg('Database empty — using defaults');
+        }
+        apiReadyRef.current = true;   // safe to start pushing changes back to API
+      } catch (e) {
+        // API failed → fall back to whatever loadPersistedData() already provided
+        // (localStorage / sgr-data tag / INITIAL_*). Do NOT push state to API.
+        apiReadyRef.current = false;
+        setApiMsg('Offline — using local backup');
+      }
+      setTimeout(() => setApiMsg(''), 3000);
+    })();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 2) Auto-save: localStorage backup immediately + debounced PUT to backend
+  useEffect(()=>{
+    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logo:logoDataUrl, utLogo:utLogoDataUrl, sigOTSmit, savedAt:lastSaved};
+    // Backup to localStorage (safety net only — DB is source of truth)
+    try { localStorage.setItem('sgr_platform_data', JSON.stringify(snapshot)); } catch(e) {}
+    // Debounced push to backend — only after the initial API GET completed
+    if (!apiReadyRef.current) return;
+    if (apiSaveTimerRef.current) clearTimeout(apiSaveTimerRef.current);
+    apiSaveTimerRef.current = setTimeout(async () => {
+      try {
+        await window.savePlatformStateToDatabase(snapshot);
+        setApiMsg('Saved to database');
+      } catch (e) {
+        setApiMsg('Save failed — kept locally');
+      }
+      setTimeout(() => setApiMsg(''), 2500);
+    }, 800);
+  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logoDataUrl, utLogoDataUrl, sigOTSmit]);
+
+  function handleLogin(u){ setUser(u); setPage('dashboard'); setEntityFilter(null); }
+  function handleLogout(){ setUser(null); setPage('dashboard'); setEntityFilter(null); }
+  function handleEntitySelect(coId){ setEntityFilter(coId); setPage('jobs'); }
+
+  // ── Save file ──────────────────────────────────────────────
+  // Rewrites the sgr-data tag in the current HTML and downloads
+  // a new copy of this file with all current data baked in.
+  function saveFile() {
+    try {
+      const now = new Date();
+      const stamp = now.toLocaleString('en-ZA', {
+        day:'2-digit', month:'short', year:'numeric',
+        hour:'2-digit', minute:'2-digit', hour12:false
+      });
+      // Date-stamped filename so Drive folder shows version order clearly
+      const dateTag = now.toISOString().slice(0,10); // e.g. 2026-04-10
+      const payload = JSON.stringify({v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logo:logoDataUrl, utLogo:utLogoDataUrl, savedAt: stamp});
+      // outerHTML preserves the original <script type="text/babel"> source intact
+      let html = document.documentElement.outerHTML;
+      // Update (or insert) the sgr-data tag
+      if (html.includes('id="sgr-data"')) {
+        html = html.replace(
+          /<script id="sgr-data"[^>]*>[\s\S]*?<\/script>/,
+          `<script id="sgr-data" type="application\/json">${payload}<\/script>`
+        );
+      } else {
+        html = html.replace('</head>', `<script id="sgr-data" type="application\/json">${payload}<\/script>\n</head>`);
+      }
+      const blob = new Blob([html], {type:'text/html;charset=utf-8'});
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href     = url;
+      a.download = `signacore-dashboard-${dateTag}.html`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setLastSaved(stamp);
+      setSaveMsg('saved');
+      setTimeout(()=>setSaveMsg(''), 2500);
+    } catch(e) {
+      alert('Save failed: ' + e.message);
+    }
+  }
+
+  if (!user) return <LoginPage onLogin={handleLogin}/>;
+
+  const assistantBlocked = []; // imports removed from nav; assets & hr open to all roles
+  const safePage = (user.role==='assistant' && assistantBlocked.includes(page)) ? 'dashboard' : page;
+
+  const pageMap = {
+    dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={logoDataUrl}/>,
+    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates}/>,
+    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers}/>,
+    assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
+    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl}/>,
+    calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
+    purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>,
+    suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
+    inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={logoDataUrl} quickRates={quickRates} setQuickRates={setQuickRates}/>,
+    imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
+    reports:     <ReportsPage     jobs={jobs} companies={companies} user={user}/>,
+    accounting:  <AccountingPage  bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} suppliers={suppliers} customers={customers} companies={companies} user={user}/>,
+    hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={logoDataUrl} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
+  };
+
+  return (
+    <div className="flex h-screen overflow-hidden">
+      <Sidebar companies={companies} page={safePage} setPage={setPage} open={sidebarOpen} setOpen={setSidebarOpen} user={user} entityFilter={entityFilter} onEntitySelect={handleEntitySelect} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl}/>
+      {apiMsg && (
+        <div style={{
+          position:'fixed', top:'14px', right:'14px', zIndex:1000,
+          padding:'8px 14px', borderRadius:'8px',
+          background: /fail|offline/i.test(apiMsg) ? '#fee2e2' : '#dcfce7',
+          color:      /fail|offline/i.test(apiMsg) ? '#991b1b' : '#166534',
+          fontSize:'0.82rem', fontWeight:600, boxShadow:'0 4px 12px rgba(0,0,0,0.08)'
+        }}>{apiMsg}</div>
+      )}
+      <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
+        <Header page={safePage} onMenu={()=>setSidebarOpen(true)} onLogout={handleLogout} user={user} onSave={saveFile} saveMsg={saveMsg} onShare={()=>setShowShare(true)} lastSaved={lastSaved} logoDataUrl={logoDataUrl}/>
+        {showShare&&<ShareGuideModal onClose={()=>setShowShare(false)} lastSaved={lastSaved}/>}
+        <main className="flex-1 overflow-y-auto bg-gray-50 relative">
+          {safePage!=='dashboard'&&(
+            <div style={{
+              position:'fixed',bottom:'16px',right:'20px',
+              fontFamily:'Barlow Condensed,sans-serif',fontSize:'4rem',fontWeight:900,fontStyle:'italic',
+              color:'#06065c',opacity:0.035,userSelect:'none',pointerEvents:'none',
+              letterSpacing:'0.05em',lineHeight:1,zIndex:0,whiteSpace:'nowrap'
+            }}>SIGNACORE</div>
+          )}
+          {pageMap[safePage]}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+// Remove loading screen as soon as React mounts
+(function() {
+  var el = document.getElementById('sgr-loading');
+  if (el) el.remove();
+  document.body.classList.remove('loading');
+})();
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
