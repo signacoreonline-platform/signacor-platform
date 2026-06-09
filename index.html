@@ -2884,7 +2884,7 @@ function QuoteBadge({ status }) {
 /* ═══════════════════════════════════════════
    CREATE QUOTE MODAL
 ═══════════════════════════════════════════ */
-function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies, nextNum, preparedBy, customers, savedCalcs, completeProducts, existingQuote, quickRates }) {
+function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies, nextNum, preparedBy, customers, setCustomers, savedCalcs, completeProducts, existingQuote, quickRates }) {
   const eq = existingQuote;
   const today = new Date().toISOString().slice(0,10);
   const validDef = new Date(Date.now()+14*24*3600*1000).toISOString().slice(0,10);
@@ -2942,6 +2942,16 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
     return ()=>clearTimeout(t);
   }, [lines, client, contact, email, tel, address, vatNum, co, date, valid, notes, salesperson, discount, setupFee, poRef]);
 
+  const [saveAsCustomerMsg, setSaveAsCustomerMsg] = useState('');
+  function saveAsNewCustomer() {
+    if (!client.trim()) { setSaveAsCustomerMsg('⚠ Enter a company name first.'); setTimeout(()=>setSaveAsCustomerMsg(''),3000); return; }
+    const exists = customers.find(c=>c.companyName.trim().toLowerCase()===client.trim().toLowerCase());
+    if (exists) { setSaveAsCustomerMsg('ℹ Already saved as a customer.'); setTimeout(()=>setSaveAsCustomerMsg(''),3000); return; }
+    const nc = { id: Date.now()+Math.random(), companyName: client.trim(), contactPerson: contact.trim(), email: email.trim(), tel: tel.trim(), address: address.trim(), vatNumber: vatNum.trim() };
+    setCustomers(prev=>[...prev, nc]);
+    setSaveAsCustomerMsg('✓ Saved as new customer!');
+    setTimeout(()=>setSaveAsCustomerMsg(''),3000);
+  }
   function loadCustomer(id) {
     // IDs can be integers or floats (Date.now()+Math.random()), so compare as strings
     const c = customers.find(x=>String(x.id)===String(id));
@@ -3100,15 +3110,22 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
 
         {/* Client */}
         <div>
-          <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
             <p className="text-xs font-black text-gray-400 uppercase tracking-widest">Client Details</p>
-            {customers.length>0&&(
-              <select onChange={e=>loadCustomer(e.target.value)} defaultValue=""
-                className="text-xs border border-brand-200 bg-brand-50 text-brand-700 rounded-lg px-2.5 py-1.5 font-semibold focus:ring-1 focus:ring-brand-400">
-                <option value="">📂 Load saved customer…</option>
-                {customers.map(c=><option key={c.id} value={c.id}>{c.companyName}{c.contactPerson?` · ${c.contactPerson}`:''}</option>)}
-              </select>
-            )}
+            <div className="flex items-center gap-2 flex-wrap">
+              {customers.length>0&&(
+                <select onChange={e=>loadCustomer(e.target.value)} defaultValue=""
+                  className="text-xs border border-brand-200 bg-brand-50 text-brand-700 rounded-lg px-2.5 py-1.5 font-semibold focus:ring-1 focus:ring-brand-400">
+                  <option value="">📂 Load saved customer…</option>
+                  {customers.map(c=><option key={c.id} value={c.id}>{c.companyName}{c.contactPerson?` · ${c.contactPerson}`:''}</option>)}
+                </select>
+              )}
+              <button type="button" onClick={saveAsNewCustomer}
+                className="text-xs font-bold px-2.5 py-1.5 rounded-lg border border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 transition-colors">
+                ＋ Save as Customer
+              </button>
+              {saveAsCustomerMsg&&<span className="text-xs font-semibold text-emerald-600">{saveAsCustomerMsg}</span>}
+            </div>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div className="col-span-2"><label className="block text-xs font-semibold text-gray-500 mb-1">Company / Trading Name *</label>
@@ -3980,7 +3997,7 @@ function EditInvoiceForm({ job, onSave, onClose }) {
 /* ═══════════════════════════════════════════
    QUOTES PAGE
 ═══════════════════════════════════════════ */
-function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates }) {
+function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates }) {
   const [subTab,    setSubTab]    = useState('quotes'); // 'quotes' | 'invoices'
   const [showCreate,setShowCreate]=useState(false);
   const [viewQuote,setViewQuote]=useState(null);
@@ -4427,7 +4444,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         onClose={()=>setShowCreate(false)} onSave={handleSave}
         inventory={inventory} setInventory={setInventory} companies={nonUtech}
         nextNum={getNextQuoteNum(quotes)} preparedBy={user.name}
-        customers={customers||[]} savedCalcs={savedCalcs||[]}
+        customers={customers||[]} setCustomers={setCustomers}
+        savedCalcs={savedCalcs||[]}
         completeProducts={completeProducts||[]}
         quickRates={quickRates||[]}
       />}
@@ -4436,7 +4454,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         onClose={()=>setEditQuote(null)} onSave={handleSave}
         inventory={inventory} setInventory={setInventory} companies={nonUtech}
         nextNum={editQuote.num} preparedBy={user.name}
-        customers={customers||[]} savedCalcs={savedCalcs||[]}
+        customers={customers||[]} setCustomers={setCustomers}
+        savedCalcs={savedCalcs||[]}
         completeProducts={completeProducts||[]}
         quickRates={quickRates||[]}
         existingQuote={editQuote}
@@ -14171,7 +14190,7 @@ function App() {
 
   const pageMap = {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates}/>,
+    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl}/>,
@@ -14181,7 +14200,7 @@ function App() {
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={logoDataUrl} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
     reports:     <ReportsPage     jobs={jobs} companies={companies} user={user}/>,
-    accounting:  <AccountingPage  bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} suppliers={suppliers} customers={customers} companies={companies} user={user}/>,
+    accounting:  <AccountingPage jobs={jobs}  bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} suppliers={suppliers} customers={customers} companies={companies} user={user}/>,
     hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={logoDataUrl} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
   };
 
