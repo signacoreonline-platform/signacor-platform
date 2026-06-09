@@ -1637,6 +1637,9 @@ function printInvoice(job, companies, logoDataUrl) {
 '.bank{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 13px;margin-bottom:16px;clear:both;page-break-inside:avoid}'+
 '.bank .lbl{font-size:8px;font-weight:700;color:#065f46;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}'+
 '.bank table td{padding:2px 0;font-size:9.5px;color:#374151}.bank table td:first-child{color:#6b7280;width:130px}'+
+'.note-box{background:#fffbeb;border:1px solid #fde68a;border-left:3px solid #f59e0b;border-radius:0 6px 6px 0;padding:10px 14px;margin-bottom:16px;clear:both;page-break-inside:avoid}'+
+'.note-box .lbl{font-size:8px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:5px}'+
+'.note-box p{font-size:10px;color:#78350f;line-height:1.6;white-space:pre-wrap}'+
 '.foot{position:fixed;bottom:0;left:16mm;right:16mm;padding-top:5px;background:#fff}'+
 '.foot-line{height:2px;background:linear-gradient(90deg,#06065c 0%,#0000ff 60%,#ED0101 100%);margin-bottom:4px}'+
 '.foot p{font-size:8px;color:#4b5563;text-align:center;letter-spacing:0.02em}'+
@@ -1716,6 +1719,10 @@ function printInvoice(job, companies, logoDataUrl) {
 '<tr><td>Reference:</td><td>'+invNum+' / '+job.client+'</td></tr>'+
 '</tbody></table>'+
 '</div>'+
+
+(job.notes
+? '<div class="note-box no-break"><div class="lbl">Notes</div><p>'+job.notes+'</p></div>'
+: '')+
 
 '<script>window.onload=function(){window.print();}<\/script>'+
 '</body></html>';
