@@ -1706,8 +1706,6 @@ function printInvoice(job, companies, logoDataUrl) {
 '<tr class="total-row"><td>TOTAL DUE</td><td>'+fmt(total)+'</td></tr>'+
 '</table></div></div>'+
 
-'<div class="due-notice no-break"><p>&#128197; Payment due by: <strong>'+due+'</strong> &nbsp;&mdash;&nbsp; Please use <strong>'+invNum+'</strong> as your payment reference.</p></div>'+
-
 '<div class="bank no-break">'+
 '<div class="lbl">Banking Details</div>'+
 '<table><tbody>'+
@@ -1722,6 +1720,127 @@ function printInvoice(job, companies, logoDataUrl) {
 '<script>window.onload=function(){window.print();}<\/script>'+
 '</body></html>';
 
+  const w = window.open('','_blank','width=960,height=750');
+  if (!w) { alert('Pop-up blocked! Please allow pop-ups for this page.'); return; }
+  w.document.open(); w.document.write(html); w.document.close();
+}
+
+/* ═══════════════════════════════════════════
+   PRINT PROFORMA INVOICE (from quote)
+═══════════════════════════════════════════ */
+function printProformaWindow(quote, proformaNum, companies, logoDataUrl) {
+  const co = companies.find(c=>c.id===quote.co)||{name:'Signacore',short:'SGR'};
+  const lines = quote.lines||[];
+  const sub = lines.reduce((s,l)=>s+(l.subtotal||0),0);
+  const discPct = parseFloat(quote.discount)||0;
+  const discAmt = sub*(discPct/100);
+  const setupFeeAmt = parseFloat(quote.setupFee)||0;
+  const afterDisc = sub - discAmt + setupFeeAmt;
+  const vat = afterDisc*0.15;
+  const total = afterDisc+vat;
+  const fmt = n=>'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const today = new Date().toISOString().slice(0,10);
+  const due = new Date(Date.now()+30*864e5).toISOString().slice(0,10);
+  const rows = lines.map((l,i)=>(
+    '<tr><td style="width:26px;color:#4b5563;font-size:10px;">'+(i+1)+'</td>'+
+    '<td style="font-size:11px;">'+(l.desc||'—')+'</td>'+
+    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;">'+(l.qty||'')+'</td>'+
+    '<td style="width:60px;text-align:center;font-size:10px;color:#555;">'+(l.unit||'')+'</td>'+
+    '<td style="width:90px;text-align:right;font-size:10.5px;">'+(l.unitPrice?fmt(l.unitPrice):'')+'</td>'+
+    '<td style="width:100px;text-align:right;font-size:10.5px;font-weight:600;">'+fmt(l.subtotal||0)+'</td></tr>'
+  )).join('');
+  const logoHtml = logoDataUrl
+    ? '<img src="'+logoDataUrl+'" style="max-height:112px;max-width:322px;object-fit:contain;display:block;">'
+    : "<div style=\"font-family:'Barlow Condensed',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.08em;\">SIGNACORE</div>";
+  const css =
+"*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Noto Sans SC',Arial,sans-serif;font-size:11.5px;color:#1a1a1a;padding:10mm 16mm 26mm 16mm;background:#fff}"+
+".hdr{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:0}"+
+".inv-title{font-family:'Barlow Condensed',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#06065c;letter-spacing:0.05em;text-transform:uppercase;line-height:1}"+
+".inv-badge{display:inline-block;background:#7c3aed;color:#fff;font-family:'Barlow Condensed',Arial,sans-serif;font-size:0.72rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;padding:3px 12px;border-radius:20px;margin-bottom:5px}"+
+".proforma-notice{background:#faf5ff;border:1px solid #e9d5ff;border-left:3px solid #7c3aed;border-radius:0 6px 6px 0;padding:9px 13px;margin-bottom:12px;clear:both;page-break-inside:avoid}"+
+".proforma-notice p{font-size:10.5px;color:#4c1d95;font-weight:700}"+
+".qi-meta{margin-top:5px;font-size:9.5px;color:#555;text-align:right;border-collapse:collapse}"+
+".qi-meta td{padding:1.5px 5px}.qi-meta td:first-child{color:#4b5563;text-align:right}"+
+".qi-meta td strong{color:#06065c;font-weight:700}"+
+".rule{height:3px;background:linear-gradient(90deg,#06065c 0%,#0000ff 60%,#ED0101 100%);margin:8px 0 10px 0}"+
+".tagline{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}"+
+".tagline .co{font-family:'Barlow Condensed',Arial,sans-serif;font-size:0.8rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:#06065c}"+
+".tagline .reg{font-size:8px;color:#4b5563;letter-spacing:0.05em}"+
+".parties{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}"+
+".box{border-radius:6px;padding:10px 13px}.box-to{background:#f0f4ff;border:1px solid #c7d2fe;border-left:3px solid #0000ff}"+
+".box-from{background:#f8f9ff;border:1px solid #e0e7ff}"+
+".box .lbl{font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:4px;color:#4b5563}"+
+".box .nm{font-size:12.5px;font-weight:800;color:#06065c;margin-bottom:3px;font-family:'Barlow Condensed',Arial,sans-serif;letter-spacing:0.04em}"+
+".box p{font-size:9.5px;color:#555;line-height:1.55}"+
+"table.ln{width:100%;border-collapse:collapse;margin-bottom:12px}table.ln thead tr{background:#06065c}"+
+"table.ln th{color:#fff;padding:7px 9px;font-size:8px;text-transform:uppercase;letter-spacing:0.8px;text-align:left;font-weight:700}"+
+"table.ln td{padding:7px 9px;border-bottom:1px solid #f0f0f0;vertical-align:top}"+
+"table.ln tbody tr:nth-child(even) td{background:#f7f8ff}"+
+".tots-wrap{display:flex;justify-content:flex-end;margin-bottom:14px;clear:both}.tots{width:270px}"+
+".tots table{width:100%;border-collapse:collapse}.tots td{padding:4px 6px;font-size:11px;border-bottom:1px solid #f0f0f0}"+
+".tots td:last-child{text-align:right;font-weight:600}.tots .vat-row td{color:#555}"+
+".tots .total-row td{background:#06065c;color:#fff;font-size:13px;font-weight:900;border:none;padding:7px 6px;font-family:'Barlow Condensed',Arial,sans-serif;letter-spacing:0.04em}"+
+".bank{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 13px;margin-bottom:16px;clear:both}"+
+".bank .lbl{font-size:8px;font-weight:700;color:#065f46;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}"+
+".bank table td{padding:2px 0;font-size:9.5px;color:#374151}.bank table td:first-child{color:#6b7280;width:130px}"+
+".foot{position:fixed;bottom:0;left:16mm;right:16mm;padding-top:5px;background:#fff}"+
+".foot-line{height:2px;background:linear-gradient(90deg,#06065c 0%,#0000ff 60%,#ED0101 100%);margin-bottom:4px}"+
+".foot p{font-size:8px;color:#4b5563;text-align:center}"+
+"@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}.no-break{page-break-inside:avoid}}";
+  const html =
+'<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Proforma_'+proformaNum+'</title>'+
+'<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,700;0,800;1,700&family=Noto+Sans+SC:wght@400;700&display=swap" rel="stylesheet">'+
+'<style>'+css+'</style></head><body>'+
+'<div class="hdr"><div>'+logoHtml+'</div>'+
+'<div style="text-align:right"><div class="inv-badge">PROFORMA INVOICE</div>'+
+'<div class="inv-title">'+proformaNum+'</div>'+
+'<table class="qi-meta"><tbody>'+
+'<tr><td>Date Issued:</td><td><strong>'+today+'</strong></td></tr>'+
+'<tr><td>Payment Due:</td><td><strong>'+due+'</strong></td></tr>'+
+'<tr><td>Quote Ref:</td><td>'+quote.num+'</td></tr>'+
+'</tbody></table></div></div>'+
+'<div class="rule"></div>'+
+'<div class="tagline"><div>'+
+'<div class="co">Applied Graphics &amp; Visual Displays</div>'+
+'<div class="reg">Hornet Honey (Pty) Ltd t/a Signacore · Reg. No. 2022/4307/44/07 · VAT No: 4660306046</div>'+
+'</div><div style="font-size:9px;color:#ED0101;font-weight:700;font-family:\'Barlow Condensed\',sans-serif;text-transform:uppercase;letter-spacing:0.08em">Mossel Bay</div></div>'+
+'<div class="parties">'+
+'<div class="box box-to"><div class="lbl">Billed To</div><div class="nm">'+quote.client+'</div>'+
+(quote.contact?'<p>Attn: '+quote.contact+'</p>':'')+
+(quote.vatNum?'<p>VAT Reg: '+quote.vatNum+'</p>':'')+
+(quote.email?'<p>'+quote.email+'</p>':'')+
+(quote.tel?'<p>Tel: '+quote.tel+'</p>':'')+
+'</div>'+
+'<div class="box box-from"><div class="lbl">Remit To</div><div class="nm">Signacore</div>'+
+'<p>21 Voortrekker St, Mossdustria, Mossel Bay</p>'+
+'<p>Tel: 040-940-5555 · orders@snsg.co.za</p>'+
+'<p style="margin-top:4px;color:#06065c;font-weight:600">www.signacore.co.za</p>'+
+'</div></div>'+
+(rows.length>0?'<table class="ln"><thead><tr><th style="width:26px">#</th><th>Description</th>'+
+'<th style="width:55px;text-align:center">Qty</th><th style="width:60px;text-align:center">Unit</th>'+
+'<th style="width:90px;text-align:right">Rate</th><th style="width:100px;text-align:right">Total</th>'+
+'</tr></thead><tbody>'+rows+'</tbody></table>':
+'<div style="border:1px solid #e5e7eb;border-radius:6px;padding:14px;text-align:center;color:#4b5563;font-size:11px;margin-bottom:12px;">No line items.</div>')+
+'<div class="tots-wrap no-break"><div class="tots"><table>'+
+'<tr><td>Subtotal (excl. VAT)</td><td>'+fmt(sub)+'</td></tr>'+
+(discAmt>0?'<tr class="vat-row"><td>Discount ('+discPct+'%)</td><td>- '+fmt(discAmt)+'</td></tr>':'')+
+(setupFeeAmt>0?'<tr style="color:#4f46e5"><td>Design &amp; Setup Fee</td><td>+ '+fmt(setupFeeAmt)+'</td></tr>':'')+
+'<tr class="vat-row"><td>VAT (15%)</td><td>'+fmt(vat)+'</td></tr>'+
+'<tr class="total-row"><td>TOTAL DUE</td><td>'+fmt(total)+'</td></tr>'+
+'</table></div></div>'+
+'<div class="proforma-notice no-break"><p>This is a Proforma Invoice only. Payment is required before production commences. This document is not a VAT invoice. A Tax Invoice will be issued upon completion.</p></div>'+
+'<div class="bank no-break"><div class="lbl">Banking Details</div><table><tbody>'+
+'<tr><td>Bank:</td><td>Standard Bank</td></tr>'+
+'<tr><td>Account Name:</td><td>Hornet Honey trading as Signacore</td></tr>'+
+'<tr><td>Account No:</td><td>2-825-229-72</td></tr>'+
+'<tr><td>Branch Code:</td><td>051001</td></tr>'+
+'<tr><td>Reference:</td><td>'+proformaNum+' / '+quote.client+'</td></tr>'+
+'</tbody></table></div>'+
+(quote.notes?'<div style="border:1px solid #e5e7eb;border-radius:6px;padding:10px 13px;margin-bottom:12px;font-size:10px;color:#555;">'+quote.notes+'</div>':'')+
+'<div class="foot"><div class="foot-line"></div>'+
+'<p>Hornet Honey (Pty) Ltd t/a Signacore · 21 Voortrekker St, Mossdustria, Mossel Bay · 040-940-5555 · orders@snsg.co.za</p>'+
+'</div>'+
+'<script>window.onload=function(){window.print();}<\/script></body></html>';
   const w = window.open('','_blank','width=960,height=750');
   if (!w) { alert('Pop-up blocked! Please allow pop-ups for this page.'); return; }
   w.document.open(); w.document.write(html); w.document.close();
@@ -1846,10 +1965,11 @@ async function getLogoDimensions(dataUrl, maxW, maxH) {
 
 async function generateCoverLetterPdf(data, companies, logoDataUrl, type) {
   const { jsPDF } = window.jspdf;
-  const doc      = new jsPDF({ unit:'mm', format:'a4', orientation:'portrait' });
-  const isQuote  = type === 'quote';
+  const doc        = new jsPDF({ unit:'mm', format:'a4', orientation:'portrait' });
+  const isQuote    = type === 'quote';
+  const isProforma = type === 'proforma';
   const co       = companies.find(c=>c.id===data.co)||{name:'Signacore',short:'SGR'};
-  const refNum   = isQuote ? data.num : (data.invoiceNum||data.num);
+  const refNum   = isQuote ? data.num : (isProforma ? (data._proformaNum||data.num) : (data.invoiceNum||data.num));
   const contact  = data.contact||data.client||'Sir/Madam';
   const today    = new Date().toLocaleDateString('en-ZA',{day:'numeric',month:'long',year:'numeric'});
   const validity = isQuote ? (data.validUntil||'14 days from date of issue') : (data.invoiceDue||'30 days from invoice date');
@@ -1982,11 +2102,12 @@ async function generateCoverLetterPdf(data, companies, logoDataUrl, type) {
 ═══════════════════════════════════════════ */
 async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   const { jsPDF } = window.jspdf;
-  const doc     = new jsPDF({ unit:'mm', format:'a4', orientation:'portrait' });
-  const isQuote = type === 'quote';
+  const doc        = new jsPDF({ unit:'mm', format:'a4', orientation:'portrait' });
+  const isQuote    = type === 'quote';
+  const isProforma = type === 'proforma';
   const co      = companies.find(c=>c.id===data.co)||{name:'Signacore',short:'SGR'};
   const fmt     = n => 'R '+Number(n||0).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,',');
-  const refNum  = isQuote ? data.num : (data.invoiceNum||data.num);
+  const refNum  = isQuote ? data.num : (isProforma ? (data._proformaNum||data.num) : (data.invoiceNum||data.num));
   const lines   = data.lines||[];
   const sub         = lines.reduce((s,l)=>s+(l.subtotal||0),0);
   const disc        = data.discount||0;
@@ -2013,7 +2134,7 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
     doc.setFont('helvetica','bold'); doc.setFontSize(16); sc(C_RED); doc.text('SIGNACORE',LM,y+14);
   }}
   doc.setFont('helvetica','bold'); doc.setFontSize(22); sc(C_DARK);
-  doc.text(isQuote?'QUOTATION':'TAX INVOICE', RM, y+8, {align:'right'});
+  doc.text(isQuote?'QUOTATION':isProforma?'PROFORMA INVOICE':'TAX INVOICE', RM, y+8, {align:'right'});
   doc.setFont('helvetica','normal'); doc.setFontSize(8); sc(C_GREY);
   doc.text(co.short||co.name, RM, y+14, {align:'right'});
   doc.text('VAT: 4660306046  ·  040-940-5555  ·  orders@snsg.co.za', RM, y+19, {align:'right'});
@@ -2032,6 +2153,8 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   const refDate = isQuote?(data.date||today):(data.invoiceDate||today);
   const refFields = isQuote
     ? [['Quote No',refNum],['Date',refDate],['Valid Until',data.validUntil||'14 days'],['Prepared By',data.preparedBy||'Signacore']]
+    : isProforma
+    ? [['Proforma No',refNum],['Date',today],['Quote Ref',data.num||'—'],['Due Date',new Date(Date.now()+30*864e5).toISOString().slice(0,10)]]
     : [['Invoice No',refNum],['Date',refDate],['Due Date',data.invoiceDue||'30 days'],['Status',(data.invoiceStatus||'PENDING').toUpperCase()]];
   refFields.forEach((f,i)=>{
     const cx = LM+5+i*(CW/4);
@@ -2142,9 +2265,10 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
    GENERATE BOTH PDFS + BUILD + DOWNLOAD .EML
 ═══════════════════════════════════════════ */
 async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMarkSent) {
-  const isQuote  = type === 'quote';
-  const refNum   = isQuote ? data.num : (data.invoiceNum||data.num);
-  const docLabel = isQuote ? 'Quotation' : 'Tax Invoice';
+  const isQuote    = type === 'quote';
+  const isProforma = type === 'proforma';
+  const refNum   = isQuote ? data.num : (isProforma ? (data._proformaNum||data.num) : (data.invoiceNum||data.num));
+  const docLabel = isQuote ? 'Quotation' : isProforma ? 'Proforma Invoice' : 'Tax Invoice';
   const co       = companies.find(c=>c.id===data.co)||{name:'Signacore'};
 
   // Generate both PDFs in parallel
@@ -2154,8 +2278,15 @@ async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMa
   ]);
 
   const to      = data.email||'';
-  const subject = docLabel+' '+refNum+' \u2014 '+(data.client||'');
-  const body    = isQuote
+  const subject = docLabel+' '+refNum+' — '+(data.client||'');
+  const body    = isProforma
+    ? 'Dear '+(data.contact||data.client||'Sir/Madam')+',\r\n\r\n'
+      +'Thank you for approving our quotation '+data.num+'.\r\n\r\n'
+      +'Please find attached our Proforma Invoice '+refNum+' for your records. This document serves as a request for payment prior to production commencing.\r\n\r\n'
+      +'Please use '+refNum+' as your payment reference. Once payment is received, we will proceed with your order and issue a formal Tax Invoice upon completion.\r\n\r\n'
+      +'Should you have any questions, please do not hesitate to contact us.\r\n\r\n'
+      +'Kind regards,\r\n'+co.name+'\r\norders@snsg.co.za  |  040-940-5555'
+    : isQuote
     ? 'Dear '+(data.contact||data.client||'Sir/Madam')+',\r\n\r\n'
       +'Thank you for the opportunity to provide you with our services.\r\n\r\n'
       +'Please find attached our Cover Letter and '+docLabel+' '+refNum+' for your review and consideration.\r\n\r\n'
@@ -2169,10 +2300,10 @@ async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMa
 
   const emlContent = buildEmlFile(to, subject, body, [
     { filename:'Cover_Letter_'+refNum+'.pdf',                base64: coverB64 },
-    { filename:(isQuote?'Quotation_':'Invoice_')+refNum+'.pdf', base64: docB64  }
+    { filename:(isQuote?'Quotation_':isProforma?'Proforma_':'Invoice_')+refNum+'.pdf', base64: docB64  }
   ]);
 
-  downloadFile(emlContent, (isQuote?'Quote_':'Invoice_')+refNum+'.eml', 'message/rfc822');
+  downloadFile(emlContent, (isQuote?'Quote_':isProforma?'Proforma_':'Invoice_')+refNum+'.eml', 'message/rfc822');
   if (onMarkSent) onMarkSent();
 }
 
@@ -2180,9 +2311,10 @@ async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMa
    EMAIL FLOW MODAL  (single-click .eml)
 ═══════════════════════════════════════════ */
 function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSent }) {
-  const isQuote  = type === 'quote';
-  const refNum   = isQuote ? data.num : (data.invoiceNum||data.num);
-  const docLabel = isQuote ? 'Quotation' : 'Tax Invoice';
+  const isQuote    = type === 'quote';
+  const isProforma = type === 'proforma';
+  const refNum   = isQuote ? data.num : (isProforma ? (data._proformaNum||data.num) : (data.invoiceNum||data.num));
+  const docLabel = isQuote ? 'Quotation' : isProforma ? 'Proforma Invoice' : 'Tax Invoice';
   const [status, setStatus] = useState('idle'); // idle | generating | done | error
   const [errMsg, setErrMsg] = useState('');
 
@@ -3543,8 +3675,9 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
 /* ═══════════════════════════════════════════
    QUOTE VIEW MODAL
 ═══════════════════════════════════════════ */
-function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit }) {
+function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs }) {
   const [showEmailFlow, setShowEmailFlow] = useState(false);
+  const [showProformaEmail, setShowProformaEmail] = useState(false);
   const co = companies.find(c=>c.id===quote.co)||{short:'?',name:'—'};
   const sub = quote.lines.reduce((s,l)=>s+(l.subtotal||0),0);
   const disc = parseFloat(quote.discount)||0;
@@ -3736,6 +3869,18 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
               ✏️ Edit Quote
             </button>
           )}
+          {quote.status==='approved'&&(
+            <button onClick={()=>{ const pNum=getNextInvoiceNum(jobs||[]); printProformaWindow(quote,pNum,companies,logoDataUrl); }}
+              className="flex items-center gap-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded-xl px-4 py-2.5 font-bold">
+              📄 Proforma Invoice
+            </button>
+          )}
+          {quote.status==='approved'&&(
+            <button onClick={()=>setShowProformaEmail(true)}
+              className="flex items-center gap-1.5 text-xs bg-violet-100 hover:bg-violet-200 text-violet-800 rounded-xl px-4 py-2.5 font-bold border border-violet-300">
+              📧 Email Proforma
+            </button>
+          )}
           {quote.status==='approved'&&!quote.convertedJobId&&(
             <button onClick={()=>onConvertToJob(quote)}
               className="flex items-center gap-1.5 text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl px-4 py-2.5 font-bold">
@@ -3750,6 +3895,14 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
           type="quote" data={quote} companies={companies} logoDataUrl={logoDataUrl}
           onClose={()=>setShowEmailFlow(false)}
           onMarkSent={()=>{ if(!['approved','declined','converted'].includes(quote.status)) onUpdate({...quote,status:'sent'}); }}
+        />
+      )}
+      {showProformaEmail&&(
+        <EmailFlowModal
+          type="proforma" data={{...quote, _proformaNum: getNextInvoiceNum(jobs||[])}}
+          companies={companies} logoDataUrl={logoDataUrl}
+          onClose={()=>setShowProformaEmail(false)}
+          onMarkSent={()=>{}}
         />
       )}
     </Modal>
@@ -4487,6 +4640,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         onConvertToJob={handleConvertToJob}
         companies={companies} logoDataUrl={logoDataUrl}
         onEdit={handleEditQuote}
+        jobs={jobs}
       />}
       {/* ── Edit Invoice modal ── */}
       {editInvoice&&(
