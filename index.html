@@ -13663,6 +13663,19 @@ function ReportsPage({ jobs, companies, user }) {
   );
 }
 
+function ShareGuideModal({ onClose, lastSaved }) {
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center'}} onClick={onClose}>
+      <div style={{background:'white',borderRadius:'16px',padding:'28px',maxWidth:'420px',width:'90%',boxShadow:'0 20px 40px rgba(0,0,0,0.2)'}} onClick={e=>e.stopPropagation()}>
+        <h2 style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'1.6rem',fontWeight:900,color:'#06065c',marginBottom:'10px'}}>Save & Share</h2>
+        <p style={{fontSize:'0.875rem',color:'#4b5563',lineHeight:1.6}}>Use the <strong>Save</strong> button in the header to download a self-contained copy of the platform with all your current data embedded.</p>
+        {lastSaved&&<p style={{fontSize:'0.75rem',color:'#9ca3af',marginTop:'10px'}}>Last saved: {lastSaved}</p>}
+        <button onClick={onClose} style={{marginTop:'18px',width:'100%',background:'#06065c',color:'white',border:'none',borderRadius:'10px',padding:'10px 0',fontWeight:700,fontSize:'0.9rem',cursor:'pointer'}}>Close</button>
+      </div>
+    </div>
+  );
+}
+
 /* ═══════════════════════════════════════════
    ROOT APP
 ═══════════════════════════════════════════ */
@@ -13674,6 +13687,7 @@ function App() {
   const [sidebarOpen,  setSidebarOpen]  = useState(false);
   const [entityFilter, setEntityFilter] = useState(null);
   const [saveMsg,      setSaveMsg]      = useState('');
+  const [lastSaved,    setLastSaved]    = useState('');
   const [showShare,    setShowShare]    = useState(false);
   const [companies]                     = useState(INITIAL_COMPANIES);
   const [jobs,         setJobs]         = useState(_saved ? _saved.jobs      : INITIAL_JOBS);
