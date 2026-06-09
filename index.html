@@ -13925,7 +13925,10 @@ function ShareGuideModal({ onClose, lastSaved }) {
 function App() {
   const _saved = loadPersistedData();
 
-  const [user,         setUser]         = useState(null);
+  const [user,         setUser]         = useState(()=>{
+    try{const s=localStorage.getItem('sgr_user');if(s){const u=JSON.parse(s);if(u&&u.role&&u.email)return u;}}catch(e){}
+    return null;
+  });
   const [page,         setPage]         = useState('dashboard');
   const [sidebarOpen,  setSidebarOpen]  = useState(false);
   const [entityFilter, setEntityFilter] = useState(null);
@@ -14138,8 +14141,8 @@ function App() {
     }, 800);
   }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logoDataUrl, utLogoDataUrl, sigOTSmit]);
 
-  function handleLogin(u){ setUser(u); setPage('dashboard'); setEntityFilter(null); }
-  function handleLogout(){ setUser(null); setPage('dashboard'); setEntityFilter(null); }
+  function handleLogin(u){ try{localStorage.setItem('sgr_user',JSON.stringify(u));}catch(e){} setUser(u); setPage('dashboard'); setEntityFilter(null); }
+  function handleLogout(){ try{localStorage.removeItem('sgr_user');}catch(e){} setUser(null); setPage('dashboard'); setEntityFilter(null); }
   function handleEntitySelect(coId){ setEntityFilter(coId); setPage('jobs'); }
 
   // ── Save file ──────────────────────────────────────────────
