@@ -3643,24 +3643,37 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
               <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Update Status</p>
               <div className="flex flex-wrap gap-2">
                 {['draft','sent','approved','declined'].map(s=>{
+                  // Once a quote is sent, it cannot go back to draft
+                  const isDisabled = (s==='draft' && ['sent'].includes(quote.status));
                   const activeColors = {draft:'bg-gray-800 text-white border-gray-800',sent:'bg-blue-600 text-white border-blue-600',approved:'bg-green-600 text-white border-green-600',declined:'bg-red-600 text-white border-red-600'};
+                  const descriptions = {draft:'Awaiting action',sent:'Sent to client 📧',approved:'Accepted — converts to Job ✅',declined:'Client declined ❌'};
                   return (
-                    <button key={s} onClick={()=>{
-                      if(s==='approved'){
-                        if(!window.confirm('Set this quote to APPROVED? This is permanent — once approved it cannot be reversed (it will be converted to a job).')) return;
-                      }
-                      if(s==='declined'){
-                        if(!window.confirm('Set this quote to DECLINED? This is permanent and cannot be reversed.')) return;
-                      }
-                      onUpdate({...quote,status:s});
-                    }}
-                      className={`text-xs rounded-lg px-3 py-1.5 border font-semibold transition-all ${quote.status===s?(activeColors[s]||'bg-gray-800 text-white border-gray-800'):'bg-white border-gray-200 text-gray-600 hover:border-gray-400'}`}>
-                      {QUOTE_STATUS_META[s]?.label||s}
-                    </button>
+                    <div key={s} className="flex flex-col items-center gap-0.5">
+                      <button
+                        disabled={isDisabled}
+                        onClick={()=>{
+                          if(s==='approved'){
+                            if(!window.confirm('Set this quote to APPROVED? This is PERMANENT — once approved it cannot be reversed. It will be ready to convert to a Job.')) return;
+                          }
+                          if(s==='declined'){
+                            if(!window.confirm('Set this quote to DECLINED? This is PERMANENT and cannot be reversed. Are you sure?')) return;
+                          }
+                          onUpdate({...quote,status:s});
+                        }}
+                        className={`text-xs rounded-lg px-3 py-1.5 border font-semibold transition-all ${isDisabled?'opacity-30 cursor-not-allowed bg-white border-gray-200 text-gray-400':quote.status===s?(activeColors[s]||'bg-gray-800 text-white border-gray-800'):'bg-white border-gray-200 text-gray-600 hover:border-gray-400'}`}>
+                        {QUOTE_STATUS_META[s]?.label||s}
+                        {quote.status===s&&' ✓'}
+                      </button>
+                      <span className="text-[9px] text-gray-400 text-center max-w-[80px] leading-tight">{descriptions[s]}</span>
+                    </div>
                   );
                 })}
               </div>
-              <p className="text-xs text-gray-400 mt-1.5">⚠️ Approved and Declined are permanent — confirm before selecting.</p>
+              <p className="text-xs text-gray-400 mt-2">
+                {quote.status==='sent'
+                  ? '📧 Quote has been sent — status automatically set when emailed to customer.'
+                  : '⚠️ Approved and Declined are permanent. Once sent, cannot revert to Draft.'}
+              </p>
             </div>
           )
         }
@@ -3974,13 +3987,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [editQuote, setEditQuote] = useState(null);   // quote open in edit modal
   const [editInvoice, setEditInvoice] = useState(null); // job open in invoice edit modal
   const [filter,setFilter]=useState('all');
-  const [invFilter,setInvFilter]=useState('all'); // 'all' | 'paid' | 'pending'
+  const [invFilter,setInvFilter]=useState('all'); // 'all' | 'paid' | 'partial' | 'pending'
+  const [jobPayModal,setJobPayModal]=useState(null); // job being viewed in payment history modal
   const nonUtech = companies.filter(c=>c.id!==UNIONTECH_ID);
   const displayed = filter==='all' ? quotes : quotes.filter(q=>q.status===filter);
   const isAdmin = user.role === 'admin';
   // Invoices sub-tab: all jobs with an invoiceNum
   const invoicedJobs = jobs.filter(j=>j.invoiceNum).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
-  const displayedInvoices = invFilter==='all' ? invoicedJobs : invoicedJobs.filter(j=>j.invoiceStatus===invFilter);
+  const displayedInvoices = invFilter==='all' ? invoicedJobs : invoicedJobs.filter(j=>(j.invoiceStatus||'pending')===invFilter);
 
   function handleLogoUpload(e) {
     const file = e.target.files[0]; if(!file) return;
@@ -4065,6 +4079,172 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const updated={...q,status:'converted',convertedJobId:newJob.id};
     setQuotes(prev=>prev.map(qx=>qx.id===q.id?updated:qx));
     setViewQuote(updated);
+  }
+
+  // ── Job Invoice Payment History Modal ──
+  function JobPaymentHistoryModal({ job, onClose }) {
+    const invTotal = parseFloat(job.value)||0; // already incl. VAT
+    const [payments, setPayments] = useState(job.payments||[]);
+    const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+    const balance = invTotal - totalPaid;
+    const overpayment = totalPaid > invTotal ? totalPaid - invTotal : 0;
+    const [date,   setDate]   = useState(new Date().toISOString().slice(0,10));
+    const [method, setMethod] = useState('EFT');
+    const [amount, setAmount] = useState('');
+    const [notes,  setNotes]  = useState('');
+
+    function saveJob(updated) {
+      setJobs(prev=>prev.map(j=>j.id===updated.id?updated:j));
+      setJobPayModal(updated);
+    }
+    function addPayment() {
+      if(!amount||parseFloat(amount)<=0){alert('Enter a valid amount');return;}
+      const newP={id:Date.now(),date,method,amount:parseFloat(amount),notes:notes.trim()};
+      const updated=[...payments,newP];
+      const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
+      const paidAt=newTotal>=invTotal?(date||new Date().toISOString().slice(0,10)):job.paidAt||null;
+      const saved={...job,payments:updated,invoiceStatus:newStatus,paidAt};
+      setPayments(updated); saveJob(saved);
+      setAmount(''); setNotes('');
+    }
+    function deletePayment(pid) {
+      if(!isAdmin){alert('Only admins can delete payments.');return;}
+      if(!window.confirm('Delete this payment record? This may change the invoice status.'))return;
+      const updated=payments.filter(p=>p.id!==pid);
+      const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
+      const saved={...job,payments:updated,invoiceStatus:newStatus,paidAt:newTotal>=invTotal?job.paidAt:null};
+      setPayments(updated); saveJob(saved);
+    }
+    function editPayment(pid) {
+      if(!isAdmin){alert('Only admins can edit payments.');return;}
+      const p=payments.find(x=>x.id===pid); if(!p) return;
+      const newAmt=prompt('Edit amount (R):',p.amount);
+      if(newAmt===null)return;
+      const newNotes=prompt('Edit notes:',p.notes||'');
+      if(newNotes===null)return;
+      const updated=payments.map(x=>x.id===pid?{...x,amount:parseFloat(newAmt)||x.amount,notes:newNotes.trim()}:x);
+      const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
+      const paidAt=newTotal>=invTotal?job.paidAt:null;
+      const saved={...job,payments:updated,invoiceStatus:newStatus,paidAt};
+      setPayments(updated); saveJob(saved);
+    }
+    const iCls="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
+    const zr=n=>'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+    return (
+      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[92vh] overflow-y-auto">
+          <div className="px-5 py-4 flex items-center justify-between" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
+            <div>
+              <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>PAYMENT HISTORY — {job.invoiceNum}</p>
+              <p className="text-blue-200 text-xs mt-0.5">{job.client} · Due: {job.invoiceDue||'—'}</p>
+            </div>
+            <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
+          </div>
+          <div className="p-5 space-y-4">
+            {/* Summary cards */}
+            <div className="grid grid-cols-3 gap-3">
+              <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 text-center">
+                <p className="text-xs text-gray-400 mb-1">Invoice Total (incl. VAT)</p>
+                <p className="text-lg font-black" style={{color:'#06065c'}}>{zr(invTotal)}</p>
+                <p className="text-xs text-gray-400 mt-0.5">Due: {job.invoiceDue||'—'}</p>
+              </div>
+              <div className="bg-green-50 border border-green-200 rounded-xl p-3 text-center">
+                <p className="text-xs text-green-600 mb-1">Total Paid</p>
+                <p className="text-lg font-black text-green-700">{zr(totalPaid)}</p>
+                <p className="text-xs text-green-500 mt-0.5">{payments.length} payment{payments.length!==1?'s':''}</p>
+              </div>
+              {overpayment>0?(
+                <div className="bg-orange-50 border border-orange-200 rounded-xl p-3 text-center">
+                  <p className="text-xs text-orange-600 mb-1">Overpayment</p>
+                  <p className="text-lg font-black text-orange-700">{zr(overpayment)}</p>
+                  <p className="text-xs text-orange-400 mt-0.5">Refund to client</p>
+                </div>
+              ):balance>0?(
+                <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-center">
+                  <p className="text-xs text-amber-600 mb-1">Balance Due</p>
+                  <p className="text-lg font-black text-amber-700">{zr(balance)}</p>
+                  <p className="text-xs text-amber-500 mt-0.5">Remaining</p>
+                </div>
+              ):(
+                <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center">
+                  <p className="text-xs text-emerald-600 mb-1">Fully Paid ✓</p>
+                  <p className="text-lg font-black text-emerald-700">{zr(0)}</p>
+                  <p className="text-xs text-emerald-500 mt-0.5">Balance clear</p>
+                </div>
+              )}
+            </div>
+            {/* Payment history table */}
+            <div>
+              <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Payment History</p>
+              {payments.length===0?(
+                <p className="text-xs text-gray-400 italic text-center py-5 bg-gray-50 rounded-xl">No payments recorded yet.</p>
+              ):(
+                <div className="border border-gray-200 rounded-xl overflow-hidden">
+                  <table className="w-full text-xs">
+                    <thead className="bg-gray-50 border-b border-gray-100">
+                      <tr>
+                        <th className="px-3 py-2 text-left text-gray-500 font-bold">Date</th>
+                        <th className="px-3 py-2 text-left text-gray-500 font-bold">Method</th>
+                        <th className="px-3 py-2 text-right text-gray-500 font-bold">Amount</th>
+                        <th className="px-3 py-2 text-left text-gray-500 font-bold">Notes</th>
+                        <th className="w-16"/>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {payments.map(p=>(
+                        <tr key={p.id} className="border-t border-gray-100">
+                          <td className="px-3 py-2 text-gray-700">{p.date}</td>
+                          <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold">{p.method}</span></td>
+                          <td className="px-3 py-2 text-right font-bold text-green-700">{zr(p.amount)}</td>
+                          <td className="px-3 py-2 text-gray-400">{p.notes||'—'}</td>
+                          <td className="px-1 text-center">
+                            {isAdmin?(
+                              <span className="flex gap-1 justify-center">
+                                <button onClick={()=>editPayment(p.id)} className="text-blue-300 hover:text-blue-600 text-xs px-1">✏️</button>
+                                <button onClick={()=>deletePayment(p.id)} className="text-gray-300 hover:text-red-400 text-sm">✕</button>
+                              </span>
+                            ):<span className="text-gray-200 text-xs">🔒</span>}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot className="bg-gray-50 border-t border-gray-200">
+                      <tr>
+                        <td colSpan="2" className="px-3 py-2 font-black text-gray-600 text-right text-xs">Total Paid:</td>
+                        <td className="px-3 py-2 text-right font-black text-green-700">{zr(totalPaid)}</td>
+                        <td colSpan="2"/>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              )}
+            </div>
+            {/* Record payment form */}
+            <div className="border border-dashed border-green-300 rounded-xl p-4 bg-green-50/40">
+              <p className="text-xs font-black text-green-700 uppercase tracking-widest mb-3">Record New Payment</p>
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
+                <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
+                  <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>
+                    {['EFT','Cash','Card','Cheque','Other'].map(m=><option key={m}>{m}</option>)}
+                  </select>
+                </div>
+                <div><label className="text-xs font-bold text-gray-500 block mb-1">Amount (R)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} placeholder={balance>0?balance.toFixed(2):'0.00'} min="0.01" step="0.01"/></div>
+                <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes (optional)</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="Reference, partial payment, etc."/></div>
+              </div>
+              <button onClick={addPayment} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#059669'}}>＋ Record Payment</button>
+            </div>
+            {!isAdmin&&<p className="text-xs text-gray-400 text-center">🔒 Only admins can edit or delete payment records.</p>}
+            <div className="flex justify-end pt-1">
+              <button onClick={onClose} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-4 py-2 font-semibold hover:bg-gray-50">Close</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   const statusFilters=['all','draft','sent','approved','declined','converted'];
@@ -4154,7 +4334,12 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       {/* ── INVOICES SUB-TAB ── */}
       {subTab==='invoices'&&(<>
         <div className="flex gap-2 flex-wrap">
-          {[{k:'all',label:`All (${invoicedJobs.length})`},{k:'paid',label:`✓ Paid (${invoicedJobs.filter(j=>j.invoiceStatus==='paid').length})`},{k:'pending',label:`⏳ Pending (${invoicedJobs.filter(j=>j.invoiceStatus!=='paid').length})`}].map(({k,label})=>(
+          {[
+            {k:'all',    label:`All (${invoicedJobs.length})`},
+            {k:'paid',   label:`✓ Paid (${invoicedJobs.filter(j=>j.invoiceStatus==='paid').length})`},
+            {k:'partial',label:`⏳ Partial (${invoicedJobs.filter(j=>j.invoiceStatus==='partial').length})`},
+            {k:'pending',label:`🕐 Pending (${invoicedJobs.filter(j=>!j.invoiceStatus||j.invoiceStatus==='pending').length})`},
+          ].map(({k,label})=>(
             <button key={k} onClick={()=>setInvFilter(k)}
               className={`text-xs rounded-lg px-3 py-1.5 border font-semibold transition-all ${invFilter===k?'bg-gray-900 text-white border-gray-900':'bg-white border-gray-200 text-gray-500 hover:border-gray-400'}`}>
               {label}
@@ -4171,17 +4356,25 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           <div className="space-y-2">
             {displayedInvoices.map(j=>{
               const co=companies.find(c=>c.id===j.co)||{short:'?'};
-              const isPaid = j.invoiceStatus==='paid';
+              const isPaid    = j.invoiceStatus==='paid';
+              const isPartial = j.invoiceStatus==='partial';
               const hasWriteOff = !!j.writeOff;
+              const jPayments = j.payments||[];
+              const totalPaid = jPayments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+              const balance   = (j.value||0) - totalPaid;
+              const statusBadge = isPaid
+                ? 'bg-emerald-100 text-emerald-700 border-emerald-200'
+                : isPartial
+                  ? 'bg-blue-100 text-blue-700 border-blue-200'
+                  : 'bg-amber-100 text-amber-700 border-amber-200';
+              const statusLabel = isPaid ? '✓ Paid' : isPartial ? '⏳ Partial' : '🕐 Pending';
               return (
-                <div key={j.id} className="bg-white rounded-2xl border border-gray-200 p-4 flex items-center gap-4">
+                <div key={j.id} className={`bg-white rounded-2xl border p-4 flex items-center gap-4 ${isPartial?'border-blue-200':'border-gray-200'}`}>
                   <div className="w-10 h-10 bg-brand-600 rounded-xl flex items-center justify-center text-white font-black text-xs flex-shrink-0">INV</div>
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2 mb-1 flex-wrap">
                       <span className="text-xs font-black text-brand-600 font-mono">{j.invoiceNum}</span>
-                      <span className={`text-xs font-bold px-2 py-0.5 rounded-full border ${isPaid?'bg-emerald-100 text-emerald-700 border-emerald-200':'bg-amber-100 text-amber-700 border-amber-200'}`}>
-                        {isPaid?'✓ Paid':'Pending'}
-                      </span>
+                      <span className={`text-xs font-bold px-2 py-0.5 rounded-full border ${statusBadge}`}>{statusLabel}</span>
                       {hasWriteOff&&<span className={`text-xs font-bold px-2 py-0.5 rounded-full border ${j.writeOff==='warranty'?'bg-purple-100 text-purple-700 border-purple-200':'bg-orange-100 text-orange-700 border-orange-200'}`}>{j.writeOff==='warranty'?'🛡️ Warranty':'🔧 Maintenance'}</span>}
                       <span className="text-xs text-gray-400">{co.short}</span>
                     </div>
@@ -4189,13 +4382,19 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                     <p className="text-xs text-gray-400 mt-0.5">
                       Job: {j.num} · Invoice date: {j.invoiceDate||'—'} · Due: {j.invoiceDue||'—'}
                       {isPaid&&j.paidAt&&` · Paid: ${j.paidAt}`}
+                      {isPartial&&` · Paid: ${zar(totalPaid)} · Balance: ${zar(balance)}`}
                     </p>
                   </div>
                   <div className="text-right flex-shrink-0">
                     <p className="text-base font-black text-gray-900">{zar(j.value||0)}</p>
                     <p className="text-xs text-gray-400">incl. VAT</p>
+                    {isPartial&&<p className="text-xs font-bold text-blue-600 mt-0.5">Balance: {zar(balance)}</p>}
                   </div>
                   <div className="flex flex-col gap-1">
+                    <button onClick={()=>setJobPayModal(j)}
+                      className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#ecfdf5',color:'#059669'}}>
+                      💳 Payments
+                    </button>
                     {!isPaid&&(
                       <button onClick={()=>setJobs(prev=>prev.map(x=>x.id===j.id?{...x,invoiceStatus:'paid',paidAt:new Date().toISOString().slice(0,10)}:x))}
                         className="text-xs bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-3 py-1.5 rounded-xl">
@@ -4219,6 +4418,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           </div>
         )}
       </>)}
+
+      {/* ── Job Payment History Modal ── */}
+      {jobPayModal&&<JobPaymentHistoryModal job={jobPayModal} onClose={()=>setJobPayModal(null)}/>}
 
       {/* ── New Quote modal ── */}
       {showCreate&&<CreateQuoteModal
@@ -6886,19 +7088,30 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
         {isAdmin&&<KpiCard icon="💰" label="Monthly Revenue"
           value={(() => {
             const now = new Date();
-            // From jobs invoiced this month
-            const jobRev = jobs.filter(j => {
-              const d = j.paidAt ? new Date(j.paidAt) : j.invoiceDate ? new Date(j.invoiceDate) : new Date(j.id);
-              return (j.status==='invoiced'||j.paidAt) && d.getFullYear()===now.getFullYear() && d.getMonth()===now.getMonth();
-            }).reduce((s,j) => s + (j.value||0), 0);
+            const thisMonth = d => d.getFullYear()===now.getFullYear() && d.getMonth()===now.getMonth();
+            // From job payments recorded this month (supports partial)
+            const jobRev = (jobs||[]).reduce((s,j)=>{
+              const pmts = j.payments||[];
+              if(pmts.length>0){
+                // Sum individual payments made this month
+                return s + pmts.filter(p=>p.date&&thisMonth(new Date(p.date))).reduce((t,p)=>t+(parseFloat(p.amount)||0),0);
+              }
+              // Fall back: fully-paid job with paidAt this month
+              if(j.invoiceStatus==='paid'&&j.paidAt&&thisMonth(new Date(j.paidAt))) return s+(j.value||0);
+              return s;
+            },0);
             // From accounting invoices paid this month
-            const accRev = (accInvoices||[]).filter(i=>i.status==='paid'&&i.paidDate).filter(i=>{
-              const d=new Date(i.paidDate);
-              return d.getFullYear()===now.getFullYear()&&d.getMonth()===now.getMonth();
-            }).reduce((s,i)=>{
-              const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-              const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
-              return s+sub+vat;
+            const accRev = (accInvoices||[]).reduce((s,i)=>{
+              const pmts = i.payments||[];
+              if(pmts.length>0){
+                return s + pmts.filter(p=>p.date&&thisMonth(new Date(p.date))).reduce((t,p)=>t+(parseFloat(p.amount)||0),0);
+              }
+              if(i.status==='paid'&&i.paidDate&&thisMonth(new Date(i.paidDate))){
+                const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+                const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
+                return s+sub+vat;
+              }
+              return s;
             },0);
             const total = jobRev + accRev;
             return 'R ' + total.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
@@ -12106,8 +12319,13 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
     const invIncome = accInvoices.filter(i=>i.status==='paid').reduce((s,i)=>{
       return s + (i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
     },0);
-    // From job invoices (paid — jobs with paidDate or paid=true)
-    const jobIncome = (jobs||[]).filter(j=>(j.paidDate||j.paid)&&[7,8,9].includes(j.stage)).reduce((s,j)=>s+(parseFloat(j.value)||0),0);
+    // From job invoices — cash received via payments array or fully paid
+    const jobIncome = (jobs||[]).filter(j=>[7,8,9].includes(j.stage)||j.invoiceNum).reduce((s,j)=>{
+      const pmts = j.payments||[];
+      if(pmts.length>0) return s+pmts.reduce((t,p)=>t+(parseFloat(p.amount)||0),0);
+      if(j.invoiceStatus==='paid'||j.paidDate||j.paid) return s+(parseFloat(j.value)||0);
+      return s;
+    },0);
     // From bank txns
     const allocated = bankTxns.filter(t=>t.accountId);
     const bankIncome  = allocated.filter(t=>chartOfAccounts.find(a=>a.id===t.accountId)?.type==='Income').reduce((s,t)=>s+t.credit,0);
@@ -12402,15 +12620,16 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
     const STAGE_INVOICE = [7,8,9]; // Installation, Completed, Invoiced
     return (jobs||[]).filter(j=>STAGE_INVOICE.includes(j.stage)||j.invoiceNum).map(j=>{
       const val = parseFloat(j.value)||0;
-      // Determine status from job stage/status
+      // Derive status: prefer invoiceStatus on the job, then fall back to stage/paid flags
       let status = 'sent';
-      if(j.stage===9||j.status==='invoiced') status = 'sent';
-      if(j.stage===8||j.status==='completed') status = 'sent';
-      if(j.paidDate||j.paid) status = 'paid';
-      const invNum = j.invoiceNum || ('INV-' + String(j.num||'').replace(/\D/g,'').padStart(5,'0'));
+      if(j.invoiceStatus==='paid' || j.paidDate || j.paid) status = 'paid';
+      else if(j.invoiceStatus==='partial') status = 'partial';
+      else if(j.invoiceStatus==='pending') status = 'sent';
+      // Check overdue
       const invDate = j.invoiceDate || j.date || new Date().toISOString().slice(0,10);
       const dueDate = j.invoiceDue || new Date(new Date(invDate).getTime()+30*864e5).toISOString().slice(0,10);
-      const vatAmt = val * 0.15;
+      if(status!=='paid' && new Date()>new Date(dueDate)) status = (j.invoiceStatus==='partial')?'partial':'overdue';
+      const invNum = j.invoiceNum || ('INV-' + String(j.num||'').replace(/\D/g,'').padStart(5,'0'));
       return {
         id: 'job-'+j.id,
         number: invNum,
@@ -12421,7 +12640,8 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
         status: status,
         source: 'job',
         jobNum: j.num,
-        paidDate: j.paidDate||null,
+        paidDate: j.paidDate || (j.invoiceStatus==='paid'?j.paidAt:null) || null,
+        payments: j.payments||[],
         lineItems: [{
           description: j.desc || 'Signage / Production Job',
           qty: 1,
@@ -12443,7 +12663,7 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
 
   const fullPL = getFullPL();
   const debtors = getAgedDebtors(allInvoices);
-  const totalDebtors = debtors.reduce((s,d)=>s+d.total,0);
+  const totalDebtors = debtors.reduce((s,d)=>s+d.balance,0); // balance due (after partial payments)
   const totalCreditors = accBills.filter(b=>b.status!=='paid'&&b.status!=='void').reduce((s,b)=>s+(b.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0),0);
   const invStats = { total: allInvoices.length, paid: allInvoices.filter(i=>i.status==='paid').length, partial: allInvoices.filter(i=>i.status==='partial').length, outstanding: allInvoices.filter(i=>['sent','overdue','partial'].includes(i.status)).length, draft: allInvoices.filter(i=>i.status==='draft').length };
   const billStats = { total: accBills.length, paid: accBills.filter(b=>b.status==='paid').length, outstanding: accBills.filter(b=>['approved','overdue'].includes(b.status)).length };
@@ -12645,7 +12865,7 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
             </div>
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
               <p className="text-xs text-gray-400 mb-1">Outstanding (Receivable)</p>
-              <p className="text-2xl font-black text-blue-700">{fmtAmt(allInvoices.filter(i=>['sent','overdue'].includes(i.status)).reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</p>
+              <p className="text-2xl font-black text-blue-700">{fmtAmt(allInvoices.filter(i=>['sent','overdue','partial'].includes(i.status)).reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);const total=sub+vat;const paid=(i.payments||[]).reduce((t,p)=>t+(parseFloat(p.amount)||0),0);return s+(total-paid);},0))}</p>
               <p className="text-xs text-gray-400 mt-1">{invStats.outstanding} awaiting payment</p>
             </div>
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
@@ -12661,10 +12881,11 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
           </div>
 
           {/* KPI row 2 — invoice breakdown */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
             {[
               {label:'Total Invoices',   val:invStats.total,       color:'#06065c', sub:'all sources'},
               {label:'Paid',             val:invStats.paid,        color:'#059669', sub:'income confirmed'},
+              {label:'Partial',          val:invStats.partial,     color:'#f59e0b', sub:'partially paid'},
               {label:'Outstanding',      val:invStats.outstanding, color:'#2563eb', sub:'awaiting payment'},
               {label:'Draft',            val:invStats.draft,       color:'#6b7280', sub:'not yet sent'},
             ].map((k,i)=>(
@@ -12685,24 +12906,27 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
                 <p className="text-xs font-black text-gray-500 uppercase tracking-wide">Aged Debtors (Receivable)</p>
                 <button onClick={()=>setAccTab('reports')} className="text-xs text-blue-500 hover:underline">Reports →</button>
               </div>
-              <p className="text-2xl font-black text-blue-700 mb-3">{fmtAmt(allInvoices.filter(i=>['sent','overdue'].includes(i.status)).reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</p>
+              <p className="text-2xl font-black text-blue-700 mb-3">{fmtAmt(allInvoices.filter(i=>['sent','overdue','partial'].includes(i.status)).reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);const total=sub+vat;const paid=(i.payments||[]).reduce((t,p)=>t+(parseFloat(p.amount)||0),0);return s+(total-paid);},0))}</p>
               <div className="space-y-1.5">
-                {allInvoices.filter(i=>['sent','overdue'].includes(i.status)).slice(0,5).map(i=>{
+                {allInvoices.filter(i=>['sent','overdue','partial'].includes(i.status)).slice(0,5).map(i=>{
                   const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
                   const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
+                  const total=sub+vat;
+                  const paid=(i.payments||[]).reduce((t,p)=>t+(parseFloat(p.amount)||0),0);
+                  const balance=total-paid;
                   const due=new Date(i.dueDate||i.date); const days=Math.floor((new Date()-due)/(1000*60*60*24));
                   return <div key={i.id} className="flex justify-between items-center text-xs">
                     <div>
                       <span className="text-gray-700 font-semibold truncate max-w-[110px] block">{i.contactName}</span>
-                      <span className="text-gray-400">{i.number}</span>
+                      <span className="text-gray-400">{i.number}{i.status==='partial'&&<span className="ml-1 text-amber-500 font-bold">partial</span>}</span>
                     </div>
                     <div className="text-right">
-                      <span className={`font-bold block ${days>0?'text-red-600':'text-blue-600'}`}>{fmtAmt(sub+vat)}</span>
+                      <span className={`font-bold block ${days>0?'text-red-600':'text-blue-600'}`}>{fmtAmt(balance)}</span>
                       {days>0&&<span className="text-red-400 text-xs">{days}d overdue</span>}
                     </div>
                   </div>;
                 })}
-                {allInvoices.filter(i=>['sent','overdue'].includes(i.status)).length===0&&<p className="text-xs text-gray-400 italic">No outstanding invoices</p>}
+                {allInvoices.filter(i=>['sent','overdue','partial'].includes(i.status)).length===0&&<p className="text-xs text-gray-400 italic">No outstanding invoices</p>}
               </div>
             </div>
             {/* Aged Creditors */}
