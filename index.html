@@ -2251,6 +2251,11 @@ function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSen
                 <p className="text-sm font-black text-emerald-700">Email package downloaded!</p>
                 <p className="text-xs text-emerald-600 mt-1">Find the <strong>.eml file</strong> in your Downloads folder</p>
               </div>
+              <div className="bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 text-xs text-amber-800">
+                <p className="font-bold mb-0.5">📁 Recommended: Save packages to a dedicated folder</p>
+                <p className="font-mono text-amber-700">Documents\Signacore\Email Packages\</p>
+                <p className="mt-1 text-amber-700">Move each .eml file there after downloading so all invoice emails are in one place for future reference.</p>
+              </div>
               <div className="bg-blue-50 border border-blue-100 rounded-xl p-3">
                 <p className="text-xs font-bold text-blue-800 mb-1">Next steps:</p>
                 <div className="space-y-0.5">
@@ -3997,12 +4002,13 @@ function EditInvoiceForm({ job, onSave, onClose }) {
 /* ═══════════════════════════════════════════
    QUOTES PAGE
 ═══════════════════════════════════════════ */
-function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates }) {
+function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, onJobCreated }) {
   const [subTab,    setSubTab]    = useState('quotes'); // 'quotes' | 'invoices'
   const [showCreate,setShowCreate]=useState(false);
   const [viewQuote,setViewQuote]=useState(null);
   const [editQuote, setEditQuote] = useState(null);   // quote open in edit modal
   const [editInvoice, setEditInvoice] = useState(null); // job open in invoice edit modal
+  const [emailInvoiceJob, setEmailInvoiceJob] = useState(null); // job for email flow modal
   const [filter,setFilter]=useState('all');
   const [invFilter,setInvFilter]=useState('all'); // 'all' | 'paid' | 'partial' | 'pending'
   const [jobPayModal,setJobPayModal]=useState(null); // job being viewed in payment history modal
@@ -4095,7 +4101,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
 
     const updated={...q,status:'converted',convertedJobId:newJob.id};
     setQuotes(prev=>prev.map(qx=>qx.id===q.id?updated:qx));
-    setViewQuote(updated);
+    setViewQuote(null); // close the quote view
+    // Navigate directly to Jobs and open the new job
+    if(onJobCreated) onJobCreated(newJob.id);
   }
 
   // ── Job Invoice Payment History Modal ──
@@ -4428,6 +4436,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       className="text-xs bg-gray-800 hover:bg-gray-900 text-white font-bold px-3 py-1.5 rounded-xl">
                       🧾 Print
                     </button>
+                    <button onClick={()=>setEmailInvoiceJob(j)}
+                      className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#dbeafe',color:'#1e40af'}}>
+                      📧 Email
+                    </button>
                   </div>
                 </div>
               );
@@ -4438,6 +4450,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
 
       {/* ── Job Payment History Modal ── */}
       {jobPayModal&&<JobPaymentHistoryModal job={jobPayModal} onClose={()=>setJobPayModal(null)}/>}
+
+      {/* ── Email Invoice Modal ── */}
+      {emailInvoiceJob&&(
+        <EmailFlowModal
+          type="invoice" data={emailInvoiceJob} companies={companies} logoDataUrl={logoDataUrl}
+          onClose={()=>setEmailInvoiceJob(null)}
+        />
+      )}
 
       {/* ── New Quote modal ── */}
       {showCreate&&<CreateQuoteModal
@@ -7532,12 +7552,20 @@ function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl 
 const DONE_STATUSES = ['completed','invoiced'];
 const WIP_STATUSES  = STAGE_STATUSES.filter(s=>!DONE_STATUSES.includes(s));
 
-function JobsPage({ jobs, setJobs, companies, user, entityFilter, setEntityFilter, logoDataUrl }) {
+function JobsPage({ jobs, setJobs, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared }) {
   const [jobTab,       setJobTab]       = useState('active'); // 'active' | 'completed'
   const [statusFilter, setStatusFilter] = useState('all');
   const [search,       setSearch]       = useState('');
   const [detail,       setDetail]       = useState(null);
   const [showAdd,      setShowAdd]      = useState(false);
+
+  // Auto-open newly created job when navigated here from Sales
+  React.useEffect(()=>{
+    if(highlightJobId){
+      setDetail(highlightJobId);
+      if(onHighlightCleared) onHighlightCleared();
+    }
+  },[highlightJobId]);
 
   const isAdmin = user.role !== 'assistant';
   // Always exclude SGR Holdings from Jobs view
@@ -12296,6 +12324,7 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
   // Invoice state
   const [showInvModal,  setShowInvModal]  = useState(false);
   const [editInv,       setEditInv]       = useState(null);
+  const [viewInv,       setViewInv]       = useState(null); // read-only view
   const [showBillModal, setShowBillModal] = useState(false);
   const [editBill,      setEditBill]      = useState(null);
   // Payment history modal state
@@ -12304,8 +12333,11 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
   const isAdmin = user?.role !== 'assistant';
 
   function nextInvNum() {
-    const nums = accInvoices.map(i=>parseInt((i.number||'').replace(/\D/g,''))||0);
-    return 'SNS-INV-' + String((Math.max(0,...nums)+1)).padStart(4,'0');
+    // Include job invoice numbers too to avoid any cross-module overlap
+    const accNums = accInvoices.map(i=>parseInt((i.number||'').replace(/\D/g,''))||0);
+    const jobNums = (jobs||[]).map(j=>parseInt((j.invoiceNum||'').replace(/\D/g,''))||0);
+    const allNums = [...accNums, ...jobNums];
+    return 'SNS-INV-' + String((Math.max(0,...allNums)+1)).padStart(4,'0');
   }
   function nextBillNum() {
     const nums = accBills.map(b=>parseInt((b.number||'').replace(/\D/g,''))||0);
@@ -12313,6 +12345,12 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
   }
 
   function saveInvoice(inv) {
+    // Duplicate invoice number check — number must not exist on any OTHER invoice
+    const duplicate = accInvoices.find(i=>i.id!==inv.id && i.number && i.number.trim().toLowerCase()===(inv.number||'').trim().toLowerCase());
+    if(duplicate){
+      alert('⚠ Invoice number "'+inv.number+'" is already used by another invoice. Please choose a unique number.');
+      return;
+    }
     setAccInvoices(prev => prev.find(i=>i.id===inv.id) ? prev.map(i=>i.id===inv.id?inv:i) : [inv,...prev]);
     setShowInvModal(false); setEditInv(null);
   }
@@ -12445,6 +12483,70 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
     document.body.removeChild(a); URL.revokeObjectURL(url);
   }
 
+  // ── View Invoice Modal (read-only) ──
+  function ViewInvoiceModal({ inv, onClose, onEdit }) {
+    const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+    const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+    const isJob=inv.source==='job';
+    return (
+      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[95vh] overflow-y-auto">
+          <div className="px-5 py-4 flex items-center justify-between" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
+            <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>👁 VIEW INVOICE — {inv.number}</p>
+            <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
+          </div>
+          <div className="p-5 space-y-4">
+            {isJob&&<div className="bg-purple-50 border border-purple-200 rounded-xl px-4 py-2 text-xs text-purple-700 font-semibold">📋 This invoice is linked to Job {inv.jobNum} — edit it in the Jobs section.</div>}
+            <div className="grid grid-cols-2 gap-3 text-sm">
+              <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">CONTACT</span><span className="font-semibold">{inv.contactName||'—'}</span></div>
+              <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">EMAIL</span><span>{inv.contactEmail||'—'}</span></div>
+              <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">INVOICE DATE</span><span>{fmtDate(inv.date)}</span></div>
+              <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">DUE DATE</span><span>{fmtDate(inv.dueDate)}</span></div>
+              <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">REFERENCE</span><span>{inv.reference||'—'}</span></div>
+              <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">STATUS</span><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status}</span></div>
+              {inv.contactAddress&&<div className="bg-gray-50 rounded-xl p-3 col-span-2"><span className="text-xs font-bold text-gray-400 block mb-1">ADDRESS</span><span className="whitespace-pre-wrap">{inv.contactAddress}</span></div>}
+            </div>
+            <div className="border border-gray-200 rounded-xl overflow-hidden">
+              <table className="w-full text-xs">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-3 py-2 text-left text-gray-500 font-bold">Description</th>
+                    <th className="px-3 py-2 text-center text-gray-500 font-bold w-16">Qty</th>
+                    <th className="px-3 py-2 text-right text-gray-500 font-bold w-28">Unit Price</th>
+                    <th className="px-3 py-2 text-center text-gray-500 font-bold w-20">Acc Code</th>
+                    <th className="px-3 py-2 text-center text-gray-500 font-bold w-16">VAT</th>
+                    <th className="px-3 py-2 text-right text-gray-500 font-bold w-24">Amount</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(inv.lineItems||[]).map((l,i)=>(
+                    <tr key={i} className="border-t border-gray-100">
+                      <td className="px-3 py-2 text-gray-700">{l.description||'—'}</td>
+                      <td className="px-3 py-2 text-center text-gray-600">{l.qty}</td>
+                      <td className="px-3 py-2 text-right text-gray-600">{fmtAmt(parseFloat(l.unitAmount||0))}</td>
+                      <td className="px-3 py-2 text-center text-gray-400">{l.accountCode||'—'}</td>
+                      <td className="px-3 py-2 text-center text-gray-500">{l.taxType||'—'}</td>
+                      <td className="px-3 py-2 text-right font-semibold text-gray-700">{fmtAmt(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0))}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="bg-gray-50 border-t border-gray-200 px-4 py-2 flex justify-end gap-6 text-xs">
+                <span className="text-gray-500">Excl. VAT: <strong className="text-gray-800">{fmtAmt(sub)}</strong></span>
+                <span className="text-gray-500">VAT (15%): <strong className="text-blue-700">{fmtAmt(vat)}</strong></span>
+                <span className="text-gray-600 font-black text-sm">Total (incl. VAT): <span style={{color:'#06065c'}}>{fmtAmt(sub+vat)}</span></span>
+              </div>
+            </div>
+            <div className="flex gap-3 pt-1">
+              {onEdit&&<button onClick={onEdit} className="px-5 py-2.5 text-white font-bold rounded-xl text-sm" style={{background:'#06065c'}}>✏️ Edit Invoice</button>}
+              <button onClick={onClose} className="px-5 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600">Close</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // ── Invoice Modal ──
   function InvoiceModal({ inv, onSave, onClose }) {
     const isNew = !inv;
@@ -12524,9 +12626,9 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
                   </tbody>
                 </table>
                 <div className="bg-gray-50 border-t border-gray-200 px-4 py-2 flex justify-end gap-6 text-xs">
-                  <span className="text-gray-500">Subtotal: <strong className="text-gray-800">{fmtAmt(subtotal)}</strong></span>
+                  <span className="text-gray-500">Excl. VAT: <strong className="text-gray-800">{fmtAmt(subtotal)}</strong></span>
                   <span className="text-gray-500">VAT (15%): <strong className="text-blue-700">{fmtAmt(vat)}</strong></span>
-                  <span className="text-gray-600 font-black text-sm">Total: <span style={{color:'#06065c'}}>{fmtAmt(subtotal+vat)}</span></span>
+                  <span className="text-gray-600 font-black text-sm">Total (incl. VAT): <span style={{color:'#06065c'}}>{fmtAmt(subtotal+vat)}</span></span>
                 </div>
               </div>
             </div>
@@ -12856,6 +12958,7 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
       {editTxn&&<AllocationModal txn={editTxn} onSave={saveAllocation} onClose={()=>setEditTxn(null)}/>}
       {showAddAccount&&<AddAccountModal onClose={()=>setShowAddAccount(false)}/>}
       {showInvModal&&<InvoiceModal inv={editInv} onSave={saveInvoice} onClose={()=>{setShowInvModal(false);setEditInv(null);}}/>}
+      {viewInv&&<ViewInvoiceModal inv={viewInv} onClose={()=>setViewInv(null)} onEdit={viewInv.source!=='job'?()=>{setEditInv(viewInv);setShowInvModal(true);setViewInv(null);}:null}/>}
       {showBillModal&&<BillModal bill={editBill} onSave={saveBill} onClose={()=>{setShowBillModal(false);setEditBill(null);}}/>}
       {showPayModal&&payModalInv&&<PaymentHistoryModal inv={payModalInv} onClose={()=>{setShowPayModal(false);setPayModalInv(null);}}/>}
 
@@ -13112,9 +13215,9 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
                     <th className="px-4 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">Date</th>
                     <th className="px-4 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">Due</th>
                     <th className="px-4 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">Source</th>
-                    <th className="px-4 py-2.5 text-right text-xs font-bold text-gray-500 uppercase">Subtotal</th>
+                    <th className="px-4 py-2.5 text-right text-xs font-bold text-gray-500 uppercase">Excl. VAT</th>
                     <th className="px-4 py-2.5 text-right text-xs font-bold text-gray-500 uppercase">VAT</th>
-                    <th className="px-4 py-2.5 text-right text-xs font-bold text-gray-500 uppercase">Total</th>
+                    <th className="px-4 py-2.5 text-right text-xs font-bold text-gray-500 uppercase">Total (incl. VAT)</th>
                     <th className="px-4 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Status</th>
                     <th className="px-4 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Actions</th>
                   </tr>
@@ -13145,9 +13248,12 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
                         </td>
                         <td className="px-4 py-2.5 text-center">
                           {isJob?(
-                            <span className="text-xs text-gray-400 italic">Job record</span>
+                            <div className="flex items-center justify-center gap-1">
+                              <button onClick={()=>setViewInv(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f0f4ff',color:'#4338ca'}}>👁 View</button>
+                            </div>
                           ):(
                             <div className="flex items-center justify-center gap-1 flex-wrap">
+                              <button onClick={()=>setViewInv(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f0f4ff',color:'#4338ca'}}>👁 View</button>
                               <button onClick={()=>{setPayModalInv(inv);setShowPayModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#ecfdf5',color:'#059669'}}>💳 Payments</button>
                               <button onClick={()=>{setEditInv(inv);setShowInvModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#e6e6ff',color:'#06065c'}}>Edit</button>
                               {inv.status!=='paid'&&<button onClick={()=>markInvPaid(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dcfce7',color:'#059669'}}>✓ Paid</button>}
@@ -13168,9 +13274,9 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
               </table>
             </div>
             <div className="px-4 py-2 border-t border-gray-100 bg-gray-50 flex justify-end gap-6 text-xs text-gray-500">
-              <span>Subtotal: <strong className="text-gray-800">{fmtAmt(allInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),s),0))}</strong></span>
+              <span>Excl. VAT: <strong className="text-gray-800">{fmtAmt(allInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),s),0))}</strong></span>
               <span>VAT: <strong className="text-blue-600">{fmtAmt(allInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,s),0))}</strong></span>
-              <span>Total invoiced: <strong style={{color:'#06065c'}}>{fmtAmt(allInvoices.reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</strong></span>
+              <span>Total invoiced (incl. VAT): <strong style={{color:'#06065c'}}>{fmtAmt(allInvoices.reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</strong></span>
             </div>
           </div>
         </div>
@@ -13932,6 +14038,7 @@ function App() {
   const [page,         setPage]         = useState('dashboard');
   const [sidebarOpen,  setSidebarOpen]  = useState(false);
   const [entityFilter, setEntityFilter] = useState(null);
+  const [highlightJobId, setHighlightJobId] = useState(null); // navigate to specific job after creation
   const [saveMsg,      setSaveMsg]      = useState('');
   const [lastSaved,    setLastSaved]    = useState('');
   const [showShare,    setShowShare]    = useState(false);
@@ -14193,10 +14300,10 @@ function App() {
 
   const pageMap = {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates}/>,
+    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
-    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl}/>,
+    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
