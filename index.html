@@ -12741,6 +12741,9 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
     const STAGE_INVOICE = [7,8,9]; // Installation, Completed, Invoiced
     return (jobs||[]).filter(j=>STAGE_INVOICE.includes(j.stage)||j.invoiceNum).map(j=>{
       const val = parseFloat(j.value)||0;
+      // j.value is incl. VAT — convert to excl. VAT so the accounting module
+      // can correctly add 15% VAT and arrive back at the original incl. VAT total.
+      const valExVat = val > 0 ? val / 1.15 : 0;
       // Derive status: prefer invoiceStatus on the job, then fall back to stage/paid flags
       let status = 'sent';
       if(j.invoiceStatus==='paid' || j.paidDate || j.paid) status = 'paid';
@@ -12766,7 +12769,7 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
         lineItems: [{
           description: j.desc || 'Signage / Production Job',
           qty: 1,
-          unitAmount: val,
+          unitAmount: valExVat,
           accountCode: '4000',
           taxType: '15%'
         }]
