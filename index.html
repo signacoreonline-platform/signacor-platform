@@ -14512,4 +14512,50 @@ function App() {
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={logoDataUrl} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
-    reports:     <ReportsPage     jobs={jobs} companies={
+    reports:     <ReportsPage     jobs={jobs} companies={companies} user={user}/>,
+    accounting:  <AccountingPage jobs={jobs}  bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} suppliers={suppliers} customers={customers} companies={companies} user={user}/>,
+    hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={logoDataUrl} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
+  };
+
+  return (
+    <div className="flex h-screen overflow-hidden">
+      <Sidebar companies={companies} page={safePage} setPage={setPage} open={sidebarOpen} setOpen={setSidebarOpen} user={user} entityFilter={entityFilter} onEntitySelect={handleEntitySelect} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl}/>
+      {apiMsg && (
+        <div style={{
+          position:'fixed', top:'14px', right:'14px', zIndex:1000,
+          padding:'8px 14px', borderRadius:'8px',
+          background: /fail|offline/i.test(apiMsg) ? '#fee2e2' : '#dcfce7',
+          color:      /fail|offline/i.test(apiMsg) ? '#991b1b' : '#166534',
+          fontSize:'0.82rem', fontWeight:600, boxShadow:'0 4px 12px rgba(0,0,0,0.08)'
+        }}>{apiMsg}</div>
+      )}
+      <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
+        <Header page={safePage} onMenu={()=>setSidebarOpen(true)} onLogout={handleLogout} user={user} onSave={saveFile} saveMsg={saveMsg} onShare={()=>setShowShare(true)} lastSaved={lastSaved} logoDataUrl={logoDataUrl}/>
+        {showShare&&<ShareGuideModal onClose={()=>setShowShare(false)} lastSaved={lastSaved}/>}
+        <main className="flex-1 overflow-y-auto bg-gray-50 relative">
+          {safePage!=='dashboard'&&(
+            <div style={{
+              position:'fixed',bottom:'16px',right:'20px',
+              fontFamily:'Barlow Condensed,sans-serif',fontSize:'4rem',fontWeight:900,fontStyle:'italic',
+              color:'#06065c',opacity:0.035,userSelect:'none',pointerEvents:'none',
+              letterSpacing:'0.05em',lineHeight:1,zIndex:0,whiteSpace:'nowrap'
+            }}>SIGNACORE</div>
+          )}
+          {pageMap[safePage]}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+// Remove loading screen as soon as React mounts
+(function() {
+  var el = document.getElementById('sgr-loading');
+  if (el) el.remove();
+  document.body.classList.remove('loading');
+})();
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
