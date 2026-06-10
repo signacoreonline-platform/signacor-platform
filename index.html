@@ -1660,6 +1660,7 @@ function printInvoice(job, companies, logoDataUrl) {
 '<tr><td>Invoice Date:</td><td><strong>'+invDate+'</strong></td></tr>'+
 '<tr><td>Due Date:</td><td><strong>'+due+'</strong></td></tr>'+
 (job.quoteNum?'<tr><td>Quote Ref:</td><td>'+job.quoteNum+'</td></tr>':'')+
+(job.reference?'<tr><td>Reference:</td><td><strong>'+job.reference+'</strong></td></tr>':'')+
 '<tr><td>Job No:</td><td>'+job.num+'</td></tr>'+
 '</tbody></table>'+
 '</div>'+
@@ -3069,7 +3070,9 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   const [showCPPicker,   setShowCPPicker]   = useState(false);
   const [attachments,    setAttachments]    = useState(eq?.attachments||[]);
   const [poRef,          setPoRef]          = useState(_draft?.poRef??eq?.poRef??'');
+  const [reference,      setReference]      = useState(_draft?.reference??eq?.reference??'');
   const [openTypeaheadId, setOpenTypeaheadId] = useState(null);
+  const [clientSuggestions, setClientSuggestions] = useState([]);
 
   // ── Active line tracking: controls which line shows the calculator + save button ──
   const [activeLineId, setActiveLineId] = useState(()=>{
@@ -3079,12 +3082,12 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   useEffect(()=>{
     const t = setTimeout(()=>{
       try {
-        const draft = { client, contact, email, tel, address, vatNum, co, date, valid, notes, salesperson, discount, setupFee, lines, poRef, _draftAt: new Date().toISOString() };
+        const draft = { client, contact, email, tel, address, vatNum, co, date, valid, notes, salesperson, discount, setupFee, lines, poRef, reference, _draftAt: new Date().toISOString() };
         localStorage.setItem(_draftKey, JSON.stringify(draft));
       } catch(e){}
     }, 1200);
     return ()=>clearTimeout(t);
-  }, [lines, client, contact, email, tel, address, vatNum, co, date, valid, notes, salesperson, discount, setupFee, poRef]);
+  }, [lines, client, contact, email, tel, address, vatNum, co, date, valid, notes, salesperson, discount, setupFee, poRef, reference]);
 
   const [saveAsCustomerMsg, setSaveAsCustomerMsg] = useState('');
   function saveAsNewCustomer() {
@@ -3223,7 +3226,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       status: isEdit ? eq.status : 'draft',
       lines, preparedBy, salesperson, discount, setupFee,
       convertedJobId: eq?.convertedJobId||null,
-      poRef, attachments,
+      poRef, reference, attachments,
       _savedAt: new Date().toISOString(),
     });
     try { localStorage.removeItem(_draftKey); } catch(e){}
@@ -3273,7 +3276,25 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div className="col-span-2"><label className="block text-xs font-semibold text-gray-500 mb-1">Company / Trading Name *</label>
-              <input value={client} onChange={e=>setClient(e.target.value)} required className={iCls} placeholder="e.g. Woolworths (Pty) Ltd"/></div>
+              <div className="relative">
+                <input value={client}
+                  onChange={e=>{ setClient(e.target.value); const q=e.target.value.trim(); setClientSuggestions(q.length>=1?customers.filter(c=>(c.companyName||'').toLowerCase().includes(q.toLowerCase())).slice(0,8):[]); }}
+                  onBlur={()=>setTimeout(()=>setClientSuggestions([]),200)}
+                  required className={iCls} placeholder="e.g. Woolworths (Pty) Ltd" autoComplete="off"/>
+                {clientSuggestions.length>0&&(
+                  <div className="absolute z-50 left-0 right-0 top-full mt-1 bg-white border border-gray-200 rounded-xl shadow-lg max-h-52 overflow-y-auto">
+                    {clientSuggestions.map(c=>(
+                      <button key={c.id} type="button"
+                        onMouseDown={e=>e.preventDefault()}
+                        onClick={()=>{ loadCustomer(c.id); setClientSuggestions([]); }}
+                        className="w-full text-left px-3 py-2 text-sm hover:bg-brand-50 hover:text-brand-700 flex items-center gap-2 first:rounded-t-xl last:rounded-b-xl border-b border-gray-100 last:border-b-0">
+                        <span className="font-semibold text-gray-800">{c.companyName}</span>
+                        {c.contactPerson&&<span className="text-xs text-gray-400">· {c.contactPerson}</span>}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div></div>
             <div><label className="block text-xs font-semibold text-gray-500 mb-1">Contact Person</label>
               <input value={contact} onChange={e=>setContact(e.target.value)} className={iCls} placeholder="Full name"/></div>
             <div><label className="block text-xs font-semibold text-gray-500 mb-1">VAT Number</label>
@@ -3312,6 +3333,11 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                 <input value={salesperson} onChange={e=>setSalesperson(e.target.value)}
                   className={iCls+' mt-2'} placeholder="Type sales person name…" autoFocus/>
               )}
+            </div>
+            <div className="col-span-3">
+              <label className="block text-xs font-semibold text-gray-500 mb-1">🔖 Reference</label>
+              <input value={reference} onChange={e=>setReference(e.target.value)}
+                className={iCls} placeholder="e.g. PO-12345, Project Alpha, Customer ref…"/>
             </div>
           </div>
         </div>
@@ -3734,6 +3760,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
               {quote.preparedBy&&<div className="flex justify-between text-xs"><span className="text-gray-500">Prepared By</span><span className="text-gray-700">{quote.preparedBy}</span></div>}
               {quote.salesperson&&<div className="flex justify-between text-xs"><span className="text-gray-500">Sales Person</span><span className="font-semibold text-indigo-700">👤 {quote.salesperson}</span></div>}
               {quote.poRef&&<div className="flex justify-between text-xs"><span className="text-gray-500">PO Reference</span><span className="font-semibold text-gray-800">{quote.poRef}</span></div>}
+              {quote.reference&&<div className="flex justify-between text-xs"><span className="text-gray-500">Reference</span><span className="font-semibold text-orange-700">🔖 {quote.reference}</span></div>}
               <div className="flex justify-between text-xs"><span className="text-gray-500">Company</span><span className="text-gray-700">{co.name}</span></div>
             </div>
           </div>
@@ -4214,7 +4241,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       lines: q.lines, quoteNum: q.num, notes: q.notes||'',
       setupFee: q.setupFee||'', discount: q.discount||'',
       salesperson: q.salesperson||'', preparedBy: q.preparedBy||'',
-      poRef: q.poRef||'',
+      poRef: q.poRef||'', reference: q.reference||'',
       invoiceNum: invNum, invoiceDate: today, invoiceDue: dueDate, invoiceStatus: 'pending',
     };
     setJobs(prev=>[newJob,...prev]);
@@ -4498,7 +4525,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       <span className="text-xs text-gray-400">{co.short}</span>
                       {q.salesperson&&<span className="text-xs text-indigo-600 bg-indigo-50 rounded-lg px-2 py-0.5">👤 {q.salesperson}</span>}
                     </div>
-                    <p className="text-sm font-bold text-gray-800 truncate">{q.client}</p>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="text-sm font-bold text-gray-800 truncate">{q.client}</p>
+                      {q.reference&&<span className="text-xs font-semibold text-orange-700 bg-orange-50 border border-orange-200 rounded-full px-2 py-0.5 flex-shrink-0">🔖 {q.reference}</span>}
+                    </div>
                     <p className="text-xs text-gray-400 mt-0.5">
                       {q.lines.length} line item{q.lines.length!==1?'s':''} · {q.date} · Valid {q.validUntil}
                       {q.contact&&` · ${q.contact}`}
@@ -4563,7 +4593,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       {hasWriteOff&&<span className={`text-xs font-bold px-2 py-0.5 rounded-full border ${j.writeOff==='warranty'?'bg-purple-100 text-purple-700 border-purple-200':'bg-orange-100 text-orange-700 border-orange-200'}`}>{j.writeOff==='warranty'?'🛡️ Warranty':'🔧 Maintenance'}</span>}
                       <span className="text-xs text-gray-400">{co.short}</span>
                     </div>
-                    <p className="text-sm font-bold text-gray-800 truncate">{j.client}</p>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="text-sm font-bold text-gray-800 truncate">{j.client}</p>
+                      {j.reference&&<span className="text-xs font-semibold text-orange-700 bg-orange-50 border border-orange-200 rounded-full px-2 py-0.5 flex-shrink-0">🔖 {j.reference}</span>}
+                    </div>
                     <p className="text-xs text-gray-400 mt-0.5">
                       Job: {j.num} · Invoice date: {j.invoiceDate||'—'} · Due: {j.invoiceDue||'—'}
                       {isPaid&&j.paidAt&&` · Paid: ${j.paidAt}`}
@@ -4586,12 +4619,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                         ✓ Mark Paid
                       </button>
                     )}
-                    {isAdmin&&(
-                      <button onClick={()=>setEditInvoice(j)}
-                        className="text-xs bg-amber-500 hover:bg-amber-600 text-white font-bold px-3 py-1.5 rounded-xl">
-                        ✏️ Edit
-                      </button>
-                    )}
+                    <button onClick={()=>setEditInvoice(j)}
+                      className="text-xs bg-amber-500 hover:bg-amber-600 text-white font-bold px-3 py-1.5 rounded-xl">
+                      ✏️ Edit
+                    </button>
                     <button onClick={()=>printInvoice(j,companies,logoDataUrl)}
                       className="text-xs bg-gray-800 hover:bg-gray-900 text-white font-bold px-3 py-1.5 rounded-xl">
                       🧾 Print
@@ -7188,15 +7219,8 @@ function Header({ page, onMenu, onLogout, user, onSave, saveMsg, lastSaved, logo
       </button>
       {logoDataUrl&&<img src={logoDataUrl} alt="Signacore" className="h-9 object-contain hidden lg:block flex-shrink-0"/>}
       <h1 className="text-base font-bold flex-1" style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'1.1rem',letterSpacing:'0.05em',color:'#06065c',textTransform:'uppercase'}}>{titles[page]||page}</h1>
-      {lastSaved&&<span className="text-xs text-gray-400 hidden md:block">💾 {lastSaved}</span>}
       <span className="text-xs text-gray-400 hidden sm:block">{today}</span>
       {isAssistant&&<span className="hidden sm:inline-flex items-center gap-1 text-xs rounded-lg px-2 py-1 font-semibold" style={{background:'#e6e6ff',border:'1px solid #9999ff',color:'#06065c'}}>👤 {user.title}</span>}
-      {/* Save file button — available to all users */}
-      <button onClick={onSave}
-        className={`flex items-center gap-1.5 text-xs font-bold rounded-lg px-3 py-1.5 border transition-all`}
-        style={saveMsg?{background:'#10b981',color:'white',borderColor:'#10b981'}:{background:'white',color:'#06065c',borderColor:'#ccccff'}}>
-        {saveMsg?'✅ Saved!':'💾 Save'}
-      </button>
       <button onClick={onLogout} className="text-xs text-gray-500 border border-gray-200 rounded-lg px-3 py-1.5 hover:bg-gray-50">Sign Out</button>
     </header>
   );
