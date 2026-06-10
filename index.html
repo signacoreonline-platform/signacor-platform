@@ -4189,7 +4189,7 @@ function EditInvoiceForm({ job, onSave, onClose }) {
 /* ═══════════════════════════════════════════
    QUOTES PAGE
 ═══════════════════════════════════════════ */
-function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, onJobCreated }) {
+function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated }) {
   const [subTab,    setSubTab]    = useState('quotes'); // 'quotes' | 'invoices'
   const [showCreate,setShowCreate]=useState(false);
   const [viewQuote,setViewQuote]=useState(null);
@@ -4202,8 +4202,15 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const nonUtech = companies.filter(c=>c.id!==UNIONTECH_ID);
   const displayed = filter==='all' ? quotes : quotes.filter(q=>q.status===filter);
   const isAdmin = user.role === 'admin';
-  // Invoices sub-tab: all jobs with an invoiceNum
-  const invoicedJobs = jobs.filter(j=>j.invoiceNum).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
+  // Invoices sub-tab: all jobs with an invoiceNum + manual accounting invoices
+  const jobInvItems = jobs.filter(j=>j.invoiceNum).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
+  const manualInvItems = (accInvoices||[]).filter(i=>i.status!=='void').map(i=>{
+    const sub=(i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+    const vat=(i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+    const normStatus=i.status==='paid'?'paid':i.status==='partial'?'partial':'pending';
+    return {id:i.id,invoiceNum:i.number,invoiceStatus:normStatus,client:i.contactName||'',value:sub+vat,invoiceDate:i.date,invoiceDue:i.dueDate,paidAt:i.paidDate,reference:i.reference,payments:i.payments||[],num:'manual',co:null,_isManual:true};
+  }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
+  const invoicedJobs = [...jobInvItems,...manualInvItems].sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const displayedInvoices = invFilter==='all' ? invoicedJobs : invoicedJobs.filter(j=>(j.invoiceStatus||'pending')===invFilter);
 
   function handleLogoUpload(e) {
@@ -4570,7 +4577,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         ):(
           <div className="space-y-2">
             {displayedInvoices.map(j=>{
-              const co=companies.find(c=>c.id===j.co)||{short:'?'};
+              const co=j.co?(companies.find(c=>c.id===j.co)||{short:'?'}):{short:'Manual'};
               const isPaid    = j.invoiceStatus==='paid';
               const isPartial = j.invoiceStatus==='partial';
               const hasWriteOff = !!j.writeOff;
@@ -4598,7 +4605,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       {j.reference&&<span className="text-xs font-semibold text-orange-700 bg-orange-50 border border-orange-200 rounded-full px-2 py-0.5 flex-shrink-0">🔖 {j.reference}</span>}
                     </div>
                     <p className="text-xs text-gray-400 mt-0.5">
-                      Job: {j.num} · Invoice date: {j.invoiceDate||'—'} · Due: {j.invoiceDue||'—'}
+                      {j._isManual?'Manual invoice':'Job: '+j.num} · Invoice date: {j.invoiceDate||'—'} · Due: {j.invoiceDue||'—'}
                       {isPaid&&j.paidAt&&` · Paid: ${j.paidAt}`}
                       {isPartial&&` · Paid: ${zar(totalPaid)} · Balance: ${zar(balance)}`}
                     </p>
@@ -4609,28 +4616,36 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                     {isPartial&&<p className="text-xs font-bold text-blue-600 mt-0.5">Balance: {zar(balance)}</p>}
                   </div>
                   <div className="flex flex-col gap-1">
-                    <button onClick={()=>setJobPayModal(j)}
-                      className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#ecfdf5',color:'#059669'}}>
-                      💳 Payments
-                    </button>
-                    {!isPaid&&(
-                      <button onClick={()=>setJobs(prev=>prev.map(x=>x.id===j.id?{...x,invoiceStatus:'paid',paidAt:new Date().toISOString().slice(0,10)}:x))}
-                        className="text-xs bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-3 py-1.5 rounded-xl">
-                        ✓ Mark Paid
-                      </button>
+                    {j._isManual?(
+                      <span className="text-xs font-semibold px-3 py-1.5 rounded-xl text-center" style={{background:'#eff6ff',color:'#1d4ed8'}}>
+                        Manage in<br/>Accounting
+                      </span>
+                    ):(
+                      <>
+                        <button onClick={()=>setJobPayModal(j)}
+                          className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#ecfdf5',color:'#059669'}}>
+                          💳 Payments
+                        </button>
+                        {!isPaid&&(
+                          <button onClick={()=>setJobs(prev=>prev.map(x=>x.id===j.id?{...x,invoiceStatus:'paid',paidAt:new Date().toISOString().slice(0,10)}:x))}
+                            className="text-xs bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-3 py-1.5 rounded-xl">
+                            ✓ Mark Paid
+                          </button>
+                        )}
+                        <button onClick={()=>setEditInvoice(j)}
+                          className="text-xs bg-amber-500 hover:bg-amber-600 text-white font-bold px-3 py-1.5 rounded-xl">
+                          ✏️ Edit
+                        </button>
+                        <button onClick={()=>printInvoice(j,companies,logoDataUrl)}
+                          className="text-xs bg-gray-800 hover:bg-gray-900 text-white font-bold px-3 py-1.5 rounded-xl">
+                          🧾 Print
+                        </button>
+                        <button onClick={()=>setEmailInvoiceJob(j)}
+                          className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#dbeafe',color:'#1e40af'}}>
+                          📧 Email
+                        </button>
+                      </>
                     )}
-                    <button onClick={()=>setEditInvoice(j)}
-                      className="text-xs bg-amber-500 hover:bg-amber-600 text-white font-bold px-3 py-1.5 rounded-xl">
-                      ✏️ Edit
-                    </button>
-                    <button onClick={()=>printInvoice(j,companies,logoDataUrl)}
-                      className="text-xs bg-gray-800 hover:bg-gray-900 text-white font-bold px-3 py-1.5 rounded-xl">
-                      🧾 Print
-                    </button>
-                    <button onClick={()=>setEmailInvoiceJob(j)}
-                      className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#dbeafe',color:'#1e40af'}}>
-                      📧 Email
-                    </button>
                   </div>
                 </div>
               );
@@ -12518,11 +12533,11 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
   const isAdmin = user?.role !== 'assistant';
 
   function nextInvNum() {
-    // Include job invoice numbers too to avoid any cross-module overlap
+    // Use same INV-XXXXX format as job invoices, pulling max from both sources
     const accNums = accInvoices.map(i=>parseInt((i.number||'').replace(/\D/g,''))||0);
     const jobNums = (jobs||[]).map(j=>parseInt((j.invoiceNum||'').replace(/\D/g,''))||0);
     const allNums = [...accNums, ...jobNums];
-    return 'SNS-INV-' + String((Math.max(0,...allNums)+1)).padStart(4,'0');
+    return 'INV-' + String((Math.max(0,...allNums)+1)).padStart(5,'0');
   }
   function nextBillNum() {
     const nums = accBills.map(b=>parseInt((b.number||'').replace(/\D/g,''))||0);
@@ -14488,7 +14503,7 @@ function App() {
 
   const pageMap = {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }}/>,
+    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)}/>,
