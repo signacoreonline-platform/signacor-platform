@@ -3122,7 +3122,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   function saveLineAsStandardItem(line) {
     if (!setInventory) return;
     const newItem = {
-      id: 'inv_' + Date.now(),
+      id: Date.now(),
       name: line.desc.trim(),
       cat: 'General',
       unit: line.unit || 'each',
@@ -3167,7 +3167,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
         u[field]=value;
       }
       if(field==='itemId'){
-        const item=inventory.find(i=>i.id===parseInt(value));
+        const item=inventory.find(i=>String(i.id)===String(value));
         u.desc=item?item.name:''; u.unit=item?item.unit||'m²':'m²'; u.unitPrice=item?item.sell:0;
       }
       // auto-calc from dimension inputs (mm) → qty
