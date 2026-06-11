@@ -2487,10 +2487,10 @@ function StageBar({ stage }) {
   );
 }
 
-function Modal({ onClose, children, wide, xl }) {
+function Modal({ onClose, children, wide, xl, screen }) {
   return (
-    <div className="fixed inset-0 bg-black/50 modal-backdrop z-50 flex items-center justify-center p-4 overflow-y-auto" onClick={onClose}>
-      <div className={`bg-white rounded-2xl shadow-2xl w-full my-4 ${xl?'max-w-6xl':wide?'max-w-3xl':'max-w-md'}`} onClick={e=>e.stopPropagation()}>
+    <div className="fixed inset-0 bg-black/50 modal-backdrop z-50 flex items-center justify-center p-2 overflow-y-auto" onClick={onClose}>
+      <div className={`bg-white rounded-2xl shadow-2xl w-full my-4 ${screen?'max-w-[97vw]':xl?'max-w-6xl':wide?'max-w-3xl':'max-w-md'}`} onClick={e=>e.stopPropagation()}>
         {children}
       </div>
     </div>
@@ -3047,7 +3047,130 @@ function QuoteBadge({ status }) {
 /* ═══════════════════════════════════════════
    CREATE QUOTE MODAL
 ═══════════════════════════════════════════ */
-function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies, nextNum, preparedBy, customers, setCustomers, savedCalcs, completeProducts, existingQuote, quickRates }) {
+/* ═══════════════════════════════════════════
+   SAVE AS STANDARD INVENTORY ITEM — from Quote line
+═══════════════════════════════════════════ */
+function SaveAsInventoryModal({ line, inventory, setInventory, onClose, onSaved }) {
+  const DEFAULT_CATS = ['Vinyl','Laminate','Substrates','Ink & Consumables','Aluminium Profiles','Hardware & Fittings','Electrical Components','Fabric & Mesh','Paper & Board','Tools & Equipment','Signage Faces','LED Components','Packaging','Consumables','Other','General'];
+  const existingCats = [...new Set(inventory.map(i=>i.cat).filter(Boolean))];
+  const allCats = [...new Set([...DEFAULT_CATS,...existingCats])].sort();
+  const genSku = () => 'SKU-' + Date.now().toString().slice(-6);
+  const [f, setF] = React.useState({
+    sku: genSku(),
+    name: line.desc ? line.desc.trim() : '',
+    cat: 'General',
+    unit: line.unit || 'unit',
+    cost: 0,
+    sell: Number(line.unitPrice) || 0,
+    stock: 0,
+    reorder: 5,
+    supplierId: '',
+    notes: 'Added from quotation',
+    active: true,
+    _catNew: false,
+  });
+  const upd = k => e => setF(p=>({...p,[k]:e.target.value}));
+  const iCls = "w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 bg-white";
+  const lCls = "block text-xs font-semibold text-gray-500 mb-1";
+  function handleSave(e) {
+    e.preventDefault();
+    if (!f.sku.trim()) return alert('SKU is required.');
+    if (!f.name.trim()) return alert('Item name is required.');
+    const newItem = {
+      id: Date.now(),
+      sku: f.sku.trim(),
+      name: f.name.trim(),
+      cat: f.cat || 'General',
+      unit: f.unit || 'unit',
+      cost: Number(f.cost) || 0,
+      sell: Number(f.sell) || 0,
+      stock: Number(f.stock) || 0,
+      reorder: Number(f.reorder) || 5,
+      supplierId: f.supplierId || null,
+      notes: f.notes || '',
+      active: true,
+    };
+    setInventory(prev => [...prev, newItem]);
+    onSaved(line.id);
+  }
+  return (
+    <div className="fixed inset-0 bg-black/60 z-[70] flex items-center justify-center p-4" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg">
+        <div className="flex items-center justify-between px-6 py-4 border-b" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
+          <h2 className="text-white font-black text-sm tracking-wide">💾 SAVE AS STANDARD INVENTORY ITEM</h2>
+          <button type="button" onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
+        </div>
+        <form onSubmit={handleSave} className="p-6 space-y-4 overflow-y-auto max-h-[80vh]">
+          <p className="text-xs text-gray-500 bg-blue-50 border border-blue-200 rounded-xl px-3 py-2">
+            This will add the item to your <strong>Inventory</strong> as an active, usable stock item. Fill in all fields below — fields marked * are required.
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className={lCls}>SKU / Code *</label>
+              <input required className={iCls} value={f.sku} onChange={upd('sku')} placeholder="e.g. VNL-001"/>
+            </div>
+            <div>
+              <label className={lCls}>Category</label>
+              {f._catNew ? (
+                <div className="flex gap-1 items-center">
+                  <input className={iCls} value={f.cat} onChange={upd('cat')} placeholder="New category…" autoFocus/>
+                  <button type="button" onClick={()=>setF(p=>({...p,_catNew:false,cat:'General'}))} className="shrink-0 text-gray-400 hover:text-gray-600 text-lg px-1">✕</button>
+                </div>
+              ) : (
+                <select className={iCls} value={f.cat} onChange={e=>{
+                  if(e.target.value==='__new__') setF(p=>({...p,_catNew:true,cat:''}));
+                  else setF(p=>({...p,cat:e.target.value}));
+                }}>
+                  {allCats.map(c=><option key={c} value={c}>{c}</option>)}
+                  <option value="__new__">＋ Add new category…</option>
+                </select>
+              )}
+            </div>
+            <div className="col-span-2">
+              <label className={lCls}>Item Name / Description *</label>
+              <input required className={iCls} value={f.name} onChange={upd('name')} placeholder="e.g. 3M Gloss White Vinyl 1220mm"/>
+            </div>
+            <div>
+              <label className={lCls}>Unit</label>
+              <select className={iCls} value={f.unit} onChange={upd('unit')}>
+                {['unit','each','m','m²','m (linear)','sheet','roll','pack','litre','kg','box','set','hour','day'].map(u=><option key={u} value={u}>{u}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className={lCls}>Stock Qty (on hand)</label>
+              <input type="number" min="0" step="0.01" className={iCls} value={f.stock} onChange={upd('stock')}/>
+            </div>
+            <div>
+              <label className={lCls}>Reorder Level</label>
+              <input type="number" min="0" className={iCls} value={f.reorder} onChange={upd('reorder')} placeholder="e.g. 5"/>
+            </div>
+            <div>
+              <label className={lCls}>Cost Price (R excl. VAT)</label>
+              <input type="number" min="0" step="0.01" className={iCls} value={f.cost} onChange={upd('cost')} placeholder="0.00"/>
+            </div>
+            <div>
+              <label className={lCls}>Sell Price (R excl. VAT)</label>
+              <input type="number" min="0" step="0.01" className={iCls} value={f.sell} onChange={upd('sell')} placeholder="0.00"/>
+            </div>
+          </div>
+          <div>
+            <label className={lCls}>Notes</label>
+            <textarea rows={2} className={iCls+' resize-none'} value={f.notes} onChange={upd('notes')} placeholder="Optional notes about this item…"/>
+          </div>
+          <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2">
+            ✅ Item will be saved as <strong>Active</strong> and immediately available to select in future quotes.
+          </p>
+          <div className="flex gap-3 pt-1">
+            <button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Cancel</button>
+            <button type="submit" className="flex-1 text-white rounded-xl py-2.5 text-sm font-bold" style={{background:'#06065c'}}>💾 Save to Inventory</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies, nextNum, preparedBy, customers, setCustomers, savedCalcs, completeProducts, existingQuote, quickRates, initialData }) {
   const eq = existingQuote;
   const today = new Date().toISOString().slice(0,10);
   const validDef = new Date(Date.now()+14*24*3600*1000).toISOString().slice(0,10);
@@ -3071,24 +3194,25 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
     } catch(e) { return null; }
   })();
 
-  const [client,setClient]=useState(_draft?.client??eq?.client??''); const [contact,setContact]=useState(_draft?.contact??eq?.contact??'');
-  const [email,setEmail]=useState(_draft?.email??eq?.email??''); const [tel,setTel]=useState(_draft?.tel??eq?.tel??'');
-  const [address,setAddress]=useState(_draft?.address??eq?.address??''); const [vatNum,setVatNum]=useState(_draft?.vatNum??eq?.vatNum??'');
-  const [co,setCo]=useState(String(_draft?.co||eq?.co||companies[0]?.id||3));
+  const id = initialData; // copy-source (no existingQuote when copying)
+  const [client,setClient]=useState(_draft?.client??eq?.client??id?.client??''); const [contact,setContact]=useState(_draft?.contact??eq?.contact??id?.contact??'');
+  const [email,setEmail]=useState(_draft?.email??eq?.email??id?.email??''); const [tel,setTel]=useState(_draft?.tel??eq?.tel??id?.tel??'');
+  const [address,setAddress]=useState(_draft?.address??eq?.address??id?.address??''); const [vatNum,setVatNum]=useState(_draft?.vatNum??eq?.vatNum??id?.vatNum??'');
+  const [co,setCo]=useState(String(_draft?.co||eq?.co||id?.co||companies[0]?.id||3));
   const [date,setDate]=useState(_draft?.date||eq?.date||today); const [valid,setValid]=useState(_draft?.valid||eq?.validUntil||validDef);
-  const [notes,setNotes]=useState(_draft?.notes??eq?.notes??'');
-  const [salesperson,setSalesperson]=useState(_draft?.salesperson??eq?.salesperson??'');
+  const [notes,setNotes]=useState(_draft?.notes??eq?.notes??id?.notes??'');
+  const [salesperson,setSalesperson]=useState(_draft?.salesperson??eq?.salesperson??id?.salesperson??'');
   const SALESPEOPLE = ['Ockert Smit','Reinhart Smit','Janique Bettini'];
   const spDropVal = SALESPEOPLE.includes(salesperson) ? salesperson : (salesperson ? 'custom' : '');
   const UNIT_OPTIONS = ['m²','m (linear)','unit','each','set','hour','day','sheet','pack','kg'];
-  const [discount,setDiscount]=useState(_draft?.discount??eq?.discount??'');
-  const [setupFee,setSetupFee]=useState(_draft?.setupFee??eq?.setupFee??'');
-  const [lines,setLines]=useState(_draft?.lines||eq?.lines||[{id:1,itemId:null,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]);
+  const [discount,setDiscount]=useState(_draft?.discount??eq?.discount??id?.discount??'');
+  const [setupFee,setSetupFee]=useState(_draft?.setupFee??eq?.setupFee??id?.setupFee??'');
+  const [lines,setLines]=useState(_draft?.lines||eq?.lines||(id?.lines?.map(l=>({...l,id:Date.now()+Math.random(),cpLinked:false,cpId:undefined})))||[{id:1,itemId:null,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]);
   const [showCalcPicker, setShowCalcPicker] = useState(false);
   const [showCPPicker,   setShowCPPicker]   = useState(false);
   const [attachments,    setAttachments]    = useState(eq?.attachments||[]);
-  const [poRef,          setPoRef]          = useState(_draft?.poRef??eq?.poRef??'');
-  const [reference,      setReference]      = useState(_draft?.reference??eq?.reference??'');
+  const [poRef,          setPoRef]          = useState(_draft?.poRef??eq?.poRef??id?.poRef??'');
+  const [reference,      setReference]      = useState(_draft?.reference??eq?.reference??id?.reference??'');
   const [openTypeaheadId, setOpenTypeaheadId] = useState(null);
   const [clientSuggestions, setClientSuggestions] = useState([]);
 
@@ -3137,22 +3261,10 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
 
   // ── Save a custom quote line as a standard inventory item ──
   const [savedLineIds, setSavedLineIds] = useState({});
+  const [saveStdItemLine, setSaveStdItemLine] = useState(null);
   function saveLineAsStandardItem(line) {
     if (!setInventory) return;
-    const newItem = {
-      id: Date.now(),
-      name: line.desc.trim(),
-      cat: 'General',
-      unit: line.unit || 'each',
-      cost: 0,
-      sell: Number(line.unitPrice) || 0,
-      stock: 0,
-      minStock: 0,
-      supplier: '',
-      notes: 'Added from quotation',
-    };
-    setInventory(prev => [...prev, newItem]);
-    setSavedLineIds(prev => ({...prev, [line.id]: true}));
+    setSaveStdItemLine(line);
   }
   function importFromCalc(calc) {
     const newLines = calc.items.map(it=>({
@@ -3269,9 +3381,9 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   }
 
   return (
-    <Modal onClose={onClose} xl>
+    <Modal onClose={onClose} screen>
       <ModalHeader title={eq ? `✏️ Edit Quote — ${eq.num}` : `📋 New Quotation — ${nextNum}`} onClose={onClose}/>
-      <form onSubmit={submit} className="px-6 py-5 space-y-5 overflow-y-auto max-h-[90vh]">
+      <form onSubmit={submit} className="px-6 py-5 space-y-5 overflow-y-auto max-h-[92vh]">
 
         {/* Client */}
         <div>
@@ -3282,7 +3394,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                 <select onChange={e=>loadCustomer(e.target.value)} defaultValue=""
                   className="text-xs border border-brand-200 bg-brand-50 text-brand-700 rounded-lg px-2.5 py-1.5 font-semibold focus:ring-1 focus:ring-brand-400">
                   <option value="">📂 Load saved customer…</option>
-                  {customers.map(c=><option key={c.id} value={c.id}>{c.companyName}{c.contactPerson?` · ${c.contactPerson}`:''}</option>)}
+                  {[...customers].sort((a,b)=>(a.companyName||'').localeCompare(b.companyName||'')).map(c=><option key={c.id} value={c.id}>{c.companyName}{c.contactPerson?` · ${c.contactPerson}`:''}</option>)}
                 </select>
               )}
               <button type="button" onClick={saveAsNewCustomer}
@@ -3490,16 +3602,16 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                             </div>
                           </div>
                         )}
-                        {/* ── Save as standard item button — only on active line ── */}
-                        {activeLineId===line.id && !line.itemId && !line.cpLinked && line.desc && line.desc.trim().length>2 && Number(line.unitPrice)>0 && setInventory && (
+                        {/* ── Save as standard item button — shown on active line when desc is filled ── */}
+                        {activeLineId===line.id && !line.itemId && !line.cpLinked && line.desc && line.desc.trim().length>2 && setInventory && (
                           savedLineIds[line.id]
                             ? <div className="mt-1.5 flex items-center gap-1 text-xs text-green-600 font-semibold px-1">
                                 ✅ Saved to inventory
                               </div>
                             : <button type="button"
                                 onClick={()=>saveLineAsStandardItem(line)}
-                                className="mt-1.5 flex items-center gap-1 text-xs font-semibold px-2 py-1 rounded-lg border border-dashed border-brand-300 text-brand-600 hover:bg-brand-50 transition-colors">
-                                💾 Save as standard item
+                                className="mt-1.5 flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg border border-brand-400 text-brand-700 bg-brand-50 hover:bg-brand-100 transition-colors shadow-sm">
+                                💾 Save as Standard Item
                               </button>
                         )}
                       </>
@@ -3724,6 +3836,13 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
         completeProducts={completeProducts||[]}
         onAdd={lineDef=>{ addCompleteProduct(lineDef); setShowCPPicker(false); }}
         onClose={()=>setShowCPPicker(false)}
+      />}
+      {saveStdItemLine&&<SaveAsInventoryModal
+        line={saveStdItemLine}
+        inventory={inventory}
+        setInventory={setInventory}
+        onClose={()=>setSaveStdItemLine(null)}
+        onSaved={lineId=>{ setSavedLineIds(prev=>({...prev,[lineId]:true})); setSaveStdItemLine(null); }}
       />}
     </Modal>
   );
@@ -4218,6 +4337,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [showCreate,setShowCreate]=useState(false);
   const [viewQuote,setViewQuote]=useState(null);
   const [editQuote, setEditQuote] = useState(null);   // quote open in edit modal
+  const [copyQuote, setCopyQuote] = useState(null);   // quote being copied to new quote
   const [editInvoice, setEditInvoice] = useState(null); // job open in invoice edit modal
   const [emailInvoiceJob, setEmailInvoiceJob] = useState(null); // job for email flow modal
   const [filter,setFilter]=useState('all');
@@ -4569,6 +4689,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                     <p className="text-base font-black text-gray-900">{zar(total)}</p>
                     <p className="text-xs text-gray-400">incl. VAT</p>
                   </div>
+                  <button
+                    type="button"
+                    title="Copy to new quote"
+                    onClick={e=>{ e.stopPropagation(); setCopyQuote(q); }}
+                    className="flex-shrink-0 text-xs font-bold px-2.5 py-1.5 rounded-lg border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 transition-colors whitespace-nowrap">
+                    📋 Copy
+                  </button>
                   <span className="text-gray-300 text-lg group-hover:text-brand-400 transition-colors">›</span>
                 </div>
               );
@@ -4709,6 +4836,17 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         completeProducts={completeProducts||[]}
         quickRates={quickRates||[]}
         existingQuote={editQuote}
+      />}
+      {/* ── Copy Quote modal (new quote pre-filled from source) ── */}
+      {copyQuote&&<CreateQuoteModal
+        onClose={()=>setCopyQuote(null)} onSave={q=>{ handleSave(q); setCopyQuote(null); }}
+        inventory={inventory} setInventory={setInventory} companies={nonUtech}
+        nextNum={getNextQuoteNum(quotes)} preparedBy={user.name}
+        customers={customers||[]} setCustomers={setCustomers}
+        savedCalcs={savedCalcs||[]}
+        completeProducts={completeProducts||[]}
+        quickRates={quickRates||[]}
+        initialData={copyQuote}
       />}
       {/* ── View Quote modal ── */}
       {viewQuote&&<QuoteViewModal
