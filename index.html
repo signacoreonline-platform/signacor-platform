@@ -384,7 +384,7 @@ const zarK = n => 'R ' + (Number(n)/1000).toFixed(0) + 'k';
 const USERS = [
   { email:'admin@signacore.co.za',    pw:'Eunice2026!',    role:'admin',     name:'Ockert Smit',    initials:'OS', title:'Administrator'   },
   { email:'accounts@signacore.co.za', pw:'Accounts2024!',  role:'accounts',  name:'Accountant',     initials:'AC', title:'Accounts'        },
-  { email:'assist@signacore.co.za',   pw:'Assist2024!',    role:'admin',     name:'Sales Assistant', initials:'SA', title:'Sales / Quoting' },
+  { email:'assist@signacore.co.za',   pw:'Assist2024!',    role:'assistant', name:'Sales Assistant', initials:'SA', title:'Sales / Quoting' },
 ];
 // Signacore Holdings company ID — blocked for assistant role
 const UNIONTECH_ID = 1;
@@ -14384,7 +14384,15 @@ function App() {
         if (cancelled) return;
         const hasData = dbData && typeof dbData === 'object' && Object.keys(dbData).length > 0;
         if (hasData) {
-          applyServerData(dbData);
+          // Only overwrite local state when server data is not older than what we loaded
+          // from localStorage.  If the user refreshed within the 800 ms autosave debounce
+          // the server won't have their latest change yet — skipping applyServerData keeps
+          // the task alive in local state so the next autosave can push it to the server.
+          const localAt  = _saved ? (_saved._autoSavedAt || _saved.savedAt || '') : '';
+          const serverAt = dbData._autoSavedAt || dbData.savedAt || '';
+          if (!localAt || serverAt >= localAt) {
+            applyServerData(dbData);
+          }
           serverBaselineRef.current = dbData;
           setApiMsg('Loaded from database');
         } else {
