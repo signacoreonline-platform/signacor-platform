@@ -3184,12 +3184,13 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       const d = JSON.parse(raw);
       // Only use draft if it has content and (no existing quote, OR draft is newer than eq was last saved)
       if (!d || !d._draftAt) return null;
+      // Only restore a draft when EDITING an existing quote.
+      // New quotes and copy-quote always open clean (no stale draft).
+      if (!eq) return null;
       // If editing an existing quote, only use the draft if it is genuinely newer.
       // For old quotes that have no _savedAt, discard any draft to avoid stale data.
-      if (eq) {
-        if (!eq._savedAt) return null; // old quote — never load a draft over it
-        if (new Date(d._draftAt) <= new Date(eq._savedAt)) return null;
-      }
+      if (!eq._savedAt) return null; // old quote — never load a draft over it
+      if (new Date(d._draftAt) <= new Date(eq._savedAt)) return null;
       return d;
     } catch(e) { return null; }
   })();
@@ -3602,8 +3603,8 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                             </div>
                           </div>
                         )}
-                        {/* ── Save as standard item button — shown on active line when desc is filled ── */}
-                        {activeLineId===line.id && !line.itemId && !line.cpLinked && line.desc && line.desc.trim().length>2 && setInventory && (
+                        {/* ── Save as standard item button — shown on any custom line with a filled description ── */}
+                        {!line.itemId && !line.cpLinked && line.desc && line.desc.trim().length>2 && setInventory && (
                           savedLineIds[line.id]
                             ? <div className="mt-1.5 flex items-center gap-1 text-xs text-green-600 font-semibold px-1">
                                 ✅ Saved to inventory
