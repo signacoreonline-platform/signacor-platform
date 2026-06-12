@@ -1487,7 +1487,16 @@ function getNextInvoiceNum(jobs) {
 function printJobCard(job, companies) {
   const co = companies.find(c=>c.id===job.co)||{name:'Signacore',short:'SGR'};
   const lines = job.lines||[];
-  const rows = lines.map((l,i)=>'<tr><td>'+(i+1)+'</td><td>'+((l.desc||'\u2014'))+'</td><td class="c">'+l.qty+'</td><td class="c">'+(l.unit||'')+'</td></tr>').join('');
+  const rows = lines.map(function(l,i){
+    var dimStr='';
+    if(l.sqmL){
+      dimStr = l.sqmW ? l.sqmL+'m \xd7 '+l.sqmW+'m' : l.sqmL+'m';
+    }
+    var descCell = (l.desc||'\u2014') + (dimStr ? '<br><span style="font-size:9px;color:#666;">'+dimStr+'</span>' : '');
+    var qtyCell = l.qty||'';
+    var unitCell = l.unit||'';
+    return '<tr><td>'+(i+1)+'</td><td>'+descCell+'</td><td class="c">'+qtyCell+'</td><td class="c">'+unitCell+'</td></tr>';
+  }).join('');
   const stageNames=['Lead','Brief','Design','Artwork Approval','Quote Approved','Deposit Received','In Production','Installation','Complete','Invoiced'];
   const currentStage = stageNames[job.stage]||'In Progress';
   const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Job Card '+job.num+'</title>'+
@@ -7621,6 +7630,8 @@ function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl 
   const [editingNotes, setEditingNotes]=useState(false);
   const [noteDraft, setNoteDraft]=useState('');
   const [costBreakdownOpen, setCostBreakdownOpen]=useState(false);
+  const [editingLines, setEditingLines]=useState(false);
+  const [linesDraft, setLinesDraft]=useState([]);
 
   useEffect(()=>{
     if (job) setBd(job.breakdown ? {...job.breakdown} : emptyBreakdown());
@@ -7660,6 +7671,14 @@ function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl 
   function startEditNotes(){ setNoteDraft(job.notes||''); setEditingNotes(true); }
   function saveNotes(){ setJobs(prev=>prev.map(j=>j.id===job.id?{...j,notes:noteDraft.trim()}:j)); setEditingNotes(false); }
   function cancelNotes(){ setEditingNotes(false); }
+
+  // ── Scope of Work / Line Items ──
+  function startEditLines(){ setLinesDraft((job.lines||[]).map(l=>({...l, id: l.id||Date.now()+Math.random()}))); setEditingLines(true); }
+  function saveLines(){ setJobs(prev=>prev.map(j=>j.id===job.id?{...j,lines:linesDraft.filter(l=>(l.desc||'').trim())}:j)); setEditingLines(false); }
+  function cancelLines(){ setEditingLines(false); }
+  function addSowLine(){ setLinesDraft(prev=>[...prev,{id:Date.now()+Math.random(),desc:'',qty:1,unit:'',unitPrice:0,subtotal:0}]); }
+  function removeSowLine(id){ setLinesDraft(prev=>prev.filter(l=>l.id!==id)); }
+  function updateSowLine(id,key,val){ setLinesDraft(prev=>prev.map(l=>l.id===id?{...l,[key]:val}:l)); }
 
   const editTotal = bd ? breakdownTotal(bd) : 0;
 
@@ -7718,6 +7737,74 @@ function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl 
           ].map(x=><div key={x.l} className={`${x.bg} rounded-xl p-3`}><p className="text-xs text-gray-500">{x.l}</p><p className={`text-sm font-black mt-0.5 ${x.c}`}>{x.v}</p></div>)}
         </div>
         )}
+      </div>
+
+      {/* ─── SCOPE OF WORK ─── */}
+      <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+          <div>
+            <h3 className="text-sm font-bold text-gray-700">📋 Scope of Work</h3>
+            <p className="text-xs text-gray-400 mt-0.5">Work items and specifications — used on the printed job card</p>
+          </div>
+          {!editingLines
+            ? <button onClick={startEditLines} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
+                {(job.lines&&job.lines.length>0) ? '✏️ Edit' : '+ Add Items'}
+              </button>
+            : <div className="flex gap-2">
+                <button onClick={cancelLines} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-3 py-2 font-semibold hover:bg-gray-50">Cancel</button>
+                <button onClick={saveLines}   className="text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">✓ Save</button>
+              </div>
+          }
+        </div>
+        <div className="p-5">
+          {editingLines ? (
+            <div className="space-y-2">
+              {linesDraft.map((l,idx)=>(
+                <div key={l.id} className="flex gap-2 items-start">
+                  <span className="text-xs text-gray-400 w-5 pt-2.5 flex-shrink-0 text-right">{idx+1}.</span>
+                  <input value={l.desc||''} onChange={e=>updateSowLine(l.id,'desc',e.target.value)}
+                    placeholder="Description / item name"
+                    className="flex-1 border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/>
+                  <input type="number" value={l.qty||''} onChange={e=>updateSowLine(l.id,'qty',e.target.value)}
+                    placeholder="Qty" className="w-16 border border-gray-300 rounded-xl px-2 py-2 text-sm text-center focus:ring-2 focus:ring-brand-400"/>
+                  <input value={l.unit||''} onChange={e=>updateSowLine(l.id,'unit',e.target.value)}
+                    placeholder="Unit" className="w-16 border border-gray-300 rounded-xl px-2 py-2 text-sm text-center focus:ring-2 focus:ring-brand-400"/>
+                  <button onClick={()=>removeSowLine(l.id)} className="text-red-400 hover:text-red-600 text-lg font-bold pt-1 flex-shrink-0 leading-none">×</button>
+                </div>
+              ))}
+              <button onClick={addSowLine} className="mt-2 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Add line</button>
+            </div>
+          ) : (job.lines&&job.lines.length>0) ? (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-gray-100">
+                    <th className="text-left text-xs font-semibold text-gray-400 pb-2 pr-3 w-7">#</th>
+                    <th className="text-left text-xs font-semibold text-gray-400 pb-2">Description / Item</th>
+                    <th className="text-center text-xs font-semibold text-gray-400 pb-2 w-16">Qty</th>
+                    <th className="text-center text-xs font-semibold text-gray-400 pb-2 w-16">Unit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {job.lines.map((l,i)=>(
+                    <tr key={i} className={`border-b border-gray-50 ${i%2===1?'bg-gray-50/50':''}`}>
+                      <td className="py-2 pr-3 text-xs text-gray-400 text-right">{i+1}</td>
+                      <td className="py-2 text-gray-800">{l.desc||'—'}</td>
+                      <td className="py-2 text-center text-gray-600">{l.qty}</td>
+                      <td className="py-2 text-center text-gray-500 text-xs">{l.unit||''}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="text-center py-4">
+              <p className="text-gray-400 text-sm">No work items specified yet.</p>
+              <p className="text-xs text-gray-300 mt-1">Jobs converted from a quote inherit the quote's line items automatically.</p>
+              <button onClick={startEditLines} className="mt-2 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Add items manually</button>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* ─── SPECIAL NOTES ─── */}
