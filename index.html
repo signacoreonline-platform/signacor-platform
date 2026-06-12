@@ -4641,7 +4641,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
 
       {/* Sub-tabs */}
       <div className="flex gap-1 bg-gray-100 rounded-2xl p-1 w-fit">
-        {[{k:'quotes',label:'📋 Quotes'},{k:'invoices',label:'🧾 Invoices'}].map(({k,label})=>(
+        {[{k:'quotes',label:'📋 Quotes'},{k:'accepted',label:'✅ Accepted'},{k:'invoices',label:'🧾 Invoices'}].map(({k,label})=>(
           <button key={k} onClick={()=>setSubTab(k)}
             className={`text-xs font-bold px-4 py-2 rounded-xl transition-all ${subTab===k?'bg-white text-gray-900 shadow-sm':'text-gray-500 hover:text-gray-700'}`}>
             {label}
@@ -4712,6 +4712,98 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
             })}
           </div>
         )}
+      </>)}
+
+      {/* ── ACCEPTED QUOTES SUB-TAB ── */}
+      {subTab==='accepted'&&(<>
+        {(()=>{
+          const acceptedQuotes=[...quotes.filter(q=>q.status==='converted')].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
+          if(acceptedQuotes.length===0) return (
+            <div className="bg-white rounded-2xl border border-gray-200 p-12 text-center">
+              <div className="text-4xl mb-3">✅</div>
+              <p className="text-gray-500 font-semibold">No accepted quotes yet</p>
+              <p className="text-gray-400 text-xs mt-1">Quotes converted to jobs will appear here permanently for reference.</p>
+            </div>
+          );
+          return (
+            <div className="space-y-3">
+              <p className="text-xs text-gray-400">{acceptedQuotes.length} quote{acceptedQuotes.length!==1?'s':''} accepted — full details preserved for reference</p>
+              {acceptedQuotes.map(q=>{
+                const sub=q.lines.reduce((s,l)=>s+(l.subtotal||0),0);
+                const disc=parseFloat(q.discount)||0;
+                const discAmt=sub*(disc/100);
+                const setup=parseFloat(q.setupFee)||0;
+                const total=(sub-discAmt+setup)*1.15;
+                const co=companies.find(c=>c.id===q.co)||{short:'?'};
+                const linkedJob=jobs.find(j=>j.id===q.convertedJobId||j.quoteNum===q.num);
+                return (
+                  <div key={q.id} className="bg-white rounded-2xl border border-emerald-100 overflow-hidden">
+                    <div className="px-5 py-4 border-b border-emerald-50 bg-emerald-50/40 flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <div className="flex items-center gap-2 mb-1 flex-wrap">
+                          <span className="text-xs font-black text-emerald-700 font-mono">{q.num}</span>
+                          <span className="text-xs px-2 py-0.5 rounded-full font-semibold bg-emerald-100 text-emerald-700">✅ Accepted</span>
+                          <span className="text-xs text-gray-400">{co.short}</span>
+                          {q.salesperson&&<span className="text-xs text-indigo-600 bg-indigo-50 rounded-lg px-2 py-0.5">👤 {q.salesperson}</span>}
+                        </div>
+                        <p className="text-base font-black text-gray-900">{q.client}</p>
+                        {q.contact&&<p className="text-xs text-gray-500 mt-0.5">{q.contact}{q.email?' · '+q.email:''}{q.tel?' · '+q.tel:''}</p>}
+                        {q.reference&&<p className="text-xs text-orange-600 mt-0.5">🔖 {q.reference}</p>}
+                        <p className="text-xs text-gray-400 mt-1">Quoted: {q.date||'—'} · Valid: {q.validUntil||'—'}</p>
+                      </div>
+                      <div className="text-right flex-shrink-0">
+                        <p className="text-lg font-black text-gray-900">{zar(total)}</p>
+                        <p className="text-xs text-gray-400">incl. VAT</p>
+                        {linkedJob&&<p className="text-xs font-bold text-brand-600 mt-1">→ Job {linkedJob.num}</p>}
+                        {linkedJob&&<p className="text-xs text-gray-400">{STATUS_META[linkedJob.status]?.label||linkedJob.status}</p>}
+                      </div>
+                    </div>
+                    {q.lines&&q.lines.length>0&&(
+                      <div className="px-5 py-3">
+                        <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Scope of Work</p>
+                        <table className="w-full text-sm">
+                          <tbody>
+                            {q.lines.map((l,i)=>(
+                              <tr key={i} className={`border-b border-gray-50 ${i%2===1?'bg-gray-50/50':''}`}>
+                                <td className="py-1.5 pr-3 text-xs text-gray-400 text-right w-7">{i+1}</td>
+                                <td className="py-1.5 text-gray-800">{l.desc||'—'}</td>
+                                <td className="py-1.5 text-center text-gray-500 w-16">{l.qty}</td>
+                                <td className="py-1.5 text-center text-gray-400 text-xs w-16">{l.unit||''}</td>
+                                <td className="py-1.5 text-right font-semibold text-gray-700 w-24">{zar(l.subtotal||0)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        {(disc>0||setup>0)&&(
+                          <div className="mt-2 pt-2 border-t border-gray-100 text-xs text-gray-500 space-y-0.5 text-right">
+                            {disc>0&&<p>Discount {disc}%: <span className="font-semibold text-red-500">-{zar(discAmt)}</span></p>}
+                            {setup>0&&<p>Setup fee: <span className="font-semibold">{zar(setup)}</span></p>}
+                            <p className="font-black text-gray-900 text-sm">Total incl. VAT: {zar(total)}</p>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {q.notes&&(
+                      <div className="px-5 pb-3">
+                        <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Notes</p>
+                        <p className="text-xs text-gray-600 whitespace-pre-wrap">{q.notes}</p>
+                      </div>
+                    )}
+                    <div className="px-5 py-3 border-t border-gray-100 bg-gray-50/50 flex items-center gap-3 flex-wrap">
+                      <button onClick={()=>setViewQuote(q)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-brand-200 bg-brand-50 text-brand-700 hover:bg-brand-100 transition-colors">
+                        👁 View Full Quote
+                      </button>
+                      <button onClick={()=>setCopyQuote(q)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 transition-colors">
+                        📋 Copy to New Quote
+                      </button>
+                      {linkedJob&&<span className="text-xs text-gray-400 ml-auto">Job: <strong className="text-gray-700">{linkedJob.num}</strong></span>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })()}
       </>)}
 
       {/* ── INVOICES SUB-TAB ── */}
@@ -7622,7 +7714,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
 /* ═══════════════════════════════════════════
    JOB DETAIL  (with editable cost breakdown)
 ═══════════════════════════════════════════ */
-function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl }) {
+function JobDetail({ jobId, jobs, setJobs, quotes, companies, onBack, user, logoDataUrl }) {
   const [showInvoiceEmail, setShowInvoiceEmail] = useState(false);
   const job=jobs.find(j=>j.id===jobId);
   const [editingCosts, setEditingCosts]=useState(false);
@@ -7806,6 +7898,74 @@ function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl 
           )}
         </div>
       </div>
+
+      {/* ─── SOURCE QUOTE ─── */}
+      {job.quoteNum&&(()=>{
+        const srcQ=(quotes||[]).find(q=>q.num===job.quoteNum);
+        const sub=srcQ?(srcQ.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0):0;
+        const disc=srcQ?parseFloat(srcQ.discount)||0:0;
+        const discAmt=sub*(disc/100);
+        const setup=srcQ?parseFloat(srcQ.setupFee)||0:0;
+        const total=(sub-discAmt+setup)*1.15;
+        return (
+          <div className="bg-white rounded-2xl border border-brand-100 overflow-hidden">
+            <div className="px-5 py-4 border-b border-brand-50 bg-brand-50/30 flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-bold text-gray-700">📋 Source Quote: {job.quoteNum}</h3>
+                {srcQ?(
+                  <>
+                    <p className="text-xs text-gray-400 mt-0.5">Original quotation — {srcQ.date||'—'} · Valid: {srcQ.validUntil||'—'}</p>
+                    {srcQ.contact&&<p className="text-xs text-gray-500 mt-1">{srcQ.contact}{srcQ.email?' · '+srcQ.email:''}{srcQ.tel?' · '+srcQ.tel:''}</p>}
+                    {srcQ.address&&<p className="text-xs text-gray-400 mt-0.5">{srcQ.address}</p>}
+                    {srcQ.vatNum&&<p className="text-xs text-gray-400 mt-0.5">VAT: {srcQ.vatNum}</p>}
+                    {srcQ.reference&&<p className="text-xs text-orange-600 mt-0.5">🔖 Ref: {srcQ.reference}</p>}
+                    {srcQ.poRef&&<p className="text-xs text-gray-500 mt-0.5">PO: {srcQ.poRef}</p>}
+                  </>
+                ):(
+                  <p className="text-xs text-gray-400 mt-0.5">View full quote details in Sales → Accepted tab.</p>
+                )}
+              </div>
+              {srcQ&&(
+                <div className="text-right flex-shrink-0">
+                  <p className="text-base font-black text-gray-900">{zar(total)}</p>
+                  <p className="text-xs text-gray-400">incl. VAT (quoted)</p>
+                </div>
+              )}
+            </div>
+            {srcQ&&srcQ.lines&&srcQ.lines.length>0&&(
+              <div className="px-5 py-3">
+                <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Quoted Items</p>
+                <table className="w-full text-sm">
+                  <tbody>
+                    {srcQ.lines.map((l,i)=>(
+                      <tr key={i} className={`border-b border-gray-50 ${i%2===1?'bg-gray-50/50':''}`}>
+                        <td className="py-1.5 pr-3 text-xs text-gray-400 w-7 text-right">{i+1}</td>
+                        <td className="py-1.5 text-gray-800">{l.desc||'—'}</td>
+                        <td className="py-1.5 text-center text-gray-500 w-16">{l.qty}</td>
+                        <td className="py-1.5 text-center text-gray-400 text-xs w-16">{l.unit||''}</td>
+                        <td className="py-1.5 text-right font-semibold text-gray-700 w-24">{zar(l.subtotal||0)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {(disc>0||setup>0)&&(
+                  <div className="mt-2 pt-2 border-t border-gray-100 text-xs text-gray-500 space-y-0.5 text-right">
+                    {disc>0&&<p>Discount {disc}%: <span className="font-semibold text-red-500">-{zar(discAmt)}</span></p>}
+                    {setup>0&&<p>Setup fee: <span className="font-semibold">{zar(setup)}</span></p>}
+                    <p className="font-black text-gray-900 text-sm">Total incl. VAT: {zar(total)}</p>
+                  </div>
+                )}
+              </div>
+            )}
+            {srcQ&&srcQ.notes&&(
+              <div className="px-5 pb-3">
+                <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Quote Notes</p>
+                <p className="text-xs text-gray-600 whitespace-pre-wrap">{srcQ.notes}</p>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* ─── SPECIAL NOTES ─── */}
       <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
@@ -8002,7 +8162,7 @@ function JobDetail({ jobId, jobs, setJobs, companies, onBack, user, logoDataUrl 
 const DONE_STATUSES = ['completed','invoiced'];
 const WIP_STATUSES  = STAGE_STATUSES.filter(s=>!DONE_STATUSES.includes(s));
 
-function JobsPage({ jobs, setJobs, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared }) {
+function JobsPage({ jobs, setJobs, quotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared }) {
   const [jobTab,       setJobTab]       = useState('active'); // 'active' | 'completed'
   const [statusFilter, setStatusFilter] = useState('all');
   const [search,       setSearch]       = useState('');
@@ -8042,7 +8202,7 @@ function JobsPage({ jobs, setJobs, companies, user, entityFilter, setEntityFilte
   const completedCount = visibleJobs.filter(j=> DONE_STATUSES.includes(j.status)).length;
   const statusOpts     = jobTab==='active' ? WIP_STATUSES : DONE_STATUSES;
 
-  if(detail!==null) return <JobDetail jobId={detail} jobs={jobs} setJobs={setJobs} companies={companies} onBack={()=>setDetail(null)} user={user} logoDataUrl={logoDataUrl}/>;
+  if(detail!==null) return <JobDetail jobId={detail} jobs={jobs} setJobs={setJobs} quotes={quotes} companies={companies} onBack={()=>setDetail(null)} user={user} logoDataUrl={logoDataUrl}/>;
 
   return (
     <div className="p-4 space-y-4">
@@ -14764,7 +14924,7 @@ function App() {
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
-    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)}/>,
+    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
