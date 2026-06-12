@@ -14777,7 +14777,31 @@ function App() {
           const localAt  = _saved ? (_saved._autoSavedAt || _saved.savedAt || '') : '';
           const serverAt = dbData._autoSavedAt || dbData.savedAt || '';
           if (!localAt || serverAt >= localAt) {
-            applyServerData(dbData);
+            // Guard against the race where a user adds a customer/employee entry WHILE
+            // the initial GET is in flight.  currentSnapshotRef tracks live state; _saved
+            // is the startup snapshot.  If they differ the user made changes during the
+            // load window — do a selective merge (same logic as the 30 s poll) instead of
+            // a full overwrite, so freshly-added entries are never silently discarded.
+            const current       = currentSnapshotRef.current;
+            const startSnapshot = _saved;
+            if (current && startSnapshot) {
+              const changedLocally   = locallyChangedSections(current, startSnapshot);
+              const hasLocalChanges  = changedLocally && Object.values(changedLocally).some(Boolean);
+              if (hasLocalChanges) {
+                const selective = {};
+                for (const k of STATE_SECTIONS) {
+                  if (!changedLocally[k] && Array.isArray(dbData[k])) selective[k] = dbData[k];
+                }
+                if (!changedLocally.logo      && typeof dbData.logo === 'string')  selective.logo      = dbData.logo;
+                if (!changedLocally.utLogo    && typeof dbData.utLogo === 'string') selective.utLogo    = dbData.utLogo;
+                if (!changedLocally.sigOTSmit && dbData.sigOTSmit)                  selective.sigOTSmit = dbData.sigOTSmit;
+                applyServerData(selective);
+              } else {
+                applyServerData(dbData);
+              }
+            } else {
+              applyServerData(dbData);
+            }
           }
           serverBaselineRef.current = dbData;
           setApiMsg('Loaded from database');
@@ -14785,6 +14809,39 @@ function App() {
           setApiMsg('Database empty — using defaults');
         }
         apiReadyRef.current = true;
+        // Flush any save that was queued before apiReady became true.
+        // Covers entries added during the server-load window whose auto-save
+        // was blocked by the apiReadyRef guard and never retried.
+        if (apiSaveTimerRef.current) clearTimeout(apiSaveTimerRef.current);
+        apiSaveTimerRef.current = setTimeout(async () => {
+          const snapshot = currentSnapshotRef.current;
+          if (!snapshot) return;
+          try {
+            const baseline = serverBaselineRef.current;
+            let payload;
+            if (baseline) {
+              const changed    = locallyChangedSections(snapshot, baseline);
+              const hasChanges = changed && Object.values(changed).some(Boolean);
+              if (!hasChanges) return; // nothing new to flush
+              payload = Object.assign({}, baseline);
+              for (const k of STATE_SECTIONS) { if (changed[k]) payload[k] = snapshot[k]; }
+              if (changed.logo)      payload.logo      = snapshot.logo;
+              if (changed.utLogo)    payload.utLogo    = snapshot.utLogo;
+              if (changed.sigOTSmit) payload.sigOTSmit = snapshot.sigOTSmit;
+              payload.v            = DATA_VERSION;
+              payload._autoSavedAt = new Date().toISOString();
+              payload.savedAt      = snapshot.savedAt;
+            } else {
+              payload = Object.assign({}, snapshot, { _autoSavedAt: new Date().toISOString() });
+            }
+            await saveToServer(payload);
+            serverBaselineRef.current = payload;
+            setApiMsg('Saved ✓');
+          } catch(e) {
+            setApiMsg('Save failed — kept locally');
+          }
+          setTimeout(() => setApiMsg(''), 2500);
+        }, 300);
       } catch (e) {
         apiReadyRef.current = false;
         setApiMsg('Offline — using local backup');
