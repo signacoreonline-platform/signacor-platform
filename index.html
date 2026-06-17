@@ -39,6 +39,18 @@
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin=""></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin=""></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script>
+    /* Force Babel's CLASSIC JSX runtime. Newer @babel/standalone builds default to the
+       automatic runtime, which compiles JSX into `import { jsx } from "react/jsx-runtime"`.
+       That import can't run inside a classic <script> ("Cannot use import statement outside
+       a module"), which left the app stuck on the loading screen. Classic runtime emits
+       React.createElement, matching the React UMD build loaded above. */
+    try {
+      Babel.registerPreset('react-classic', {
+        presets: [[Babel.availablePresets['react'], { runtime: 'classic' }]]
+      });
+    } catch (e) { /* older Babel already defaults to classic — safe to ignore */ }
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
   <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,400;0,600;0,700;0,800;1,700;1,800&amp;family=Noto+Sans+SC:wght@300;400;500;700&amp;display=swap" rel="stylesheet">
@@ -102,7 +114,7 @@
 
 <div id="root"></div>
 
-<script type="text/babel">
+<script type="text/babel" data-presets="react-classic">
 
 const { useState, useEffect, useRef, useMemo } = React;
 
