@@ -1,7 +1,41 @@
+<!DOCTYPE html>
 <html lang="en"><head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Signacore — Business Platform</title>
+  <script>
+    /* Boot watchdog — the loading screen can never hang silently.
+       If the app fails to mount, surface the reason on the splash instead of
+       leaving the user stuck on "Loading…" forever. Does nothing on normal boot. */
+    (function () {
+      function rootEmpty() {
+        var r = document.getElementById('root');
+        return r && r.childNodes.length === 0 && document.getElementById('sgr-loading');
+      }
+      function showBootError(msg) {
+        var el = document.getElementById('sgr-loading');
+        if (!el) return;
+        var box = el.querySelector('div') || el;
+        box.innerHTML =
+          '<div style="font-size:1.4rem;font-weight:900;margin-bottom:10px;">SIGNACORE</div>' +
+          '<div style="opacity:0.85;margin-bottom:14px;">The platform could not finish loading.</div>' +
+          '<div style="font-size:0.78rem;opacity:0.7;max-width:420px;margin:0 auto 16px;">' +
+          String(msg).slice(0, 300).replace(/</g, '&lt;') + '</div>' +
+          '<button onclick="try{localStorage.clear()}catch(e){}; location.reload();" ' +
+          'style="padding:8px 16px;border:0;border-radius:6px;cursor:pointer;font-weight:600;">' +
+          'Clear saved data &amp; reload</button>';
+      }
+      window.addEventListener('error', function (e) {
+        if (rootEmpty()) showBootError((e && e.message) || 'Script error during startup.');
+      });
+      window.addEventListener('unhandledrejection', function (e) {
+        if (rootEmpty()) showBootError((e && e.reason && (e.reason.message || e.reason)) || 'Startup error.');
+      });
+      setTimeout(function () {
+        if (rootEmpty()) showBootError('The app did not finish loading — usually a connection issue loading React/Babel, or a startup error.');
+      }, 30000);
+    })();
+  </script>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin=""></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin=""></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -14943,8 +14977,10 @@ function App() {
       // Date-stamped filename so Drive folder shows version order clearly
       const dateTag = now.toISOString().slice(0,10); // e.g. 2026-04-10
       const payload = JSON.stringify({v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logo:logoDataUrl, utLogo:utLogoDataUrl, savedAt: stamp});
-      // outerHTML preserves the original <script type="text/babel"> source intact
-      let html = document.documentElement.outerHTML;
+      // outerHTML preserves the original <script type="text/babel"> source intact.
+      // outerHTML omits the DOCTYPE; without it the saved file loads in quirks mode,
+      // which broke startup. Prepend it so saved files stay in standards mode.
+      let html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
       // Update (or insert) the sgr-data tag
       if (html.includes('id="sgr-data"')) {
         html = html.replace(
