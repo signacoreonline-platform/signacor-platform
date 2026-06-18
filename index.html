@@ -4558,6 +4558,31 @@ function EditInvoiceForm({ job, onSave, onClose }) {
 }
 
 /* ═══════════════════════════════════════════
+   PAYMENT RECONCILIATION
+   A deposit / partial payment can be recorded against a quote / proforma
+   (quote.payments) BEFORE or AFTER it is converted to a job. Once converted,
+   the job is the invoice everything downstream reads from. This helper merges
+   the linked quote's payments into the job — deduped by payment id so deposits
+   carried over at conversion are never double-counted — and re-derives the
+   invoice status. Quote total and job.value are both VAT-inclusive, so the
+   amounts reconcile directly.
+═══════════════════════════════════════════ */
+function reconcileJobInvoice(job, quotes){
+  const own  = Array.isArray(job.payments) ? job.payments : [];
+  const link = (quotes||[]).find(q=>q && q.num && job.quoteNum && q.num===job.quoteNum);
+  const seen = new Set(own.map(p=>p&&p.id));
+  const merged = own.slice();
+  if(link && Array.isArray(link.payments)){
+    link.payments.forEach(p=>{ if(p && !seen.has(p.id)){ merged.push(p); seen.add(p.id); } });
+  }
+  const invTotal  = parseFloat(job.value)||0;
+  const totalPaid = merged.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+  let invoiceStatus = job.invoiceStatus||'pending';
+  if(totalPaid>0) invoiceStatus = (totalPaid>=invTotal && invTotal>0) ? 'paid' : 'partial';
+  return { payments: merged, invoiceStatus, totalPaid };
+}
+
+/* ═══════════════════════════════════════════
    QUOTES PAGE
 ═══════════════════════════════════════════ */
 function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated }) {
@@ -4575,7 +4600,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const displayed = filter==='all' ? quotes : quotes.filter(q=>q.status===filter);
   const isAdmin = user.role === 'admin';
   // Invoices sub-tab: all jobs with an invoiceNum + manual accounting invoices
-  const jobInvItems = jobs.filter(j=>j.invoiceNum).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
+  const jobInvItems = jobs.filter(j=>j.invoiceNum).map(j=>{
+    // Pull through any deposit / partial recorded on the linked quote / proforma
+    const rec = reconcileJobInvoice(j, quotes);
+    return rec.payments.length!==(j.payments||[]).length
+      ? {...j, payments:rec.payments, invoiceStatus:rec.invoiceStatus}
+      : j;
+  }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const manualInvItems = (accInvoices||[]).filter(i=>i.status!=='void').map(i=>{
     const sub=(i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
     const vat=(i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
@@ -4597,7 +4628,19 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     setQuotes(prev=>prev.find(x=>x.id===q.id) ? prev.map(x=>x.id===q.id?q:x) : [q,...prev]);
     setEditQuote(null);
   }
-  function handleUpdate(updated){ setQuotes(prev=>prev.map(q=>q.id===updated.id?updated:q)); setViewQuote(updated); }
+  function handleUpdate(updated){
+    setQuotes(prev=>prev.map(q=>q.id===updated.id?updated:q));
+    // Keep any linked converted job's payments in sync with the quote / proforma,
+    // so deposits & partials recorded here pull through to the invoice everywhere.
+    if(updated && updated.num){
+      setJobs(prev=>prev.map(j=>{
+        if(j.quoteNum!==updated.num) return j;
+        const rec = reconcileJobInvoice(j, [updated]);
+        return {...j, payments:rec.payments, invoiceStatus:rec.invoiceStatus};
+      }));
+    }
+    setViewQuote(updated);
+  }
   function handleEditQuote(q){ setViewQuote(null); setEditQuote(q); }
   function handleConvertToJob(q){
     const jobNum = getNextJobNum(jobs);
@@ -12935,7 +12978,7 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 /* ═══════════════════════════════════════════
    ACCOUNTING PAGE
 ═══════════════════════════════════════════ */
-function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices, setAccInvoices, accBills, setAccBills, suppliers, customers, companies, user }) {
+function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices, setAccInvoices, accBills, setAccBills, suppliers, customers, companies, user }) {
   const [accTab, setAccTab] = useState('dashboard');
   const [showImport, setShowImport] = useState(false);
   const [showAddAccount, setShowAddAccount] = useState(false);
@@ -13260,8 +13303,9 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
     },0);
     // From job invoices — cash received via payments array or fully paid
     const jobIncome = (jobs||[]).filter(j=>[7,8,9].includes(j.stage)||j.invoiceNum).reduce((s,j)=>{
-      const pmts = j.payments||[];
-      if(pmts.length>0) return s+pmts.reduce((t,p)=>t+(parseFloat(p.amount)||0),0);
+      // Include deposits / partials recorded against the linked quote / proforma
+      const rec = reconcileJobInvoice(j, quotes);
+      if(rec.payments.length>0) return s+rec.totalPaid;
       if(j.invoiceStatus==='paid'||j.paidDate||j.paid) return s+(parseFloat(j.value)||0);
       return s;
     },0);
@@ -13626,15 +13670,17 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
       // j.value is incl. VAT — convert to excl. VAT so the accounting module
       // can correctly add 15% VAT and arrive back at the original incl. VAT total.
       const valExVat = val > 0 ? val / 1.15 : 0;
-      // Derive status: prefer invoiceStatus on the job, then fall back to stage/paid flags
+      // Pull through any deposit / partial recorded on the linked quote / proforma
+      const rec = reconcileJobInvoice(j, quotes);
+      // Derive status: prefer reconciled payment status, then fall back to stage/paid flags
       let status = 'sent';
-      if(j.invoiceStatus==='paid' || j.paidDate || j.paid) status = 'paid';
-      else if(j.invoiceStatus==='partial') status = 'partial';
+      if(rec.invoiceStatus==='paid' || j.paidDate || j.paid) status = 'paid';
+      else if(rec.invoiceStatus==='partial') status = 'partial';
       else if(j.invoiceStatus==='pending') status = 'sent';
       // Check overdue
       const invDate = j.invoiceDate || j.date || new Date().toISOString().slice(0,10);
       const dueDate = j.invoiceDue || new Date(new Date(invDate).getTime()+30*864e5).toISOString().slice(0,10);
-      if(status!=='paid' && new Date()>new Date(dueDate)) status = (j.invoiceStatus==='partial')?'partial':'overdue';
+      if(status!=='paid' && new Date()>new Date(dueDate)) status = (rec.invoiceStatus==='partial')?'partial':'overdue';
       const invNum = j.invoiceNum || ('INV-' + String(j.num||'').replace(/\D/g,'').padStart(5,'0'));
       return {
         id: 'job-'+j.id,
@@ -13647,7 +13693,7 @@ function AccountingPage({ jobs, bankTxns, setBankTxns, chartOfAccounts, setChart
         source: 'job',
         jobNum: j.num,
         paidDate: j.paidDate || (j.invoiceStatus==='paid'?j.paidAt:null) || null,
-        payments: j.payments||[],
+        payments: rec.payments,
         lineItems: [{
           description: j.desc || 'Signage / Production Job',
           qty: 1,
@@ -15262,7 +15308,7 @@ function App() {
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={logoDataUrl} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
     reports:     <ReportsPage     jobs={jobs} companies={companies} user={user}/>,
-    accounting:  <AccountingPage jobs={jobs}  bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} suppliers={suppliers} customers={customers} companies={companies} user={user}/>,
+    accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} suppliers={suppliers} customers={customers} companies={companies} user={user}/>,
     hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={logoDataUrl} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
   };
 
