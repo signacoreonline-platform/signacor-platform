@@ -1527,6 +1527,19 @@ function getNextInvoiceNum(jobs) {
   return 'INV-'+String((nums.length>0?Math.max(...nums):0)+1).padStart(5,'0');
 }
 
+/* Build a human-readable "size" string for a line item, shown beneath the
+   description on invoices / proformas. Derived from the L×W (mm) calculator
+   fields and the unit, plus a custom size field if present. */
+function lineSizeText(l){
+  if(!l) return '';
+  if(l.sizeText) return String(l.sizeText);
+  let s='';
+  if(l.unit==='m²' && l.sqmL && l.sqmW) s = l.sqmL+' × '+l.sqmW+' mm';
+  else if(l.unit==='m (linear)' && l.sqmL)   s = l.sqmL+' mm';
+  if(s && l.pQty && Number(l.pQty)>1) s += '  ·  '+l.pQty+' off';
+  return s;
+}
+
 /* ═══════════════════════════════════════════
    PRINT JOB CARD (no financials)
 ═══════════════════════════════════════════ */
@@ -1656,14 +1669,13 @@ function printInvoice(job, companies, logoDataUrl) {
   const afterDisc = sub - discAmt + setupFeeAmt;
   const vat = afterDisc*0.15; const total = afterDisc+vat;
   const fmt = n=>'R\u00a0'+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
-  const rows = lines.map((l,i)=>(
-    '<tr><td style="width:26px;color:#4b5563;font-size:10px;">'+(i+1)+'</td>'+
-    '<td style="font-size:11px;">'+(l.desc||'\u2014')+'</td>'+
-    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;">'+(l.qty||'')+'</td>'+
-    '<td style="width:60px;text-align:center;font-size:10px;color:#555;">'+(l.unit||'')+'</td>'+
-    '<td style="width:90px;text-align:right;font-size:10.5px;">'+(l.unitPrice?fmt(l.unitPrice):'')+'</td>'+
-    '<td style="width:100px;text-align:right;font-size:10.5px;font-weight:600;">'+fmt(l.subtotal||0)+'</td></tr>'
-  )).join('');
+  const rows = lines.map((l,i)=>{
+    const sz = lineSizeText(l);
+    return '<tr><td style="width:42px;color:#4b5563;font-size:10px;vertical-align:top;">'+(i+1)+'</td>'+
+    '<td style="font-size:11px;word-break:break-word;vertical-align:top;">'+(l.desc||'\u2014')+(sz?'<div style="font-size:9px;color:#777;margin-top:2px;">'+sz+'</div>':'')+'</td>'+
+    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+(l.qty||'')+'</td>'+
+    '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(l.subtotal||0)+'</td></tr>';
+  }).join('');
   const invNum = job.invoiceNum||('INV-'+job.num.replace(/[^0-9]/g,'').padStart(5,'0'));
   const invDate = job.invoiceDate||(new Date().toISOString().slice(0,10));
   const due = job.invoiceDue||(new Date(Date.now()+30*864e5).toISOString().slice(0,10));
@@ -1767,11 +1779,9 @@ function printInvoice(job, companies, logoDataUrl) {
 
 (rows.length>0
 ?'<table class="ln"><thead><tr>'+
-'<th style="width:26px">#</th><th>Description</th>'+
-'<th style="width:55px;text-align:center">Qty</th>'+
-'<th style="width:60px;text-align:center">Unit</th>'+
-'<th style="width:90px;text-align:right">Rate</th>'+
-'<th style="width:100px;text-align:right">Total</th>'+
+'<th style="width:42px">Item No</th><th>Description</th>'+
+'<th style="width:60px;text-align:center">Qty</th>'+
+'<th style="width:120px;text-align:right">Total</th>'+
 '</tr></thead><tbody>'+rows+'</tbody></table>'
 :'<div style="border:1px solid #e5e7eb;border-radius:6px;padding:14px;text-align:center;color:#4b5563;font-size:11px;margin-bottom:12px;">No line items on record.</div>')+
 
@@ -1822,14 +1832,13 @@ function printProformaWindow(quote, proformaNum, companies, logoDataUrl) {
   const fmt = n=>'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const today = new Date().toISOString().slice(0,10);
   const due = new Date(Date.now()+30*864e5).toISOString().slice(0,10);
-  const rows = lines.map((l,i)=>(
-    '<tr><td style="width:26px;color:#4b5563;font-size:10px;">'+(i+1)+'</td>'+
-    '<td style="font-size:11px;">'+(l.desc||'—')+'</td>'+
-    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;">'+(l.qty||'')+'</td>'+
-    '<td style="width:60px;text-align:center;font-size:10px;color:#555;">'+(l.unit||'')+'</td>'+
-    '<td style="width:90px;text-align:right;font-size:10.5px;">'+(l.unitPrice?fmt(l.unitPrice):'')+'</td>'+
-    '<td style="width:100px;text-align:right;font-size:10.5px;font-weight:600;">'+fmt(l.subtotal||0)+'</td></tr>'
-  )).join('');
+  const rows = lines.map((l,i)=>{
+    const sz = lineSizeText(l);
+    return '<tr><td style="width:42px;color:#4b5563;font-size:10px;vertical-align:top;">'+(i+1)+'</td>'+
+    '<td style="font-size:11px;word-break:break-word;vertical-align:top;">'+(l.desc||'—')+(sz?'<div style="font-size:9px;color:#777;margin-top:2px;">'+sz+'</div>':'')+'</td>'+
+    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+(l.qty||'')+'</td>'+
+    '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(l.subtotal||0)+'</td></tr>';
+  }).join('');
   const logoHtml = logoDataUrl
     ? '<img src="'+logoDataUrl+'" style="max-height:112px;max-width:322px;object-fit:contain;display:block;">'
     : "<div style=\"font-family:'Barlow Condensed',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.08em;\">SIGNACORE</div>";
@@ -1897,9 +1906,9 @@ function printProformaWindow(quote, proformaNum, companies, logoDataUrl) {
 '<p>Tel: 040-940-5555 · orders@snsg.co.za</p>'+
 '<p style="margin-top:4px;color:#06065c;font-weight:600">www.signacore.co.za</p>'+
 '</div></div>'+
-(rows.length>0?'<table class="ln"><thead><tr><th style="width:26px">#</th><th>Description</th>'+
-'<th style="width:55px;text-align:center">Qty</th><th style="width:60px;text-align:center">Unit</th>'+
-'<th style="width:90px;text-align:right">Rate</th><th style="width:100px;text-align:right">Total</th>'+
+(rows.length>0?'<table class="ln"><thead><tr><th style="width:42px">Item No</th><th>Description</th>'+
+'<th style="width:60px;text-align:center">Qty</th>'+
+'<th style="width:120px;text-align:right">Total</th>'+
 '</tr></thead><tbody>'+rows+'</tbody></table>':
 '<div style="border:1px solid #e5e7eb;border-radius:6px;padding:14px;text-align:center;color:#4b5563;font-size:11px;margin-bottom:12px;">No line items.</div>')+
 '<div class="tots-wrap no-break"><div class="tots"><table>'+
@@ -2269,25 +2278,49 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   doc.text('orders@snsg.co.za  ·  040-940-5555', LM+92, y+24);
   y += boxH+8;
 
-  // Line items header
-  const cX=[LM,LM+8,LM+120];
-  sf(C_DARK); doc.rect(LM,y,CW,7,'F');
-  doc.setFont('helvetica','bold'); doc.setFontSize(7); sc(C_WHITE);
-  doc.text('#', cX[0]+1, y+4.5);
-  doc.text('Description', cX[1]+1, y+4.5);
-  doc.text('Amount', RM-1, y+4.5, {align:'right'});
-  y += 7;
+  // Line items header — 4 columns: Item No | Description (+sizes) | Qty | Total
+  const numX   = LM+1;
+  const descX  = LM+11;
+  const qtyX   = RM-30;            // centre of Qty column
+  const amtX   = RM-1;             // right edge of Total column
+  const descMaxW = (RM-46) - descX; // wrap width so full description fits
+  const drawLineHeader = () => {
+    sf(C_DARK); doc.rect(LM,y,CW,7,'F');
+    doc.setFont('helvetica','bold'); doc.setFontSize(7); sc(C_WHITE);
+    doc.text('Item No', numX, y+4.5);
+    doc.text('Description', descX, y+4.5);
+    doc.text('Qty', qtyX, y+4.5, {align:'center'});
+    doc.text('Total', amtX, y+4.5, {align:'right'});
+    y += 7;
+  };
+  drawLineHeader();
 
-  // Line item rows (page break at 268 to leave room for footer at 281)
+  // Line item rows — variable height so long descriptions wrap fully
+  doc.setFont('helvetica','normal');
   lines.forEach((ln,idx)=>{
-    if (y > 268) { doc.addPage(); y=20; }
-    const rH=7;
+    const descStr = (ln.desc||'—');
+    const szStr   = lineSizeText(ln);
+    doc.setFontSize(7.5);
+    const descLines = doc.splitTextToSize(descStr, descMaxW);
+    doc.setFontSize(6.5);
+    const szLines   = szStr ? doc.splitTextToSize(szStr, descMaxW) : [];
+    const rH = Math.max(7, 3 + descLines.length*3.6 + szLines.length*3.2);
+    if (y + rH > 272) { doc.addPage(); y=20; drawLineHeader(); }
     sf(idx%2===0?C_WHITE:C_LGREY); sd(C_MGREY); doc.setLineWidth(0.1);
     doc.rect(LM,y,CW,rH,'FD');
+    // Item No
     doc.setFont('helvetica','normal'); doc.setFontSize(7.5); sc(C_DARK);
-    doc.text(String(idx+1), cX[0]+1, y+4.5);
-    doc.text((ln.desc||'').substring(0,90), cX[1]+1, y+4.5);
-    doc.text(fmt(ln.subtotal||0).replace('R ',''), RM-1, y+4.5, {align:'right'});
+    doc.text(String(idx+1), numX, y+5);
+    // Description (wrapped) + sizes beneath
+    let ty = y+5;
+    descLines.forEach(t=>{ doc.text(t, descX, ty); ty+=3.6; });
+    if (szLines.length){ doc.setFontSize(6.5); sc(C_GREY); szLines.forEach(t=>{ doc.text(t, descX, ty); ty+=3.2; }); doc.setFontSize(7.5); sc(C_DARK); }
+    // Qty
+    const q = ln.qty;
+    const qtyStr = (q===''||q==null) ? '' : (Number.isInteger(Number(q)) ? String(q) : Number(q).toFixed(2));
+    doc.text(qtyStr, qtyX, y+5, {align:'center'});
+    // Total
+    doc.text(fmt(ln.subtotal||0).replace('R ',''), amtX, y+5, {align:'right'});
     y += rH;
   });
   y += 5;
@@ -3907,9 +3940,124 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
 /* ═══════════════════════════════════════════
    QUOTE VIEW MODAL
 ═══════════════════════════════════════════ */
+/* ═══════════════════════════════════════════
+   QUOTE / PROFORMA PAYMENTS MODAL
+   Records deposits & partial payments against a quote/proforma.
+   Stored on quote.payments and persisted via onUpdate (platform_state).
+═══════════════════════════════════════════ */
+function QuotePaymentsModal({ quote, total, onUpdate, onClose }) {
+  const [payments, setPayments] = useState(quote.payments||[]);
+  const [date,   setDate]   = useState(new Date().toISOString().slice(0,10));
+  const [method, setMethod] = useState('EFT');
+  const [amount, setAmount] = useState('');
+  const [notes,  setNotes]  = useState('');
+  const zr = n => 'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const iCls = "w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
+  const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+  const balance   = total - totalPaid;
+  const depRate   = total<=5000 ? 1.0 : 0.80;
+  const deposit   = total*depRate;
+
+  function persist(updated){ setPayments(updated); onUpdate({...quote, payments:updated}); }
+  function addPayment(){
+    if(!amount||parseFloat(amount)<=0){ alert('Enter a valid amount'); return; }
+    persist([...payments,{id:Date.now(),date,method,amount:parseFloat(amount),notes:notes.trim()}]);
+    setAmount(''); setNotes('');
+  }
+  function deletePayment(pid){
+    if(!window.confirm('Delete this payment record?')) return;
+    persist(payments.filter(p=>p.id!==pid));
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[92vh] overflow-y-auto">
+        <div className="px-5 py-4 flex items-center justify-between" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
+          <div>
+            <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>💳 PAYMENTS — {quote.num}</p>
+            <p className="text-blue-200 text-xs mt-0.5">{quote.client} · Deposits &amp; partial payments on this quote / proforma</p>
+          </div>
+          <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
+        </div>
+        <div className="p-5 space-y-4">
+          {/* Summary cards */}
+          <div className="grid grid-cols-3 gap-3">
+            <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 text-center">
+              <p className="text-xs text-gray-400 mb-1">Quote Total (incl. VAT)</p>
+              <p className="text-lg font-black" style={{color:'#06065c'}}>{zr(total)}</p>
+              <p className="text-xs text-gray-400 mt-0.5">{depRate===1?'100%':'80%'} deposit: {zr(deposit)}</p>
+            </div>
+            <div className="bg-green-50 border border-green-200 rounded-xl p-3 text-center">
+              <p className="text-xs text-green-600 mb-1">Total Paid</p>
+              <p className="text-lg font-black text-green-700">{zr(totalPaid)}</p>
+              <p className="text-xs text-green-500 mt-0.5">{payments.length} payment{payments.length!==1?'s':''}</p>
+            </div>
+            {balance>0?(
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-center">
+                <p className="text-xs text-amber-600 mb-1">Balance</p>
+                <p className="text-lg font-black text-amber-700">{zr(balance)}</p>
+                <p className="text-xs text-amber-500 mt-0.5">Outstanding</p>
+              </div>
+            ):(
+              <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center">
+                <p className="text-xs text-emerald-600 mb-1">Fully Paid ✓</p>
+                <p className="text-lg font-black text-emerald-700">{zr(0)}</p>
+                <p className="text-xs text-emerald-500 mt-0.5">Balance clear</p>
+              </div>
+            )}
+          </div>
+          {/* History */}
+          <div>
+            <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Payment History</p>
+            {payments.length===0?(
+              <p className="text-xs text-gray-400 italic text-center py-5 bg-gray-50 rounded-xl">No payments recorded yet.</p>
+            ):(
+              <div className="border border-gray-200 rounded-xl overflow-hidden">
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50 border-b border-gray-100">
+                    <tr><th className="px-3 py-2 text-left text-gray-500 font-bold">Date</th><th className="px-3 py-2 text-left text-gray-500 font-bold">Method</th><th className="px-3 py-2 text-right text-gray-500 font-bold">Amount</th><th className="px-3 py-2 text-left text-gray-500 font-bold">Notes</th><th className="w-10"/></tr>
+                  </thead>
+                  <tbody>
+                    {payments.map(p=>(
+                      <tr key={p.id} className="border-t border-gray-100">
+                        <td className="px-3 py-2 text-gray-700">{p.date}</td>
+                        <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold">{p.method}</span></td>
+                        <td className="px-3 py-2 text-right font-bold text-green-700">{zr(p.amount)}</td>
+                        <td className="px-3 py-2 text-gray-400">{p.notes||'—'}</td>
+                        <td className="px-1 text-center"><button onClick={()=>deletePayment(p.id)} className="text-gray-300 hover:text-red-400 text-sm">✕</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+          {/* Record form */}
+          <div className="border border-dashed border-green-300 rounded-xl p-4 bg-green-50/40">
+            <p className="text-xs font-black text-green-700 uppercase tracking-widest mb-3">Record New Payment</p>
+            <div className="grid grid-cols-2 gap-3">
+              <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
+              <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
+                <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>{['EFT','Cash','Card','Cheque','Other'].map(m=><option key={m}>{m}</option>)}</select>
+              </div>
+              <div><label className="text-xs font-bold text-gray-500 block mb-1">Amount (R)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} placeholder={balance>0?balance.toFixed(2):'0.00'} min="0.01" step="0.01"/></div>
+              <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes (optional)</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="Deposit, partial payment, etc."/></div>
+            </div>
+            <button onClick={addPayment} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#059669'}}>＋ Record Payment</button>
+          </div>
+          <div className="flex justify-end pt-1">
+            <button onClick={onClose} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-4 py-2 font-semibold hover:bg-gray-50">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs }) {
   const [showEmailFlow, setShowEmailFlow] = useState(false);
   const [showProformaEmail, setShowProformaEmail] = useState(false);
+  const [showPayments, setShowPayments] = useState(false);
   const co = companies.find(c=>c.id===quote.co)||{short:'?',name:'—'};
   const sub = quote.lines.reduce((s,l)=>s+(l.subtotal||0),0);
   const disc = parseFloat(quote.discount)||0;
@@ -3920,6 +4068,14 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
   const total = subAfterDisc+vat;
   const depRate = total<=5000 ? 1.0 : 0.80;
   const dep = total*depRate;
+  // Proforma uses the SAME number that will become the Tax Invoice number.
+  // Assigned once and stored on the quote so proforma + invoice always match.
+  const proformaNum = quote.proformaNum || getNextInvoiceNum(jobs||[]);
+  const ensureProformaNum = ()=>{ if(!quote.proformaNum) onUpdate({...quote, proformaNum}); };
+  // Payments recorded against this quote / proforma (deposits, partials)
+  const quotePayments = quote.payments || [];
+  const quotePaid     = quotePayments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+  const quoteBalance  = total - quotePaid;
   return (
     <Modal onClose={onClose} wide>
       <ModalHeader title={`${quote.num} — ${quote.client}`} onClose={onClose}/>
@@ -4103,7 +4259,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
             </button>
           )}
           {quote.status==='approved'&&(
-            <button onClick={()=>{ const pNum=getNextInvoiceNum(jobs||[]); printProformaWindow(quote,pNum,companies,logoDataUrl); }}
+            <button onClick={()=>{ ensureProformaNum(); printProformaWindow(quote,proformaNum,companies,logoDataUrl); }}
               className="flex items-center gap-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded-xl px-4 py-2.5 font-bold">
               📄 Proforma Invoice
             </button>
@@ -4112,6 +4268,13 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
             <button onClick={()=>setShowProformaEmail(true)}
               className="flex items-center gap-1.5 text-xs bg-violet-100 hover:bg-violet-200 text-violet-800 rounded-xl px-4 py-2.5 font-bold border border-violet-300">
               📧 Email Proforma
+            </button>
+          )}
+          {(quote.status==='approved'||quote.status==='converted')&&(
+            <button onClick={()=>setShowPayments(true)}
+              className="flex items-center gap-1.5 text-xs rounded-xl px-4 py-2.5 font-bold"
+              style={{background:'#ecfdf5',color:'#059669',border:'1px solid #a7f3d0'}}>
+              💳 Payments{quotePaid>0?` · ${quotePaid>=total?'Paid':'Bal '+zar(quoteBalance)}`:''}
             </button>
           )}
           {quote.status==='approved'&&!quote.convertedJobId&&(
@@ -4132,10 +4295,16 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
       )}
       {showProformaEmail&&(
         <EmailFlowModal
-          type="proforma" data={{...quote, _proformaNum: getNextInvoiceNum(jobs||[])}}
+          type="proforma" data={{...quote, _proformaNum: proformaNum}}
           companies={companies} logoDataUrl={logoDataUrl}
           onClose={()=>setShowProformaEmail(false)}
-          onMarkSent={()=>{}}
+          onMarkSent={ensureProformaNum}
+        />
+      )}
+      {showPayments&&(
+        <QuotePaymentsModal
+          quote={quote} total={total} onUpdate={onUpdate}
+          onClose={()=>setShowPayments(false)}
         />
       )}
     </Modal>
@@ -4228,11 +4397,14 @@ function EditInvoiceForm({ job, onSave, onClose }) {
       <div className="grid grid-cols-2 gap-3">
         <div className="col-span-2"><label className="text-xs font-bold text-gray-500 block mb-1">Client / Customer</label><input value={client} onChange={e=>setClient(e.target.value)} className={iCls}/></div>
         <div><label className="text-xs font-bold text-gray-500 block mb-1">Invoice Number</label><input value={invoiceNum} onChange={e=>setInvoiceNum(e.target.value)} className={iCls}/></div>
-        <div><label className="text-xs font-bold text-gray-500 block mb-1">Status</label>
-          <select value={invoiceStatus} onChange={e=>setInvoiceStatus(e.target.value)} className={iCls}>
-            <option value="pending">⏳ Pending</option>
-            <option value="paid">✓ Paid</option>
-          </select>
+        <div><label className="text-xs font-bold text-gray-500 block mb-1">Status (set by payments)</label>
+          {(()=>{
+            const cls = invoiceStatus==='paid' ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : invoiceStatus==='partial' ? 'bg-blue-50 text-blue-700 border-blue-200'
+                      : 'bg-amber-50 text-amber-700 border-amber-200';
+            const lbl = invoiceStatus==='paid' ? '✓ Fully Paid' : invoiceStatus==='partial' ? '⏳ Partly Paid' : '🕐 Pending';
+            return <div className={`w-full border rounded-xl px-3 py-2 text-sm font-bold ${cls}`}>{lbl}</div>;
+          })()}
         </div>
         <div><label className="text-xs font-bold text-gray-500 block mb-1">Invoice Date</label><input type="date" value={invoiceDate} onChange={e=>setInvoiceDate(e.target.value)} className={iCls}/></div>
         <div><label className="text-xs font-bold text-gray-500 block mb-1">Due Date</label><input type="date" value={invoiceDue} onChange={e=>setInvoiceDue(e.target.value)} className={iCls}/></div>
@@ -4429,7 +4601,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   function handleEditQuote(q){ setViewQuote(null); setEditQuote(q); }
   function handleConvertToJob(q){
     const jobNum = getNextJobNum(jobs);
-    const invNum = getNextInvoiceNum(jobs);
+    const invNum = q.proformaNum || getNextInvoiceNum(jobs);
     const today  = new Date().toISOString().slice(0,10);
     const dueDate= new Date(Date.now()+30*864e5).toISOString().slice(0,10);
     const _qSub      = q.lines.reduce(function(s,l){return s+(l.subtotal||0);},0);
@@ -4449,7 +4621,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       setupFee: q.setupFee||'', discount: q.discount||'',
       salesperson: q.salesperson||'', preparedBy: q.preparedBy||'',
       poRef: q.poRef||'', reference: q.reference||'',
-      invoiceNum: invNum, invoiceDate: today, invoiceDue: dueDate, invoiceStatus: 'pending',
+      invoiceNum: invNum, invoiceDate: today, invoiceDue: dueDate,
+      // Carry any deposits/partials already recorded on the quote/proforma
+      payments: (q.payments||[]).map(p=>({...p})),
+      invoiceStatus: (()=>{ const paid=(q.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0); const tot=_qAfterDisc*1.15; return paid>=tot&&tot>0?'paid':paid>0?'partial':'pending'; })(),
     };
     setJobs(prev=>[newJob,...prev]);
 
@@ -4857,8 +5032,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         <div className="flex gap-2 flex-wrap">
           {[
             {k:'all',    label:`All (${invoicedJobs.length})`},
-            {k:'paid',   label:`✓ Paid (${invoicedJobs.filter(j=>j.invoiceStatus==='paid').length})`},
-            {k:'partial',label:`⏳ Partial (${invoicedJobs.filter(j=>j.invoiceStatus==='partial').length})`},
+            {k:'paid',   label:`✓ Fully Paid (${invoicedJobs.filter(j=>j.invoiceStatus==='paid').length})`},
+            {k:'partial',label:`⏳ Partly Paid (${invoicedJobs.filter(j=>j.invoiceStatus==='partial').length})`},
             {k:'pending',label:`🕐 Pending (${invoicedJobs.filter(j=>!j.invoiceStatus||j.invoiceStatus==='pending').length})`},
           ].map(({k,label})=>(
             <button key={k} onClick={()=>setInvFilter(k)}
@@ -4888,7 +5063,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                 : isPartial
                   ? 'bg-blue-100 text-blue-700 border-blue-200'
                   : 'bg-amber-100 text-amber-700 border-amber-200';
-              const statusLabel = isPaid ? '✓ Paid' : isPartial ? '⏳ Partial' : '🕐 Pending';
+              const statusLabel = isPaid ? '✓ Fully Paid' : isPartial ? '⏳ Partly Paid' : '🕐 Pending';
               return (
                 <div key={j.id} className={`bg-white rounded-2xl border p-4 flex items-center gap-4 ${isPartial?'border-blue-200':'border-gray-200'}`}>
                   <div className="w-10 h-10 bg-brand-600 rounded-xl flex items-center justify-center text-white font-black text-xs flex-shrink-0">INV</div>
@@ -4925,12 +5100,6 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                           className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#ecfdf5',color:'#059669'}}>
                           💳 Payments
                         </button>
-                        {!isPaid&&(
-                          <button onClick={()=>setJobs(prev=>prev.map(x=>x.id===j.id?{...x,invoiceStatus:'paid',paidAt:new Date().toISOString().slice(0,10)}:x))}
-                            className="text-xs bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-3 py-1.5 rounded-xl">
-                            ✓ Mark Paid
-                          </button>
-                        )}
                         <button onClick={()=>setEditInvoice(j)}
                           className="text-xs bg-amber-500 hover:bg-amber-600 text-white font-bold px-3 py-1.5 rounded-xl">
                           ✏️ Edit
@@ -5008,7 +5177,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       {/* ── Edit Invoice modal ── */}
       {editInvoice&&(
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={e=>e.target===e.currentTarget&&setEditInvoice(null)}>
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl">
             <div className="px-5 py-4 flex items-center justify-between" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
               <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>✏️ EDIT INVOICE — {editInvoice.invoiceNum}</p>
               <button onClick={()=>setEditInvoice(null)} className="text-white/60 hover:text-white text-xl">✕</button>
@@ -5765,12 +5934,30 @@ function DisciplinaryModal({ employees, onClose, onSave, existing, logoDataUrl }
 }
 
 // ── Employee Detail View ─────────────────────────────────────────
-function EmployeeDetailView({ emp, leaveRequests, disciplinary, employees, onBack, onEditEmp, setLeaveRequests, setDisciplinary, logoDataUrl }) {
+function EmployeeDetailView({ emp, leaveRequests, disciplinary, employees, onBack, onEditEmp, setLeaveRequests, setDisciplinary, setEmployees, logoDataUrl }) {
   const [tab, setTab] = useState('overview');
   const [showLeave, setShowLeave] = useState(false);
   const [showDisc, setShowDisc] = useState(false);
   const [editLeave, setEditLeave] = useState(null);
   const [editDisc, setEditDisc] = useState(null);
+  const [editingSummary, setEditingSummary] = useState(false);
+  // Manual leave adjustments (days) per leave type — stored on the employee record
+  const [leaveAdjust, setLeaveAdjust] = useState(emp.leaveAdjust||{});
+
+  // Months of service to date (used for annual-leave accrual)
+  const monthsWorked = (()=>{
+    if(!emp.startDate) return 0;
+    const s = new Date(emp.startDate), now = new Date();
+    if(isNaN(s)) return 0;
+    let m = (now.getFullYear()-s.getFullYear())*12 + (now.getMonth()-s.getMonth());
+    if(now.getDate() < s.getDate()) m -= 1;          // not yet a full month
+    return Math.max(0, m + (now.getDate()>=s.getDate()?(now.getDate()-s.getDate())/30:0));
+  })();
+
+  function saveLeaveSummary(){
+    if(setEmployees) setEmployees(prev=>prev.map(e=>e.id===emp.id?{...e, leaveAdjust}:e));
+    setEditingSummary(false);
+  }
 
   const myLeave = leaveRequests.filter(r=>r.employeeId===emp.id||Number(r.employeeId)===emp.id);
   const myDisc  = disciplinary.filter(r=>r.employeeId===emp.id||Number(r.employeeId)===emp.id);
@@ -5830,15 +6017,66 @@ function EmployeeDetailView({ emp, leaveRequests, disciplinary, employees, onBac
             <p className="text-sm"><span className="text-gray-400 w-28 inline-block">Account:</span>{emp.bankAccount||'—'}</p>
             <p className="text-sm"><span className="text-gray-400 w-28 inline-block">Branch:</span>{emp.bankBranch||'—'}</p>
           </div>
-          <div className="bg-white rounded-xl border p-4">
-            <h3 className="text-sm font-semibold text-gray-600 mb-3">Leave Summary</h3>
-            {LEAVE_TYPES.filter(t=>t.days>0).map(lt=>{
-              const used = myLeave.filter(r=>r.leaveType===lt.key&&r.status==='approved').reduce((s,r)=>s+Number(r.days),0);
-              return <div key={lt.key} className="flex justify-between text-sm py-1 border-b last:border-0">
-                <span className="text-gray-600">{lt.label}</span>
-                <span className={`font-medium ${used>lt.days?'text-red-500':''}`}>{used}/{lt.days} days</span>
-              </div>;
-            })}
+          <div className="bg-white rounded-xl border p-4 md:col-span-2">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-gray-600">Leave Summary <span className="text-xs text-gray-400 font-normal">· as at {new Date().toLocaleDateString('en-ZA')}</span></h3>
+              {setEmployees && (editingSummary
+                ? <div className="flex gap-2">
+                    <button onClick={saveLeaveSummary} className="text-xs font-semibold px-3 py-1 rounded-lg bg-brand-500 text-white hover:bg-brand-600">💾 Save</button>
+                    <button onClick={()=>{setLeaveAdjust(emp.leaveAdjust||{});setEditingSummary(false);}} className="text-xs px-3 py-1 rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50">Cancel</button>
+                  </div>
+                : <button onClick={()=>setEditingSummary(true)} className="text-xs font-semibold px-3 py-1 rounded-lg border border-gray-200 text-brand-600 hover:bg-gray-50">✏️ Edit</button>)}
+            </div>
+            {(()=>{
+              const annualDays = (LEAVE_TYPES.find(t=>t.key==='annual')||{days:15}).days;
+              const annualRate = annualDays/12;
+              const annualAccrued = Math.round(monthsWorked*annualRate*10)/10;
+              return (<>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-xs text-gray-400 border-b">
+                      <th className="text-left py-1 font-medium">Type</th>
+                      <th className="text-right py-1 font-medium">Entitlement</th>
+                      <th className="text-right py-1 font-medium">Accrued</th>
+                      <th className="text-right py-1 font-medium">Used</th>
+                      <th className="text-right py-1 font-medium">Adjust</th>
+                      <th className="text-right py-1 font-medium">Credit</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {LEAVE_TYPES.filter(t=>t.days>0).map(lt=>{
+                      const used = myLeave.filter(r=>r.leaveType===lt.key&&r.status==='approved').reduce((s,r)=>s+Number(r.days),0);
+                      const isAnnual = lt.key==='annual';
+                      const accrued = isAnnual ? annualAccrued : lt.days;
+                      const adj = parseFloat(leaveAdjust[lt.key])||0;
+                      const credit = Math.round((accrued - used + adj)*10)/10;
+                      return (
+                        <tr key={lt.key} className="border-b last:border-0">
+                          <td className="py-1.5 text-gray-600">{lt.label}</td>
+                          <td className="py-1.5 text-right text-gray-500">{lt.days}</td>
+                          <td className="py-1.5 text-right text-gray-500">{isAnnual?accrued:'—'}</td>
+                          <td className="py-1.5 text-right text-gray-700">{used}</td>
+                          <td className="py-1.5 text-right">
+                            {editingSummary
+                              ? <input type="number" step="0.5" value={leaveAdjust[lt.key]??''} onChange={e=>setLeaveAdjust(prev=>({...prev,[lt.key]:e.target.value}))} className="w-16 border border-gray-300 rounded px-1 py-0.5 text-right text-xs" placeholder="0"/>
+                              : <span className={adj?'text-gray-700':'text-gray-300'}>{adj?(adj>0?'+':'')+adj:'0'}</span>}
+                          </td>
+                          <td className={`py-1.5 text-right font-bold ${credit<0?'text-red-500':'text-emerald-600'}`}>{credit}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <p className="text-xs text-gray-400 mt-3 leading-relaxed">
+                Annual leave accrues at {annualRate.toFixed(2)} days/month (BCEA {annualDays} days/year). <strong>Credit to date = Accrued − Used + Manual adjustment.</strong>
+                {emp.startDate
+                  ? ` Service: ${monthsWorked.toFixed(1)} months since ${emp.startDate}. Annual accrued to date = ${monthsWorked.toFixed(1)} × ${annualRate.toFixed(2)} = ${annualAccrued} days.`
+                  : ' Set a start date on the employee record to calculate accrual.'}
+              </p>
+              </>);
+            })()}
           </div>
         </div>
       )}
@@ -7062,6 +7300,7 @@ function HRPage({ employees, setEmployees, leaveRequests, setLeaveRequests, disc
       onEditEmp={()=>{setEditEmp(emp);setShowAdd(true);setViewEmp(null);}}
       setLeaveRequests={setLeaveRequests}
       setDisciplinary={setDisciplinary}
+      setEmployees={setEmployees}
       logoDataUrl={logoDataUrl}
     />;
   }
@@ -7150,7 +7389,14 @@ function HRPage({ employees, setEmployees, leaveRequests, setLeaveRequests, disc
                   const statusBg = {pending:'bg-yellow-100 text-yellow-700',approved:'bg-green-100 text-green-700',rejected:'bg-red-100 text-red-700'};
                   return (
                     <tr key={r.id} className="border-b last:border-0 hover:bg-gray-50">
-                      <td className="px-4 py-3 font-medium">{emp?`${emp.firstName} ${emp.lastName}`:'Unknown'}</td>
+                      <td className="px-4 py-3 font-medium">
+                        {emp
+                          ? <button onClick={()=>setViewEmp(emp.id)} title={`Open ${emp.firstName} ${emp.lastName}'s personal file`}
+                              className="text-brand-600 hover:text-brand-800 hover:underline font-medium text-left">
+                              {emp.firstName} {emp.lastName}
+                            </button>
+                          : 'Unknown'}
+                      </td>
                       <td className="px-4 py-3">{LEAVE_TYPES.find(t=>t.key===r.leaveType)?.label||r.leaveType}</td>
                       <td className="px-4 py-3">{r.startDate}</td>
                       <td className="px-4 py-3">{r.endDate}</td>
@@ -7636,36 +7882,22 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
       <div className={`grid gap-3 ${isAdmin?'grid-cols-2 lg:grid-cols-4':'grid-cols-2 lg:grid-cols-3'}`}>
         {isAdmin&&<KpiCard icon="💰" label="Monthly Revenue"
           value={(() => {
-            const now = new Date();
-            const thisMonth = d => d.getFullYear()===now.getFullYear() && d.getMonth()===now.getMonth();
-            // From job payments recorded this month (supports partial)
-            const jobRev = (jobs||[]).reduce((s,j)=>{
-              const pmts = j.payments||[];
-              if(pmts.length>0){
-                // Sum individual payments made this month
-                return s + pmts.filter(p=>p.date&&thisMonth(new Date(p.date))).reduce((t,p)=>t+(parseFloat(p.amount)||0),0);
-              }
-              // Fall back: fully-paid job with paidAt this month
-              if(j.invoiceStatus==='paid'&&j.paidAt&&thisMonth(new Date(j.paidAt))) return s+(j.value||0);
-              return s;
-            },0);
-            // From accounting invoices paid this month
-            const accRev = (accInvoices||[]).reduce((s,i)=>{
-              const pmts = i.payments||[];
-              if(pmts.length>0){
-                return s + pmts.filter(p=>p.date&&thisMonth(new Date(p.date))).reduce((t,p)=>t+(parseFloat(p.amount)||0),0);
-              }
-              if(i.status==='paid'&&i.paidDate&&thisMonth(new Date(i.paidDate))){
+            // Total of ALL paid invoices — kept in line with Sales › Invoices › Paid
+            // (job invoices with invoiceStatus 'paid' + accounting invoices with status 'paid').
+            const jobRev = (jobs||[])
+              .filter(j=>j.invoiceStatus==='paid')
+              .reduce((s,j)=>s+(parseFloat(j.value)||0),0);
+            const accRev = (accInvoices||[])
+              .filter(i=>i.status==='paid')
+              .reduce((s,i)=>{
                 const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
                 const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
                 return s+sub+vat;
-              }
-              return s;
-            },0);
+              },0);
             const total = jobRev + accRev;
             return 'R ' + total.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
           })()}
-          sub="Paid invoices this month" accent="text-brand-500"/>}
+          sub="Total of all paid invoices" accent="text-brand-500"/>}
         <KpiCard       icon="💼" label="Active Jobs"       value={active}     sub="In pipeline"     accent="text-brand-500"/>
         {isAdmin&&<KpiCard icon="📈" label="Gross Margin"   value={margin+'%'} sub="Invoiced jobs"   accent="text-emerald-600"/>}
         {isAdmin&&<KpiCard icon="⚠️" label="Low Stock"     value={lowStock}   sub="Need reordering" accent="text-red-600"/>}
@@ -8159,17 +8391,11 @@ function JobDetail({ jobId, jobs, setJobs, quotes, companies, onBack, user, logo
               <div className="flex items-center gap-2 text-xs bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5">
                 <span className="text-gray-400">Invoice:</span>
                 <span className="font-bold text-gray-700">{job.invoiceNum}</span>
-                <span className={`font-semibold px-2 py-0.5 rounded-full text-xs ${job.invoiceStatus==='paid'?'bg-emerald-100 text-emerald-700':'bg-amber-100 text-amber-700'}`}>
-                  {job.invoiceStatus==='paid'?'✓ Paid':'Pending'}
+                <span className={`font-semibold px-2 py-0.5 rounded-full text-xs ${job.invoiceStatus==='paid'?'bg-emerald-100 text-emerald-700':job.invoiceStatus==='partial'?'bg-blue-100 text-blue-700':'bg-amber-100 text-amber-700'}`}>
+                  {job.invoiceStatus==='paid'?'✓ Fully Paid':job.invoiceStatus==='partial'?'⏳ Partly Paid':'🕐 Pending'}
                 </span>
                 {job.invoiceStatus==='paid'&&job.paidAt&&(
                   <span className="text-gray-400">{job.paidAt}</span>
-                )}
-                {job.invoiceStatus!=='paid'&&(
-                  <button onClick={()=>setJobs(prev=>prev.map(j=>j.id===job.id?{...j,invoiceStatus:'paid',paidAt:new Date().toISOString().slice(0,10)}:j))}
-                    className="text-xs text-emerald-600 hover:text-emerald-700 font-bold hover:underline ml-1">
-                    Mark Paid
-                  </button>
                 )}
               </div>
               {/* Write-off */}
