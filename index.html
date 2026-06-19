@@ -5065,6 +5065,25 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                   </div>
                 );
               })}
+              {(()=>{
+                // Total of accepted (converted) quotes — uses the same formula as
+                // Dashboard › Quotes Accepted so the two figures always tie up.
+                const acceptedTotal=acceptedQuotes.reduce((s,q)=>{
+                  const sub=(q.lines||[]).reduce((t,l)=>t+(l.subtotal||0),0);
+                  const disc=parseFloat(q.discount)||0;
+                  const setup=parseFloat(q.setupFee)||0;
+                  return s+(sub-sub*(disc/100)+setup)*1.15;
+                },0);
+                return (
+                  <div className="bg-white rounded-2xl border-2 border-emerald-200 px-5 py-4 flex items-center justify-between flex-wrap gap-2">
+                    <div>
+                      <p className="text-xs font-black text-emerald-700 uppercase tracking-wide">Total Quotes Accepted</p>
+                      <p className="text-xs text-gray-400 mt-0.5">{acceptedQuotes.length} quote{acceptedQuotes.length!==1?'s':''} converted · ties up with Dashboard › Quotes Accepted</p>
+                    </div>
+                    <p className="text-2xl font-black text-gray-900">{zar(acceptedTotal)}</p>
+                  </div>
+                );
+              })()}
             </div>
           );
         })()}
@@ -7925,22 +7944,23 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
       <div className={`grid gap-3 ${isAdmin?'grid-cols-2 lg:grid-cols-4':'grid-cols-2 lg:grid-cols-3'}`}>
         {isAdmin&&<KpiCard icon="💰" label="Monthly Revenue"
           value={(() => {
-            // Total of ALL paid invoices — kept in line with Sales › Invoices › Paid
-            // (job invoices with invoiceStatus 'paid' + accounting invoices with status 'paid').
-            const jobRev = (jobs||[])
-              .filter(j=>j.invoiceStatus==='paid')
+            // Total Invoiced (incl. VAT) — matches Accounting › Total Invoiced.
+            // Job invoices (j.value is already incl. VAT) + manual accounting invoices,
+            // excluding any job already linked to a manual invoice by reference.
+            const manualRefs = new Set((accInvoices||[]).map(i=>i.reference).filter(Boolean));
+            const jobInv = (jobs||[])
+              .filter(j=>([7,8,9].includes(j.stage)||j.invoiceNum) && !manualRefs.has(j.num))
               .reduce((s,j)=>s+(parseFloat(j.value)||0),0);
-            const accRev = (accInvoices||[])
-              .filter(i=>i.status==='paid')
+            const accInv = (accInvoices||[])
               .reduce((s,i)=>{
                 const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
                 const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
                 return s+sub+vat;
               },0);
-            const total = jobRev + accRev;
+            const total = jobInv + accInv;
             return 'R ' + total.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
           })()}
-          sub="Total of all paid invoices" accent="text-brand-500"/>}
+          sub="Total invoiced (incl. VAT)" accent="text-brand-500"/>}
         <KpiCard       icon="💼" label="Active Jobs"       value={active}     sub="In pipeline"     accent="text-brand-500"/>
         {isAdmin&&<KpiCard icon="📈" label="Gross Margin"   value={margin+'%'} sub="Invoiced jobs"   accent="text-emerald-600"/>}
         {isAdmin&&<KpiCard icon="⚠️" label="Low Stock"     value={lowStock}   sub="Need reordering" accent="text-red-600"/>}
@@ -8058,10 +8078,18 @@ function JobDetail({ jobId, jobs, setJobs, quotes, companies, onBack, user, logo
   const profit=totalCost>0?job.value-totalCost:null;
   const margin=profit!=null&&job.value>0?(profit/job.value*100).toFixed(1):null;
   const isLast=job.stage>=9;
+  // System-controlled stages that an operator may NOT activate manually on the
+  // lifecycle scale: Deposit Received (5) and Invoiced (9). Deposit Received is
+  // actioned automatically when a deposit/partial payment is recorded; Invoiced
+  // is actioned automatically once the job carries a tax invoice.
+  const LOCKED_STAGES=[5,9];
+  const nextStage=job.stage+1;
+  const nextLocked=LOCKED_STAGES.includes(nextStage);
 
   function advanceStage(){
     if(isLast) return;
     const ns=job.stage+1;
+    if(LOCKED_STAGES.includes(ns)) return; // locked — system-controlled only
     setJobs(prev=>prev.map(j=>j.id===job.id?{...j,stage:ns,status:STAGE_STATUSES[ns]}:j));
   }
   function deleteJob(){
@@ -8120,22 +8148,45 @@ function JobDetail({ jobId, jobs, setJobs, quotes, companies, onBack, user, logo
         <div>
           <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Job Lifecycle</p>
           <div className="flex flex-wrap gap-1 mb-3">
-            {STAGE_NAMES.map((s,i)=>(
-              <div key={i} className="flex items-center gap-0.5">
-                <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all
-                  ${i<job.stage?'bg-brand-500 text-white':i===job.stage?'bg-brand-100 text-brand-700 ring-2 ring-brand-400':'bg-gray-100 text-gray-400'}`}>
-                  {i<job.stage?'✓':i+1}
+            {STAGE_NAMES.map((s,i)=>{
+              const reached=i<job.stage, active=i===job.stage, locked=LOCKED_STAGES.includes(i);
+              let dotCls;
+              if(i===5){ // Deposit Received — system-controlled (amber)
+                dotCls=reached?'bg-amber-500 text-white':active?'bg-amber-100 text-amber-700 ring-2 ring-amber-400':'bg-amber-50 text-amber-500 border border-dashed border-amber-300';
+              } else if(i===9){ // Invoiced — system-controlled (violet)
+                dotCls=reached?'bg-violet-500 text-white':active?'bg-violet-100 text-violet-700 ring-2 ring-violet-400':'bg-violet-50 text-violet-500 border border-dashed border-violet-300';
+              } else {
+                dotCls=reached?'bg-brand-500 text-white':active?'bg-brand-100 text-brand-700 ring-2 ring-brand-400':'bg-gray-100 text-gray-400';
+              }
+              const content=reached?'✓':(locked&&!active?'🔒':i+1);
+              return (
+                <div key={i} className="flex items-center gap-0.5">
+                  <div title={STAGE_NAMES[i]+(locked?' — activates automatically':'')} className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all ${dotCls}`}>
+                    {content}
+                  </div>
+                  {i<STAGE_NAMES.length-1&&<div className={`w-3 h-0.5 ${i<job.stage?'bg-brand-400':'bg-gray-200'}`}/>}
                 </div>
-                {i<STAGE_NAMES.length-1&&<div className={`w-3 h-0.5 ${i<job.stage?'bg-brand-400':'bg-gray-200'}`}/>}
-              </div>
-            ))}
+              );
+            })}
+          </div>
+          <div className="flex flex-wrap gap-3 mb-3 text-xs text-gray-400">
+            <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full bg-amber-400"></span>Deposit Received — auto on payment</span>
+            <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full bg-violet-400"></span>Invoiced — auto on tax invoice</span>
           </div>
           <p className="text-xs text-gray-500 mb-3">Current: <strong>{STAGE_NAMES[job.stage]}</strong></p>
           {isLast
             ? <div className="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 flex items-center gap-2"><span className="text-emerald-500 text-lg">✅</span><p className="text-sm font-bold text-emerald-700">Job Complete — Invoiced</p></div>
-            : <button onClick={advanceStage} className="flex items-center gap-2 bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-5 py-2.5 text-sm font-bold transition-colors">
-                <span>→</span><span>Advance to: <strong>{STAGE_NAMES[job.stage+1]}</strong></span>
-              </button>
+            : nextLocked
+              ? <div className="bg-gray-50 border border-dashed border-gray-300 rounded-xl px-4 py-3 flex items-start gap-2">
+                  <span className="text-lg">🔒</span>
+                  <div>
+                    <p className="text-sm font-bold text-gray-600">{STAGE_NAMES[nextStage]} — activates automatically</p>
+                    <p className="text-xs text-gray-400 mt-0.5">{nextStage===5?'Record a deposit / partial payment on the linked quote, proforma or invoice and this stage advances on its own.':'Activates automatically once this job carries a tax invoice (quote converted to an invoice).'}</p>
+                  </div>
+                </div>
+              : <button onClick={advanceStage} className="flex items-center gap-2 bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-5 py-2.5 text-sm font-bold transition-colors">
+                  <span>→</span><span>Advance to: <strong>{STAGE_NAMES[job.stage+1]}</strong></span>
+                </button>
           }
         </div>
 
@@ -14202,12 +14253,17 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
                     </td></tr>
                   )}
                 </tbody>
+                {/* Totals row — aligned directly under the Excl. VAT / VAT / Total (incl. VAT) columns */}
+                <tfoot>
+                  <tr className="border-t-2 border-gray-200" style={{background:'#f8f9ff'}}>
+                    <td className="px-4 py-2.5 text-xs font-black text-gray-500 uppercase" colSpan="5">Totals</td>
+                    <td className="px-4 py-2.5 text-xs text-right font-black text-gray-800">{fmtAmt(allInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),s),0))}</td>
+                    <td className="px-4 py-2.5 text-xs text-right font-black text-blue-600">{fmtAmt(allInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,s),0))}</td>
+                    <td className="px-4 py-2.5 text-xs text-right font-black" style={{color:'#06065c'}}>{fmtAmt(allInvoices.reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</td>
+                    <td colSpan="2"></td>
+                  </tr>
+                </tfoot>
               </table>
-            </div>
-            <div className="px-4 py-2 border-t border-gray-100 bg-gray-50 flex justify-end gap-6 text-xs text-gray-500">
-              <span>Excl. VAT: <strong className="text-gray-800">{fmtAmt(allInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),s),0))}</strong></span>
-              <span>VAT: <strong className="text-blue-600">{fmtAmt(allInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,s),0))}</strong></span>
-              <span>Total invoiced (incl. VAT): <strong style={{color:'#06065c'}}>{fmtAmt(allInvoices.reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</strong></span>
             </div>
           </div>
         </div>
@@ -15013,6 +15069,27 @@ function App() {
   const serverBaselineRef = useRef(null);  // last full state received from server
   const currentSnapshotRef = useRef(null); // always-current local snapshot (avoids stale closures in poll)
   const [apiMsg, setApiMsg] = useState('');
+
+  // ── Auto-action system-controlled lifecycle stages ──────────────
+  //  Deposit Received (stage 5): activates automatically once any deposit /
+  //  partial payment is recorded on the job or its linked quote / proforma /
+  //  invoice. Operators can never advance into this stage manually.
+  //  Invoiced (stage 9): activates automatically once a completed job (stage 8)
+  //  carries a tax-invoice number (i.e. the quote was converted to an invoice).
+  //  Both rules are idempotent, so this never loops.
+  useEffect(()=>{
+    let changed=false;
+    const next=(jobs||[]).map(j=>{
+      const st=j.stage||0;
+      if(st===4){
+        const rec=reconcileJobInvoice(j,quotes);
+        if(rec.totalPaid>0){ changed=true; return {...j,stage:5,status:STAGE_STATUSES[5]}; }
+      }
+      if(st===8 && j.invoiceNum){ changed=true; return {...j,stage:9,status:STAGE_STATUSES[9]}; }
+      return j;
+    });
+    if(changed) setJobs(next);
+  },[jobs,quotes]);
 
   // All array/object sections stored in platform_state
   const STATE_SECTIONS = ['jobs','inventory','quotes','customers','suppliers','assets',
