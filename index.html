@@ -3055,7 +3055,7 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
   );
 }
 
-function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoices=[], onOpenQuote, onOpenInvoice }) {
+function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoices=[], companies=[], logoDataUrl, onOpenQuote, onOpenInvoice }) {
   const [showAdd,    setShowAdd]    = useState(false);
   const [editing,    setEditing]    = useState(null);
   const [search,     setSearch]     = useState('');
@@ -3089,6 +3089,23 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
   }
   const qStatusLabel = s => QUOTE_STATUS_META[s]?.label || s || '—';
   const invStatusLabel = s => s==='paid'?'✓ Paid':s==='partial'?'⏳ Partly paid':'🕐 Pending';
+
+  // ── Open the actual invoice document for a clicked dropdown invoice ──
+  // Job-invoices are printed directly (same output as the Invoices tab "Print"
+  // button), re-synced from their linked quote so values match. Manual invoices
+  // (managed in Accounting) fall back to navigating to the Invoices tab.
+  function openInvoiceDoc(inv){
+    if(inv.manual){ onOpenInvoice&&onOpenInvoice(inv); return; }
+    const j=(jobs||[]).find(x=>x.id===inv.id);
+    if(!j){ onOpenInvoice&&onOpenInvoice(inv); return; }
+    const link=(quotes||[]).find(q=>q && q.num && j.quoteNum && q.num===j.quoteNum);
+    const pj=link ? {...j,
+      lines:link.lines, discount:link.discount||'', setupFee:link.setupFee||'',
+      client:link.client, contact:link.contact||j.contact||'', email:link.email||j.email||'',
+      tel:link.tel||j.tel||'', address:link.address||j.address||'', vatNum:link.vatNum||j.vatNum||'',
+      notes:j.notes||link.notes||''} : j;
+    printInvoice(pj, companies, logoDataUrl);
+  }
 
   // ── Per-customer row with hover dropdown of related quotes & invoices ──
   function CustomerRow({ c }){
@@ -3134,7 +3151,8 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
                 {cInvoices.length===0?(
                   <p className="px-3 py-2 text-xs text-gray-400">No invoices for this client.</p>
                 ):cInvoices.map(inv=>(
-                  <button key={'i'+inv.id} type="button" onClick={()=>{ setOpen(false); onOpenInvoice&&onOpenInvoice(inv); }}
+                  <button key={'i'+inv.id} type="button" onClick={()=>{ setOpen(false); openInvoiceDoc(inv); }}
+                    title={inv.manual?'Open in Accounting (manual invoice)':'Open invoice document'}
                     className="w-full text-left px-3 py-2 flex items-center justify-between gap-2 hover:bg-brand-50 border-b border-gray-50">
                     <span className="text-xs font-mono font-bold text-brand-600 flex-shrink-0">{inv.num}{inv.manual&&<span className="ml-1 text-gray-300">(M)</span>}</span>
                     <span className="text-xs text-gray-400 flex-1 truncate text-center">{inv.date||'—'}</span>
@@ -3153,7 +3171,7 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
           {c.address&&<p className="text-xs text-gray-400 mt-0.5 truncate">📍 {c.address}</p>}
           {c.notes&&<p className="text-xs text-amber-600 mt-0.5 truncate">💬 {c.notes}</p>}
           {(cQuotes.length>0||cInvoices.length>0)&&(
-            <p className="text-xs text-gray-300 mt-1">{cQuotes.length} quote{cQuotes.length!==1?'s':''} · {cInvoices.length} invoice{cInvoices.length!==1?'s':''} — hover name to view</p>
+            <p className="text-xs text-gray-300 mt-1">{cQuotes.length} quote{cQuotes.length!==1?'s':''} · {cInvoices.length} invoice{cInvoices.length!==1?'s':''} — hover name, then click to open</p>
           )}
         </div>
         <button onClick={()=>{setEditing(c);setShowAdd(true);}}
@@ -15595,7 +15613,7 @@ function App() {
   const pageMap = {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices}/>,
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)}/>,
-    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} onOpenQuote={(q)=>{ setSalesOpen({type:'quote', id:q.id}); setPage('sales'); }} onOpenInvoice={(inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); }}/>,
+    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} logoDataUrl={logoDataUrl} onOpenQuote={(q)=>{ setSalesOpen({type:'quote', id:q.id}); setPage('sales'); }} onOpenInvoice={(inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); }}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
