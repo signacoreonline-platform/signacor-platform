@@ -3110,6 +3110,13 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
   // ── Per-customer row with hover dropdown of related quotes & invoices ──
   function CustomerRow({ c }){
     const [open, setOpen] = useState(false);
+    const closeTimer = useRef(null);
+    const cancelClose = () => { if(closeTimer.current){ clearTimeout(closeTimer.current); closeTimer.current=null; } };
+    const openMenu    = () => { cancelClose(); setOpen(true); };
+    // Delay closing so the cursor can travel from the name into the menu
+    // without the dropdown vanishing mid-move.
+    const scheduleClose = () => { cancelClose(); closeTimer.current=setTimeout(()=>setOpen(false),200); };
+    useEffect(()=>cancelClose,[]);
     const cQuotes   = quotesFor(c);
     const cInvoices = invoicesFor(c);
     return (
@@ -3120,13 +3127,16 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
         <div className="min-w-0 flex-1">
           {/* Hoverable company name → dropdown of related quotes & invoices */}
           <div className="relative inline-block" style={{maxWidth:'100%'}}
-            onMouseEnter={()=>setOpen(true)} onMouseLeave={()=>setOpen(false)}>
-            <p className="text-sm font-bold text-gray-800 cursor-pointer inline-flex items-center gap-1 hover:text-brand-600">
+            onMouseEnter={openMenu} onMouseLeave={scheduleClose}>
+            <p className="text-sm font-bold text-gray-800 cursor-pointer inline-flex items-center gap-1 hover:text-brand-600"
+              onClick={()=>setOpen(o=>!o)}>
               {c.companyName}
               <span className="text-xs text-gray-300">▾</span>
             </p>
             {open&&(
-              <div className="absolute left-0 top-full mt-1 z-30 w-80 max-w-[88vw] bg-white rounded-xl shadow-xl border border-gray-200 overflow-hidden"
+              <div className="absolute left-0 top-full pt-1 z-30 w-80 max-w-[88vw]"
+                onMouseEnter={openMenu} onMouseLeave={scheduleClose}>
+              <div className="bg-white rounded-xl shadow-xl border border-gray-200 overflow-hidden"
                 style={{maxHeight:'320px',overflowY:'auto'}}>
                 {/* Quotes */}
                 <div className="px-3 py-2 bg-gray-50 border-b border-gray-100 flex items-center justify-between">
@@ -3159,6 +3169,7 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
                     <span className="text-xs text-gray-500 flex-shrink-0">{invStatusLabel(inv.status)}</span>
                   </button>
                 ))}
+              </div>
               </div>
             )}
           </div>
