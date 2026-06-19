@@ -3055,7 +3055,7 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
   );
 }
 
-function CustomersPage({ customers, setCustomers }) {
+function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoices=[], onOpenQuote, onOpenInvoice }) {
   const [showAdd,    setShowAdd]    = useState(false);
   const [editing,    setEditing]    = useState(null);
   const [search,     setSearch]     = useState('');
@@ -3070,6 +3070,98 @@ function CustomersPage({ customers, setCustomers }) {
   }
   function handleBulkImport(newCustomers) {
     setCustomers(prev => [...prev, ...newCustomers]);
+  }
+
+  // ── Match a quote / job / manual-invoice to a customer by client name ──
+  const _norm = s => (s||'').trim().toLowerCase();
+  function nameMatches(recordName, c){
+    const n = _norm(recordName); if(!n) return false;
+    const cn = _norm(c.companyName); const cp = _norm(c.contactPerson);
+    return (cn && (n===cn || n.includes(cn) || cn.includes(n))) || (cp && n===cp);
+  }
+  function quotesFor(c){ return (quotes||[]).filter(q=>nameMatches(q.client,c)); }
+  function invoicesFor(c){
+    const jobInv = (jobs||[]).filter(j=>j.invoiceNum && nameMatches(j.client,c))
+      .map(j=>({id:j.id, num:j.invoiceNum, date:j.invoiceDate, status:j.invoiceStatus||'pending', manual:false}));
+    const manualInv = (accInvoices||[]).filter(i=>i.status!=='void' && nameMatches(i.contactName,c))
+      .map(i=>({id:i.id, num:i.number, date:i.date, status:i.status||'pending', manual:true}));
+    return [...jobInv,...manualInv].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
+  }
+  const qStatusLabel = s => QUOTE_STATUS_META[s]?.label || s || '—';
+  const invStatusLabel = s => s==='paid'?'✓ Paid':s==='partial'?'⏳ Partly paid':'🕐 Pending';
+
+  // ── Per-customer row with hover dropdown of related quotes & invoices ──
+  function CustomerRow({ c }){
+    const [open, setOpen] = useState(false);
+    const cQuotes   = quotesFor(c);
+    const cInvoices = invoicesFor(c);
+    return (
+      <div className="bg-white rounded-2xl border border-gray-200 p-4 flex items-start gap-4 hover:border-brand-300 hover:shadow-sm transition-all">
+        <div className="w-10 h-10 rounded-xl bg-brand-100 flex items-center justify-center flex-shrink-0">
+          <span className="text-brand-600 font-black text-sm">{(c.companyName||'?')[0].toUpperCase()}</span>
+        </div>
+        <div className="min-w-0 flex-1">
+          {/* Hoverable company name → dropdown of related quotes & invoices */}
+          <div className="relative inline-block" style={{maxWidth:'100%'}}
+            onMouseEnter={()=>setOpen(true)} onMouseLeave={()=>setOpen(false)}>
+            <p className="text-sm font-bold text-gray-800 cursor-pointer inline-flex items-center gap-1 hover:text-brand-600">
+              {c.companyName}
+              <span className="text-xs text-gray-300">▾</span>
+            </p>
+            {open&&(
+              <div className="absolute left-0 top-full mt-1 z-30 w-80 max-w-[88vw] bg-white rounded-xl shadow-xl border border-gray-200 overflow-hidden"
+                style={{maxHeight:'320px',overflowY:'auto'}}>
+                {/* Quotes */}
+                <div className="px-3 py-2 bg-gray-50 border-b border-gray-100 flex items-center justify-between">
+                  <span className="text-xs font-black text-gray-600 uppercase tracking-wide">📋 Quotes</span>
+                  <span className="text-xs text-gray-400">{cQuotes.length}</span>
+                </div>
+                {cQuotes.length===0?(
+                  <p className="px-3 py-2 text-xs text-gray-400">No quotes for this client.</p>
+                ):cQuotes.map(q=>(
+                  <button key={'q'+q.id} type="button" onClick={()=>{ setOpen(false); onOpenQuote&&onOpenQuote(q); }}
+                    className="w-full text-left px-3 py-2 flex items-center justify-between gap-2 hover:bg-brand-50 border-b border-gray-50">
+                    <span className="text-xs font-mono font-bold text-brand-600 flex-shrink-0">{q.num}</span>
+                    <span className="text-xs text-gray-400 flex-1 truncate text-center">{q.date||'—'}</span>
+                    <span className="text-xs text-gray-500 flex-shrink-0">{qStatusLabel(q.status)}</span>
+                  </button>
+                ))}
+                {/* Invoices */}
+                <div className="px-3 py-2 bg-gray-50 border-y border-gray-100 flex items-center justify-between">
+                  <span className="text-xs font-black text-gray-600 uppercase tracking-wide">🧾 Invoices</span>
+                  <span className="text-xs text-gray-400">{cInvoices.length}</span>
+                </div>
+                {cInvoices.length===0?(
+                  <p className="px-3 py-2 text-xs text-gray-400">No invoices for this client.</p>
+                ):cInvoices.map(inv=>(
+                  <button key={'i'+inv.id} type="button" onClick={()=>{ setOpen(false); onOpenInvoice&&onOpenInvoice(inv); }}
+                    className="w-full text-left px-3 py-2 flex items-center justify-between gap-2 hover:bg-brand-50 border-b border-gray-50">
+                    <span className="text-xs font-mono font-bold text-brand-600 flex-shrink-0">{inv.num}{inv.manual&&<span className="ml-1 text-gray-300">(M)</span>}</span>
+                    <span className="text-xs text-gray-400 flex-1 truncate text-center">{inv.date||'—'}</span>
+                    <span className="text-xs text-gray-500 flex-shrink-0">{invStatusLabel(inv.status)}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-x-4 gap-y-0.5 mt-1">
+            {c.contactPerson&&<span className="text-xs text-gray-500">👤 {c.contactPerson}</span>}
+            {c.email&&<span className="text-xs text-gray-500">✉️ {c.email}</span>}
+            {c.tel&&<span className="text-xs text-gray-500">📞 {c.tel}</span>}
+            {c.vatNumber&&<span className="text-xs text-gray-400">VAT: {c.vatNumber}</span>}
+          </div>
+          {c.address&&<p className="text-xs text-gray-400 mt-0.5 truncate">📍 {c.address}</p>}
+          {c.notes&&<p className="text-xs text-amber-600 mt-0.5 truncate">💬 {c.notes}</p>}
+          {(cQuotes.length>0||cInvoices.length>0)&&(
+            <p className="text-xs text-gray-300 mt-1">{cQuotes.length} quote{cQuotes.length!==1?'s':''} · {cInvoices.length} invoice{cInvoices.length!==1?'s':''} — hover name to view</p>
+          )}
+        </div>
+        <button onClick={()=>{setEditing(c);setShowAdd(true);}}
+          className="text-xs border border-gray-200 rounded-lg px-3 py-1.5 text-gray-500 hover:bg-gray-50 font-semibold flex-shrink-0">
+          Edit
+        </button>
+      </div>
+    );
   }
   return (
     <div className="p-4 md:p-6 space-y-4 max-w-4xl mx-auto">
@@ -3103,28 +3195,7 @@ function CustomersPage({ customers, setCustomers }) {
         </div>
       ):(
         <div className="space-y-2">
-          {filtered.map(c=>(
-            <div key={c.id} className="bg-white rounded-2xl border border-gray-200 p-4 flex items-start gap-4 hover:border-brand-300 hover:shadow-sm transition-all">
-              <div className="w-10 h-10 rounded-xl bg-brand-100 flex items-center justify-center flex-shrink-0">
-                <span className="text-brand-600 font-black text-sm">{(c.companyName||'?')[0].toUpperCase()}</span>
-              </div>
-              <div className="min-w-0 flex-1">
-                <p className="text-sm font-bold text-gray-800">{c.companyName}</p>
-                <div className="flex flex-wrap gap-x-4 gap-y-0.5 mt-1">
-                  {c.contactPerson&&<span className="text-xs text-gray-500">👤 {c.contactPerson}</span>}
-                  {c.email&&<span className="text-xs text-gray-500">✉️ {c.email}</span>}
-                  {c.tel&&<span className="text-xs text-gray-500">📞 {c.tel}</span>}
-                  {c.vatNumber&&<span className="text-xs text-gray-400">VAT: {c.vatNumber}</span>}
-                </div>
-                {c.address&&<p className="text-xs text-gray-400 mt-0.5 truncate">📍 {c.address}</p>}
-                {c.notes&&<p className="text-xs text-amber-600 mt-0.5 truncate">💬 {c.notes}</p>}
-              </div>
-              <button onClick={()=>{setEditing(c);setShowAdd(true);}}
-                className="text-xs border border-gray-200 rounded-lg px-3 py-1.5 text-gray-500 hover:bg-gray-50 font-semibold flex-shrink-0">
-                Edit
-              </button>
-            </div>
-          ))}
+          {filtered.map(c=>(<CustomerRow key={c.id} c={c}/>))}
         </div>
       )}
       {showAdd&&<AddEditCustomerModal customer={editing} onClose={()=>{setShowAdd(false);setEditing(null);}} onSave={handleSave}/>}
@@ -4597,7 +4668,7 @@ function reconcileJobInvoice(job, quotes){
 /* ═══════════════════════════════════════════
    QUOTES PAGE
 ═══════════════════════════════════════════ */
-function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated }) {
+function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated, initialOpen, onInitialOpenHandled }) {
   const [subTab,    setSubTab]    = useState('quotes'); // 'quotes' | 'invoices'
   const [showCreate,setShowCreate]=useState(false);
   const [viewQuote,setViewQuote]=useState(null);
@@ -4606,18 +4677,39 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [editInvoice, setEditInvoice] = useState(null); // job open in invoice edit modal
   const [emailInvoiceJob, setEmailInvoiceJob] = useState(null); // job for email flow modal
   const [filter,setFilter]=useState('all');
+  const [search,setSearch]=useState('');           // client-name search (Quotes sub-tab)
   const [invFilter,setInvFilter]=useState('all'); // 'all' | 'paid' | 'partial' | 'pending'
+  const [invHighlight,setInvHighlight]=useState(null); // invoice id to highlight when opened from elsewhere
   const [jobPayModal,setJobPayModal]=useState(null); // job being viewed in payment history modal
   const nonUtech = companies.filter(c=>c.id!==UNIONTECH_ID);
-  const displayed = filter==='all' ? quotes : quotes.filter(q=>q.status===filter);
+  const _searchTerm = search.trim().toLowerCase();
+  const displayed = (filter==='all' ? quotes : quotes.filter(q=>q.status===filter))
+    .filter(q=>!_searchTerm || (q.client||'').toLowerCase().includes(_searchTerm));
   const isAdmin = user.role === 'admin';
-  // Invoices sub-tab: all jobs with an invoiceNum + manual accounting invoices
+  // Invoices sub-tab: all jobs with an invoiceNum + manual accounting invoices.
+  // Each job-invoice is re-synced from its linked quote so its values always match
+  // the quotation (line items, discount, setup fee, total incl. VAT and contact
+  // details). This is display-layer only — when a payment is later saved the
+  // corrected value is what gets persisted.
   const jobInvItems = jobs.filter(j=>j.invoiceNum).map(j=>{
+    const link = (quotes||[]).find(q=>q && q.num && j.quoteNum && q.num===j.quoteNum);
+    let job = j;
+    if(link){
+      const _sub      = (link.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
+      const _discPct  = parseFloat(link.discount)||0;
+      const _setupFee = parseFloat(link.setupFee)||0;
+      const _afterDisc= _sub - _sub*(_discPct/100) + _setupFee;
+      job = {
+        ...j,
+        lines: link.lines, discount: link.discount||'', setupFee: link.setupFee||'',
+        value: _afterDisc*1.15,
+        client: link.client, contact: link.contact||j.contact||'', email: link.email||j.email||'',
+        tel: link.tel||j.tel||'', address: link.address||j.address||'', vatNum: link.vatNum||j.vatNum||'',
+      };
+    }
     // Pull through any deposit / partial recorded on the linked quote / proforma
-    const rec = reconcileJobInvoice(j, quotes);
-    return rec.payments.length!==(j.payments||[]).length
-      ? {...j, payments:rec.payments, invoiceStatus:rec.invoiceStatus}
-      : j;
+    const rec = reconcileJobInvoice(job, quotes);
+    return {...job, payments:rec.payments, invoiceStatus:rec.invoiceStatus};
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const manualInvItems = (accInvoices||[]).filter(i=>i.status!=='void').map(i=>{
     const sub=(i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
@@ -4627,6 +4719,21 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const invoicedJobs = [...jobInvItems,...manualInvItems].sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const displayedInvoices = invFilter==='all' ? invoicedJobs : invoicedJobs.filter(j=>(j.invoiceStatus||'pending')===invFilter);
+
+  // ── Open a specific quote / invoice when navigated here from Customers ──
+  useEffect(()=>{
+    if(!initialOpen) return;
+    if(initialOpen.type==='quote'){
+      const q=(quotes||[]).find(x=>x.id===initialOpen.id);
+      if(q){ setSubTab('quotes'); setSearch(''); setFilter('all'); setViewQuote(q); }
+    } else if(initialOpen.type==='invoice'){
+      setSubTab('invoices'); setInvFilter('all'); setInvHighlight(initialOpen.id);
+      setTimeout(()=>{ const el=document.getElementById('inv-row-'+initialOpen.id); if(el) el.scrollIntoView({behavior:'smooth',block:'center'}); }, 80);
+      setTimeout(()=>setInvHighlight(null), 4000);
+    }
+    if(onInitialOpenHandled) onInitialOpenHandled();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[initialOpen]);
 
   function handleLogoUpload(e) {
     const file = e.target.files[0]; if(!file) return;
@@ -4955,6 +5062,17 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
 
       {/* ── QUOTES SUB-TAB ── */}
       {subTab==='quotes'&&(<>
+        {/* Search by client name */}
+        <div className="relative">
+          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm pointer-events-none">🔍</span>
+          <input value={search} onChange={e=>setSearch(e.target.value)}
+            placeholder="Search quotes by client name…"
+            className="w-full border border-gray-200 rounded-xl pl-9 pr-9 py-2.5 text-sm bg-white focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/>
+          {search&&(
+            <button type="button" onClick={()=>setSearch('')}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700 text-sm">✕</button>
+          )}
+        </div>
         <div className="flex gap-2 flex-wrap">
           {statusFilters.map(s=>(
             <button key={s} onClick={()=>setFilter(s)}
@@ -4964,12 +5082,15 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
             </button>
           ))}
         </div>
+        {_searchTerm&&(
+          <p className="text-xs text-gray-400">{displayed.length} result{displayed.length!==1?'s':''} for "{search}"</p>
+        )}
         {displayed.length===0?(
           <div className="bg-white rounded-2xl border border-gray-200 p-12 text-center">
             <div className="text-4xl mb-3">📋</div>
             <p className="text-gray-500 font-semibold">No quotes here</p>
             <p className="text-gray-400 text-xs mt-1">
-              {filter==='all'?'Click "New Quote" to build your first quotation.':'Try switching the filter above.'}
+              {_searchTerm?`No quotes match "${search}". Try a different client name.`:filter==='all'?'Click "New Quote" to build your first quotation.':'Try switching the filter above.'}
             </p>
           </div>
         ):(
@@ -5167,7 +5288,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                   : 'bg-amber-100 text-amber-700 border-amber-200';
               const statusLabel = isPaid ? '✓ Fully Paid' : isPartial ? '⏳ Partly Paid' : '🕐 Pending';
               return (
-                <div key={j.id} className={`bg-white rounded-2xl border p-4 flex items-center gap-4 ${isPartial?'border-blue-200':'border-gray-200'}`}>
+                <div key={j.id} id={'inv-row-'+j.id} className={`bg-white rounded-2xl border p-4 flex items-center gap-4 transition-all ${invHighlight===j.id?'border-brand-500 ring-2 ring-brand-300 shadow-md':isPartial?'border-blue-200':'border-gray-200'}`}>
                   <div className="w-10 h-10 bg-brand-600 rounded-xl flex items-center justify-center text-white font-black text-xs flex-shrink-0">INV</div>
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2 mb-1 flex-wrap">
@@ -7962,8 +8083,13 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   // Always exclude SGR Holdings from Dashboard
   const visibleCompanies = companies.filter(c=>c.id!==UNIONTECH_ID);
   const visibleJobs      = jobs.filter(j=>j.co!==UNIONTECH_ID);
+  // ── Current-month scope ── Dashboard financial figures reflect only this month.
+  const _now = new Date();
+  const _curMonthLabel = _now.toLocaleString('default',{month:'long',year:'numeric'});
+  const inCurrentMonth = d => { if(!d) return false; const dt=new Date(d); return !isNaN(dt) && dt.getFullYear()===_now.getFullYear() && dt.getMonth()===_now.getMonth(); };
   const active=visibleJobs.filter(j=>!['completed','invoiced'].includes(j.status)).length;
-  const invJobs=visibleJobs.filter(j=>j.status==='invoiced');
+  // Gross margin: invoiced jobs invoiced in the current month
+  const invJobs=visibleJobs.filter(j=>j.status==='invoiced' && inCurrentMonth(j.invoiceDate||j.id));
   const rev=invJobs.reduce((s,j)=>s+j.value,0);
   const cost=invJobs.reduce((s,j)=>s+breakdownTotal(j.breakdown),0);
   const margin=rev>0?((rev-cost)/rev*100).toFixed(1):'0.0';
@@ -8000,14 +8126,16 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
       <div className={`grid gap-3 ${isAdmin?'grid-cols-2 lg:grid-cols-4':'grid-cols-2 lg:grid-cols-3'}`}>
         {isAdmin&&<KpiCard icon="💰" label="Monthly Revenue"
           value={(() => {
-            // Total Invoiced (incl. VAT) — matches Accounting › Total Invoiced.
-            // Job invoices (j.value is already incl. VAT) + manual accounting invoices,
-            // excluding any job already linked to a manual invoice by reference.
+            // Total invoiced THIS MONTH (incl. VAT).
+            // Job invoices (j.value is already incl. VAT) + manual accounting invoices
+            // dated in the current month, excluding any job already linked to a
+            // manual invoice by reference.
             const manualRefs = new Set((accInvoices||[]).map(i=>i.reference).filter(Boolean));
             const jobInv = (jobs||[])
-              .filter(j=>([7,8,9].includes(j.stage)||j.invoiceNum) && !manualRefs.has(j.num))
+              .filter(j=>([7,8,9].includes(j.stage)||j.invoiceNum) && !manualRefs.has(j.num) && inCurrentMonth(j.invoiceDate||j.id))
               .reduce((s,j)=>s+(parseFloat(j.value)||0),0);
             const accInv = (accInvoices||[])
+              .filter(i=>inCurrentMonth(i.date))
               .reduce((s,i)=>{
                 const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
                 const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
@@ -8016,9 +8144,9 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
             const total = jobInv + accInv;
             return 'R ' + total.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
           })()}
-          sub="Total invoiced (incl. VAT)" accent="text-brand-500"/>}
+          sub={_curMonthLabel+' (incl. VAT)'} accent="text-brand-500"/>}
         <KpiCard       icon="💼" label="Active Jobs"       value={active}     sub="In pipeline"     accent="text-brand-500"/>
-        {isAdmin&&<KpiCard icon="📈" label="Gross Margin"   value={margin+'%'} sub="Invoiced jobs"   accent="text-emerald-600"/>}
+        {isAdmin&&<KpiCard icon="📈" label="Gross Margin"   value={margin+'%'} sub="Invoiced this month"   accent="text-emerald-600"/>}
         {isAdmin&&<KpiCard icon="⚠️" label="Low Stock"     value={lowStock}   sub="Need reordering" accent="text-red-600"/>}
         {!isAdmin&&<KpiCard icon="📋" label="Total Jobs"   value={totalJobs}  sub="All companies"   accent="text-gray-800"/>}
         {!isAdmin&&<KpiCard icon="💬" label="In Quoting"   value={quoteJobs}  sub="Needs follow-up" accent="text-brand-500"/>}
@@ -8041,7 +8169,8 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
       {/* Quotes Made / Quotes Accepted metric cards */}
       {isAdmin&&(()=>{
         const qTotal = q => { const sub=q.lines.reduce((s,l)=>s+(l.subtotal||0),0); const disc=parseFloat(q.discount)||0; const setup=parseFloat(q.setupFee)||0; return (sub-sub*(disc/100)+setup)*1.15; };
-        const allQuotes      = quotes||[];
+        // This-month scope: quotes dated in the current calendar month.
+        const allQuotes      = (quotes||[]).filter(q=>inCurrentMonth(q.date));
         const convertedQuotes= allQuotes.filter(q=>q.status==='converted');
         const quotesMadeTotal    = allQuotes.reduce((s,q)=>s+qTotal(q),0);
         const quotesAcceptedTotal= convertedQuotes.reduce((s,q)=>s+qTotal(q),0);
@@ -8051,14 +8180,14 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
             <div className="bg-white rounded-2xl border border-gray-200 p-4" style={{borderTop:'3px solid #0000ff'}}>
               <div className="w-3 h-3 rounded-full mb-2" style={{background:'#0000ff'}}/>
               <p className="text-xs font-bold text-gray-500 uppercase tracking-wide">📋 Quotes Made</p>
-              <p className="text-xs text-gray-400 mb-1">Total in system</p>
+              <p className="text-xs text-gray-400 mb-1">{_curMonthLabel}</p>
               <p className="text-xl font-black text-gray-900">{fmt(quotesMadeTotal)}</p>
-              <p className="text-xs text-gray-400 mt-0.5">{allQuotes.length} quote{allQuotes.length!==1?'s':''}</p>
+              <p className="text-xs text-gray-400 mt-0.5">{allQuotes.length} quote{allQuotes.length!==1?'s':''} this month</p>
             </div>
             <div className="bg-white rounded-2xl border border-gray-200 p-4" style={{borderTop:'3px solid #10b981'}}>
               <div className="w-3 h-3 rounded-full mb-2" style={{background:'#10b981'}}/>
               <p className="text-xs font-bold text-gray-500 uppercase tracking-wide">✅ Quotes Accepted</p>
-              <p className="text-xs text-gray-400 mb-1">Total converted to jobs</p>
+              <p className="text-xs text-gray-400 mb-1">Converted · {_curMonthLabel}</p>
               <p className="text-xl font-black text-gray-900">{fmt(quotesAcceptedTotal)}</p>
               <p className="text-xs text-gray-400 mt-0.5">{convertedQuotes.length} quote{convertedQuotes.length!==1?'s':''} converted</p>
             </div>
@@ -15115,6 +15244,7 @@ function App() {
   const [sidebarOpen,  setSidebarOpen]  = useState(false);
   const [entityFilter, setEntityFilter] = useState(null);
   const [highlightJobId, setHighlightJobId] = useState(null); // navigate to specific job after creation
+  const [salesOpen, setSalesOpen] = useState(null); // {type:'quote'|'invoice', id} to open on Sales page
   const [saveMsg,      setSaveMsg]      = useState('');
   const [lastSaved,    setLastSaved]    = useState('');
   const [showShare,    setShowShare]    = useState(false);
@@ -15464,8 +15594,8 @@ function App() {
 
   const pageMap = {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }}/>,
-    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers}/>,
+    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)}/>,
+    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} onOpenQuote={(q)=>{ setSalesOpen({type:'quote', id:q.id}); setPage('sales'); }} onOpenInvoice={(inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); }}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
