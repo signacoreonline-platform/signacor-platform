@@ -1540,6 +1540,18 @@ function lineSizeText(l){
   return s;
 }
 
+/* Number of physical items for a line, shown in the "Qty" column of printed
+   quotes / proformas / invoices. For dimensioned items (m² or linear metre) the
+   stored qty is an area/length, so the item count is the "pieces" value (pQty).
+   For plain units the qty itself is the count. */
+function lineItemCount(l){
+  if(!l) return '';
+  const hasDim = l.sqmL && (l.unit==='m²' || l.unit==='m (linear)');
+  if(hasDim) return parseFloat(l.pQty)||1;
+  const q = l.qty;
+  return (q===''||q==null) ? '' : q;
+}
+
 /* ═══════════════════════════════════════════
    PRINT JOB CARD (no financials)
 ═══════════════════════════════════════════ */
@@ -1673,7 +1685,7 @@ function printInvoice(job, companies, logoDataUrl) {
     const sz = lineSizeText(l);
     return '<tr><td style="width:42px;color:#4b5563;font-size:10px;vertical-align:top;">'+(i+1)+'</td>'+
     '<td style="font-size:11px;word-break:break-word;vertical-align:top;">'+(l.desc||'\u2014')+(sz?'<div style="font-size:9px;color:#777;margin-top:2px;">'+sz+'</div>':'')+'</td>'+
-    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+(l.qty||'')+'</td>'+
+    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+lineItemCount(l)+'</td>'+
     '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(l.subtotal||0)+'</td></tr>';
   }).join('');
   const invNum = job.invoiceNum||('INV-'+job.num.replace(/[^0-9]/g,'').padStart(5,'0'));
@@ -1836,7 +1848,7 @@ function printProformaWindow(quote, proformaNum, companies, logoDataUrl) {
     const sz = lineSizeText(l);
     return '<tr><td style="width:42px;color:#4b5563;font-size:10px;vertical-align:top;">'+(i+1)+'</td>'+
     '<td style="font-size:11px;word-break:break-word;vertical-align:top;">'+(l.desc||'—')+(sz?'<div style="font-size:9px;color:#777;margin-top:2px;">'+sz+'</div>':'')+'</td>'+
-    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+(l.qty||'')+'</td>'+
+    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+lineItemCount(l)+'</td>'+
     '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(l.subtotal||0)+'</td></tr>';
   }).join('');
   const logoHtml = logoDataUrl
@@ -2316,7 +2328,7 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
     descLines.forEach(t=>{ doc.text(t, descX, ty); ty+=3.6; });
     if (szLines.length){ doc.setFontSize(6.5); sc(C_GREY); szLines.forEach(t=>{ doc.text(t, descX, ty); ty+=3.2; }); doc.setFontSize(7.5); sc(C_DARK); }
     // Qty
-    const q = ln.qty;
+    const q = lineItemCount(ln);
     const qtyStr = (q===''||q==null) ? '' : (Number.isInteger(Number(q)) ? String(q) : Number(q).toFixed(2));
     doc.text(qtyStr, qtyX, y+5, {align:'center'});
     // Total
@@ -4258,13 +4270,13 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
               ✏️ Edit Quote
             </button>
           )}
-          {quote.status==='approved'&&(
+          {quote.status!=='declined'&&(
             <button onClick={()=>{ ensureProformaNum(); printProformaWindow(quote,proformaNum,companies,logoDataUrl); }}
               className="flex items-center gap-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded-xl px-4 py-2.5 font-bold">
               📄 Proforma Invoice
             </button>
           )}
-          {quote.status==='approved'&&(
+          {quote.status!=='declined'&&(
             <button onClick={()=>setShowProformaEmail(true)}
               className="flex items-center gap-1.5 text-xs bg-violet-100 hover:bg-violet-200 text-violet-800 rounded-xl px-4 py-2.5 font-bold border border-violet-300">
               📧 Email Proforma
@@ -4625,11 +4637,39 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
 
   function handleSave(q){
     // If editing an existing quote, update it; otherwise prepend as new
+    const isEdit = !!(quotes||[]).find(x=>x.id===q.id);
     setQuotes(prev=>prev.find(x=>x.id===q.id) ? prev.map(x=>x.id===q.id?q:x) : [q,...prev]);
+    // ── Pull quote changes through to any linked (converted) job's invoice ──
+    // The proforma is generated live from the quote so it already reflects edits;
+    // the job's invoice copies the quote at conversion, so sync it here too.
+    if(isEdit){
+      setJobs(prev=>prev.map(j=>{
+        if(j.quoteNum!==q.num) return j;
+        const _sub      = (q.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
+        const _discPct  = parseFloat(q.discount)||0;
+        const _setupFee = parseFloat(q.setupFee)||0;
+        const _afterDisc= _sub - _sub*(_discPct/100) + _setupFee;
+        return {
+          ...j,
+          lines: q.lines, discount: q.discount||'', setupFee: q.setupFee||'',
+          value: _afterDisc*1.15,
+          client: q.client, contact: q.contact||'', email: q.email||'',
+          tel: q.tel||'', address: q.address||'', vatNum: q.vatNum||'',
+          notes: q.notes||j.notes||'',
+        };
+      }));
+    }
     setEditQuote(null);
   }
   function handleUpdate(updated){
     setQuotes(prev=>prev.map(q=>q.id===updated.id?updated:q));
+    // If the quote is declined, remove any job it was converted into so it no
+    // longer shows up in Jobs / Accounting / Dashboard.
+    if(updated && updated.status==='declined'){
+      setJobs(prev=>prev.filter(j=>!((updated.convertedJobId && j.id===updated.convertedJobId) || (updated.num && j.quoteNum===updated.num))));
+      setViewQuote(updated);
+      return;
+    }
     // Keep any linked converted job's payments in sync with the quote / proforma,
     // so deposits & partials recorded here pull through to the invoice everywhere.
     if(updated && updated.num){
@@ -7862,28 +7902,44 @@ function Header({ page, onMenu, onLogout, user, onSave, saveMsg, lastSaved, logo
 /* ═══════════════════════════════════════════
    CHARTS
 ═══════════════════════════════════════════ */
-function RevenueChart({ jobs=[] }) {
+function RevenueChart({ jobs=[], accInvoices=[] }) {
   const ref=useRef(null);
   useEffect(()=>{
-    // Build last-6-months buckets from actual job data
+    // Build last-6-months buckets from actual invoiced data.
+    // Revenue definition matches the "Monthly Revenue" KPI: job invoices (stage
+    // 7/8/9 or with an invoice number, value incl. VAT) plus manual accounting
+    // invoices, so the monthly bars reconcile with the headline figure.
     const now=new Date();
     const months=[];
     for(let i=5;i>=0;i--){
       const d=new Date(now.getFullYear(),now.getMonth()-i,1);
       months.push({m:d.toLocaleString('default',{month:'short'}),year:d.getFullYear(),month:d.getMonth(),rev:0,cost:0});
     }
+    const manualRefs=new Set((accInvoices||[]).map(i=>i.reference).filter(Boolean));
     jobs.forEach(j=>{
       if(!j.value)return;
-      if(!['invoiced'].includes(j.status))return;
+      if(!([7,8,9].includes(j.stage)||j.invoiceNum))return;
+      if(manualRefs.has(j.num))return; // avoid double-count with a linked manual invoice
       const d=j.invoiceDate?new Date(j.invoiceDate):new Date(j.id); // prefer actual invoiceDate over creation timestamp
       const bucket=months.find(b=>b.year===d.getFullYear()&&b.month===d.getMonth());
       if(!bucket)return;
       bucket.rev+=(j.value||0);
     });
+    (accInvoices||[]).forEach(inv=>{
+      const sub=(inv.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+      const vat=(inv.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
+      const val=sub+vat;
+      if(!val)return;
+      const d=inv.date?new Date(inv.date):null;
+      if(!d)return;
+      const bucket=months.find(b=>b.year===d.getFullYear()&&b.month===d.getMonth());
+      if(!bucket)return;
+      bucket.rev+=val;
+    });
     const hasData=months.some(b=>b.rev>0);
     const chart=new Chart(ref.current,{type:'bar',data:{labels:months.map(m=>m.m),datasets:[{label:'Revenue',data:months.map(m=>m.rev),backgroundColor:hasData?'#0000ffcc':'#cbd5e133',borderRadius:5}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`R ${ctx.raw.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2})}`}}},scales:{y:{ticks:{callback:v=>`R${(v/1000).toFixed(0)}k`,font:{size:10}},grid:{color:'#f1f5f9'}},x:{ticks:{font:{size:11}},grid:{display:false}}}}});
     return ()=>chart.destroy();
-  },[jobs]);
+  },[jobs,accInvoices]);
   return <canvas ref={ref}/>;
 }
 
@@ -7973,7 +8029,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
         {isAdmin&&(
           <div className="lg:col-span-3 bg-white rounded-2xl border border-gray-200 p-4">
             <h3 className="text-sm font-bold mb-3" style={{color:'#06065c'}}>Total Revenue — Last 6 Months</h3>
-            <div className="h-52"><RevenueChart jobs={visibleJobs}/></div>
+            <div className="h-52"><RevenueChart jobs={visibleJobs} accInvoices={accInvoices}/></div>
           </div>
         )}
         <div className={`${isAdmin?'lg:col-span-2':''} bg-white rounded-2xl border border-gray-200 p-4`}>
@@ -8055,7 +8111,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
 /* ═══════════════════════════════════════════
    JOB DETAIL  (with editable cost breakdown)
 ═══════════════════════════════════════════ */
-function JobDetail({ jobId, jobs, setJobs, quotes, companies, onBack, user, logoDataUrl }) {
+function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack, user, logoDataUrl }) {
   const [showInvoiceEmail, setShowInvoiceEmail] = useState(false);
   const job=jobs.find(j=>j.id===jobId);
   const [editingCosts, setEditingCosts]=useState(false);
@@ -8093,7 +8149,18 @@ function JobDetail({ jobId, jobs, setJobs, quotes, companies, onBack, user, logo
     setJobs(prev=>prev.map(j=>j.id===job.id?{...j,stage:ns,status:STAGE_STATUSES[ns]}:j));
   }
   function deleteJob(){
-    if(window.confirm(`Delete job ${job.num} — ${job.client}? This cannot be undone.`)){setJobs(prev=>prev.filter(j=>j.id!==job.id));onBack();}
+    if(window.confirm(`Delete job ${job.num} — ${job.client}? This cannot be undone.`)){
+      setJobs(prev=>prev.filter(j=>j.id!==job.id));
+      // Unlink the source quote so it no longer points at a deleted job
+      if(setQuotes && (job.quoteNum || job.id)){
+        setQuotes(prev=>prev.map(q=>{
+          const linked = (q.convertedJobId===job.id) || (job.quoteNum && q.num===job.quoteNum);
+          if(!linked) return q;
+          return {...q, convertedJobId:null, status: q.status==='converted' ? 'approved' : q.status};
+        }));
+      }
+      onBack();
+    }
   }
   function updateBd(key,val){
     setBd(prev=>({...prev,[key]:parseFloat(val)||0}));
@@ -8472,7 +8539,31 @@ function JobDetail({ jobId, jobs, setJobs, quotes, companies, onBack, user, logo
             className="flex items-center gap-1.5 text-xs bg-gray-800 hover:bg-gray-900 text-white rounded-xl px-4 py-2.5 font-bold">
             🖨️ Print Job Card
           </button>
-          {job.invoiceNum&&(
+          {/* Proforma Invoice — available at any stage; uses the same number that becomes the Tax Invoice */}
+          <button onClick={()=>printProformaWindow(job, job.invoiceNum||('PRO-'+String(job.num||'')), companies, logoDataUrl)}
+            className="flex items-center gap-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded-xl px-4 py-2.5 font-bold">
+            📄 Print Proforma Invoice
+          </button>
+          {/* ── INVOICE ── An invoice can only be created once the job reaches the Installation stage (7). ── */}
+          {(() => {
+            const INSTALL_STAGE = 7;
+            const invoiceCreated  = !!job.invoiceCreated || (!!job.invoiceNum && job.stage>=9);
+            const canCreateInvoice= job.stage>=INSTALL_STAGE;
+            if(!invoiceCreated){
+              return canCreateInvoice ? (
+                <button onClick={()=>{
+                    const today=new Date().toISOString().slice(0,10);
+                    const due=new Date(Date.now()+30*864e5).toISOString().slice(0,10);
+                    setJobs(prev=>prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:(j.invoiceNum||getNextInvoiceNum(prev)), invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due)}:j));
+                  }}
+                  className="flex items-center gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl px-4 py-2.5 font-bold">
+                  🧾 Create Invoice
+                </button>
+              ) : (
+                <div className="text-xs text-gray-400 italic py-2 px-1">Invoice can be created once the job is advanced to the <strong>Installation</strong> stage.</div>
+              );
+            }
+            return (
             <>
               <button onClick={()=>printInvoice(job,companies,logoDataUrl)}
                 className="flex items-center gap-1.5 text-xs bg-brand-600 hover:bg-brand-700 text-white rounded-xl px-4 py-2.5 font-bold">
@@ -8505,10 +8596,8 @@ function JobDetail({ jobId, jobs, setJobs, quotes, companies, onBack, user, logo
                 {!job.writeOff&&<span className="text-xs text-gray-300">None selected</span>}
               </div>
             </>
-          )}
-          {!job.invoiceNum&&(
-            <div className="text-xs text-gray-400 italic py-2">Convert a quote to this job to generate an invoice automatically.</div>
-          )}
+            );
+          })()}
         </div>
       </div>
 
@@ -8528,7 +8617,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, companies, onBack, user, logo
 const DONE_STATUSES = ['completed','invoiced'];
 const WIP_STATUSES  = STAGE_STATUSES.filter(s=>!DONE_STATUSES.includes(s));
 
-function JobsPage({ jobs, setJobs, quotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared }) {
+function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared }) {
   const [jobTab,       setJobTab]       = useState('active'); // 'active' | 'completed'
   const [statusFilter, setStatusFilter] = useState('all');
   const [search,       setSearch]       = useState('');
@@ -8568,7 +8657,7 @@ function JobsPage({ jobs, setJobs, quotes, companies, user, entityFilter, setEnt
   const completedCount = visibleJobs.filter(j=> DONE_STATUSES.includes(j.status)).length;
   const statusOpts     = jobTab==='active' ? WIP_STATUSES : DONE_STATUSES;
 
-  if(detail!==null) return <JobDetail jobId={detail} jobs={jobs} setJobs={setJobs} quotes={quotes} companies={companies} onBack={()=>setDetail(null)} user={user} logoDataUrl={logoDataUrl}/>;
+  if(detail!==null) return <JobDetail jobId={detail} jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} onBack={()=>setDetail(null)} user={user} logoDataUrl={logoDataUrl}/>;
 
   return (
     <div className="p-4 space-y-4">
@@ -13964,7 +14053,7 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
               <p className="text-xs text-gray-400 mb-1">Total Invoiced</p>
-              <p className="text-2xl font-black" style={{color:'#06065c'}}>{fmtAmt(allInvoices.reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);return s+sub*(1+(i.lineItems||[]).some(l=>l.taxType==='15%')?0.15:0);},0))}</p>
+              <p className="text-2xl font-black" style={{color:'#06065c'}}>{fmtAmt(allInvoices.reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</p>
               <p className="text-xs text-gray-400 mt-1">{invStats.total} invoices total</p>
             </div>
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
@@ -15378,7 +15467,7 @@ function App() {
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
-    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)}/>,
+    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
