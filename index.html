@@ -2447,9 +2447,26 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
 ═══════════════════════════════════════════ */
 function htmlToPdfBase64(fullHtml) {
   return new Promise((resolve, reject) => {
-    if (!window.html2pdf) { reject(new Error('PDF renderer (html2pdf) not loaded — check your internet connection and reload.')); return; }
-    // Render inside an isolated off-screen iframe so the document's
-    // global CSS (body{}, *{}, table{} …) cannot leak into the dashboard.
+    // We render the document inside an isolated off-screen iframe so its global
+    // CSS (body{}, *{}, table{}, and every .class{} rule) is fully applied and
+    // cannot leak into the dashboard. We then rasterise the iframe's OWN
+    // document with html2canvas — which respects that document's <style> block —
+    // and place the image into an A4 PDF.
+    //
+    // NOTE: the previous approach, html2pdf().from(idoc.body), cloned only the
+    // <body> element into the PARENT page to render it. The document's <style>
+    // rules live in the iframe's <head> and did NOT travel with the cloned body,
+    // so every class-based style was lost and the emailed PDF looked broken.
+    // Capturing the iframe document directly keeps the emailed PDF identical to
+    // the on-screen "Save / Print" view.
+    const h2c = window.html2canvas
+      || (window.html2pdf && window.html2pdf.html2canvas)
+      || null;
+    if (!window.jspdf || (!h2c && !window.html2pdf)) {
+      reject(new Error('PDF renderer not loaded — check your internet connection and reload.'));
+      return;
+    }
+
     const iframe = document.createElement('iframe');
     iframe.setAttribute('aria-hidden', 'true');
     iframe.style.position = 'fixed';
@@ -2469,24 +2486,63 @@ function htmlToPdfBase64(fullHtml) {
         idoc.write(fullHtml);
         idoc.close();
 
+        // The footer is pinned with position:fixed for the browser print view.
+        // In a single rasterised capture that would float/overlap, so let it
+        // flow at the end of the content instead (and reclaim the reserved gap).
+        const ov = idoc.createElement('style');
+        ov.textContent = '.foot{position:static!important;left:auto!important;right:auto!important;margin-top:18px}body{padding-bottom:10mm!important}';
+        (idoc.head || idoc.documentElement).appendChild(ov);
+
         // Wait for fonts + the logo image to be ready so nothing renders blank.
         try { if (idoc.fonts && idoc.fonts.ready) await idoc.fonts.ready; } catch (e) {}
         const imgs = Array.from(idoc.images || []);
         await Promise.all(imgs.map(img => img.complete ? Promise.resolve()
           : new Promise(r => { img.onload = img.onerror = r; })));
-        await new Promise(r => setTimeout(r, 250));
+        await new Promise(r => setTimeout(r, 300));
 
+        const { jsPDF } = window.jspdf;
+
+        if (h2c) {
+          // Preferred path: rasterise the styled iframe document directly.
+          const canvas = await h2c(idoc.body, {
+            scale: 2,
+            useCORS: true,
+            backgroundColor: '#ffffff',
+            windowWidth: idoc.body.scrollWidth,
+            windowHeight: idoc.body.scrollHeight
+          });
+          const pdf = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
+          const pageH = 297;
+          const imgW = 210;
+          const imgH = canvas.height * imgW / canvas.width;
+          const imgData = canvas.toDataURL('image/jpeg', 0.98);
+          let position = 0;
+          let heightLeft = imgH;
+          pdf.addImage(imgData, 'JPEG', 0, position, imgW, imgH);
+          heightLeft -= pageH;
+          while (heightLeft > 0.5) {
+            position -= pageH;
+            pdf.addPage();
+            pdf.addImage(imgData, 'JPEG', 0, position, imgW, imgH);
+            heightLeft -= pageH;
+          }
+          const b64 = pdf.output('datauristring').split(',')[1];
+          cleanup();
+          resolve(b64);
+          return;
+        }
+
+        // Fallback (only if html2canvas is not exposed): render from the full
+        // HTML string so the <style> block is at least included in the render
+        // container, rather than from(body) which strips all class styles.
         const opt = {
           margin: 0,
           image: { type: 'jpeg', quality: 0.98 },
-          html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff', windowWidth: idoc.body.scrollWidth },
+          html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff' },
           jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
-          // 'css' honours page-break-inside:avoid so blocks/paragraphs stay whole;
-          // 'legacy' keeps the natural single-page-until-overflow behaviour.
           pagebreak: { mode: ['css', 'legacy'] }
         };
-
-        const pdf = await window.html2pdf().set(opt).from(idoc.body).toPdf().get('pdf');
+        const pdf = await window.html2pdf().set(opt).from(fullHtml, 'string').toPdf().get('pdf');
         const b64 = pdf.output('datauristring').split(',')[1];
         cleanup();
         resolve(b64);
