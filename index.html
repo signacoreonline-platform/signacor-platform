@@ -1124,6 +1124,38 @@ function getNextQuoteNum(quotes) {
   return 'SQ-' + String((nums.length>0?Math.max(...nums):0)+1).padStart(5,'0');
 }
 
+/* ═══════════════════════════════════════════
+   CANONICAL TERMS & CONDITIONS — single source of truth.
+   Used by BOTH the formal document PDF (buildQuoteHtml /
+   buildInvoiceHtml) AND the Cover Letter PDF so the terms
+   shown to the client are always identical.
+═══════════════════════════════════════════ */
+function quoteTermsList(depRate){
+  const full = depRate===1;
+  return [
+    'This quotation is valid for 14 days from the date of issue unless otherwise stated above.',
+    'A '+(full?'100%':'80%')+' deposit is required upon acceptance of this quotation before any production or procurement commences.'+(full?' (Full deposit applies as the total value is R5,000 or less.)':''),
+    ...(full?[]:['The remaining 20% balance is payable on completion, prior to delivery or installation.']),
+    'All prices are quoted in South African Rand (ZAR). VAT is charged at 15% where applicable.',
+    'Alterations to approved artwork or specifications after production has commenced may result in additional charges.',
+    'Artwork/design files supplied by the client must be in PDF, AI or EPS format at 100% scale. Signacore accepts no responsibility for print quality from substandard files.',
+    'Lead times stated are estimates and may vary due to material availability, weather conditions, or site access.',
+    'Ownership of all goods remains with Signacore until full payment is received.',
+    'Installation is excluded unless specifically listed as a line item in this quotation.',
+    'Any work outside the scope of this quotation will be separately quoted and invoiced.'
+  ];
+}
+function invoiceTermsList(refNum){
+  return [
+    'Payment is due in full by the invoice due date stated above.',
+    'Please use the invoice number ('+refNum+') as your payment reference.',
+    'All prices are quoted in South African Rand (ZAR). VAT is charged at 15% where applicable.',
+    'Ownership of all goods remains with Signacore until full payment is received.',
+    'Banking details for electronic payment are provided below.',
+    'Any query regarding this invoice should be raised in writing within 7 days of the invoice date.'
+  ];
+}
+
 function buildQuoteHtml(q, companies, logoDataUrl) {
   const co = companies.find(c=>c.id===q.co)||{name:'Signacore',short:'SGR'};
   const sub = q.lines.reduce((s,l)=>s+(l.subtotal||0),0);
@@ -1304,18 +1336,7 @@ ${q.notes?(`<div class="notes"><div class="lbl">Notes</div><p>${q.notes}</p></di
 <!-- T&C -->
 <div class="tc no-break">
   <div class="lbl">Terms &amp; Conditions</div>
-  <ol>
-    <li>This quotation is valid for 14 days from the date of issue unless otherwise stated above.</li>
-    <li>A ${depRate===1?'100%':'80%'} deposit is required upon acceptance of this quotation before any production or procurement commences.${depRate===1?' (Full deposit applies as the total value is R5,000 or less.)':''}</li>
-    ${depRate===1?'':`<li>The remaining 20% balance is payable on completion, prior to delivery or installation.</li>`}
-    <li>All prices are quoted in South African Rand (ZAR). VAT is charged at 15% where applicable.</li>
-    <li>Alterations to approved artwork or specifications after production has commenced may result in additional charges.</li>
-    <li>Artwork/design files supplied by the client must be in PDF, AI or EPS format at 100% scale. Signacore accepts no responsibility for print quality from substandard files.</li>
-    <li>Lead times stated are estimates and may vary due to material availability, weather conditions, or site access.</li>
-    <li>Ownership of all goods remains with Signacore until full payment is received.</li>
-    <li>Installation is excluded unless specifically listed as a line item in this quotation.</li>
-    <li>Any work outside the scope of this quotation will be separately quoted and invoiced.</li>
-  </ol>
+  <ol>${quoteTermsList(depRate).map(t=>`<li>${t}</li>`).join('')}</ol>
 </div>
 
 <!-- BANK DETAILS -->
@@ -1743,6 +1764,9 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
 '.bank{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 13px;margin-bottom:16px;clear:both;page-break-inside:avoid}'+
 '.bank .lbl{font-size:8px;font-weight:700;color:#065f46;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}'+
 '.bank table td{padding:2px 0;font-size:9.5px;color:#374151}.bank table td:first-child{color:#6b7280;width:130px}'+
+'.tc{margin-bottom:16px;clear:both;page-break-inside:avoid}'+
+'.tc .lbl{font-size:8px;font-weight:700;color:#4b5563;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;border-bottom:1px solid #e5e7eb;padding-bottom:3px}'+
+'.tc ol{padding-left:14px}.tc li{font-size:8.5px;color:#6b7280;margin-bottom:2px;line-height:1.55}'+
 '.note-box{background:#fffbeb;border:1px solid #fde68a;border-left:3px solid #f59e0b;border-radius:0 6px 6px 0;padding:10px 14px;margin-bottom:16px;clear:both;page-break-inside:avoid}'+
 '.note-box .lbl{font-size:8px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:5px}'+
 '.note-box p{font-size:10px;color:#78350f;line-height:1.6;white-space:pre-wrap}'+
@@ -1813,6 +1837,11 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
 '<tr class="vat-row"><td>VAT (15%)</td><td>'+fmt(vat)+'</td></tr>'+
 '<tr class="total-row"><td>TOTAL DUE</td><td>'+fmt(total)+'</td></tr>'+
 '</table></div></div>'+
+
+'<div class="tc no-break">'+
+'<div class="lbl">Terms &amp; Conditions</div>'+
+'<ol>'+invoiceTermsList(invNum).map(t=>'<li>'+t+'</li>').join('')+'</ol>'+
+'</div>'+
 
 '<div class="bank no-break">'+
 '<div class="lbl">Banking Details</div>'+
@@ -2157,41 +2186,41 @@ async function generateCoverLetterPdf(data, companies, logoDataUrl, type) {
     'We would be most grateful if you could process payment within the agreed terms (due: '+validity+'). Please use your invoice number as your payment reference. On behalf of the entire Signacore team, we thank you warmly for your valued business and look forward to the pleasure of working with you again in the future.'
   ];
   paras.forEach(para => {
-    const wrapped = doc.splitTextToSize(para, 115);
+    const wrapped = doc.splitTextToSize(para, 168);
     doc.text(wrapped, LM, y);
     y += wrapped.length * 5 + 5;
   });
 
-  // --- Sidebar (terms) ---
-  const sideX=142, sideW=48, sideY=50;
-  sf(C_LGREY); sd(C_MGREY); doc.setLineWidth(0.3);
-  doc.roundedRect(sideX, sideY, sideW, 88, 2, 2, 'FD');
-  sf(C_RED); doc.rect(sideX, sideY, 2, 88, 'F');
-  doc.setFont('helvetica','bold'); doc.setFontSize(7); sc(C_RED);
-  doc.text('KEY TERMS', sideX+5, sideY+7);
-  const terms = isQuote ? [
-    ['Deposit',(depRate===1?'100%':'80%')+' on acceptance'],...(depRate===1?[]:[['Balance','20% on completion']]),
-    ['Currency','ZAR incl. VAT 15%'],['Valid For','14 days from issue'],
-    ['Ownership','On full payment'],['Lead Time','Subject to material\navailability']
-  ] : [
-    ['Payment','On invoice due date'],['Currency','ZAR incl. VAT 15%'],
-    ['Bank','Standard Bank'],['Acc Name','Hornet Honey t/a Signacore'],
-    ['Acc No','2-825-229-72'],['Branch','051001'],['Ref',refNum]
-  ];
-  let ty = sideY+14;
-  terms.forEach(([k,v]) => {
-    if (ty > sideY+84) return;
-    doc.setFont('helvetica','bold'); doc.setFontSize(6.5); sc(C_GREY);
-    doc.text(k+':', sideX+5, ty);
-    doc.setFont('helvetica','normal'); sc(C_DARK);
-    const vl = doc.splitTextToSize(v, sideW-8);
-    doc.text(vl, sideX+5, ty+3.5);
-    ty += 3.5 + vl.length*3.5 + 2;
+  // --- Terms & Conditions (identical wording to the formal document) ---
+  const termsList = isQuote ? quoteTermsList(depRate) : invoiceTermsList(refNum);
+  y += 2;
+  doc.setFont('helvetica','bold'); doc.setFontSize(9); sc(C_RED);
+  doc.text('TERMS & CONDITIONS', LM, y); y += 2;
+  sd(C_RED); doc.setLineWidth(0.4); doc.line(LM, y, RM, y); y += 5;
+  doc.setFont('helvetica','normal'); doc.setFontSize(8); sc(C_GREY);
+  termsList.forEach((t, i) => {
+    const wrapped = doc.splitTextToSize((i+1)+'. '+t, CW-2);
+    if (y + wrapped.length*3.6 > 270) { doc.addPage(); y = 20; }
+    doc.text(wrapped, LM, y);
+    y += wrapped.length*3.6 + 1.6;
   });
+  y += 4;
+
+  // --- Banking details (invoice only — mirrors the invoice document) ---
+  if (!isQuote) {
+    if (y + 30 > 270) { doc.addPage(); y = 20; }
+    doc.setFont('helvetica','bold'); doc.setFontSize(8.5); sc(C_DARK);
+    doc.text('Banking Details', LM, y); y += 4.5;
+    doc.setFont('helvetica','normal'); doc.setFontSize(8); sc(C_GREY);
+    [['Bank','Standard Bank'],['Account Name','Hornet Honey trading as Signacore'],['Account No','2-825-229-72'],['Branch Code','051001'],['Reference',refNum+' / '+(data.client||'')]].forEach(([k,v])=>{
+      doc.text(k+':', LM, y); sc(C_DARK); doc.text(v, LM+34, y); sc(C_GREY); y += 4;
+    });
+    y += 4;
+  }
 
   // --- QR review box ---
-  y = Math.max(y, sideY+93);
   const qrBoxH = 44;
+  if (y + qrBoxH + 6 > 278) { doc.addPage(); y = 20; }
   sf(C_LBLUE); sd([191,219,254]); doc.setLineWidth(0.3);
   doc.roundedRect(LM, y, CW, qrBoxH, 3, 3, 'FD');
   doc.setFont('helvetica','bold'); doc.setFontSize(9.5); sc(C_BLUE);
