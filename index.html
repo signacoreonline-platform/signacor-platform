@@ -8310,9 +8310,10 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   const convPct        = monthQuotes.length>0 ? Math.round(monthConverted.length/monthQuotes.length*100) : 0;
   const convColor      = convPct>=75 ? '#10b981' : convPct>=50 ? '#0000ff' : convPct>=25 ? '#f59e0b' : '#ED0101';
   const convMsg        = convPct>=75 ? '🔥 Outstanding — keep it up!' : convPct>=50 ? '💪 Strong — push for more' : convPct>=25 ? '📈 Building momentum' : '🚀 Let’s win more quotes';
-  // ── Salesman of the Month ── salesperson with the highest total quote value this month
+  // ── Salesman of the Month ── salesperson with the highest total ACCEPTED quote value this month
+  // Only quotes the customer accepted (status 'converted') count — not every quote made.
   const _spTotals = {};
-  (quotes||[]).filter(q=>inCurrentMonth(q.date)).forEach(q=>{
+  (quotes||[]).filter(q=>q.status==='converted' && inCurrentMonth(q.date)).forEach(q=>{
     const name = (q.salesperson||'').trim() || 'Unassigned';
     const sub  = (q.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
     const disc = parseFloat(q.discount)||0;
@@ -8324,7 +8325,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   const topSalesmanTotal= _spTop ? _spTop[1] : 0;
   const topSalesmanSub  = _spTop
     ? 'R ' + topSalesmanTotal.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2}) + ' · ' + _curMonthLabel
-    : 'No quotes this month';
+    : 'No accepted quotes this month';
 
   return (
     <div className="p-4 space-y-4">
