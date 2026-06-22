@@ -8310,6 +8310,21 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   const convPct        = monthQuotes.length>0 ? Math.round(monthConverted.length/monthQuotes.length*100) : 0;
   const convColor      = convPct>=75 ? '#10b981' : convPct>=50 ? '#0000ff' : convPct>=25 ? '#f59e0b' : '#ED0101';
   const convMsg        = convPct>=75 ? '🔥 Outstanding — keep it up!' : convPct>=50 ? '💪 Strong — push for more' : convPct>=25 ? '📈 Building momentum' : '🚀 Let’s win more quotes';
+  // ── Salesman of the Month ── salesperson with the highest total quote value this month
+  const _spTotals = {};
+  (quotes||[]).filter(q=>inCurrentMonth(q.date)).forEach(q=>{
+    const name = (q.salesperson||'').trim() || 'Unassigned';
+    const sub  = (q.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
+    const disc = parseFloat(q.discount)||0;
+    const setup= parseFloat(q.setupFee)||0;
+    _spTotals[name] = (_spTotals[name]||0) + (sub-sub*(disc/100)+setup)*1.15;
+  });
+  const _spTop          = Object.entries(_spTotals).sort((a,b)=>b[1]-a[1])[0];
+  const topSalesman     = _spTop ? _spTop[0] : '—';
+  const topSalesmanTotal= _spTop ? _spTop[1] : 0;
+  const topSalesmanSub  = _spTop
+    ? 'R ' + topSalesmanTotal.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2}) + ' · ' + _curMonthLabel
+    : 'No quotes this month';
 
   return (
     <div className="p-4 space-y-4">
@@ -8376,7 +8391,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
             </div>
           </div>
         )}
-        {isAdmin&&<KpiCard icon="⚠️" label="Low Stock"     value={lowStock}   sub="Need reordering" accent="text-red-600"/>}
+        {isAdmin&&<KpiCard icon="🏆" label="Salesman of the Month" value={topSalesman} sub={topSalesmanSub} accent="text-amber-500"/>}
         {!isAdmin&&<KpiCard icon="📋" label="Total Jobs"   value={totalJobs}  sub="All companies"   accent="text-gray-800"/>}
         {!isAdmin&&<KpiCard icon="💬" label="In Quoting"   value={quoteJobs}  sub="Needs follow-up" accent="text-brand-500"/>}
       </div>
