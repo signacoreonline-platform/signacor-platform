@@ -57,6 +57,7 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/html2pdf.js@0.10.1/dist/html2pdf.bundle.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script>
     tailwind.config = {
@@ -1123,7 +1124,7 @@ function getNextQuoteNum(quotes) {
   return 'SQ-' + String((nums.length>0?Math.max(...nums):0)+1).padStart(5,'0');
 }
 
-function printQuoteWindow(q, companies, logoDataUrl) {
+function buildQuoteHtml(q, companies, logoDataUrl) {
   const co = companies.find(c=>c.id===q.co)||{name:'Signacore',short:'SGR'};
   const sub = q.lines.reduce((s,l)=>s+(l.subtotal||0),0);
   const disc = parseFloat(q.discount)||0;
@@ -1346,8 +1347,13 @@ ${q.notes?(`<div class="notes"><div class="lbl">Notes</div><p>${q.notes}</p></di
   </div>
 </div>
 
-<script>window.onload=function(){window.print();}<\/script>
 </body></html>`;
+  return html;
+}
+
+function printQuoteWindow(q, companies, logoDataUrl) {
+  const html = buildQuoteHtml(q, companies, logoDataUrl)
+    .replace('</body></html>', '<script>window.onload=function(){window.print();}<\/script></body></html>');
   const w = window.open('', '_blank', 'width=960,height=750');
   if (!w) {
     alert('Pop-up blocked! Please allow pop-ups for this page and try again.');
@@ -1674,7 +1680,7 @@ stageNames.map(function(s,i){
 /* ═══════════════════════════════════════════
    PRINT INVOICE
 ═══════════════════════════════════════════ */
-function printInvoice(job, companies, logoDataUrl) {
+function buildInvoiceHtml(job, companies, logoDataUrl) {
   const co = companies.find(c=>c.id===job.co)||{name:'Signacore',short:'SGR'};
   const lines = job.lines||[];
   const sub = lines.reduce((s,l)=>s+(l.subtotal||0),0);
@@ -1823,9 +1829,13 @@ function printInvoice(job, companies, logoDataUrl) {
 ? '<div class="note-box no-break"><div class="lbl">Notes</div><p>'+job.notes+'</p></div>'
 : '')+
 
-'<script>window.onload=function(){window.print();}<\/script>'+
 '</body></html>';
+  return html;
+}
 
+function printInvoice(job, companies, logoDataUrl) {
+  const html = buildInvoiceHtml(job, companies, logoDataUrl)
+    .replace('</body></html>', '<script>window.onload=function(){window.print();}<\/script></body></html>');
   const w = window.open('','_blank','width=960,height=750');
   if (!w) { alert('Pop-up blocked! Please allow pop-ups for this page.'); return; }
   w.document.open(); w.document.write(html); w.document.close();
@@ -1834,7 +1844,7 @@ function printInvoice(job, companies, logoDataUrl) {
 /* ═══════════════════════════════════════════
    PRINT PROFORMA INVOICE (from quote)
 ═══════════════════════════════════════════ */
-function printProformaWindow(quote, proformaNum, companies, logoDataUrl) {
+function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
   const co = companies.find(c=>c.id===quote.co)||{name:'Signacore',short:'SGR'};
   const lines = quote.lines||[];
   const sub = lines.reduce((s,l)=>s+(l.subtotal||0),0);
@@ -1877,9 +1887,9 @@ function printProformaWindow(quote, proformaNum, companies, logoDataUrl) {
 ".box .lbl{font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:4px;color:#4b5563}"+
 ".box .nm{font-size:12.5px;font-weight:800;color:#06065c;margin-bottom:3px;font-family:'Barlow Condensed',Arial,sans-serif;letter-spacing:0.04em}"+
 ".box p{font-size:9.5px;color:#555;line-height:1.55}"+
-"table.ln{width:100%;border-collapse:collapse;margin-bottom:12px}table.ln thead tr{background:#06065c}"+
+"table.ln{width:100%;border-collapse:collapse;margin-bottom:12px;page-break-inside:auto}table.ln thead{display:table-header-group}table.ln thead tr{background:#06065c}"+
 "table.ln th{color:#fff;padding:7px 9px;font-size:8px;text-transform:uppercase;letter-spacing:0.8px;text-align:left;font-weight:700}"+
-"table.ln td{padding:7px 9px;border-bottom:1px solid #f0f0f0;vertical-align:top}"+
+"table.ln td{padding:7px 9px;border-bottom:1px solid #f0f0f0;vertical-align:top;page-break-inside:avoid}"+
 "table.ln tbody tr:nth-child(even) td{background:#f7f8ff}"+
 ".tots-wrap{display:flex;justify-content:flex-end;margin-bottom:14px;clear:both}.tots{width:270px}"+
 ".tots table{width:100%;border-collapse:collapse}.tots td{padding:4px 6px;font-size:11px;border-bottom:1px solid #f0f0f0}"+
@@ -1888,7 +1898,7 @@ function printProformaWindow(quote, proformaNum, companies, logoDataUrl) {
 ".bank{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 13px;margin-bottom:16px;clear:both}"+
 ".bank .lbl{font-size:8px;font-weight:700;color:#065f46;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}"+
 ".bank table td{padding:2px 0;font-size:9.5px;color:#374151}.bank table td:first-child{color:#6b7280;width:130px}"+
-".foot{position:fixed;bottom:0;left:16mm;right:16mm;padding-top:5px;background:#fff}"+
+".foot{margin-top:18px;padding-top:5px;background:#fff;page-break-inside:avoid}"+
 ".foot-line{height:2px;background:linear-gradient(90deg,#06065c 0%,#0000ff 60%,#ED0101 100%);margin-bottom:4px}"+
 ".foot p{font-size:8px;color:#4b5563;text-align:center}"+
 "@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}.no-break{page-break-inside:avoid}}";
@@ -1945,7 +1955,13 @@ function printProformaWindow(quote, proformaNum, companies, logoDataUrl) {
 '<div class="foot"><div class="foot-line"></div>'+
 '<p>Hornet Honey (Pty) Ltd t/a Signacore · 21 Voortrekker St, Mossdustria, Mossel Bay · 040-940-5555 · orders@snsg.co.za</p>'+
 '</div>'+
-'<script>window.onload=function(){window.print();}<\/script></body></html>';
+'</body></html>';
+  return html;
+}
+
+function printProformaWindow(quote, proformaNum, companies, logoDataUrl) {
+  const html = buildProformaHtml(quote, proformaNum, companies, logoDataUrl)
+    .replace('</body></html>', '<script>window.onload=function(){window.print();}<\/script></body></html>');
   const w = window.open('','_blank','width=960,height=750');
   if (!w) { alert('Pop-up blocked! Please allow pop-ups for this page.'); return; }
   w.document.open(); w.document.write(html); w.document.close();
@@ -2391,6 +2407,79 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
 }
 
 /* ═══════════════════════════════════════════
+   RENDER THE RICH HTML DOCUMENT → PDF (html2pdf)
+   Used by the email pack so the attached PDF is
+   byte-for-byte the SAME layout as the on-screen
+   "Save / Print" version. Page breaks are handled
+   by CSS (page-break-inside:avoid) — the document
+   only flows onto a second page when it genuinely
+   cannot fit, and never splits a block/paragraph.
+   Returns a base64 string (no data: prefix).
+═══════════════════════════════════════════ */
+function htmlToPdfBase64(fullHtml) {
+  return new Promise((resolve, reject) => {
+    if (!window.html2pdf) { reject(new Error('PDF renderer (html2pdf) not loaded — check your internet connection and reload.')); return; }
+    // Render inside an isolated off-screen iframe so the document's
+    // global CSS (body{}, *{}, table{} …) cannot leak into the dashboard.
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('aria-hidden', 'true');
+    iframe.style.position = 'fixed';
+    iframe.style.left = '-10000px';
+    iframe.style.top = '0';
+    iframe.style.width = '210mm';
+    iframe.style.height = '297mm';
+    iframe.style.border = '0';
+    document.body.appendChild(iframe);
+
+    const cleanup = () => { try { document.body.removeChild(iframe); } catch (e) {} };
+
+    const run = async () => {
+      try {
+        const idoc = iframe.contentWindow.document;
+        idoc.open();
+        idoc.write(fullHtml);
+        idoc.close();
+
+        // Wait for fonts + the logo image to be ready so nothing renders blank.
+        try { if (idoc.fonts && idoc.fonts.ready) await idoc.fonts.ready; } catch (e) {}
+        const imgs = Array.from(idoc.images || []);
+        await Promise.all(imgs.map(img => img.complete ? Promise.resolve()
+          : new Promise(r => { img.onload = img.onerror = r; })));
+        await new Promise(r => setTimeout(r, 250));
+
+        const opt = {
+          margin: 0,
+          image: { type: 'jpeg', quality: 0.98 },
+          html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff', windowWidth: idoc.body.scrollWidth },
+          jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+          // 'css' honours page-break-inside:avoid so blocks/paragraphs stay whole;
+          // 'legacy' keeps the natural single-page-until-overflow behaviour.
+          pagebreak: { mode: ['css', 'legacy'] }
+        };
+
+        const pdf = await window.html2pdf().set(opt).from(idoc.body).toPdf().get('pdf');
+        const b64 = pdf.output('datauristring').split(',')[1];
+        cleanup();
+        resolve(b64);
+      } catch (err) {
+        cleanup();
+        reject(err);
+      }
+    };
+    run();
+  });
+}
+
+/* Pick the correct rich-HTML builder for the document type and render it. */
+async function generateDocumentPdfFromHtml(type, data, companies, logoDataUrl) {
+  let fullHtml;
+  if (type === 'quote')          fullHtml = buildQuoteHtml(data, companies, logoDataUrl);
+  else if (type === 'proforma')  fullHtml = buildProformaHtml(data, data._proformaNum || data.num, companies, logoDataUrl);
+  else                           fullHtml = buildInvoiceHtml(data, companies, logoDataUrl);
+  return await htmlToPdfBase64(fullHtml);
+}
+
+/* ═══════════════════════════════════════════
    GENERATE BOTH PDFS + BUILD + DOWNLOAD .EML
 ═══════════════════════════════════════════ */
 async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMarkSent) {
@@ -2400,10 +2489,12 @@ async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMa
   const docLabel = isQuote ? 'Quotation' : isProforma ? 'Proforma Invoice' : 'Tax Invoice';
   const co       = companies.find(c=>c.id===data.co)||{name:'Signacore'};
 
-  // Generate both PDFs in parallel
+  // Generate both PDFs in parallel.
+  // The document PDF is rendered from the SAME rich HTML used by the
+  // on-screen "Save / Print" view, so the emailed file matches it exactly.
   const [coverB64, docB64] = await Promise.all([
     generateCoverLetterPdf(data, companies, logoDataUrl, type),
-    generateDocumentPdf(data, companies, logoDataUrl, type)
+    generateDocumentPdfFromHtml(type, data, companies, logoDataUrl)
   ]);
 
   const to      = data.email||'';
