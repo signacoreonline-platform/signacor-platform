@@ -15404,6 +15404,57 @@ function App() {
     return changed;
   }
 
+  // Merge-save with a FRESH server baseline.
+  // Before writing, re-fetch the latest server state and overlay ONLY the sections
+  // this user actually changed (relative to the state they last synced from). This
+  // closes the multi-user data-loss window: previously the merge overlaid changes
+  // onto serverBaselineRef.current, which only refreshes on the 30 s poll, so a save
+  // landing in that window wrote back stale copies of the sections this user did not
+  // touch — silently deleting another user's concurrent additions (e.g. an admin's
+  // new client/quote vanishing when the assistant autosaved).
+  // Returns true only when the backend save is confirmed; false when there was
+  // nothing of ours to push. Throws on a failed PUT so callers show the error.
+  async function mergeAndSave(snapshot) {
+    const ownBaseline = serverBaselineRef.current;
+    // Sections THIS user edited, measured against the state they last synced from.
+    const changed = ownBaseline ? locallyChangedSections(snapshot, ownBaseline) : null;
+    const hasChanges = changed ? Object.values(changed).some(Boolean) : true;
+    if (ownBaseline && !hasChanges) return false; // nothing of ours to push
+
+    // Pull the freshest server state to merge onto. If offline, fall back to our
+    // last known baseline so availability does not regress.
+    let mergeBase = ownBaseline;
+    try {
+      const fresh = await fetchFromServer();
+      if (fresh && typeof fresh === 'object' && Object.keys(fresh).length > 0) mergeBase = fresh;
+    } catch (_) { /* offline — fall back to last known baseline */ }
+
+    let payload;
+    if (mergeBase) {
+      payload = Object.assign({}, mergeBase);
+      if (changed) {
+        // Overlay only the sections we changed; untouched sections keep the fresh
+        // server values (which now include other users' concurrent work).
+        for (const k of STATE_SECTIONS) { if (changed[k]) payload[k] = snapshot[k]; }
+        if (changed.logo)      payload.logo      = snapshot.logo;
+        if (changed.utLogo)    payload.utLogo    = snapshot.utLogo;
+        if (changed.sigOTSmit) payload.sigOTSmit = snapshot.sigOTSmit;
+      } else {
+        // No baseline to diff against — push our full snapshot sections.
+        for (const k of STATE_SECTIONS) { if (snapshot[k] !== undefined) payload[k] = snapshot[k]; }
+        payload.logo = snapshot.logo; payload.utLogo = snapshot.utLogo; payload.sigOTSmit = snapshot.sigOTSmit;
+      }
+      payload.v            = DATA_VERSION;
+      payload._autoSavedAt = new Date().toISOString();
+      payload.savedAt      = snapshot.savedAt;
+    } else {
+      payload = Object.assign({}, snapshot, { _autoSavedAt: new Date().toISOString() });
+    }
+    await saveToServer(payload);
+    serverBaselineRef.current = payload;
+    return true;
+  }
+
   // 1) Initial load from backend
   useEffect(() => {
     let cancelled = false;
@@ -15460,26 +15511,8 @@ function App() {
           const snapshot = currentSnapshotRef.current;
           if (!snapshot) return;
           try {
-            const baseline = serverBaselineRef.current;
-            let payload;
-            if (baseline) {
-              const changed    = locallyChangedSections(snapshot, baseline);
-              const hasChanges = changed && Object.values(changed).some(Boolean);
-              if (!hasChanges) return; // nothing new to flush
-              payload = Object.assign({}, baseline);
-              for (const k of STATE_SECTIONS) { if (changed[k]) payload[k] = snapshot[k]; }
-              if (changed.logo)      payload.logo      = snapshot.logo;
-              if (changed.utLogo)    payload.utLogo    = snapshot.utLogo;
-              if (changed.sigOTSmit) payload.sigOTSmit = snapshot.sigOTSmit;
-              payload.v            = DATA_VERSION;
-              payload._autoSavedAt = new Date().toISOString();
-              payload.savedAt      = snapshot.savedAt;
-            } else {
-              payload = Object.assign({}, snapshot, { _autoSavedAt: new Date().toISOString() });
-            }
-            await saveToServer(payload);
-            serverBaselineRef.current = payload;
-            setApiMsg('Saved ✓');
+            const saved = await mergeAndSave(snapshot);
+            if (saved) setApiMsg('Saved ✓');
           } catch(e) {
             setApiMsg('Save failed — kept locally');
           }
@@ -15541,27 +15574,10 @@ function App() {
     if (apiSaveTimerRef.current) clearTimeout(apiSaveTimerRef.current);
     apiSaveTimerRef.current = setTimeout(async () => {
       try {
-        const baseline = serverBaselineRef.current;
-        let payload;
-        if (baseline) {
-          // Merge: start from server baseline, overlay only locally-changed sections
-          const changed = locallyChangedSections(snapshot, baseline);
-          payload = Object.assign({}, baseline);
-          if (changed) {
-            for (const k of STATE_SECTIONS) { if (changed[k]) payload[k] = snapshot[k]; }
-            if (changed.logo)      payload.logo      = snapshot.logo;
-            if (changed.utLogo)    payload.utLogo    = snapshot.utLogo;
-            if (changed.sigOTSmit) payload.sigOTSmit = snapshot.sigOTSmit;
-          }
-          payload.v            = DATA_VERSION;
-          payload._autoSavedAt = new Date().toISOString();
-          payload.savedAt      = snapshot.savedAt;
-        } else {
-          payload = Object.assign({}, snapshot, { _autoSavedAt: new Date().toISOString() });
-        }
-        await saveToServer(payload);
-        serverBaselineRef.current = payload;
-        setApiMsg('Saved ✓');
+        // Re-fetch the freshest server baseline, then overlay only the sections this
+        // user changed — never overwrite another user's concurrent edits with stale data.
+        const saved = await mergeAndSave(snapshot);
+        if (saved) setApiMsg('Saved ✓');
       } catch (e) {
         setApiMsg('Save failed — kept locally');
       }
