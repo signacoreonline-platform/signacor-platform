@@ -6465,7 +6465,7 @@ function EmployeeDetailView({ emp, leaveRequests, disciplinary, employees, onBac
             {(()=>{
               const annualDays = (LEAVE_TYPES.find(t=>t.key==='annual')||{days:15}).days;
               const annualRate = annualDays/12;
-              const annualAccrued = Math.round(monthsWorked*annualRate*10)/10;
+              const annualAccrued = Math.round(monthsWorked*annualRate*100)/100;
               return (<>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
@@ -6485,7 +6485,7 @@ function EmployeeDetailView({ emp, leaveRequests, disciplinary, employees, onBac
                       const isAnnual = lt.key==='annual';
                       const accrued = isAnnual ? annualAccrued : lt.days;
                       const adj = parseFloat(leaveAdjust[lt.key])||0;
-                      const credit = Math.round((accrued - used + adj)*10)/10;
+                      const credit = Math.round((accrued - used + adj)*100)/100;
                       return (
                         <tr key={lt.key} className="border-b last:border-0">
                           <td className="py-1.5 text-gray-600">{lt.label}</td>
@@ -6494,7 +6494,7 @@ function EmployeeDetailView({ emp, leaveRequests, disciplinary, employees, onBac
                           <td className="py-1.5 text-right text-gray-700">{used}</td>
                           <td className="py-1.5 text-right">
                             {editingSummary
-                              ? <input type="number" step="0.5" value={leaveAdjust[lt.key]??''} onChange={e=>setLeaveAdjust(prev=>({...prev,[lt.key]:e.target.value}))} className="w-16 border border-gray-300 rounded px-1 py-0.5 text-right text-xs" placeholder="0"/>
+                              ? <input type="number" step="any" value={leaveAdjust[lt.key]??''} onChange={e=>setLeaveAdjust(prev=>({...prev,[lt.key]:e.target.value}))} className="w-20 border border-gray-300 rounded px-1 py-0.5 text-right text-xs" placeholder="0" title="Enter the adjustment in days, the way leave is actually taken (e.g. 0.5, 1, 2.5). The balance still accrues at 1.25 days/month."/>
                               : <span className={adj?'text-gray-700':'text-gray-300'}>{adj?(adj>0?'+':'')+adj:'0'}</span>}
                           </td>
                           <td className={`py-1.5 text-right font-bold ${credit<0?'text-red-500':'text-emerald-600'}`}>{credit}</td>
@@ -8516,7 +8516,14 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   // lifecycle scale: Deposit Received (5) and Invoiced (9). Deposit Received is
   // actioned automatically when a deposit/partial payment is recorded; Invoiced
   // is actioned automatically once the job carries a tax invoice.
-  const LOCKED_STAGES=[5,9];
+  const BASE_LOCKED_STAGES=[5,9];
+  // Sponsored / warranty / no-charge jobs carry a zero (or blank) value, so a
+  // deposit or payment will never be recorded and the system-controlled Deposit
+  // Received (5) / Invoiced (9) stages would never auto-activate. For these jobs
+  // we unlock those stages so the operator can advance the job manually and
+  // bypass the deposit / payment requirement.
+  const isZeroValueJob = (parseFloat(job.value)||0) <= 0;
+  const LOCKED_STAGES = isZeroValueJob ? [] : BASE_LOCKED_STAGES;
   const nextStage=job.stage+1;
   const nextLocked=LOCKED_STAGES.includes(nextStage);
 
@@ -8620,6 +8627,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
             <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full bg-violet-400"></span>Invoiced — auto on tax invoice</span>
           </div>
           <p className="text-xs text-gray-500 mb-3">Current: <strong>{STAGE_NAMES[job.stage]}</strong></p>
+          {isZeroValueJob&&!isLast&&<div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-2 mb-3 flex items-start gap-2"><span className="text-base">🎗️</span><p className="text-xs text-blue-700"><strong>Zero-value job</strong> (sponsored / warranty / no-charge). Deposit &amp; payment stages are unlocked — you can advance the job manually without recording a deposit or payment.</p></div>}
           {isLast
             ? <div className="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 flex items-center gap-2"><span className="text-emerald-500 text-lg">✅</span><p className="text-sm font-bold text-emerald-700">Job Complete — Invoiced</p></div>
             : nextLocked
@@ -13890,7 +13898,12 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
       const total = subtotal+vat;
       const paid = (i.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       const balance = total-paid;
-      return {...i, daysOverdue: days, total, paid, balance};
+      const lastPayment = (i.payments||[]).slice().sort((a,b)=>new Date(b.date||0)-new Date(a.date||0))[0]||null;
+      // Aging bucket based on days overdue
+      const bucket = days<=0 ? 'Current' : days<=30 ? '1–30' : days<=60 ? '31–60' : days<=90 ? '61–90' : '90+';
+      const lineCount = (i.lineItems||[]).length;
+      const lineSummary = (i.lineItems||[]).map(l=>l.description).filter(Boolean).join('; ');
+      return {...i, daysOverdue: days, subtotal, vat, total, paid, balance, bucket, lastPayment, lineCount, lineSummary};
     });
   }
 
@@ -15065,65 +15078,96 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
       {/* ── REPORTS ── */}
       {accTab==='reports'&&(
         <div className="space-y-4">
-          {/* P&L Statement */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
-              <div className="px-5 py-3" style={{background:'#06065c'}}>
-                <p className="text-white font-bold" style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'1.1rem',letterSpacing:'0.06em'}}>PROFIT & LOSS</p>
-                <p className="text-blue-300 text-xs">Invoices + Bank + Bills combined</p>
+          {/* P&L Statement — full width */}
+          <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+            <div className="px-5 py-3" style={{background:'#06065c'}}>
+              <p className="text-white font-bold" style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'1.1rem',letterSpacing:'0.06em'}}>PROFIT & LOSS</p>
+              <p className="text-blue-300 text-xs">Invoices + Bank + Bills combined</p>
+            </div>
+            <div className="p-5 space-y-1 max-w-2xl">
+              {[
+                {label:'Total Income',    val:fullPL.income,       bold:false, color:'text-green-700'},
+                {label:'Cost of Sales',   val:-fullPL.cos,         bold:false, color:'text-red-600',  indent:true},
+                {label:'Gross Profit',    val:fullPL.grossProfit,  bold:true,  color:fullPL.grossProfit>=0?'text-green-700':'text-red-600', border:true},
+                {label:'Total Expenses',  val:-fullPL.expense,     bold:false, color:'text-red-600',  indent:true},
+                {label:'Net Profit / (Loss)', val:fullPL.netProfit,bold:true,  color:fullPL.netProfit>=0?'text-green-700':'text-red-600', border:true, large:true},
+              ].map((row,i)=>(
+                <div key={i} className={`flex justify-between items-center py-2 ${row.border?'border-t border-gray-200 mt-2 pt-3':''} ${row.indent?'pl-4':''}`}>
+                  <span className={`text-sm ${row.bold?'font-black':'font-medium'} text-gray-700 ${row.large?'text-base':''}`}>{row.label}</span>
+                  <span className={`text-sm ${row.bold?'font-black':'font-semibold'} ${row.color} ${row.large?'text-base':''}`}>
+                    {row.val<0?'('+fmtAmt(Math.abs(row.val))+')':fmtAmt(Math.abs(row.val))}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Aged Debtors — full width, detailed */}
+          <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+            <div className="px-5 py-3 bg-blue-700 flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <p className="text-white font-bold" style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'1.1rem',letterSpacing:'0.06em'}}>AGED DEBTORS</p>
+                <p className="text-blue-200 text-xs">Outstanding customer invoices (all sources incl. jobs) — full transaction detail</p>
               </div>
-              <div className="p-5 space-y-1">
-                {[
-                  {label:'Total Income',    val:fullPL.income,       bold:false, color:'text-green-700'},
-                  {label:'Cost of Sales',   val:-fullPL.cos,         bold:false, color:'text-red-600',  indent:true},
-                  {label:'Gross Profit',    val:fullPL.grossProfit,  bold:true,  color:fullPL.grossProfit>=0?'text-green-700':'text-red-600', border:true},
-                  {label:'Total Expenses',  val:-fullPL.expense,     bold:false, color:'text-red-600',  indent:true},
-                  {label:'Net Profit / (Loss)', val:fullPL.netProfit,bold:true,  color:fullPL.netProfit>=0?'text-green-700':'text-red-600', border:true, large:true},
-                ].map((row,i)=>(
-                  <div key={i} className={`flex justify-between items-center py-2 ${row.border?'border-t border-gray-200 mt-2 pt-3':''} ${row.indent?'pl-4':''}`}>
-                    <span className={`text-sm ${row.bold?'font-black':'font-medium'} text-gray-700 ${row.large?'text-base':''}`}>{row.label}</span>
-                    <span className={`text-sm ${row.bold?'font-black':'font-semibold'} ${row.color} ${row.large?'text-base':''}`}>
-                      {row.val<0?'('+fmtAmt(Math.abs(row.val))+')':fmtAmt(Math.abs(row.val))}
-                    </span>
-                  </div>
-                ))}
+              <div className="text-right text-white">
+                <p className="text-blue-200 text-[10px] uppercase tracking-wide font-bold">Total Balance Outstanding</p>
+                <p className="font-black text-xl">{fmtAmt(debtors.reduce((s,d)=>s+d.balance,0))}</p>
               </div>
             </div>
-
-            {/* Aged Debtors */}
-            <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
-              <div className="px-5 py-3 bg-blue-700">
-                <p className="text-white font-bold" style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'1.1rem',letterSpacing:'0.06em'}}>AGED DEBTORS</p>
-                <p className="text-blue-200 text-xs">Outstanding customer invoices (all sources incl. jobs)</p>
-              </div>
-              <table className="w-full text-xs">
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs whitespace-nowrap">
                 <thead><tr className="border-b border-gray-100 bg-gray-50">
-                  <th className="px-4 py-2 text-left text-gray-400 font-bold">Customer</th>
-                  <th className="px-4 py-2 text-left text-gray-400 font-bold">Invoice</th>
-                  <th className="px-4 py-2 text-left text-gray-400 font-bold">Source</th>
-                  <th className="px-4 py-2 text-left text-gray-400 font-bold">Due</th>
-                  <th className="px-4 py-2 text-right text-gray-400 font-bold">Days</th>
-                  <th className="px-4 py-2 text-center text-gray-400 font-bold">Status</th>
-                  <th className="px-4 py-2 text-right text-gray-400 font-bold">Invoice Total</th>
-                  <th className="px-4 py-2 text-right text-gray-400 font-bold">Paid</th>
-                  <th className="px-4 py-2 text-right text-gray-400 font-bold">Balance Due</th>
+                  <th className="px-3 py-2 text-left text-gray-400 font-bold">Customer</th>
+                  <th className="px-3 py-2 text-left text-gray-400 font-bold">Email</th>
+                  <th className="px-3 py-2 text-left text-gray-400 font-bold">Invoice</th>
+                  <th className="px-3 py-2 text-left text-gray-400 font-bold">Reference</th>
+                  <th className="px-3 py-2 text-left text-gray-400 font-bold">Source</th>
+                  <th className="px-3 py-2 text-left text-gray-400 font-bold">Details</th>
+                  <th className="px-3 py-2 text-left text-gray-400 font-bold">Inv Date</th>
+                  <th className="px-3 py-2 text-left text-gray-400 font-bold">Due</th>
+                  <th className="px-3 py-2 text-right text-gray-400 font-bold">Days</th>
+                  <th className="px-3 py-2 text-center text-gray-400 font-bold">Aging</th>
+                  <th className="px-3 py-2 text-center text-gray-400 font-bold">Status</th>
+                  <th className="px-3 py-2 text-right text-gray-400 font-bold">Excl VAT</th>
+                  <th className="px-3 py-2 text-right text-gray-400 font-bold">VAT</th>
+                  <th className="px-3 py-2 text-right text-gray-400 font-bold">Invoice Total</th>
+                  <th className="px-3 py-2 text-right text-gray-400 font-bold">Paid</th>
+                  <th className="px-3 py-2 text-left text-gray-400 font-bold">Last Payment</th>
+                  <th className="px-3 py-2 text-right text-gray-400 font-bold">Balance Due</th>
                 </tr></thead>
                 <tbody>
-                  {debtors.map(d=>(
-                    <tr key={d.id} className="border-b border-gray-50">
-                      <td className="px-4 py-2 text-gray-700 font-semibold truncate max-w-[110px]">{d.contactName}</td>
-                      <td className="px-4 py-2 font-mono text-gray-500">{d.number}</td>
-                      <td className="px-4 py-2">{d.source==='job'?<span className="bg-purple-100 text-purple-700 rounded-full px-2 py-0.5 font-bold text-xs">Job</span>:<span className="bg-blue-100 text-blue-700 rounded-full px-2 py-0.5 font-bold text-xs">Manual</span>}</td>
-                      <td className="px-4 py-2 text-gray-400">{fmtDate(d.dueDate)}</td>
-                      <td className={`px-4 py-2 text-right font-bold ${d.daysOverdue>0?'text-red-600':'text-green-600'}`}>{d.daysOverdue>0?'+'+d.daysOverdue:'Current'}</td>
-                      <td className="px-4 py-2 text-center"><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[d.status]||'#6b7280'}}>{d.status}</span></td>
-                      <td className="px-4 py-2 text-right text-gray-500">{fmtAmt(d.total)}</td>
-                      <td className="px-4 py-2 text-right text-green-600">{d.paid>0?fmtAmt(d.paid):'—'}</td>
-                      <td className="px-4 py-2 text-right font-bold text-blue-800">{fmtAmt(d.balance)}</td>
+                  {debtors.map(d=>{
+                    const bucketCls = d.bucket==='Current'?'bg-green-100 text-green-700':d.bucket==='1–30'?'bg-blue-100 text-blue-700':d.bucket==='31–60'?'bg-amber-100 text-amber-700':d.bucket==='61–90'?'bg-orange-100 text-orange-700':'bg-red-100 text-red-700';
+                    return (
+                    <tr key={d.id} className="border-b border-gray-50 hover:bg-gray-50">
+                      <td className="px-3 py-2 text-gray-700 font-semibold">{d.contactName}</td>
+                      <td className="px-3 py-2 text-gray-400">{d.contactEmail||'—'}</td>
+                      <td className="px-3 py-2 font-mono text-gray-500">{d.number}</td>
+                      <td className="px-3 py-2 text-gray-500">{d.reference||'—'}</td>
+                      <td className="px-3 py-2">{d.source==='job'?<span className="bg-purple-100 text-purple-700 rounded-full px-2 py-0.5 font-bold text-xs">Job{d.jobNum?' '+d.jobNum:''}</span>:<span className="bg-blue-100 text-blue-700 rounded-full px-2 py-0.5 font-bold text-xs">Manual</span>}</td>
+                      <td className="px-3 py-2 text-gray-500 max-w-[220px] truncate" title={d.lineSummary}>{d.lineSummary||'—'}{d.lineCount>1?<span className="text-gray-300"> ({d.lineCount} lines)</span>:''}</td>
+                      <td className="px-3 py-2 text-gray-400">{fmtDate(d.date)}</td>
+                      <td className="px-3 py-2 text-gray-400">{fmtDate(d.dueDate)}</td>
+                      <td className={`px-3 py-2 text-right font-bold ${d.daysOverdue>0?'text-red-600':'text-green-600'}`}>{d.daysOverdue>0?'+'+d.daysOverdue:'Current'}</td>
+                      <td className="px-3 py-2 text-center"><span className={`px-2 py-0.5 rounded-full font-bold text-xs ${bucketCls}`}>{d.bucket}</span></td>
+                      <td className="px-3 py-2 text-center"><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[d.status]||'#6b7280'}}>{d.status}</span></td>
+                      <td className="px-3 py-2 text-right text-gray-500">{fmtAmt(d.subtotal)}</td>
+                      <td className="px-3 py-2 text-right text-gray-500">{fmtAmt(d.vat)}</td>
+                      <td className="px-3 py-2 text-right text-gray-700 font-semibold">{fmtAmt(d.total)}</td>
+                      <td className="px-3 py-2 text-right text-green-600">{d.paid>0?fmtAmt(d.paid):'—'}</td>
+                      <td className="px-3 py-2 text-gray-400">{d.lastPayment?`${fmtDate(d.lastPayment.date)}${d.lastPayment.method?' · '+d.lastPayment.method:''}`:'—'}</td>
+                      <td className="px-3 py-2 text-right font-bold text-blue-800">{fmtAmt(d.balance)}</td>
                     </tr>
-                  ))}
-                  {debtors.length===0&&<tr><td colSpan="9" className="px-4 py-6 text-center text-gray-400">No outstanding invoices</td></tr>}
-                  {debtors.length>0&&<tr className="bg-blue-50"><td colSpan="8" className="px-4 py-2 font-black text-blue-800 text-right">Total Balance Outstanding:</td><td className="px-4 py-2 text-right font-black text-blue-800">{fmtAmt(debtors.reduce((s,d)=>s+d.balance,0))}</td></tr>}
+                    );
+                  })}
+                  {debtors.length===0&&<tr><td colSpan="17" className="px-4 py-6 text-center text-gray-400">No outstanding invoices</td></tr>}
+                  {debtors.length>0&&<tr className="bg-blue-50">
+                    <td colSpan="13" className="px-3 py-2 font-black text-blue-800 text-right">Totals:</td>
+                    <td className="px-3 py-2 text-right font-black text-blue-800">{fmtAmt(debtors.reduce((s,d)=>s+d.total,0))}</td>
+                    <td className="px-3 py-2 text-right font-black text-green-700">{fmtAmt(debtors.reduce((s,d)=>s+d.paid,0))}</td>
+                    <td className="px-3 py-2"></td>
+                    <td className="px-3 py-2 text-right font-black text-blue-800">{fmtAmt(debtors.reduce((s,d)=>s+d.balance,0))}</td>
+                  </tr>}
                 </tbody>
               </table>
             </div>
