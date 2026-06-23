@@ -4868,8 +4868,12 @@ function reconcileJobInvoice(job, quotes){
   }
   const invTotal  = parseFloat(job.value)||0;
   const totalPaid = merged.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-  let invoiceStatus = job.invoiceStatus||'pending';
-  if(totalPaid>0) invoiceStatus = (totalPaid>=invTotal && invTotal>0) ? 'paid' : 'partial';
+  // Status is derived ONLY from recorded payments — a stored 'paid' flag is never
+  // trusted on its own. An invoice can show Fully Paid only when payments recorded
+  // in the Payments tab cover the full invoice value.
+  let invoiceStatus = 'pending';
+  if(totalPaid>=invTotal && invTotal>0) invoiceStatus = 'paid';
+  else if(totalPaid>0) invoiceStatus = 'partial';
   return { payments: merged, invoiceStatus, totalPaid };
 }
 
@@ -13855,8 +13859,9 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
     const jobIncome = (jobs||[]).filter(j=>[7,8,9].includes(j.stage)||j.invoiceNum).reduce((s,j)=>{
       // Include deposits / partials recorded against the linked quote / proforma
       const rec = reconcileJobInvoice(j, quotes);
+      // Cash received = sum of recorded payments only. An invoice with no recorded
+      // payments contributes nothing, even if it was previously flagged paid.
       if(rec.payments.length>0) return s+rec.totalPaid;
-      if(j.invoiceStatus==='paid'||j.paidDate||j.paid) return s+(parseFloat(j.value)||0);
       return s;
     },0);
     // From bank txns
@@ -14222,11 +14227,11 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
       const valExVat = val > 0 ? val / 1.15 : 0;
       // Pull through any deposit / partial recorded on the linked quote / proforma
       const rec = reconcileJobInvoice(j, quotes);
-      // Derive status: prefer reconciled payment status, then fall back to stage/paid flags
+      // Derive status from recorded payments only (legacy paid flags are not trusted)
       let status = 'sent';
-      if(rec.invoiceStatus==='paid' || j.paidDate || j.paid) status = 'paid';
+      if(rec.invoiceStatus==='paid') status = 'paid';
       else if(rec.invoiceStatus==='partial') status = 'partial';
-      else if(j.invoiceStatus==='pending') status = 'sent';
+      else status = 'sent';
       // Check overdue
       const invDate = j.invoiceDate || j.date || new Date().toISOString().slice(0,10);
       const dueDate = j.invoiceDue || new Date(new Date(invDate).getTime()+30*864e5).toISOString().slice(0,10);
@@ -15282,8 +15287,10 @@ function ReportsPage({ jobs, companies, user }) {
   const chartRef=useRef(null); const instRef=useRef(null);
 
   // Payments tab
-  const paidJobs = jobs.filter(j=>j.invoiceNum&&j.invoiceStatus==='paid').sort((a,b)=>new Date(b.paidAt||b.invoiceDate||0)-new Date(a.paidAt||a.invoiceDate||0));
-  const pendingJobs = jobs.filter(j=>j.invoiceNum&&j.invoiceStatus!=='paid');
+  // A job counts as fully paid only when recorded payments cover its full value.
+  const _isJobFullyPaid = j => { const tot=parseFloat(j.value)||0; const paid=(j.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0); return tot>0 && paid>=tot; };
+  const paidJobs = jobs.filter(j=>j.invoiceNum&&_isJobFullyPaid(j)).sort((a,b)=>new Date(b.paidAt||b.invoiceDate||0)-new Date(a.paidAt||a.invoiceDate||0));
+  const pendingJobs = jobs.filter(j=>j.invoiceNum&&!_isJobFullyPaid(j));
   const totalPaid = paidJobs.reduce((s,j)=>s+(j.value||0),0);
   const totalPending = pendingJobs.reduce((s,j)=>s+(j.value||0),0);
 
