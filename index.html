@@ -8992,12 +8992,26 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 const DONE_STATUSES = ['completed','invoiced'];
 const WIP_STATUSES  = STAGE_STATUSES.filter(s=>!DONE_STATUSES.includes(s));
 
-function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared }) {
+function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared, proposedProjects=[], setProposedProjects }) {
   const [jobTab,       setJobTab]       = useState('active'); // 'active' | 'completed'
   const [statusFilter, setStatusFilter] = useState('all');
   const [search,       setSearch]       = useState('');
   const [detail,       setDetail]       = useState(null);
   const [showAdd,      setShowAdd]      = useState(false);
+  const [newProposal,  setNewProposal]  = useState('');
+
+  // ── Proposed Projects (manual list of unquoted work needing attention) ──
+  const addProposal = () => {
+    const name = newProposal.trim();
+    if(!name || !setProposedProjects) return;
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+    setProposedProjects(prev=>[...(prev||[]), { id, name, note:'' }]);
+    setNewProposal('');
+  };
+  const updateProposal = (id, field, val) =>
+    setProposedProjects && setProposedProjects(prev=>(prev||[]).map(p=>p.id===id?{...p,[field]:val}:p));
+  const removeProposal = id =>
+    setProposedProjects && setProposedProjects(prev=>(prev||[]).filter(p=>p.id!==id));
 
   // Auto-open newly created job when navigated here from Sales
   React.useEffect(()=>{
@@ -9064,23 +9078,44 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
         </select>
       </div>
 
-      {/* ── Stats row ── */}
-      <div className={`grid gap-3 ${isAdmin?'grid-cols-3':'grid-cols-2'}`}>
-        <div className="bg-white rounded-2xl border p-3 text-center">
-          <p className="text-xl font-black text-gray-800">{filtered.length}</p>
-          <p className="text-xs text-gray-400 mt-0.5">{jobTab==='active'?'In Progress':'Completed'}</p>
+      {/* ── Proposed Projects (manual list of unquoted work needing attention) ── */}
+      {jobTab==='active'&&(
+        <div className="bg-white rounded-2xl border border-amber-200 p-4">
+          <div className="flex items-center gap-2 mb-3 flex-wrap">
+            <span className="text-base">📌</span>
+            <h3 className="text-sm font-black text-gray-800">Proposed Projects</h3>
+            <span className="text-xs text-gray-400">not yet quoted — need attention</span>
+            <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 font-black">{proposedProjects.length}</span>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-2 mb-3">
+            <input value={newProposal} onChange={e=>setNewProposal(e.target.value)}
+              onKeyDown={e=>{ if(e.key==='Enter') addProposal(); }}
+              placeholder="Add a proposed project (client / description)…"
+              className="flex-1 border border-gray-300 rounded-xl px-3 py-2.5 text-sm focus:ring-2 focus:ring-amber-400"/>
+            <button onClick={addProposal}
+              className="bg-amber-500 hover:bg-amber-600 text-white rounded-xl px-4 py-2.5 text-sm font-bold whitespace-nowrap">＋ Add</button>
+          </div>
+          <div className="space-y-2">
+            {proposedProjects.length===0&&(
+              <p className="text-xs text-gray-400 italic text-center py-3">No proposed projects yet. Add ones that aren't quoted but need attention.</p>
+            )}
+            {proposedProjects.map(p=>(
+              <div key={p.id} className="flex items-start gap-2 bg-amber-50/60 border border-amber-100 rounded-xl p-2.5">
+                <div className="flex-1 min-w-0 space-y-1">
+                  <input value={p.name} onChange={e=>updateProposal(p.id,'name',e.target.value)}
+                    placeholder="Project / client"
+                    className="w-full bg-transparent text-sm font-semibold text-gray-800 border-b border-transparent focus:border-amber-300 focus:outline-none"/>
+                  <input value={p.note||''} onChange={e=>updateProposal(p.id,'note',e.target.value)}
+                    placeholder="Note / next step…"
+                    className="w-full bg-transparent text-xs text-gray-500 border-b border-transparent focus:border-amber-300 focus:outline-none"/>
+                </div>
+                <button onClick={()=>removeProposal(p.id)} title="Remove"
+                  className="text-gray-300 hover:text-red-500 text-lg leading-none px-1 flex-shrink-0">✕</button>
+              </div>
+            ))}
+          </div>
         </div>
-        {isAdmin&&<div className="bg-white rounded-2xl border p-3 text-center">
-          <p className="text-lg font-black text-brand-600">{zarK(filtered.reduce((s,j)=>s+j.value,0))}</p>
-          <p className="text-xs text-gray-400 mt-0.5">{jobTab==='active'?'Pipeline Value':'Completed Value'}</p>
-        </div>}
-        <div className="bg-white rounded-2xl border p-3 text-center">
-          {jobTab==='active'
-            ? <><p className="text-xl font-black text-emerald-600">{filtered.filter(j=>['in_production','installation'].includes(j.status)).length}</p><p className="text-xs text-gray-400 mt-0.5">On the Floor</p></>
-            : <><p className="text-xl font-black text-teal-600">{filtered.filter(j=>j.status==='invoiced').length}</p><p className="text-xs text-gray-400 mt-0.5">Invoiced</p></>
-          }
-        </div>
-      </div>
+      )}
 
       {/* ── Job cards ── */}
       <div className="space-y-2">
@@ -15523,6 +15558,7 @@ function App() {
   const [completeProducts, setCompleteProducts] = useState(_saved ? (_saved.completeProducts||[])  : []);
   const [payrollRecords,   setPayrollRecords]   = useState(_saved ? (_saved.payrollRecords||[])    : []);
   const [quickRates,       setQuickRates]       = useState(_saved ? (_saved.quickRates||[])        : INITIAL_QUICK_RATES);
+  const [proposedProjects, setProposedProjects] = useState(_saved ? (_saved.proposedProjects||[])  : []);
 
   // ── DATABASE-BACKED PERSISTENCE ────────────────────────────────
   // Database (PostgreSQL via backend API) is the shared source of truth for ALL users.
@@ -15559,7 +15595,7 @@ function App() {
   // All array/object sections stored in platform_state
   const STATE_SECTIONS = ['jobs','inventory','quotes','customers','suppliers','assets',
     'employees','leaveRequests','disciplinary','savedCalcs','purchaseOrders','savedImports',
-    'bankTxns','chartOfAccounts','accInvoices','accBills','completeProducts','payrollRecords','quickRates'];
+    'bankTxns','chartOfAccounts','accInvoices','accBills','completeProducts','payrollRecords','quickRates','proposedProjects'];
 
   // Fetch latest state from the backend
   async function fetchFromServer() {
@@ -15602,6 +15638,7 @@ function App() {
     if (Array.isArray(dbData.completeProducts)) setCompleteProducts(dbData.completeProducts);
     if (Array.isArray(dbData.payrollRecords))   setPayrollRecords(dbData.payrollRecords);
     if (Array.isArray(dbData.quickRates))       setQuickRates(dbData.quickRates);
+    if (Array.isArray(dbData.proposedProjects)) setProposedProjects(dbData.proposedProjects);
     if (typeof dbData.logo === 'string')        setLogoDataUrl(dbData.logo);
     if (typeof dbData.utLogo === 'string')      setUtLogoDataUrl(dbData.utLogo);
     if (dbData.sigOTSmit)                       setSigOTSmit(dbData.sigOTSmit);
@@ -15782,7 +15819,7 @@ function App() {
   //    Merges locally-changed sections onto the server baseline before writing,
   //    so two users editing different sections never overwrite each other.
   useEffect(()=>{
-    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logo:logoDataUrl, utLogo:utLogoDataUrl, sigOTSmit, savedAt:lastSaved};
+    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, logo:logoDataUrl, utLogo:utLogoDataUrl, sigOTSmit, savedAt:lastSaved};
     currentSnapshotRef.current = snapshot; // keep ref current for poll effect
     // Backup to localStorage (safety net — DB is source of truth)
     try { localStorage.setItem('sgr_platform_data', JSON.stringify(snapshot)); } catch(e) {}
@@ -15800,7 +15837,7 @@ function App() {
       }
       setTimeout(() => setApiMsg(''), 2500);
     }, 800);
-  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logoDataUrl, utLogoDataUrl, sigOTSmit]);
+  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, logoDataUrl, utLogoDataUrl, sigOTSmit]);
 
   function handleLogin(u){ try{localStorage.setItem('sgr_user',JSON.stringify(u));}catch(e){} setUser(u); setPage('dashboard'); setEntityFilter(null); }
   function handleLogout(){ try{localStorage.removeItem('sgr_user');}catch(e){} setUser(null); setPage('dashboard'); setEntityFilter(null); }
@@ -15818,7 +15855,7 @@ function App() {
       });
       // Date-stamped filename so Drive folder shows version order clearly
       const dateTag = now.toISOString().slice(0,10); // e.g. 2026-04-10
-      const payload = JSON.stringify({v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, logo:logoDataUrl, utLogo:utLogoDataUrl, savedAt: stamp});
+      const payload = JSON.stringify({v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, logo:logoDataUrl, utLogo:utLogoDataUrl, savedAt: stamp});
       // outerHTML preserves the original <script type="text/babel"> source intact.
       // outerHTML omits the DOCTYPE; without it the saved file loads in quirks mode,
       // which broke startup. Prepend it so saved files stay in standards mode.
@@ -15859,7 +15896,7 @@ function App() {
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} logoDataUrl={logoDataUrl} onOpenQuote={(q)=>{ setSalesOpen({type:'quote', id:q.id}); setPage('sales'); }} onOpenInvoice={(inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); }}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
-    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)}/>,
+    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
