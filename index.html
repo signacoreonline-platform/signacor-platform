@@ -8314,22 +8314,19 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   const convPct        = monthQuotes.length>0 ? Math.round(monthConverted.length/monthQuotes.length*100) : 0;
   const convColor      = convPct>=75 ? '#10b981' : convPct>=50 ? '#0000ff' : convPct>=25 ? '#f59e0b' : '#ED0101';
   const convMsg        = convPct>=75 ? '🔥 Outstanding — keep it up!' : convPct>=50 ? '💪 Strong — push for more' : convPct>=25 ? '📈 Building momentum' : '🚀 Let’s win more quotes';
-  // ── Salesman of the Month ── salesperson with the highest total ACCEPTED quote value this month
-  // Only quotes the customer accepted (status 'converted') count — not every quote made.
+  // ── Salesman of the Month ── salesperson with the highest total value of JOBS CREATED this month
+  // Totals reflect the value (incl. VAT) of jobs created for each salesperson during the month.
   const _spTotals = {};
-  (quotes||[]).filter(q=>q.status==='converted' && inCurrentMonth(q.date)).forEach(q=>{
-    const name = (q.salesperson||'').trim() || 'Unassigned';
-    const sub  = (q.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
-    const disc = parseFloat(q.discount)||0;
-    const setup= parseFloat(q.setupFee)||0;
-    _spTotals[name] = (_spTotals[name]||0) + (sub-sub*(disc/100)+setup)*1.15;
+  visibleJobs.filter(j=>(j.salesperson||'').trim() && inCurrentMonth(j.id)).forEach(j=>{
+    const name = (j.salesperson||'').trim();
+    _spTotals[name] = (_spTotals[name]||0) + (parseFloat(j.value)||0);
   });
   const _spTop          = Object.entries(_spTotals).sort((a,b)=>b[1]-a[1])[0];
   const topSalesman     = _spTop ? _spTop[0] : '—';
   const topSalesmanTotal= _spTop ? _spTop[1] : 0;
   const topSalesmanSub  = _spTop
     ? 'R ' + topSalesmanTotal.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2}) + ' · ' + _curMonthLabel
-    : 'No accepted quotes this month';
+    : 'No jobs created this month';
 
   return (
     <div className="p-4 space-y-4">
@@ -13888,23 +13885,29 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
   }
 
   // ── Aged Debtors — accepts full allInvoices list (including job invoices) ──
+  // Business norm: no client has a 30-day account. Debtors pay an 80% deposit up
+  // front and the 20% balance on final payment. The outstanding balance is therefore
+  // aged from the INVOICE DATE (not a credit-term due date) into 30 / 60 / 90 buckets.
+  // Zero-value invoices and invoices paid in full are excluded entirely.
   function getAgedDebtors(invoiceList) {
     const today = new Date();
     return (invoiceList||accInvoices).filter(i=>!['paid','void'].includes(i.status)).map(i=>{
-      const due = new Date(i.dueDate||i.date);
-      const days = Math.floor((today-due)/(1000*60*60*24));
+      const issued = new Date(i.date||i.dueDate);
+      const days = Math.floor((today-issued)/(1000*60*60*24));
       const subtotal = (i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
       const vat = (i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
       const total = subtotal+vat;
       const paid = (i.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       const balance = total-paid;
       const lastPayment = (i.payments||[]).slice().sort((a,b)=>new Date(b.date||0)-new Date(a.date||0))[0]||null;
-      // Aging bucket based on days overdue
-      const bucket = days<=0 ? 'Current' : days<=30 ? '1–30' : days<=60 ? '31–60' : days<=90 ? '61–90' : '90+';
+      // Aging bucket based on days outstanding since the invoice was issued
+      const bucket = days<=30 ? '1–30' : days<=60 ? '31–60' : days<=90 ? '61–90' : '90+';
       const lineCount = (i.lineItems||[]).length;
       const lineSummary = (i.lineItems||[]).map(l=>l.description).filter(Boolean).join('; ');
       return {...i, daysOverdue: days, subtotal, vat, total, paid, balance, bucket, lastPayment, lineCount, lineSummary};
-    });
+    })
+    // Drop zero-value invoices and anything already paid in full (balance ≈ 0)
+    .filter(d=>d.total>0.005 && d.balance>0.005);
   }
 
   // ── Multi-type Xero export ──
@@ -15148,7 +15151,7 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
                       <td className="px-3 py-2 text-gray-500 max-w-[220px] truncate" title={d.lineSummary}>{d.lineSummary||'—'}{d.lineCount>1?<span className="text-gray-300"> ({d.lineCount} lines)</span>:''}</td>
                       <td className="px-3 py-2 text-gray-400">{fmtDate(d.date)}</td>
                       <td className="px-3 py-2 text-gray-400">{fmtDate(d.dueDate)}</td>
-                      <td className={`px-3 py-2 text-right font-bold ${d.daysOverdue>0?'text-red-600':'text-green-600'}`}>{d.daysOverdue>0?'+'+d.daysOverdue:'Current'}</td>
+                      <td className={`px-3 py-2 text-right font-bold ${d.daysOverdue>60?'text-red-600':d.daysOverdue>30?'text-amber-600':'text-gray-600'}`}>{Math.max(0,d.daysOverdue)} days</td>
                       <td className="px-3 py-2 text-center"><span className={`px-2 py-0.5 rounded-full font-bold text-xs ${bucketCls}`}>{d.bucket}</span></td>
                       <td className="px-3 py-2 text-center"><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[d.status]||'#6b7280'}}>{d.status}</span></td>
                       <td className="px-3 py-2 text-right text-gray-500">{fmtAmt(d.subtotal)}</td>
