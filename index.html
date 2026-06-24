@@ -12227,7 +12227,7 @@ function QuickRatesPanel({ quickRates, setQuickRates, suppliers, inventory, setI
 }
 
 function InventoryPage({ inventory, setInventory, suppliers, user, completeProducts, setCompleteProducts, setQuotes, companies, logoDataUrl, quickRates, setQuickRates }) {
-  const isAdmin = user.role !== 'assistant';
+  const isAdmin = true; // Assistant has full view + edit access to Inventory, same as admin
   const [invSubTab,     setInvSubTab]     = useState('stock'); // 'stock' | 'products'
   const [showImport,    setShowImport]    = useState(false);
   const [showQuickRates,setShowQuickRates]= useState(false);
