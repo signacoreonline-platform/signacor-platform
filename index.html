@@ -3595,6 +3595,9 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   const [reference,      setReference]      = useState(_draft?.reference??eq?.reference??id?.reference??'');
   const [openTypeaheadId, setOpenTypeaheadId] = useState(null);
   const [clientSuggestions, setClientSuggestions] = useState([]);
+  // Collapse the Client Details block to free up screen space while doing the quotation.
+  // Default open for a new quote (nothing filled in yet), collapsed when a client already exists.
+  const [clientOpen, setClientOpen] = useState(!(eq?.client || id?.client || _draft?.client));
 
   // ── Active line tracking: controls which line shows the calculator + save button ──
   const [activeLineId, setActiveLineId] = useState(()=>{
@@ -3726,7 +3729,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
 
   function submit(e){
     e.preventDefault();
-    if(!client.trim()) return;
+    if(!client.trim()){ setClientOpen(true); return; }
     const isEdit = !!eq;
     onSave({
       id: isEdit ? eq.id : Date.now(),
@@ -3768,8 +3771,13 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
         {/* Client */}
         <div>
           <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-            <p className="text-xs font-black text-gray-400 uppercase tracking-widest">Client Details</p>
-            <div className="flex items-center gap-2 flex-wrap">
+            <button type="button" onClick={()=>setClientOpen(o=>!o)}
+              className="flex items-center gap-1.5 text-xs font-black text-gray-400 uppercase tracking-widest hover:text-gray-600 transition-colors">
+              <span className={`inline-block transition-transform ${clientOpen?'rotate-90':''}`}>▶</span>
+              Client Details
+              {!clientOpen&&client&&<span className="ml-2 normal-case tracking-normal font-semibold text-gray-600">— {client}</span>}
+            </button>
+            <div className={`flex items-center gap-2 flex-wrap ${clientOpen?'':'hidden'}`}>
               {customers.length>0&&(
                 <select onChange={e=>loadCustomer(e.target.value)} defaultValue=""
                   className="text-xs border border-brand-200 bg-brand-50 text-brand-700 rounded-lg px-2.5 py-1.5 font-semibold focus:ring-1 focus:ring-brand-400">
@@ -3784,13 +3792,13 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
               {saveAsCustomerMsg&&<span className="text-xs font-semibold text-emerald-600">{saveAsCustomerMsg}</span>}
             </div>
           </div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className={`grid grid-cols-2 gap-3 ${clientOpen?'':'hidden'}`}>
             <div className="col-span-2"><label className="block text-xs font-semibold text-gray-500 mb-1">Company / Trading Name *</label>
               <div className="relative">
                 <input value={client}
                   onChange={e=>{ setClient(e.target.value); const q=e.target.value.trim(); setClientSuggestions(q.length>=1?customers.filter(c=>(c.companyName||'').toLowerCase().includes(q.toLowerCase())).slice(0,8):[]); }}
                   onBlur={()=>setTimeout(()=>setClientSuggestions([]),200)}
-                  required className={iCls} placeholder="e.g. Woolworths (Pty) Ltd" autoComplete="off"/>
+                  required={clientOpen} className={iCls} placeholder="e.g. Woolworths (Pty) Ltd" autoComplete="off"/>
                 {clientSuggestions.length>0&&(
                   <div className="absolute z-50 left-0 right-0 top-full mt-1 bg-white border border-gray-200 rounded-xl shadow-lg max-h-52 overflow-y-auto">
                     {clientSuggestions.map(c=>(
