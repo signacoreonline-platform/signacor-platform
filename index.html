@@ -4367,6 +4367,14 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
   const quotePayments = quote.payments || [];
   const quotePaid     = quotePayments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
   const quoteBalance  = total - quotePaid;
+  // ── Converted-job link health ──
+  // A quote can be flagged "converted" yet its job may be missing from Jobs
+  // (e.g. the job was deleted, or lives under a hidden entity). When that happens
+  // the normal Convert button is hidden and the quote becomes a dead-end — you
+  // can't reach the job to invoice it. Detect that and offer a safe Restore.
+  const isConverted    = !!quote.convertedJobId || quote.status==='converted';
+  const linkedJobFound = (jobs||[]).some(j=> j.id===quote.convertedJobId || (quote.num && j.quoteNum===quote.num));
+  const orphanedJob    = isConverted && !linkedJobFound;
   return (
     <Modal onClose={onClose} wide>
       <ModalHeader title={`${quote.num} — ${quote.client}`} onClose={onClose}/>
@@ -4376,8 +4384,11 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
         <div className="flex flex-wrap gap-2 items-center">
           <QuoteBadge status={quote.status}/>
           <span className="text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200 rounded-full px-2.5 py-0.5">{co.short}</span>
-          {quote.convertedJobId&&(
+          {quote.convertedJobId&&!orphanedJob&&(
             <span className="text-xs font-semibold text-purple-700 bg-purple-50 border border-purple-200 rounded-full px-2.5 py-0.5">✅ Converted to Job</span>
+          )}
+          {orphanedJob&&(
+            <span className="text-xs font-semibold text-red-700 bg-red-50 border border-red-200 rounded-full px-2.5 py-0.5">⚠ Job missing — restore below</span>
           )}
         </div>
 
@@ -4572,6 +4583,12 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
             <button onClick={()=>onConvertToJob(quote)}
               className="flex items-center gap-1.5 text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl px-4 py-2.5 font-bold">
               💼 Convert to Job
+            </button>
+          )}
+          {orphanedJob&&(
+            <button onClick={()=>onConvertToJob(quote, true)}
+              className="flex items-center gap-1.5 text-xs bg-orange-500 hover:bg-orange-600 text-white rounded-xl px-4 py-2.5 font-bold">
+              🔁 Restore Job
             </button>
           )}
           <button onClick={onClose} className="ml-auto text-xs border border-gray-200 text-gray-600 rounded-xl px-4 py-2.5 font-semibold hover:bg-gray-50">Close</button>
@@ -4995,13 +5012,20 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       setJobs(prev=>prev.map(j=>{
         if(j.quoteNum!==updated.num) return j;
         const rec = reconcileJobInvoice(j, [updated]);
-        return {...j, payments:rec.payments, invoiceStatus:rec.invoiceStatus};
+        // Deposit recorded on the quote/proforma auto-advances the linked job to
+        // Deposit Received (stage 5); never regresses a job already further along.
+        const bumpDeposit = rec.totalPaid>0 && (parseFloat(j.stage)||0)<5;
+        return {...j, payments:rec.payments, invoiceStatus:rec.invoiceStatus,
+          ...(bumpDeposit ? {stage:5, status:'deposit_received'} : {})};
       }));
     }
     setViewQuote(updated);
   }
   function handleEditQuote(q){ setViewQuote(null); setEditQuote(q); }
-  function handleConvertToJob(q){
+  // restore=true rebuilds a job for a quote that was already converted but whose
+  // job went missing. On restore we skip inventory deduction / PO generation
+  // because those side-effects already ran during the original conversion.
+  function handleConvertToJob(q, restore){
     const jobNum = getNextJobNum(jobs);
     const invNum = q.proformaNum || getNextInvoiceNum(jobs);
     const today  = new Date().toISOString().slice(0,10);
@@ -5011,14 +5035,17 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const _qDiscAmt  = _qSub*(_qDiscPct/100);
     const _qSetupFee = parseFloat(q.setupFee)||0;
     const _qAfterDisc= _qSub - _qDiscAmt + _qSetupFee;
+    // If a deposit / partial was already recorded on the quote, the job should
+    // open at "Deposit Received" (stage 5) so the pipeline picks up where it left off.
+    const _depositPaid = (q.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0) > 0;
     const newJob = {
       id:Date.now(), num:jobNum, client:q.client,
       contact: q.contact||'', email: q.email||'', tel: q.tel||'',
       address: q.address||'', vatNum: q.vatNum||'',
       desc:'From Quote '+q.num+' \u2014 '+q.lines.map(function(l){return l.desc;}).filter(Boolean).slice(0,2).join(', '),
-      status:'quote_approved', co:q.co,
+      status: _depositPaid ? 'deposit_received' : 'quote_approved', co:q.co,
       value: _qAfterDisc*1.15,
-      stage:STATUS_TO_STAGE['quote_approved']||4, breakdown:null,
+      stage: _depositPaid ? 5 : (STATUS_TO_STAGE['quote_approved']||4), breakdown:null,
       lines: q.lines, quoteNum: q.num, notes: q.notes||'',
       setupFee: q.setupFee||'', discount: q.discount||'',
       salesperson: q.salesperson||'', preparedBy: q.preparedBy||'',
@@ -5030,6 +5057,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     };
     setJobs(prev=>[newJob,...prev]);
 
+    if(!restore){
     // ── Deduct inventory for linked line items ──
     const linkedLines = q.lines.filter(l=>l.itemId);
     let updatedInventory = inventory.map(inv=>{
@@ -5069,6 +5097,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       const count = newPOs.length;
       setTimeout(()=>alert('⚠ '+lowItems.length+' inventory item'+(lowItems.length>1?'s are':' is')+' at or below reorder level.\n'+count+' Purchase Order'+(count>1?'s have':' has')+' been generated automatically.\n\nGo to Purchase Orders to review, approve, and email to suppliers.'),300);
     }
+    } // end if(!restore)
 
     const updated={...q,status:'converted',convertedJobId:newJob.id};
     setQuotes(prev=>prev.map(qx=>qx.id===q.id?updated:qx));
@@ -5100,7 +5129,12 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
       const paidAt=newTotal>=invTotal?(date||new Date().toISOString().slice(0,10)):job.paidAt||null;
-      const saved={...job,payments:updated,invoiceStatus:newStatus,paidAt};
+      // A recorded deposit / payment auto-advances the lifecycle to Deposit
+      // Received (stage 5) the first time money comes in, never regressing a job
+      // that is already further along.
+      const bumpDeposit = newTotal>0 && (parseFloat(job.stage)||0)<5;
+      const saved={...job,payments:updated,invoiceStatus:newStatus,paidAt,
+        ...(bumpDeposit ? {stage:5, status:'deposit_received'} : {})};
       setPayments(updated); saveJob(saved);
       setAmount(''); setNotes('');
     }
@@ -8938,7 +8972,10 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                 <button onClick={()=>{
                     const today=new Date().toISOString().slice(0,10);
                     const due=new Date(Date.now()+30*864e5).toISOString().slice(0,10);
-                    setJobs(prev=>prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:(j.invoiceNum||getNextInvoiceNum(prev)), invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due)}:j));
+                    // Creating the tax invoice advances the job to its final
+                    // lifecycle stage, Invoiced (9). Final payment is recorded
+                    // afterwards via Payments / Payment History.
+                    setJobs(prev=>prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:(j.invoiceNum||getNextInvoiceNum(prev)), invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j));
                   }}
                   className="flex items-center gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl px-4 py-2.5 font-bold">
                   🧾 Create Invoice
