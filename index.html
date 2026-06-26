@@ -815,6 +815,109 @@ ${rec.witnessName?`<section><div class="sec-title">Witness</div><div class="fiel
 }
 
 /* ═══════════════════════════════════════════
+   ACCOUNT STATEMENT — printable / PDF
+   Builds an A4 statement for a customer (money they owe us)
+   or supplier (money we owe them). All amounts incl. VAT.
+═══════════════════════════════════════════ */
+function printStatement(opts, logoDataUrl) {
+  const {
+    contactName='', contactType='customer', contactMeta={},
+    periodLabel='', openingBalance=0, rows=[], closingBalance=0,
+    asAtLabel=''
+  } = opts || {};
+  const R = n => 'R ' + Number(n||0).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const esc = s => String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const logoTag = logoDataUrl
+    ? `<img src="${logoDataUrl}" style="max-height:64px;max-width:200px;object-fit:contain;" alt="Signacore"/>`
+    : `<div style="font-family:'Barlow Condensed',Arial,sans-serif;font-size:26px;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.04em;">SIGNACORE</div>`;
+  const oweWord = contactType==='supplier' ? 'Balance we owe' : 'Balance due to us';
+  const rowsHtml = rows.length ? rows.map(r=>`
+    <tr>
+      <td style="white-space:nowrap">${esc(r.date)}</td>
+      <td>${esc(r.docType)}</td>
+      <td>${esc(r.ref)}</td>
+      <td style="max-width:230px">${esc(r.desc)}</td>
+      <td class="num">${r.debit?R(r.debit):''}</td>
+      <td class="num">${r.credit?R(r.credit):''}</td>
+      <td class="num" style="font-weight:700">${R(r.balance)}</td>
+    </tr>`).join('') : `<tr><td colspan="7" style="text-align:center;color:#888;padding:18px">No transactions in this period.</td></tr>`;
+  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Statement — ${esc(contactName)}</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Arial,sans-serif;font-size:12px;color:#1a1a1a;padding:14mm 16mm}
+.hdr{display:flex;justify-content:space-between;align-items:flex-start;padding-bottom:10px;border-bottom:4px solid #06065c;margin-bottom:4px}
+.company-info{text-align:right;font-size:9.5px;color:#666;line-height:1.6}
+.red-line{height:3px;background:linear-gradient(90deg,#ED0101,#ff6b6b);border-radius:2px;margin:0 0 14px}
+.title{font-family:'Barlow Condensed',Arial,sans-serif;font-size:24px;font-weight:800;color:#06065c;letter-spacing:0.06em;text-transform:uppercase}
+.meta-row{display:flex;justify-content:space-between;gap:20px;margin-bottom:14px}
+.box{border:1px solid #e5e7eb;border-radius:8px;padding:10px 12px;font-size:11px;line-height:1.6}
+.box .lbl{font-size:8.5px;color:#888;text-transform:uppercase;letter-spacing:.6px;font-weight:700;margin-bottom:3px}
+.box strong{color:#06065c;font-size:12.5px}
+table{width:100%;border-collapse:collapse;font-size:10.5px;margin-bottom:10px}
+th{background:#06065c;color:#fff;text-align:left;padding:7px 8px;font-size:9px;text-transform:uppercase;letter-spacing:.4px}
+th.num,td.num{text-align:right}
+td{padding:6px 8px;border-bottom:1px solid #eee;vertical-align:top}
+tr:nth-child(even) td{background:#f8f9ff}
+.opening td{background:#eef2ff;font-weight:700}
+.summary{margin-top:8px;margin-left:auto;width:300px;font-size:11px}
+.summary div{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #eee}
+.summary .total{font-size:14px;font-weight:900;color:#06065c;border-bottom:none;border-top:2px solid #06065c;padding-top:7px;margin-top:3px}
+.aging{margin-top:16px;width:100%}
+.aging th{background:#374151}
+.foot{margin-top:18px;font-size:9px;color:#888;border-top:1px solid #e5e7eb;padding-top:8px;line-height:1.6}
+@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+</style></head><body>
+<div class="hdr">
+  <div>${logoTag}<div class="title" style="margin-top:6px">Statement of Account</div></div>
+  <div class="company-info">
+    <strong style="color:#06065c;font-size:11px;display:block;margin-bottom:2px">Signacore</strong>
+    21 Voortrekker Street, Mossdustria<br>Mossel Bay, 6506<br>orders@snsg.co.za
+  </div>
+</div>
+<div class="red-line"></div>
+<div class="meta-row">
+  <div class="box" style="flex:1">
+    <div class="lbl">${contactType==='supplier'?'Supplier':'Customer'}</div>
+    <strong>${esc(contactName)}</strong>
+    ${contactMeta.contactPerson?`<br>${esc(contactMeta.contactPerson)}`:''}
+    ${contactMeta.email?`<br>${esc(contactMeta.email)}`:''}
+    ${contactMeta.tel?`<br>${esc(contactMeta.tel)}`:''}
+    ${contactMeta.address?`<br>${esc(contactMeta.address)}`:''}
+    ${contactMeta.vatNumber?`<br>VAT: ${esc(contactMeta.vatNumber)}`:''}
+  </div>
+  <div class="box" style="text-align:right">
+    <div class="lbl">Statement Period</div>
+    <strong>${esc(periodLabel)}</strong><br>
+    <span style="color:#888">As at ${esc(asAtLabel)}</span>
+  </div>
+</div>
+<table>
+  <thead><tr>
+    <th>Date</th><th>Type</th><th>Reference</th><th>Description</th>
+    <th class="num">Debit</th><th class="num">Credit</th><th class="num">Balance</th>
+  </tr></thead>
+  <tbody>
+    <tr class="opening"><td colspan="6">Opening Balance — brought forward</td><td class="num">${R(openingBalance)}</td></tr>
+    ${rowsHtml}
+  </tbody>
+</table>
+<div class="summary">
+  <div><span>Opening balance</span><span>${R(openingBalance)}</span></div>
+  <div class="total"><span>${oweWord}</span><span>${R(closingBalance)}</span></div>
+</div>
+<div class="foot">
+  Debit = invoices / bills raised. &nbsp; Credit = payments received & credit notes. &nbsp; All amounts include VAT @ 15% where applicable.<br>
+  ${contactType==='supplier'
+    ? 'This statement reflects amounts payable by Signacore to the above supplier as at the date shown.'
+    : 'Please remit payment for the closing balance shown above. Contact us immediately if any item appears incorrect.'}
+</div>
+<script>window.onload=function(){window.print();}<\/script>
+</body></html>`;
+  const w = window.open('','_blank','width=950,height=760');
+  w.document.write(html); w.document.close();
+}
+
+/* ═══════════════════════════════════════════
    SA PAYROLL — TAX ENGINE (2024/2025 tax year)
 ═══════════════════════════════════════════ */
 const SA_TAX_BRACKETS = [
@@ -13640,7 +13743,7 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 /* ═══════════════════════════════════════════
    ACCOUNTING PAGE
 ═══════════════════════════════════════════ */
-function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices, setAccInvoices, accBills, setAccBills, suppliers, customers, companies, user }) {
+function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices, setAccInvoices, accBills, setAccBills, creditNotes, setCreditNotes, suppliers, customers, companies, logoDataUrl, user }) {
   const [accTab, setAccTab] = useState('dashboard');
   const [showImport, setShowImport] = useState(false);
   const [showAddAccount, setShowAddAccount] = useState(false);
@@ -13956,6 +14059,159 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
     saveInvoice({...inv, status:'paid', paidDate:today, payments:newPayments});
   }
   function markBillPaid(bill){ saveBill({...bill, status:'paid', paidDate: new Date().toISOString().slice(0,10)}); }
+
+  // ── Credit Notes ──────────────────────────────────────────────
+  const cnotes = creditNotes || [];
+  const [showCnModal, setShowCnModal] = useState(false);
+  const [editCn,      setEditCn]      = useState(null);
+  function nextCnNum(){
+    const nums = cnotes.map(c=>parseInt((c.number||'').replace(/\D/g,''))||0);
+    return 'CN-' + String((Math.max(0,...nums)+1)).padStart(4,'0');
+  }
+  function saveCreditNote(cn){
+    setCreditNotes(prev => prev.find(c=>c.id===cn.id) ? prev.map(c=>c.id===cn.id?cn:c) : [cn,...prev]);
+    setShowCnModal(false); setEditCn(null);
+  }
+  function deleteCreditNote(id){
+    if(!isAdmin){alert('Only admins can delete credit notes.');return;}
+    if(window.confirm('Delete this credit note?')) setCreditNotes(prev=>prev.filter(c=>c.id!==id));
+  }
+
+  // ── Statement builder ─────────────────────────────────────────
+  // Debit  = charges that increase the balance (invoices for a customer, bills for a supplier)
+  // Credit = payments received + credit notes (reduce the balance)
+  // Running balance = Σdebit − Σcredit  →  customer = what they owe us, supplier = what we owe them.
+  const norm = s => String(s||'').trim().toLowerCase();
+  const inclTotal = li => (li||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
+  function buildStatement(name, type, fromStr, toStr){
+    const ev = [];
+    const fromT = fromStr ? new Date(fromStr).getTime() : -Infinity;
+    const toT   = toStr   ? new Date(toStr+'T23:59:59').getTime() : Infinity;
+    if(type==='supplier'){
+      accBills.filter(b=>b.status!=='void' && norm(b.supplierName)===norm(name)).forEach(b=>{
+        ev.push({date:b.date, sort:0, docType:'Bill', ref:b.number||'', desc:(b.lineItems&&b.lineItems[0]?.description)||b.supplierRef||'Supplier bill', debit:inclTotal(b.lineItems), credit:0});
+        if(Array.isArray(b.payments)&&b.payments.length){
+          b.payments.forEach(p=>ev.push({date:p.date||b.paidDate||b.date, sort:1, docType:'Payment', ref:b.number||'', desc:(p.method||'Payment made'), debit:0, credit:parseFloat(p.amount)||0}));
+        } else if(b.status==='paid'){
+          ev.push({date:b.paidDate||b.date, sort:1, docType:'Payment', ref:b.number||'', desc:'Payment made', debit:0, credit:inclTotal(b.lineItems)});
+        }
+      });
+    } else {
+      allInvoices.filter(i=>i.status!=='void' && norm(i.contactName)===norm(name)).forEach(i=>{
+        ev.push({date:i.date, sort:0, docType:'Invoice', ref:i.number||'', desc:(i.lineItems&&i.lineItems[0]?.description)||'Invoice', debit:inclTotal(i.lineItems), credit:0});
+        (i.payments||[]).forEach(p=>ev.push({date:p.date||i.paidDate||i.date, sort:1, docType:'Payment', ref:i.number||'', desc:(p.method||'Payment received'), debit:0, credit:parseFloat(p.amount)||0}));
+      });
+    }
+    cnotes.filter(c=>c.type===type && norm(c.contactName)===norm(name)).forEach(c=>{
+      ev.push({date:c.date, sort:2, docType:'Credit Note', ref:c.number||'', desc:c.reason||'Credit note', debit:0, credit:parseFloat(c.amount)||0});
+    });
+    ev.sort((a,b)=>{const d=new Date(a.date||0)-new Date(b.date||0); return d!==0?d:a.sort-b.sort;});
+    let opening=0;
+    ev.forEach(e=>{ const t=new Date(e.date||0).getTime(); if(t<fromT) opening += (e.debit-e.credit); });
+    let running=opening; const rows=[];
+    ev.forEach(e=>{ const t=new Date(e.date||0).getTime(); if(t>=fromT && t<=toT){ running += (e.debit-e.credit); rows.push({...e, balance:running}); } });
+    return {openingBalance:opening, rows, closingBalance:running};
+  }
+
+  // ── Statement sub-tab state ──
+  const _now = new Date();
+  const [stmtType,    setStmtType]    = useState('customer');
+  const [stmtContact, setStmtContact] = useState('');
+  const [stmtFrom,    setStmtFrom]    = useState(new Date(_now.getFullYear(), _now.getMonth(), 1).toISOString().slice(0,10));
+  const [stmtTo,      setStmtTo]      = useState(new Date(_now.getFullYear(), _now.getMonth()+1, 0).toISOString().slice(0,10));
+  const customerNames = Array.from(new Set([...(customers||[]).map(c=>c.company).filter(Boolean), ...allInvoices.map(i=>i.contactName).filter(Boolean)])).sort((a,b)=>a.localeCompare(b));
+  const supplierNames = Array.from(new Set([...(suppliers||[]).map(s=>s.name).filter(Boolean), ...accBills.map(b=>b.supplierName).filter(Boolean)])).sort((a,b)=>a.localeCompare(b));
+  function contactMetaFor(name, type){
+    if(type==='supplier'){ const s=(suppliers||[]).find(s=>norm(s.name)===norm(name)); return s?{contactPerson:s.contactPerson, email:s.email, tel:s.phone, address:[s.address,s.city,s.postalCode].filter(Boolean).join(', '), vatNumber:s.vatNumber}:{}; }
+    const c=(customers||[]).find(c=>norm(c.company)===norm(name)); return c?{contactPerson:c.contactPerson, email:c.email, tel:c.tel, address:c.address, vatNumber:c.vatNumber}:{};
+  }
+  function doPrintStatement(){
+    if(!stmtContact){alert('Please choose a '+(stmtType==='supplier'?'supplier':'customer')+' first.');return;}
+    const st = buildStatement(stmtContact, stmtType, stmtFrom, stmtTo);
+    const fmtD = d => new Date(d).toLocaleDateString('en-ZA',{day:'2-digit',month:'short',year:'numeric'});
+    printStatement({
+      contactName: stmtContact, contactType: stmtType, contactMeta: contactMetaFor(stmtContact, stmtType),
+      periodLabel: fmtD(stmtFrom)+' – '+fmtD(stmtTo), asAtLabel: fmtD(stmtTo),
+      openingBalance: st.openingBalance,
+      rows: st.rows.map(r=>({...r, date:fmtD(r.date)})),
+      closingBalance: st.closingBalance,
+    }, logoDataUrl);
+  }
+
+  // ── Credit Note Modal ──
+  const CN_REASONS = ['Overpayment','Goods returned','Damaged / faulty goods','Price adjustment','Discount / goodwill','Duplicate invoice','Cancelled order','Other'];
+  function CreditNoteModal({ cn, onSave, onClose }) {
+    const [form, setForm] = useState(cn || {
+      id: Date.now(), number: nextCnNum(), type:'customer', contactName:'',
+      date: new Date().toISOString().slice(0,10), amount:'', reason:'Overpayment',
+      appliedTo:'', notes:'', status:'open'
+    });
+    const upd = k => v => setForm(p=>({...p,[k]:v}));
+    const names = form.type==='supplier' ? supplierNames : customerNames;
+    const iCls = "w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
+    function save(){
+      if(!form.contactName.trim()){alert('Choose a '+(form.type==='supplier'?'supplier':'customer')+'.');return;}
+      if(!(parseFloat(form.amount)>0)){alert('Enter a credit amount greater than 0.');return;}
+      onSave({...form, amount:parseFloat(form.amount)});
+    }
+    return (
+      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
+        <div className="bg-white rounded-2xl w-full max-w-lg max-h-[92vh] overflow-y-auto">
+          <div className="px-5 py-4 border-b flex items-center justify-between" style={{background:'#06065c'}}>
+            <p className="text-white font-black">{cn?'Edit Credit Note':'New Credit Note'} · {form.number}</p>
+            <button onClick={onClose} className="text-white/80 hover:text-white text-xl leading-none">×</button>
+          </div>
+          <div className="p-5 space-y-3">
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs font-bold text-gray-500">Type</label>
+                <select className={iCls} value={form.type} onChange={e=>setForm(p=>({...p,type:e.target.value,contactName:''}))}>
+                  <option value="customer">Customer (we credit them)</option>
+                  <option value="supplier">Supplier (they credit us)</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-bold text-gray-500">Date</label>
+                <input type="date" className={iCls} value={form.date} onChange={e=>upd('date')(e.target.value)} />
+              </div>
+            </div>
+            <div>
+              <label className="text-xs font-bold text-gray-500">{form.type==='supplier'?'Supplier':'Customer'}</label>
+              <input list="cn-contact-list" className={iCls} value={form.contactName} onChange={e=>upd('contactName')(e.target.value)} placeholder={`Start typing a ${form.type==='supplier'?'supplier':'customer'} name…`} />
+              <datalist id="cn-contact-list">{names.map((n,i)=><option key={i} value={n} />)}</datalist>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs font-bold text-gray-500">Reason</label>
+                <select className={iCls} value={form.reason} onChange={e=>upd('reason')(e.target.value)}>
+                  {CN_REASONS.map(r=><option key={r} value={r}>{r}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-bold text-gray-500">Amount (incl VAT)</label>
+                <input type="number" step="0.01" className={iCls} value={form.amount} onChange={e=>upd('amount')(e.target.value)} placeholder="0.00" />
+              </div>
+            </div>
+            <div>
+              <label className="text-xs font-bold text-gray-500">Applied to invoice / bill # <span className="font-normal text-gray-400">(optional)</span></label>
+              <input className={iCls} value={form.appliedTo} onChange={e=>upd('appliedTo')(e.target.value)} placeholder="e.g. INV-00012" />
+            </div>
+            <div>
+              <label className="text-xs font-bold text-gray-500">Notes <span className="font-normal text-gray-400">(optional)</span></label>
+              <textarea className={iCls} rows="2" value={form.notes} onChange={e=>upd('notes')(e.target.value)} placeholder="Extra detail for your records…" />
+            </div>
+            <div className="bg-blue-50 border border-blue-100 rounded-lg p-3 text-xs text-blue-700">
+              This credit reduces the {form.type==='supplier'?'amount you owe this supplier':'balance this customer owes you'} and appears as a credit on their statement.
+            </div>
+            <div className="flex gap-2 pt-1">
+              <button onClick={save} className="flex-1 text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#06065c'}}>Save Credit Note</button>
+              <button onClick={onClose} className="px-4 py-2.5 rounded-xl border border-gray-200 text-sm text-gray-600">Cancel</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // ── P&L from all sources ──
   function getFullPL() {
@@ -14552,6 +14808,8 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
     {id:'dashboard', label:'🏠 Dashboard'},
     {id:'invoices',  label:'🧾 Invoices'},
     {id:'bills',     label:'🧾 Bills & Expenses'},
+    {id:'statements',label:'📄 Statements'},
+    {id:'creditnotes',label:'➖ Credit Notes'},
     {id:'bank',      label:'🏦 Bank'},
     {id:'accounts',  label:'📒 Chart of Accounts'},
     {id:'reports',   label:'📊 Reports'},
@@ -15419,6 +15677,180 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
           </div>
         </div>
       )}
+
+      {/* ════ STATEMENTS ════ */}
+      {accTab==='statements'&&(()=>{
+        const st = stmtContact ? buildStatement(stmtContact, stmtType, stmtFrom, stmtTo) : {openingBalance:0, rows:[], closingBalance:0};
+        const names = stmtType==='supplier' ? supplierNames : customerNames;
+        const setMonth = off => {
+          const d = new Date(); d.setMonth(d.getMonth()+off);
+          setStmtFrom(new Date(d.getFullYear(),d.getMonth(),1).toISOString().slice(0,10));
+          setStmtTo(new Date(d.getFullYear(),d.getMonth()+1,0).toISOString().slice(0,10));
+        };
+        return (
+        <div className="space-y-4">
+          <div className="bg-white rounded-2xl border border-gray-200 p-4">
+            <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+              <p className="font-black text-gray-800">📄 Account Statements</p>
+              <button onClick={doPrintStatement} disabled={!stmtContact} className={`text-white font-bold px-4 py-2.5 rounded-xl text-sm ${!stmtContact?'opacity-40 cursor-not-allowed':''}`} style={{background:'#06065c'}}>🖨️ Print / Save PDF</button>
+            </div>
+            <p className="text-xs text-gray-500 mb-3">Generate a monthly statement for any customer or supplier. It pulls every invoice / bill, payment and credit note automatically and shows the running balance.</p>
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div>
+                <label className="text-xs font-bold text-gray-500">Account type</label>
+                <select className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm" value={stmtType} onChange={e=>{setStmtType(e.target.value);setStmtContact('');}}>
+                  <option value="customer">Customer</option>
+                  <option value="supplier">Supplier</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-bold text-gray-500">{stmtType==='supplier'?'Supplier':'Customer'}</label>
+                <input list="stmt-contact-list" className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm" value={stmtContact} onChange={e=>setStmtContact(e.target.value)} placeholder="Choose / type a name…" />
+                <datalist id="stmt-contact-list">{names.map((n,i)=><option key={i} value={n} />)}</datalist>
+              </div>
+              <div>
+                <label className="text-xs font-bold text-gray-500">From</label>
+                <input type="date" className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm" value={stmtFrom} onChange={e=>setStmtFrom(e.target.value)} />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-gray-500">To</label>
+                <input type="date" className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm" value={stmtTo} onChange={e=>setStmtTo(e.target.value)} />
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2 mt-3">
+              <button onClick={()=>setMonth(0)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:border-blue-400">This month</button>
+              <button onClick={()=>setMonth(-1)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:border-blue-400">Last month</button>
+              <button onClick={()=>{const y=new Date().getFullYear();setStmtFrom(y+'-01-01');setStmtTo(y+'-12-31');}} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:border-blue-400">This year</button>
+              <button onClick={()=>{setStmtFrom('2000-01-01');setStmtTo(new Date().toISOString().slice(0,10));}} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:border-blue-400">All time</button>
+            </div>
+          </div>
+
+          {!stmtContact ? (
+            <div className="bg-white rounded-2xl border border-gray-200 p-8 text-center text-gray-400 text-sm">Choose a {stmtType} above to preview their statement.</div>
+          ) : (
+            <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+              <div className="px-4 py-3 border-b flex items-center justify-between flex-wrap gap-2" style={{background:'#f8f9ff'}}>
+                <div>
+                  <p className="font-black text-gray-800">{stmtContact}</p>
+                  <p className="text-xs text-gray-400">{stmtType==='supplier'?'Supplier account':'Customer account'} · {st.rows.length} transactions in period</p>
+                </div>
+                <div className="text-right">
+                  <p className="text-xs text-gray-400">{stmtType==='supplier'?'Balance we owe':'Balance due to us'}</p>
+                  <p className={`text-xl font-black ${st.closingBalance>0?'text-red-600':'text-green-600'}`}>{fmtAmt(st.closingBalance)}</p>
+                </div>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs min-w-[640px]">
+                  <thead><tr className="border-b border-gray-100 bg-gray-50 text-gray-400">
+                    <th className="px-3 py-2 text-left font-bold">Date</th>
+                    <th className="px-3 py-2 text-left font-bold">Type</th>
+                    <th className="px-3 py-2 text-left font-bold">Reference</th>
+                    <th className="px-3 py-2 text-left font-bold">Description</th>
+                    <th className="px-3 py-2 text-right font-bold">Debit</th>
+                    <th className="px-3 py-2 text-right font-bold">Credit</th>
+                    <th className="px-3 py-2 text-right font-bold">Balance</th>
+                  </tr></thead>
+                  <tbody>
+                    <tr className="border-b border-gray-100" style={{background:'#eef2ff'}}>
+                      <td className="px-3 py-2 font-bold text-gray-600" colSpan="6">Opening balance</td>
+                      <td className="px-3 py-2 text-right font-black text-gray-700">{fmtAmt(st.openingBalance)}</td>
+                    </tr>
+                    {st.rows.map((r,i)=>(
+                      <tr key={i} className="border-b border-gray-50 hover:bg-blue-50">
+                        <td className="px-3 py-2 text-gray-500 whitespace-nowrap">{fmtDate(r.date)}</td>
+                        <td className="px-3 py-2"><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:r.docType==='Invoice'||r.docType==='Bill'?'#2563eb':r.docType==='Credit Note'?'#f59e0b':'#059669'}}>{r.docType}</span></td>
+                        <td className="px-3 py-2 font-mono text-gray-500">{r.ref}</td>
+                        <td className="px-3 py-2 text-gray-600 truncate max-w-[230px]">{r.desc}</td>
+                        <td className="px-3 py-2 text-right text-gray-700">{r.debit?fmtAmt(r.debit):''}</td>
+                        <td className="px-3 py-2 text-right text-gray-700">{r.credit?fmtAmt(r.credit):''}</td>
+                        <td className="px-3 py-2 text-right font-bold text-gray-800">{fmtAmt(r.balance)}</td>
+                      </tr>
+                    ))}
+                    {st.rows.length===0&&<tr><td colSpan="7" className="px-3 py-8 text-center text-gray-400">No transactions in this period.</td></tr>}
+                    <tr className="border-t-2" style={{borderColor:'#06065c',background:'#f8f9ff'}}>
+                      <td className="px-3 py-2.5 font-black text-gray-800" colSpan="6">Closing balance — {stmtType==='supplier'?'we owe':'due to us'}</td>
+                      <td className="px-3 py-2.5 text-right font-black" style={{color:'#06065c'}}>{fmtAmt(st.closingBalance)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+        );
+      })()}
+
+      {/* ════ CREDIT NOTES ════ */}
+      {accTab==='creditnotes'&&(
+        <div className="space-y-4">
+          <div className="bg-white rounded-2xl border border-gray-200 p-4 flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <p className="font-black text-gray-800">➖ Credit Notes</p>
+              <p className="text-xs text-gray-500 mt-0.5">Record credits for overpayments, returns, damaged goods or goodwill adjustments. They flow straight onto the customer / supplier statement.</p>
+            </div>
+            <button onClick={()=>{setEditCn(null);setShowCnModal(true);}} className="text-white font-bold px-4 py-2.5 rounded-xl text-sm" style={{background:'#06065c'}}>＋ New Credit Note</button>
+          </div>
+
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <div className="bg-white rounded-2xl border border-gray-200 p-4">
+              <p className="text-xs text-gray-400 mb-1">Total credit notes</p>
+              <p className="text-2xl font-black text-gray-800">{cnotes.length}</p>
+            </div>
+            <div className="bg-white rounded-2xl border border-gray-200 p-4">
+              <p className="text-xs text-gray-400 mb-1">Customer credits</p>
+              <p className="text-2xl font-black text-blue-700">{fmtAmt(cnotes.filter(c=>c.type==='customer').reduce((s,c)=>s+(parseFloat(c.amount)||0),0))}</p>
+            </div>
+            <div className="bg-white rounded-2xl border border-gray-200 p-4">
+              <p className="text-xs text-gray-400 mb-1">Supplier credits</p>
+              <p className="text-2xl font-black text-amber-600">{fmtAmt(cnotes.filter(c=>c.type==='supplier').reduce((s,c)=>s+(parseFloat(c.amount)||0),0))}</p>
+            </div>
+            <div className="bg-white rounded-2xl border border-gray-200 p-4">
+              <p className="text-xs text-gray-400 mb-1">This month</p>
+              <p className="text-2xl font-black text-gray-800">{cnotes.filter(c=>{const d=new Date(c.date);const n=new Date();return d.getMonth()===n.getMonth()&&d.getFullYear()===n.getFullYear();}).length}</p>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs min-w-[680px]">
+                <thead><tr className="border-b border-gray-100 bg-gray-50 text-gray-400">
+                  <th className="px-3 py-2 text-left font-bold">CN #</th>
+                  <th className="px-3 py-2 text-left font-bold">Date</th>
+                  <th className="px-3 py-2 text-left font-bold">Type</th>
+                  <th className="px-3 py-2 text-left font-bold">Account</th>
+                  <th className="px-3 py-2 text-left font-bold">Reason</th>
+                  <th className="px-3 py-2 text-left font-bold">Applied to</th>
+                  <th className="px-3 py-2 text-right font-bold">Amount</th>
+                  <th className="px-3 py-2 text-center font-bold">Actions</th>
+                </tr></thead>
+                <tbody>
+                  {cnotes.map(c=>(
+                    <tr key={c.id} className="border-b border-gray-50 hover:bg-blue-50">
+                      <td className="px-3 py-2 font-mono text-gray-600">{c.number}</td>
+                      <td className="px-3 py-2 text-gray-500 whitespace-nowrap">{fmtDate(c.date)}</td>
+                      <td className="px-3 py-2"><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:c.type==='supplier'?'#d97706':'#2563eb'}}>{c.type==='supplier'?'Supplier':'Customer'}</span></td>
+                      <td className="px-3 py-2 text-gray-700 font-semibold">{c.contactName}</td>
+                      <td className="px-3 py-2 text-gray-500">{c.reason}</td>
+                      <td className="px-3 py-2 font-mono text-gray-400">{c.appliedTo||'—'}</td>
+                      <td className="px-3 py-2 text-right font-bold text-gray-800">{fmtAmt(c.amount)}</td>
+                      <td className="px-3 py-2 text-center whitespace-nowrap">
+                        <button onClick={()=>{setEditCn(c);setShowCnModal(true);}} className="p-1.5 rounded-lg text-gray-400 hover:text-blue-600 hover:bg-blue-50">✏️</button>
+                        <button onClick={()=>deleteCreditNote(c.id)} className="p-1.5 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50">🗑️</button>
+                      </td>
+                    </tr>
+                  ))}
+                  {cnotes.length===0&&<tr><td colSpan="8" className="px-3 py-10 text-center">
+                    <p className="text-gray-400 mb-2">No credit notes yet.</p>
+                    <button onClick={()=>{setEditCn(null);setShowCnModal(true);}} className="text-xs font-bold px-3 py-1.5 rounded-lg text-white" style={{background:'#06065c'}}>＋ Create your first credit note</button>
+                  </td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showCnModal && <CreditNoteModal cn={editCn} onSave={saveCreditNote} onClose={()=>{setShowCnModal(false);setEditCn(null);}} />}
     </div>
   );
 }
@@ -15794,6 +16226,7 @@ function App() {
   const [payrollRecords,   setPayrollRecords]   = useState(_saved ? (_saved.payrollRecords||[])    : []);
   const [quickRates,       setQuickRates]       = useState(_saved ? (_saved.quickRates||[])        : INITIAL_QUICK_RATES);
   const [proposedProjects, setProposedProjects] = useState(_saved ? (_saved.proposedProjects||[])  : []);
+  const [creditNotes,      setCreditNotes]      = useState(_saved ? (_saved.creditNotes||[])         : []);
 
   // ── DATABASE-BACKED PERSISTENCE ────────────────────────────────
   // Database (PostgreSQL via backend API) is the shared source of truth for ALL users.
@@ -15830,7 +16263,7 @@ function App() {
   // All array/object sections stored in platform_state
   const STATE_SECTIONS = ['jobs','inventory','quotes','customers','suppliers','assets',
     'employees','leaveRequests','disciplinary','savedCalcs','purchaseOrders','savedImports',
-    'bankTxns','chartOfAccounts','accInvoices','accBills','completeProducts','payrollRecords','quickRates','proposedProjects'];
+    'bankTxns','chartOfAccounts','accInvoices','accBills','completeProducts','payrollRecords','quickRates','proposedProjects','creditNotes'];
 
   // Fetch latest state from the backend
   async function fetchFromServer() {
@@ -16054,7 +16487,7 @@ function App() {
   //    Merges locally-changed sections onto the server baseline before writing,
   //    so two users editing different sections never overwrite each other.
   useEffect(()=>{
-    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, logo:logoDataUrl, utLogo:utLogoDataUrl, sigOTSmit, savedAt:lastSaved};
+    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, logo:logoDataUrl, utLogo:utLogoDataUrl, sigOTSmit, savedAt:lastSaved};
     currentSnapshotRef.current = snapshot; // keep ref current for poll effect
     // Backup to localStorage (safety net — DB is source of truth)
     try { localStorage.setItem('sgr_platform_data', JSON.stringify(snapshot)); } catch(e) {}
@@ -16072,7 +16505,7 @@ function App() {
       }
       setTimeout(() => setApiMsg(''), 2500);
     }, 800);
-  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, logoDataUrl, utLogoDataUrl, sigOTSmit]);
+  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, logoDataUrl, utLogoDataUrl, sigOTSmit]);
 
   function handleLogin(u){ try{localStorage.setItem('sgr_user',JSON.stringify(u));}catch(e){} setUser(u); setPage('dashboard'); setEntityFilter(null); }
   function handleLogout(){ try{localStorage.removeItem('sgr_user');}catch(e){} setUser(null); setPage('dashboard'); setEntityFilter(null); }
@@ -16090,7 +16523,7 @@ function App() {
       });
       // Date-stamped filename so Drive folder shows version order clearly
       const dateTag = now.toISOString().slice(0,10); // e.g. 2026-04-10
-      const payload = JSON.stringify({v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, logo:logoDataUrl, utLogo:utLogoDataUrl, savedAt: stamp});
+      const payload = JSON.stringify({v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, logo:logoDataUrl, utLogo:utLogoDataUrl, savedAt: stamp});
       // outerHTML preserves the original <script type="text/babel"> source intact.
       // outerHTML omits the DOCTYPE; without it the saved file loads in quirks mode,
       // which broke startup. Prepend it so saved files stay in standards mode.
@@ -16138,7 +16571,7 @@ function App() {
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={logoDataUrl} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
     reports:     <ReportsPage     jobs={jobs} companies={companies} user={user} logoDataUrl={logoDataUrl}/>,
-    accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} suppliers={suppliers} customers={customers} companies={companies} user={user}/>,
+    accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={logoDataUrl} user={user}/>,
     hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={logoDataUrl} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
   };
 
