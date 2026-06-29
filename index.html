@@ -14119,8 +14119,6 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
   const [stmtContact, setStmtContact] = useState('');
   const [stmtFrom,    setStmtFrom]    = useState(new Date(_now.getFullYear(), _now.getMonth(), 1).toISOString().slice(0,10));
   const [stmtTo,      setStmtTo]      = useState(new Date(_now.getFullYear(), _now.getMonth()+1, 0).toISOString().slice(0,10));
-  const customerNames = Array.from(new Set([...(customers||[]).map(c=>c.company).filter(Boolean), ...allInvoices.map(i=>i.contactName).filter(Boolean)])).sort((a,b)=>a.localeCompare(b));
-  const supplierNames = Array.from(new Set([...(suppliers||[]).map(s=>s.name).filter(Boolean), ...accBills.map(b=>b.supplierName).filter(Boolean)])).sort((a,b)=>a.localeCompare(b));
   function contactMetaFor(name, type){
     if(type==='supplier'){ const s=(suppliers||[]).find(s=>norm(s.name)===norm(name)); return s?{contactPerson:s.contactPerson, email:s.email, tel:s.phone, address:[s.address,s.city,s.postalCode].filter(Boolean).join(', '), vatNumber:s.vatNumber}:{}; }
     const c=(customers||[]).find(c=>norm(c.company)===norm(name)); return c?{contactPerson:c.contactPerson, email:c.email, tel:c.tel, address:c.address, vatNumber:c.vatNumber}:{};
@@ -14642,6 +14640,9 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
   const allInvoices = [...accInvoices.map(i=>({...i,source:i.source||'manual'})), ...jobInvsFiltered];
   // Sort by date descending
   allInvoices.sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
+  // Contact-name lists for Statements & Credit Notes — declared after allInvoices so it is initialised first (fixes TDZ crash)
+  const customerNames = Array.from(new Set([...(customers||[]).map(c=>c.company).filter(Boolean), ...allInvoices.map(i=>i.contactName).filter(Boolean)])).sort((a,b)=>a.localeCompare(b));
+  const supplierNames = Array.from(new Set([...(suppliers||[]).map(s=>s.name).filter(Boolean), ...accBills.map(b=>b.supplierName).filter(Boolean)])).sort((a,b)=>a.localeCompare(b));
 
   const fullPL = getFullPL();
   const debtors = getAgedDebtors(allInvoices);
