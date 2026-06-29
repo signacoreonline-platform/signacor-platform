@@ -715,7 +715,8 @@ function printDisciplinaryNotice(rec, employee, logoDataUrl) {
   const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Disciplinary Notice</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Arial,sans-serif;font-size:12px;color:#1a1a1a;padding:16mm 18mm}
+@page{size:A4;margin:16mm 18mm}
+body{font-family:Arial,sans-serif;font-size:12px;color:#1a1a1a}
 .hdr{display:flex;justify-content:space-between;align-items:flex-start;padding-bottom:12px;border-bottom:4px solid #06065c;margin-bottom:6px}
 .brand{font-size:22px;font-weight:900;color:#0000ff}.brand span{color:#555;font-size:15px}
 .brand p{font-size:10px;color:#222;margin-top:4px}
@@ -731,7 +732,7 @@ section{margin-bottom:16px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 20px}
 .field .lbl{font-size:9px;color:#333;font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}
 .field .val{font-size:12px;font-weight:700;color:#111;border-bottom:1px solid #d1d5db;padding-bottom:3px;min-height:20px}
-.text-block{border:1.5px solid #e5e7eb;border-radius:6px;padding:10px;min-height:55px;font-size:11px;color:#222;font-style:italic}
+.text-block{border:1.5px solid #e5e7eb;border-radius:6px;padding:10px;min-height:55px;font-size:11px;color:#222;font-style:italic;white-space:pre-wrap;word-break:break-word}
 .rights{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 12px;margin-bottom:14px;font-size:10px;color:#065f46;line-height:1.6}
 .sig-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:8px}
 .sig-box{text-align:center}
@@ -741,6 +742,7 @@ section{margin-bottom:16px}
 .ack{border:2px solid #1a1a1a;border-radius:8px;padding:12px;margin-top:16px}
 .ack .t{font-size:10px;font-weight:800;text-transform:uppercase;margin-bottom:6px}
 .ack p{font-size:9px;color:#555;line-height:1.6}
+section,.type-banner,.rights,.sig-grid,.sig-box,.ack,.field{page-break-inside:avoid;break-inside:avoid}
 @media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 </style></head><body>
 <div class="hdr">
@@ -750,7 +752,7 @@ section{margin-bottom:16px}
     21 Voortrekker Street, Mossdustria<br>Mossel Bay, 6506 · orders@snsg.co.za
     <div style="margin-top:8px;text-align:right">
       <div style="font-family:'Barlow Condensed',Arial,sans-serif;font-size:20px;font-weight:800;color:#06065c;letter-spacing:0.06em;text-transform:uppercase">Disciplinary Notice</div>
-      <div style="font-size:9px;color:#333;letter-spacing:0.1em;text-transform:uppercase">Date: ${rec.date||new Date().toLocaleDateString('en-ZA')}</div>
+      <div style="font-size:9px;color:#333;letter-spacing:0.1em;text-transform:uppercase">Date: ${rec.loggedAt||rec.date||new Date().toLocaleDateString('en-ZA')}</div>
     </div>
   </div>
 </div>
@@ -767,26 +769,28 @@ section{margin-bottom:16px}
     <div class="field"><div class="lbl">Full Name</div><div class="val">${emp.firstName} ${emp.lastName}</div></div>
     <div class="field"><div class="lbl">ID Number</div><div class="val">${emp.idNumber||''}</div></div>
     <div class="field"><div class="lbl">Position</div><div class="val">${emp.position||''}</div></div>
+    <div class="field"><div class="lbl">Action Type</div><div class="val">${typeLabel||''}</div></div>
     <div class="field"><div class="lbl">Date of Incident</div><div class="val">${rec.incidentDate||''}</div></div>
+    <div class="field"><div class="lbl">Hearing Date</div><div class="val">${rec.hearingDate||''}</div></div>
   </div>
 </section>
 
 <section>
   <div class="sec-title">Nature of Infringement / Charge</div>
-  <div class="text-block">${rec.infringement||'&nbsp;'}</div>
+  <div class="text-block">${rec.description||rec.infringement||'&nbsp;'}</div>
 </section>
 
-<section>
+${rec.details?`<section>
   <div class="sec-title">Details of Incident</div>
-  <div class="text-block">${rec.details||'&nbsp;'}</div>
-</section>
+  <div class="text-block">${rec.details}</div>
+</section>`:''}
 
 <section>
   <div class="sec-title">Outcome / Sanction</div>
   <div class="text-block">${rec.outcome||'&nbsp;'}</div>
 </section>
 
-${rec.witnessName?`<section><div class="sec-title">Witness</div><div class="field"><div class="lbl">Witness Name</div><div class="val">${rec.witnessName}</div></div></section>`:''}
+${(rec.witnesses||rec.witnessName)?`<section><div class="sec-title">Witnesses Present</div><div class="field"><div class="lbl">Witness Name(s)</div><div class="val">${rec.witnesses||rec.witnessName}</div></div></section>`:''}
 
 <div class="rights">
   <strong>Employee Rights:</strong> The employee has the right to be heard, the right to be represented by a fellow employee or trade union representative, and the right to appeal this decision within 5 working days. This notice does not constitute summary dismissal.
