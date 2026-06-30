@@ -709,6 +709,10 @@ section{margin-bottom:18px}
 function printDisciplinaryNotice(rec, employee, logoDataUrl) {
   const emp = employee || { firstName:'', lastName:'', position:'' };
   const typeLabel = DISC_TYPES.find(t=>t.key===rec.discType)?.label || rec.discType;
+  const fmtDate = d => { if(!d) return ''; const dt=new Date(d); return isNaN(dt)?d:dt.toLocaleDateString('en-ZA'); };
+  const sigSub = (name, date) =>
+    `Name: ${name?`<strong>${name}</strong>`:'_______________'} &nbsp;·&nbsp; Date: ${date?`<strong>${fmtDate(date)}</strong>`:'___________'}`;
+  const ackDateTxt = rec.ackDate ? `<strong>${fmtDate(rec.ackDate)}</strong>` : '______________';
   const logoTag = logoDataUrl
     ? `<img src="${logoDataUrl}" style="max-height:72px;max-width:200px;object-fit:contain;" alt="Signacore"/>`
     : `<div style="font-family:'Barlow Condensed',Arial,sans-serif;font-size:26px;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.04em;">SIGNACORE</div>`;
@@ -803,14 +807,14 @@ section{margin-bottom:16px}
 <section>
   <div class="sec-title">Signatures</div>
   <div class="sig-grid">
-    <div class="sig-box"><div class="sig-line"></div><div class="sig-lbl">Issuing Manager / HR</div><div class="sig-sub">Name &amp; Date: _______________</div></div>
-    <div class="sig-box"><div class="sig-line"></div><div class="sig-lbl">Witness Signature</div><div class="sig-sub">Name &amp; Date: _______________</div></div>
+    <div class="sig-box"><div class="sig-line"></div><div class="sig-lbl">Issuing Manager / HR</div><div class="sig-sub">${sigSub(rec.managerName, rec.managerSignDate)}</div></div>
+    <div class="sig-box"><div class="sig-line"></div><div class="sig-lbl">Witness Signature</div><div class="sig-sub">${sigSub(rec.witnessSignName||rec.witnesses, rec.witnessSignDate)}</div></div>
   </div>
 </section>
 
 <div class="ack">
   <div class="t">Employee Acknowledgement</div>
-  <p>I, <strong>${emp.firstName} ${emp.lastName}</strong>, hereby acknowledge receipt of this disciplinary notice on ______________ and confirm that the contents have been explained to me.</p>
+  <p>I, <strong>${emp.firstName} ${emp.lastName}</strong>, hereby acknowledge receipt of this disciplinary notice on ${ackDateTxt} and confirm that the contents have been explained to me.</p>
   <div style="margin-top:18px;display:flex;gap:40px">
     <div style="flex:1;text-align:center"><div style="border-bottom:1.5px solid #1a1a1a;height:60px"></div><div style="font-size:10px;color:#555;font-weight:700;margin-top:5px">Employee Signature</div></div>
     <div style="flex:1;text-align:center"><div style="border-bottom:1.5px solid #1a1a1a;height:60px"></div><div style="font-size:10px;color:#555;font-weight:700;margin-top:5px">HR / Management</div></div>
@@ -6503,7 +6507,7 @@ function LeaveRequestModal({ employees, onClose, onSave, existing, logoDataUrl }
 // ── Disciplinary Modal ───────────────────────────────────────────
 function DisciplinaryModal({ employees, onClose, onSave, existing, logoDataUrl }) {
   const isEdit = !!existing;
-  const blank = { id:null, employeeId:'', discType:'verbal', incidentDate:'', description:'', outcome:'', hearingDate:'', witnesses:'', loggedAt:new Date().toLocaleDateString('en-ZA') };
+  const blank = { id:null, employeeId:'', discType:'verbal', incidentDate:'', description:'', outcome:'', hearingDate:'', witnesses:'', managerName:'', managerSignDate:'', witnessSignName:'', witnessSignDate:'', ackDate:'', loggedAt:new Date().toLocaleDateString('en-ZA') };
   const [f, setF] = useState(isEdit ? {...existing} : blank);
   const upd = k => e => setF(p=>({...p,[k]:e.target.value}));
   const iCls = "w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400";
@@ -6545,6 +6549,16 @@ function DisciplinaryModal({ employees, onClose, onSave, existing, logoDataUrl }
           <div>
             <label className="block text-xs font-medium text-gray-600 mb-1">Witnesses (optional)</label>
             <input className={iCls} value={f.witnesses} onChange={upd('witnesses')} placeholder="Names of witnesses present"/>
+          </div>
+          <div className="pt-2 border-t">
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Signatures — type names & dates (leave blank to sign by hand)</p>
+            <div className="grid grid-cols-2 gap-4">
+              <div><label className="block text-xs font-medium text-gray-600 mb-1">Issuing Manager / HR Name</label><input className={iCls} value={f.managerName} onChange={upd('managerName')} placeholder="e.g. O T Smit"/></div>
+              <div><label className="block text-xs font-medium text-gray-600 mb-1">Manager Sign Date</label><input type="date" className={iCls} value={f.managerSignDate} onChange={upd('managerSignDate')}/></div>
+              <div><label className="block text-xs font-medium text-gray-600 mb-1">Witness Name</label><input className={iCls} value={f.witnessSignName} onChange={upd('witnessSignName')} placeholder="Witness full name"/></div>
+              <div><label className="block text-xs font-medium text-gray-600 mb-1">Witness Sign Date</label><input type="date" className={iCls} value={f.witnessSignDate} onChange={upd('witnessSignDate')}/></div>
+              <div><label className="block text-xs font-medium text-gray-600 mb-1">Employee Acknowledgement Date</label><input type="date" className={iCls} value={f.ackDate} onChange={upd('ackDate')}/></div>
+            </div>
           </div>
         </div>
         <div className="flex justify-between gap-3 px-6 py-4 border-t bg-gray-50">
