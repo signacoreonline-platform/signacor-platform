@@ -930,6 +930,50 @@ tr:nth-child(even) td{background:#f8f9ff}
 }
 
 /* ═══════════════════════════════════════════
+   CUSTOMER CREDIT HELPERS
+   A Credit Note's full face value is always the ledger amount shown on the
+   Client Statement (issued once, on its date). The optional `used` field
+   tracks how much of that credit has since been drawn down against a
+   deposit / invoice payment recorded with method "Credit", so the same
+   rand can never be allocated twice. These are plain functions (not
+   closures) so any component holding `creditNotes` + `setCreditNotes` can
+   call them the same way.
+═══════════════════════════════════════════ */
+function cnNorm(s){ return String(s||'').trim().toLowerCase(); }
+function creditNoteAvailable(creditNotes, contactName){
+  return (creditNotes||[]).filter(c=>c.type==='customer' && cnNorm(c.contactName)===cnNorm(contactName))
+    .reduce((s,c)=>s+Math.max(0,(parseFloat(c.amount)||0)-(parseFloat(c.used)||0)),0);
+}
+function applyCreditNoteUsage(creditNotes, contactName, amount){
+  let remaining = parseFloat(amount)||0;
+  const sorted = (creditNotes||[]).slice().sort((a,b)=>new Date(a.date||0)-new Date(b.date||0));
+  const updates = {};
+  sorted.forEach(c=>{
+    if(remaining<=0.005 || c.type!=='customer' || cnNorm(c.contactName)!==cnNorm(contactName)) return;
+    const avail = Math.max(0,(parseFloat(c.amount)||0)-(parseFloat(c.used)||0));
+    if(avail<=0.005) return;
+    const use = Math.min(avail, remaining);
+    updates[c.id] = (parseFloat(c.used)||0)+use;
+    remaining -= use;
+  });
+  return (creditNotes||[]).map(c=>updates[c.id]!==undefined?{...c,used:updates[c.id]}:c);
+}
+function releaseCreditNoteUsage(creditNotes, contactName, amount){
+  let remaining = parseFloat(amount)||0;
+  const sorted = (creditNotes||[]).slice().sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
+  const updates = {};
+  sorted.forEach(c=>{
+    if(remaining<=0.005 || c.type!=='customer' || cnNorm(c.contactName)!==cnNorm(contactName)) return;
+    const used = parseFloat(c.used)||0;
+    if(used<=0.005) return;
+    const release = Math.min(used, remaining);
+    updates[c.id] = used-release;
+    remaining -= release;
+  });
+  return (creditNotes||[]).map(c=>updates[c.id]!==undefined?{...c,used:updates[c.id]}:c);
+}
+
+/* ═══════════════════════════════════════════
    SA PAYROLL — TAX ENGINE (2024/2025 tax year)
 ═══════════════════════════════════════════ */
 const SA_TAX_BRACKETS = [
@@ -4359,7 +4403,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
    Records deposits & partial payments against a quote/proforma.
    Stored on quote.payments and persisted via onUpdate (platform_state).
 ═══════════════════════════════════════════ */
-function QuotePaymentsModal({ quote, total, onUpdate, onClose }) {
+function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setCreditNotes }) {
   const [payments, setPayments] = useState(quote.payments||[]);
   const [date,   setDate]   = useState(new Date().toISOString().slice(0,10));
   const [method, setMethod] = useState('EFT');
@@ -4371,15 +4415,28 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose }) {
   const balance   = total - totalPaid;
   const depRate   = total<=5000 ? 1.0 : 0.80;
   const deposit   = total*depRate;
+  const availableCredit = creditNoteAvailable(creditNotes, quote.client);
 
   function persist(updated){ setPayments(updated); onUpdate({...quote, payments:updated}); }
   function addPayment(){
     if(!amount||parseFloat(amount)<=0){ alert('Enter a valid amount'); return; }
-    persist([...payments,{id:Date.now(),date,method,amount:parseFloat(amount),notes:notes.trim()}]);
+    const amt = parseFloat(amount);
+    if(method==='Credit'){
+      if(amt > availableCredit + 0.005){
+        alert(`${quote.client} only has ${zr(availableCredit)} of available credit. Reduce the amount, issue another credit note first, or choose a different payment method.`);
+        return;
+      }
+      setCreditNotes(prev=>applyCreditNoteUsage(prev, quote.client, amt));
+    }
+    persist([...payments,{id:Date.now(),date,method,amount:amt,notes:notes.trim()}]);
     setAmount(''); setNotes('');
   }
   function deletePayment(pid){
     if(!window.confirm('Delete this payment record?')) return;
+    const removed = payments.find(p=>p.id===pid);
+    if(removed && removed.method==='Credit'){
+      setCreditNotes(prev=>releaseCreditNoteUsage(prev, quote.client, parseFloat(removed.amount)||0));
+    }
     persist(payments.filter(p=>p.id!==pid));
   }
 
@@ -4400,6 +4457,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose }) {
               <p className="text-xs text-gray-400 mb-1">Quote Total (incl. VAT)</p>
               <p className="text-lg font-black" style={{color:'#06065c'}}>{zr(total)}</p>
               <p className="text-xs text-gray-400 mt-0.5">{depRate===1?'100%':'80%'} deposit: {zr(deposit)}</p>
+              {availableCredit>0.005&&<p className="text-xs text-emerald-600 font-bold mt-0.5">{zr(availableCredit)} credit available</p>}
             </div>
             <div className="bg-green-50 border border-green-200 rounded-xl p-3 text-center">
               <p className="text-xs text-green-600 mb-1">Total Paid</p>
@@ -4452,11 +4510,12 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose }) {
             <div className="grid grid-cols-2 gap-3">
               <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
               <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
-                <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>{['EFT','Cash','Card','Cheque','Other'].map(m=><option key={m}>{m}</option>)}</select>
+                <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>{['EFT','Cash','Card','Cheque','Credit','Other'].map(m=><option key={m} disabled={m==='Credit'&&availableCredit<=0.005}>{m==='Credit'?`Credit${availableCredit>0.005?' ('+zr(availableCredit)+' available)':' (none available)'}`:m}</option>)}</select>
               </div>
               <div><label className="text-xs font-bold text-gray-500 block mb-1">Amount (R)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} placeholder={balance>0?balance.toFixed(2):'0.00'} min="0.01" step="0.01"/></div>
               <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes (optional)</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="Deposit, partial payment, etc."/></div>
             </div>
+            {method==='Credit'&&<p className="text-xs text-emerald-600 mt-2">This will draw down {quote.client}'s available credit instead of taking a cash payment.</p>}
             <button onClick={addPayment} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#059669'}}>＋ Record Payment</button>
           </div>
           <div className="flex justify-end pt-1">
@@ -4468,7 +4527,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose }) {
   );
 }
 
-function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs }) {
+function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs, creditNotes, setCreditNotes }) {
   const [showEmailFlow, setShowEmailFlow] = useState(false);
   const [showProformaEmail, setShowProformaEmail] = useState(false);
   const [showPayments, setShowPayments] = useState(false);
@@ -4736,6 +4795,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
         <QuotePaymentsModal
           quote={quote} total={total} onUpdate={onUpdate}
           onClose={()=>setShowPayments(false)}
+          creditNotes={creditNotes} setCreditNotes={setCreditNotes}
         />
       )}
     </Modal>
@@ -5020,7 +5080,7 @@ function reconcileJobInvoice(job, quotes){
 /* ═══════════════════════════════════════════
    QUOTES PAGE
 ═══════════════════════════════════════════ */
-function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated, initialOpen, onInitialOpenHandled }) {
+function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated, initialOpen, onInitialOpenHandled, creditNotes, setCreditNotes }) {
   const [subTab,    setSubTab]    = useState('quotes'); // 'quotes' | 'invoices'
   const [showCreate,setShowCreate]=useState(false);
   const [viewQuote,setViewQuote]=useState(null);
@@ -5244,6 +5304,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const [method, setMethod] = useState('EFT');
     const [amount, setAmount] = useState('');
     const [notes,  setNotes]  = useState('');
+    const availableCredit = creditNoteAvailable(creditNotes, job.client);
+    const zr = n => 'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
 
     function saveJob(updated) {
       setJobs(prev=>prev.map(j=>j.id===updated.id?updated:j));
@@ -5251,7 +5313,15 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     }
     function addPayment() {
       if(!amount||parseFloat(amount)<=0){alert('Enter a valid amount');return;}
-      const newP={id:Date.now(),date,method,amount:parseFloat(amount),notes:notes.trim()};
+      const amt = parseFloat(amount);
+      if(method==='Credit'){
+        if(amt > availableCredit + 0.005){
+          alert(`${job.client} only has ${zr(availableCredit)} of available credit. Reduce the amount, issue another credit note first, or choose a different payment method.`);
+          return;
+        }
+        setCreditNotes(prev=>applyCreditNoteUsage(prev, job.client, amt));
+      }
+      const newP={id:Date.now(),date,method,amount:amt,notes:notes.trim()};
       const updated=[...payments,newP];
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
@@ -5268,6 +5338,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     function deletePayment(pid) {
       if(!isAdmin){alert('Only admins can delete payments.');return;}
       if(!window.confirm('Delete this payment record? This may change the invoice status.'))return;
+      const removed = payments.find(p=>p.id===pid);
+      if(removed && removed.method==='Credit'){
+        setCreditNotes(prev=>releaseCreditNoteUsage(prev, job.client, parseFloat(removed.amount)||0));
+      }
       const updated=payments.filter(p=>p.id!==pid);
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
@@ -5277,6 +5351,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     function editPayment(pid) {
       if(!isAdmin){alert('Only admins can edit payments.');return;}
       const p=payments.find(x=>x.id===pid); if(!p) return;
+      if(p.method==='Credit'){ alert('Credit-funded payments can\'t be edited — delete and re-record instead, so the customer\'s available credit stays accurate.'); return; }
       const newAmt=prompt('Edit amount (R):',p.amount);
       if(newAmt===null)return;
       const newNotes=prompt('Edit notes:',p.notes||'');
@@ -5307,6 +5382,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                 <p className="text-xs text-gray-400 mb-1">Invoice Total (incl. VAT)</p>
                 <p className="text-lg font-black" style={{color:'#06065c'}}>{zr(invTotal)}</p>
                 <p className="text-xs text-gray-400 mt-0.5">Due: {job.invoiceDue||'—'}</p>
+                {availableCredit>0.005&&<p className="text-xs text-emerald-600 font-bold mt-0.5">{zr(availableCredit)} credit available</p>}
               </div>
               <div className="bg-green-50 border border-green-200 rounded-xl p-3 text-center">
                 <p className="text-xs text-green-600 mb-1">Total Paid</p>
@@ -5386,12 +5462,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
                   <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>
-                    {['EFT','Cash','Card','Cheque','Other'].map(m=><option key={m}>{m}</option>)}
+                    {['EFT','Cash','Card','Cheque','Credit','Other'].map(m=><option key={m} disabled={m==='Credit'&&availableCredit<=0.005}>{m==='Credit'?`Credit${availableCredit>0.005?' ('+zr(availableCredit)+' available)':' (none available)'}`:m}</option>)}
                   </select>
                 </div>
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Amount (R)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} placeholder={balance>0?balance.toFixed(2):'0.00'} min="0.01" step="0.01"/></div>
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes (optional)</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="Reference, partial payment, etc."/></div>
               </div>
+              {method==='Credit'&&<p className="text-xs text-emerald-600 mt-2">This will draw down {job.client}'s available credit instead of taking a cash payment.</p>}
               <button onClick={addPayment} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#059669'}}>＋ Record Payment</button>
             </div>
             {!isAdmin&&<p className="text-xs text-gray-400 text-center">🔒 Only admins can edit or delete payment records.</p>}
@@ -5803,6 +5880,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         companies={companies} logoDataUrl={logoDataUrl}
         onEdit={handleEditQuote}
         jobs={jobs}
+        creditNotes={creditNotes} setCreditNotes={setCreditNotes}
       />}
       {/* ── Edit Invoice modal ── */}
       {editInvoice&&(
@@ -14172,6 +14250,11 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
     function save(){
       if(!form.contactName.trim()){alert('Choose a '+(form.type==='supplier'?'supplier':'customer')+'.');return;}
       if(!(parseFloat(form.amount)>0)){alert('Enter a credit amount greater than 0.');return;}
+      // Guard against typos: if the name doesn't exactly match an existing contact,
+      // the credit won't be picked up by the Client Statement or Aged Debtors
+      // (both match by exact, case-insensitive name) — so warn before saving.
+      const known = names.some(n=>cnNorm(n)===cnNorm(form.contactName));
+      if(!known && !window.confirm(`"${form.contactName}" doesn't exactly match an existing ${form.type==='supplier'?'supplier':'customer'} name on file.\n\nIf the spelling doesn't match exactly, this credit will NOT show up on their statement or in Aged Debtors/Creditors.\n\nSave anyway?`)) return;
       onSave({...form, amount:parseFloat(form.amount)});
     }
     return (
@@ -14199,6 +14282,9 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
               <label className="text-xs font-bold text-gray-500">{form.type==='supplier'?'Supplier':'Customer'}</label>
               <input list="cn-contact-list" className={iCls} value={form.contactName} onChange={e=>upd('contactName')(e.target.value)} placeholder={`Start typing a ${form.type==='supplier'?'supplier':'customer'} name…`} />
               <datalist id="cn-contact-list">{names.map((n,i)=><option key={i} value={n} />)}</datalist>
+              {form.type==='customer' && form.contactName.trim() && (
+                <p className="text-xs text-gray-400 mt-1">Available credit for this customer right now: <strong className="text-emerald-600">{fmtAmt(creditNoteAvailable(cnotes, form.contactName))}</strong></p>
+              )}
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
@@ -14270,7 +14356,7 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
   // Zero-value invoices and invoices paid in full are excluded entirely.
   function getAgedDebtors(invoiceList) {
     const today = new Date();
-    return (invoiceList||accInvoices).filter(i=>!['paid','void'].includes(i.status)).map(i=>{
+    const invoiceRows = (invoiceList||accInvoices).filter(i=>!['paid','void'].includes(i.status)).map(i=>{
       const issued = new Date(i.date||i.dueDate);
       const days = Math.floor((today-issued)/(1000*60*60*24));
       const subtotal = (i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
@@ -14287,6 +14373,23 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
     })
     // Drop zero-value invoices and anything already paid in full (balance ≈ 0)
     .filter(d=>d.total>0.005 && d.balance>0.005);
+    // Any open (unused) customer credit note reduces what that customer owes,
+    // so it must show up here too — as its own line, exactly like it does on
+    // the Client Statement — otherwise the Aged Debtors total overstates the
+    // real outstanding balance.
+    const creditRows = (creditNotes||[]).filter(c=>c.type==='customer').map(c=>{
+      const remaining = Math.max(0,(parseFloat(c.amount)||0)-(parseFloat(c.used)||0));
+      if(remaining<=0.005) return null;
+      const issued = new Date(c.date||today);
+      const days = Math.floor((today-issued)/(1000*60*60*24));
+      return {
+        id:'cn-'+c.id, contactName:c.contactName, contactEmail:'', number:c.number, reference:c.reason||'',
+        source:'credit', docType:'Credit Note', date:c.date, dueDate:c.date, status:'credit',
+        daysOverdue:days, subtotal:0, vat:0, total:-remaining, paid:0, balance:-remaining, bucket:'Credit',
+        lastPayment:null, lineCount:0, lineSummary:c.notes||c.reason||'Open credit note',
+      };
+    }).filter(Boolean);
+    return [...invoiceRows, ...creditRows];
   }
 
   // ── Multi-type Xero export ──
@@ -14686,10 +14789,19 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
     const [method, setMethod] = useState('EFT');
     const [amount, setAmount] = useState('');
     const [notes,  setNotes]  = useState('');
+    const availableCredit = creditNoteAvailable(creditNotes, inv.contactName);
 
     function addPayment() {
       if(!amount||parseFloat(amount)<=0){alert('Enter a valid amount');return;}
-      const newP={id:Date.now(),date,method,amount:parseFloat(amount),notes:notes.trim()};
+      const amt = parseFloat(amount);
+      if(method==='Credit'){
+        if(amt > availableCredit + 0.005){
+          alert(`${inv.contactName} only has ${fmtAmt(availableCredit)} of available credit. Reduce the amount, issue another credit note first, or choose a different payment method.`);
+          return;
+        }
+        setCreditNotes(prev=>applyCreditNoteUsage(prev, inv.contactName, amt));
+      }
+      const newP={id:Date.now(),date,method,amount:amt,notes:notes.trim()};
       const updated=[...payments,newP];
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':inv.status;
@@ -14704,6 +14816,10 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
     function deletePayment(pid) {
       if(!isAdmin){alert('Only admins can delete payments.');return;}
       if(!window.confirm('Delete this payment? This may change the invoice status.'))return;
+      const removed = payments.find(p=>p.id===pid);
+      if(removed && removed.method==='Credit'){
+        setCreditNotes(prev=>releaseCreditNoteUsage(prev, inv.contactName, parseFloat(removed.amount)||0));
+      }
       const updated=payments.filter(p=>p.id!==pid);
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'sent';
@@ -14731,6 +14847,7 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
                 <p className="text-xs text-gray-400 mb-1">Invoice Total (incl. VAT)</p>
                 <p className="text-lg font-black" style={{color:'#06065c'}}>{fmtAmt(invTotal)}</p>
                 <p className="text-xs text-gray-400 mt-0.5">Due: {fmtDate(inv.dueDate)}</p>
+                {availableCredit>0.005&&<p className="text-xs text-emerald-600 font-bold mt-0.5">{fmtAmt(availableCredit)} credit available</p>}
               </div>
               <div className="bg-green-50 border border-green-200 rounded-xl p-3 text-center">
                 <p className="text-xs text-green-600 mb-1">Total Paid</p>
@@ -14809,12 +14926,13 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
                   <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>
-                    {['EFT','Cash','Card','Cheque','Other'].map(m=><option key={m}>{m}</option>)}
+                    {['EFT','Cash','Card','Cheque','Credit','Other'].map(m=><option key={m} disabled={m==='Credit'&&availableCredit<=0.005}>{m==='Credit'?`Credit${availableCredit>0.005?' ('+fmtAmt(availableCredit)+' available)':' (none available)'}`:m}</option>)}
                   </select>
                 </div>
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Amount (R)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} placeholder={balance>0?balance.toFixed(2):'0.00'} min="0.01" step="0.01"/></div>
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes (optional)</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="Reference, partial, etc."/></div>
               </div>
+              {method==='Credit'&&<p className="text-xs text-emerald-600 mt-2">This will draw down {inv.contactName}'s available credit instead of taking a cash payment.</p>}
               <button onClick={addPayment} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#059669'}}>＋ Record Payment</button>
             </div>
 
@@ -14873,8 +14991,8 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
             </div>
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
               <p className="text-xs text-gray-400 mb-1">Outstanding (Receivable)</p>
-              <p className="text-2xl font-black text-blue-700">{fmtAmt(allInvoices.filter(i=>['sent','overdue','partial'].includes(i.status)).reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);const total=sub+vat;const paid=(i.payments||[]).reduce((t,p)=>t+(parseFloat(p.amount)||0),0);return s+(total-paid);},0))}</p>
-              <p className="text-xs text-gray-400 mt-1">{invStats.outstanding} awaiting payment</p>
+              <p className="text-2xl font-black text-blue-700">{fmtAmt(debtors.reduce((s,d)=>s+d.balance,0))}</p>
+              <p className="text-xs text-gray-400 mt-1">{invStats.outstanding} awaiting payment{debtors.some(d=>d.source==='credit')?' · net of open credit':''}</p>
             </div>
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
               <p className="text-xs text-gray-400 mb-1">Total Expenses (paid bills)</p>
@@ -14914,27 +15032,22 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
                 <p className="text-xs font-black text-gray-500 uppercase tracking-wide">Aged Debtors (Receivable)</p>
                 <button onClick={()=>setAccTab('reports')} className="text-xs text-blue-500 hover:underline">Reports →</button>
               </div>
-              <p className="text-2xl font-black text-blue-700 mb-3">{fmtAmt(allInvoices.filter(i=>['sent','overdue','partial'].includes(i.status)).reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);const total=sub+vat;const paid=(i.payments||[]).reduce((t,p)=>t+(parseFloat(p.amount)||0),0);return s+(total-paid);},0))}</p>
+              <p className="text-2xl font-black text-blue-700 mb-3">{fmtAmt(debtors.reduce((s,d)=>s+d.balance,0))}</p>
               <div className="space-y-1.5">
-                {allInvoices.filter(i=>['sent','overdue','partial'].includes(i.status)).slice(0,5).map(i=>{
-                  const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-                  const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
-                  const total=sub+vat;
-                  const paid=(i.payments||[]).reduce((t,p)=>t+(parseFloat(p.amount)||0),0);
-                  const balance=total-paid;
-                  const due=new Date(i.dueDate||i.date); const days=Math.floor((new Date()-due)/(1000*60*60*24));
-                  return <div key={i.id} className="flex justify-between items-center text-xs">
+                {debtors.slice(0,5).map(d=>{
+                  const isCredit = d.source==='credit';
+                  return <div key={d.id} className="flex justify-between items-center text-xs">
                     <div>
-                      <span className="text-gray-700 font-semibold truncate max-w-[110px] block">{i.contactName}</span>
-                      <span className="text-gray-400">{i.number}{i.status==='partial'&&<span className="ml-1 text-amber-500 font-bold">partial</span>}</span>
+                      <span className="text-gray-700 font-semibold truncate max-w-[110px] block">{d.contactName}</span>
+                      <span className="text-gray-400">{d.number}{isCredit?<span className="ml-1 text-emerald-500 font-bold">credit</span>:(d.status==='partial'&&<span className="ml-1 text-amber-500 font-bold">partial</span>)}</span>
                     </div>
                     <div className="text-right">
-                      <span className={`font-bold block ${days>0?'text-red-600':'text-blue-600'}`}>{fmtAmt(balance)}</span>
-                      {days>0&&<span className="text-red-400 text-xs">{days}d overdue</span>}
+                      <span className={`font-bold block ${isCredit?'text-emerald-600':d.daysOverdue>0?'text-red-600':'text-blue-600'}`}>{fmtAmt(d.balance)}</span>
+                      {!isCredit&&d.daysOverdue>0&&<span className="text-red-400 text-xs">{d.daysOverdue}d overdue</span>}
                     </div>
                   </div>;
                 })}
-                {allInvoices.filter(i=>['sent','overdue','partial'].includes(i.status)).length===0&&<p className="text-xs text-gray-400 italic">No outstanding invoices</p>}
+                {debtors.length===0&&<p className="text-xs text-gray-400 italic">No outstanding invoices</p>}
               </div>
             </div>
             {/* Aged Creditors */}
@@ -15524,26 +15637,27 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
                 </tr></thead>
                 <tbody>
                   {debtors.map(d=>{
-                    const bucketCls = d.bucket==='Current'?'bg-green-100 text-green-700':d.bucket==='1–30'?'bg-blue-100 text-blue-700':d.bucket==='31–60'?'bg-amber-100 text-amber-700':d.bucket==='61–90'?'bg-orange-100 text-orange-700':'bg-red-100 text-red-700';
+                    const isCredit = d.source==='credit';
+                    const bucketCls = isCredit?'bg-emerald-100 text-emerald-700':d.bucket==='Current'?'bg-green-100 text-green-700':d.bucket==='1–30'?'bg-blue-100 text-blue-700':d.bucket==='31–60'?'bg-amber-100 text-amber-700':d.bucket==='61–90'?'bg-orange-100 text-orange-700':'bg-red-100 text-red-700';
                     return (
-                    <tr key={d.id} className="border-b border-gray-50 hover:bg-gray-50">
+                    <tr key={d.id} className={`border-b border-gray-50 hover:bg-gray-50 ${isCredit?'bg-emerald-50/40':''}`}>
                       <td className="px-3 py-2 text-gray-700 font-semibold">{d.contactName}</td>
                       <td className="px-3 py-2 text-gray-400">{d.contactEmail||'—'}</td>
                       <td className="px-3 py-2 font-mono text-gray-500">{d.number}</td>
                       <td className="px-3 py-2 text-gray-500">{d.reference||'—'}</td>
-                      <td className="px-3 py-2">{d.source==='job'?<span className="bg-purple-100 text-purple-700 rounded-full px-2 py-0.5 font-bold text-xs">Job{d.jobNum?' '+d.jobNum:''}</span>:<span className="bg-blue-100 text-blue-700 rounded-full px-2 py-0.5 font-bold text-xs">Manual</span>}</td>
+                      <td className="px-3 py-2">{isCredit?<span className="bg-emerald-100 text-emerald-700 rounded-full px-2 py-0.5 font-bold text-xs">Credit Note</span>:d.source==='job'?<span className="bg-purple-100 text-purple-700 rounded-full px-2 py-0.5 font-bold text-xs">Job{d.jobNum?' '+d.jobNum:''}</span>:<span className="bg-blue-100 text-blue-700 rounded-full px-2 py-0.5 font-bold text-xs">Manual</span>}</td>
                       <td className="px-3 py-2 text-gray-500 max-w-[220px] truncate" title={d.lineSummary}>{d.lineSummary||'—'}{d.lineCount>1?<span className="text-gray-300"> ({d.lineCount} lines)</span>:''}</td>
                       <td className="px-3 py-2 text-gray-400">{fmtDate(d.date)}</td>
                       <td className="px-3 py-2 text-gray-400">{fmtDate(d.dueDate)}</td>
-                      <td className={`px-3 py-2 text-right font-bold ${d.daysOverdue>60?'text-red-600':d.daysOverdue>30?'text-amber-600':'text-gray-600'}`}>{Math.max(0,d.daysOverdue)} days</td>
+                      <td className={`px-3 py-2 text-right font-bold ${d.daysOverdue>60?'text-red-600':d.daysOverdue>30?'text-amber-600':'text-gray-600'}`}>{isCredit?'—':`${Math.max(0,d.daysOverdue)} days`}</td>
                       <td className="px-3 py-2 text-center"><span className={`px-2 py-0.5 rounded-full font-bold text-xs ${bucketCls}`}>{d.bucket}</span></td>
-                      <td className="px-3 py-2 text-center"><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[d.status]||'#6b7280'}}>{d.status}</span></td>
+                      <td className="px-3 py-2 text-center"><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:isCredit?'#059669':STATUS_COLORS[d.status]||'#6b7280'}}>{d.status}</span></td>
                       <td className="px-3 py-2 text-right text-gray-500">{fmtAmt(d.subtotal)}</td>
                       <td className="px-3 py-2 text-right text-gray-500">{fmtAmt(d.vat)}</td>
                       <td className="px-3 py-2 text-right text-gray-700 font-semibold">{fmtAmt(d.total)}</td>
                       <td className="px-3 py-2 text-right text-green-600">{d.paid>0?fmtAmt(d.paid):'—'}</td>
                       <td className="px-3 py-2 text-gray-400">{d.lastPayment?`${fmtDate(d.lastPayment.date)}${d.lastPayment.method?' · '+d.lastPayment.method:''}`:'—'}</td>
-                      <td className="px-3 py-2 text-right font-bold text-blue-800">{fmtAmt(d.balance)}</td>
+                      <td className={`px-3 py-2 text-right font-bold ${isCredit?'text-emerald-700':'text-blue-800'}`}>{fmtAmt(d.balance)}</td>
                     </tr>
                     );
                   })}
@@ -15844,10 +15958,15 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
                   <th className="px-3 py-2 text-left font-bold">Reason</th>
                   <th className="px-3 py-2 text-left font-bold">Applied to</th>
                   <th className="px-3 py-2 text-right font-bold">Amount</th>
+                  <th className="px-3 py-2 text-right font-bold">Used</th>
+                  <th className="px-3 py-2 text-right font-bold">Remaining</th>
                   <th className="px-3 py-2 text-center font-bold">Actions</th>
                 </tr></thead>
                 <tbody>
-                  {cnotes.map(c=>(
+                  {cnotes.map(c=>{
+                    const used = parseFloat(c.used)||0;
+                    const remaining = Math.max(0,(parseFloat(c.amount)||0)-used);
+                    return (
                     <tr key={c.id} className="border-b border-gray-50 hover:bg-blue-50">
                       <td className="px-3 py-2 font-mono text-gray-600">{c.number}</td>
                       <td className="px-3 py-2 text-gray-500 whitespace-nowrap">{fmtDate(c.date)}</td>
@@ -15856,13 +15975,16 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
                       <td className="px-3 py-2 text-gray-500">{c.reason}</td>
                       <td className="px-3 py-2 font-mono text-gray-400">{c.appliedTo||'—'}</td>
                       <td className="px-3 py-2 text-right font-bold text-gray-800">{fmtAmt(c.amount)}</td>
+                      <td className="px-3 py-2 text-right text-gray-400">{used>0?fmtAmt(used):'—'}</td>
+                      <td className="px-3 py-2 text-right font-bold text-emerald-600">{c.type==='customer'?fmtAmt(remaining):'—'}</td>
                       <td className="px-3 py-2 text-center whitespace-nowrap">
                         <button onClick={()=>{setEditCn(c);setShowCnModal(true);}} className="p-1.5 rounded-lg text-gray-400 hover:text-blue-600 hover:bg-blue-50">✏️</button>
                         <button onClick={()=>deleteCreditNote(c.id)} className="p-1.5 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50">🗑️</button>
                       </td>
                     </tr>
-                  ))}
-                  {cnotes.length===0&&<tr><td colSpan="8" className="px-3 py-10 text-center">
+                    );
+                  })}
+                  {cnotes.length===0&&<tr><td colSpan="10" className="px-3 py-10 text-center">
                     <p className="text-gray-400 mb-2">No credit notes yet.</p>
                     <button onClick={()=>{setEditCn(null);setShowCnModal(true);}} className="text-xs font-bold px-3 py-1.5 rounded-lg text-white" style={{background:'#06065c'}}>＋ Create your first credit note</button>
                   </td></tr>}
@@ -16584,7 +16706,7 @@ function App() {
 
   const pageMap = {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)}/>,
+    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} creditNotes={creditNotes} setCreditNotes={setCreditNotes}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} logoDataUrl={logoDataUrl} onOpenQuote={(q)=>{ setSalesOpen({type:'quote', id:q.id}); setPage('sales'); }} onOpenInvoice={(inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); }}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects}/>,
