@@ -16427,6 +16427,10 @@ function App() {
     if (!res.ok) throw new Error('HTTP ' + res.status);
   }
 
+  // Save-ordering stamp used to compare two platform_state snapshots.
+  // A response with no stamp at all is treated as unknown/oldest (empty string).
+  function stateStamp(obj) { return (obj && (obj._autoSavedAt || obj.savedAt)) || ''; }
+
   // Apply dbData into React state — only sets keys that are present in dbData
   // (pass a selective object to update only specific sections)
   function applyServerData(dbData) {
@@ -16493,7 +16497,15 @@ function App() {
     let mergeBase = ownBaseline;
     try {
       const fresh = await fetchFromServer();
-      if (fresh && typeof fresh === 'object' && Object.keys(fresh).length > 0) mergeBase = fresh;
+      if (fresh && typeof fresh === 'object' && Object.keys(fresh).length > 0) {
+        // Guard against an out-of-order/stale GET (slow request, cold-started
+        // backend, backgrounded-tab timer firing late, etc.) landing AFTER we
+        // already know about a newer save. An older response must never become
+        // the merge base — that would silently drop records (e.g. a just-created
+        // credit note) that this client already confirmed were saved.
+        const freshAt = stateStamp(fresh), baseAt = stateStamp(ownBaseline);
+        if (!ownBaseline || !freshAt || !baseAt || freshAt >= baseAt) mergeBase = fresh;
+      }
     } catch (_) { /* offline — fall back to last known baseline */ }
 
     let payload;
@@ -16604,12 +16616,13 @@ function App() {
       try {
         const dbData = await fetchFromServer();
         if (!dbData || typeof dbData !== 'object') return;
-        // Skip if server hasn't changed since our last load
-        const serverAt  = dbData._autoSavedAt || dbData.savedAt || '';
-        const baselineAt = serverBaselineRef.current
-          ? (serverBaselineRef.current._autoSavedAt || serverBaselineRef.current.savedAt || '')
-          : '';
-        if (serverAt && serverAt === baselineAt) return;
+        // Skip if server hasn't changed since our last load, AND skip an
+        // older/out-of-order response (e.g. a slow poll request that resolves
+        // after a newer save already landed) — applying it would roll local
+        // state back to a copy missing whatever was just added elsewhere.
+        const serverAt  = stateStamp(dbData);
+        const baselineAt = stateStamp(serverBaselineRef.current);
+        if (serverAt && baselineAt && serverAt <= baselineAt) return;
         // Determine which sections the current user has locally modified
         const local    = currentSnapshotRef.current;
         const baseline = serverBaselineRef.current || {};
