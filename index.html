@@ -16568,6 +16568,37 @@ function App() {
     return true;
   }
 
+  // Serialize every mergeAndSave() call through a single FIFO queue.
+  // ROOT CAUSE of credit notes disappearing: two overlapping save calls (e.g. the
+  // initial-load "flush queued save" and the very next debounced autosave, or the
+  // backend cold-starting on Render so an earlier request's network round-trip
+  // outlasts a later one) could each run their own fetch-then-PUT cycle at the same
+  // time. mergeAndSave() only knows to union-merge credit notes when ITS OWN
+  // snapshot differs from ITS OWN captured baseline — a save queued/started just
+  // BEFORE a credit note was created has no idea the note exists, so it always
+  // treats creditNotes as "unchanged" and writes back whatever it fetched. If that
+  // stale save's PUT happens to land on the server AFTER the newer save that
+  // actually included the note, it silently overwrites the note out of existence
+  // for every logged-in user (the backend does a full last-write-wins replace with
+  // no per-field merge — see backend/src/routes/platformState.ts). The existing
+  // mergeCreditNotes() union logic is correct but never protected against this
+  // because it only runs inside whichever call happens to detect a local change.
+  // Forcing every mergeAndSave() invocation to run strictly one-at-a-time (never
+  // concurrently) removes the out-of-order-completion window entirely: each call's
+  // own fresh GET always reads the immediately-preceding save's result before it
+  // writes, so a just-created credit note can never be clobbered by a save that
+  // started earlier but happened to finish later.
+  const saveQueueRef = useRef(Promise.resolve());
+  function enqueueMergeAndSave(snapshot) {
+    const run = saveQueueRef.current.then(
+      () => mergeAndSave(snapshot),
+      () => mergeAndSave(snapshot) // previous save in the queue failed — still attempt this one
+    );
+    // Keep the chain alive even if this save throws, so later queued saves aren't blocked.
+    saveQueueRef.current = run.catch(() => {});
+    return run;
+  }
+
   // 1) Initial load from backend
   useEffect(() => {
     let cancelled = false;
@@ -16624,7 +16655,7 @@ function App() {
           const snapshot = currentSnapshotRef.current;
           if (!snapshot) return;
           try {
-            const saved = await mergeAndSave(snapshot);
+            const saved = await enqueueMergeAndSave(snapshot);
             if (saved) setApiMsg('Saved ✓');
           } catch(e) {
             setApiMsg('Save failed — kept locally');
@@ -16690,7 +16721,9 @@ function App() {
       try {
         // Re-fetch the freshest server baseline, then overlay only the sections this
         // user changed — never overwrite another user's concurrent edits with stale data.
-        const saved = await mergeAndSave(snapshot);
+        // Routed through enqueueMergeAndSave so this call can never race ahead of or
+        // behind another in-flight save (see enqueueMergeAndSave for why that matters).
+        const saved = await enqueueMergeAndSave(snapshot);
         if (saved) setApiMsg('Saved ✓');
       } catch (e) {
         setApiMsg('Save failed — kept locally');
