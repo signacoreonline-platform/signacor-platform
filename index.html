@@ -16475,6 +16475,29 @@ function App() {
     return changed;
   }
 
+  // Union-merge two creditNotes arrays by id instead of one blindly replacing
+  // the other. Credit notes are shared financial records — any of Admin,
+  // Accounts, or Assistant can create one at any time, so a save from a
+  // different user (or an unrelated save from the SAME user, or a slightly
+  // stale/out-of-order fetch) must never silently erase a note it doesn't
+  // happen to know about yet.
+  //   local        — this client's current/intended list (its own edits/deletes win)
+  //   remote       — the freshest list this client just read from the server
+  //   knownBefore  — the list this client last knew about (its previous sync point)
+  // A note missing from `local` but present in `knownBefore` was deliberately
+  // deleted by this client and must stay deleted, even if `remote` still has
+  // it. A note missing from both `local` and `knownBefore` was created by
+  // someone else since this client last synced, and must be kept.
+  function mergeCreditNotes(local, remote, knownBefore) {
+    local = Array.isArray(local) ? local : [];
+    remote = Array.isArray(remote) ? remote : [];
+    knownBefore = Array.isArray(knownBefore) ? knownBefore : [];
+    const localIds = new Set(local.map(c => c.id));
+    const knownIds = new Set(knownBefore.map(c => c.id));
+    const addedElsewhere = remote.filter(c => !localIds.has(c.id) && !knownIds.has(c.id));
+    return addedElsewhere.length ? [...local, ...addedElsewhere] : local;
+  }
+
   // Merge-save with a FRESH server baseline.
   // Before writing, re-fetch the latest server state and overlay ONLY the sections
   // this user actually changed (relative to the state they last synced from). This
@@ -16518,10 +16541,21 @@ function App() {
         if (changed.logo)      payload.logo      = snapshot.logo;
         if (changed.utLogo)    payload.utLogo    = snapshot.utLogo;
         if (changed.sigOTSmit) payload.sigOTSmit = snapshot.sigOTSmit;
+        if (changed.creditNotes) {
+          // This client just created/edited/deleted a credit note. Union it with
+          // whatever the fresh fetch knows about so a note added concurrently by
+          // another logged-in user isn't lost — while a note THIS client just
+          // deleted stays deleted (mergeCreditNotes only re-adds notes this
+          // client never knew about; see ownBaseline as the "known" cutoff).
+          payload.creditNotes = mergeCreditNotes(snapshot.creditNotes, mergeBase.creditNotes, ownBaseline.creditNotes);
+        }
       } else {
-        // No baseline to diff against — push our full snapshot sections.
+        // No baseline to diff against (first save this session) — push our full
+        // snapshot sections, but still fold in any server-side credit notes we
+        // don't locally know about yet instead of silently overwriting them.
         for (const k of STATE_SECTIONS) { if (snapshot[k] !== undefined) payload[k] = snapshot[k]; }
         payload.logo = snapshot.logo; payload.utLogo = snapshot.utLogo; payload.sigOTSmit = snapshot.sigOTSmit;
+        payload.creditNotes = mergeCreditNotes(snapshot.creditNotes, mergeBase.creditNotes, null);
       }
       payload.v            = DATA_VERSION;
       payload._autoSavedAt = new Date().toISOString();
