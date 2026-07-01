@@ -16541,22 +16541,30 @@ function App() {
         if (changed.logo)      payload.logo      = snapshot.logo;
         if (changed.utLogo)    payload.utLogo    = snapshot.utLogo;
         if (changed.sigOTSmit) payload.sigOTSmit = snapshot.sigOTSmit;
-        if (changed.creditNotes) {
-          // This client just created/edited/deleted a credit note. Union it with
-          // whatever the fresh fetch knows about so a note added concurrently by
-          // another logged-in user isn't lost — while a note THIS client just
-          // deleted stays deleted (mergeCreditNotes only re-adds notes this
-          // client never knew about; see ownBaseline as the "known" cutoff).
-          payload.creditNotes = mergeCreditNotes(snapshot.creditNotes, mergeBase.creditNotes, ownBaseline.creditNotes);
-        }
       } else {
         // No baseline to diff against (first save this session) — push our full
-        // snapshot sections, but still fold in any server-side credit notes we
-        // don't locally know about yet instead of silently overwriting them.
+        // snapshot sections.
         for (const k of STATE_SECTIONS) { if (snapshot[k] !== undefined) payload[k] = snapshot[k]; }
         payload.logo = snapshot.logo; payload.utLogo = snapshot.utLogo; payload.sigOTSmit = snapshot.sigOTSmit;
-        payload.creditNotes = mergeCreditNotes(snapshot.creditNotes, mergeBase.creditNotes, null);
       }
+      // ALWAYS union-merge creditNotes — regardless of whether THIS save's own
+      // local snapshot differs from ITS OWN baseline for that section. Credit
+      // notes are shared financial records any of Admin, Accounts, or Assistant
+      // can create at any time, so a save triggered by something else entirely
+      // (e.g. an unrelated job edit) must never silently overwrite a credit note
+      // some other logged-in session just added — which is exactly what happened
+      // before: this merge only ran when `changed.creditNotes` was true for that
+      // specific call, so the vast majority of saves (about jobs/quotes/etc.)
+      // skipped it and blindly wrote back whatever creditNotes this client's own
+      // fetch happened to return.
+      payload.creditNotes = mergeCreditNotes(snapshot.creditNotes, mergeBase.creditNotes, ownBaseline ? ownBaseline.creditNotes : null);
+      // Tell the backend which credit note ids this client already knew about
+      // before this edit, so it can perform the same non-destructive merge
+      // atomically against whatever is *actually* in the database right now —
+      // closing the remaining race where this client's own "fresh" fetch above
+      // is itself stale relative to another session's concurrent save (see
+      // backend/src/routes/platformState.ts for why this is needed).
+      payload._knownCreditNoteIds = (ownBaseline && Array.isArray(ownBaseline.creditNotes)) ? ownBaseline.creditNotes.map(c=>c.id) : [];
       payload.v            = DATA_VERSION;
       payload._autoSavedAt = new Date().toISOString();
       payload.savedAt      = snapshot.savedAt;
@@ -16633,6 +16641,12 @@ function App() {
                 if (!changedLocally.logo      && typeof dbData.logo === 'string')  selective.logo      = dbData.logo;
                 if (!changedLocally.utLogo    && typeof dbData.utLogo === 'string') selective.utLogo    = dbData.utLogo;
                 if (!changedLocally.sigOTSmit && dbData.sigOTSmit)                  selective.sigOTSmit = dbData.sigOTSmit;
+                // Never let this selective apply drop a credit note the running
+                // session already knows about — union instead of a raw overwrite
+                // (see mergeCreditNotes() above).
+                if (Array.isArray(dbData.creditNotes)) {
+                  selective.creditNotes = mergeCreditNotes(current.creditNotes, dbData.creditNotes, startSnapshot.creditNotes);
+                }
                 applyServerData(selective);
               } else {
                 applyServerData(dbData);
@@ -16698,6 +16712,14 @@ function App() {
         if (!changed.logo      && typeof dbData.logo === 'string')   selective.logo      = dbData.logo;
         if (!changed.utLogo    && typeof dbData.utLogo === 'string')  selective.utLogo    = dbData.utLogo;
         if (!changed.sigOTSmit && dbData.sigOTSmit)                   selective.sigOTSmit = dbData.sigOTSmit;
+        // Credit notes are shared financial records any role can create at any
+        // time — never let a routine poll silently drop one this client already
+        // knows about just because this particular fetch happens to be missing
+        // it (e.g. a slightly stale/out-of-order response). Union instead of a
+        // raw overwrite, same non-destructive merge used by every save.
+        if (Array.isArray(dbData.creditNotes)) {
+          selective.creditNotes = mergeCreditNotes(local ? local.creditNotes : [], dbData.creditNotes, baseline.creditNotes);
+        }
         applyServerData(selective);
         serverBaselineRef.current = dbData;
       } catch(e) { /* silent — network unavailable */ }
