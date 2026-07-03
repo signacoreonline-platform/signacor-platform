@@ -14492,6 +14492,7 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
               <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">DUE DATE</span><span>{fmtDate(inv.dueDate)}</span></div>
               <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">REFERENCE</span><span>{inv.reference||'—'}</span></div>
               <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">STATUS</span><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status}</span></div>
+              {inv.discount>0&&<div className="bg-red-50 rounded-xl p-3"><span className="text-xs font-bold text-red-400 block mb-1">DISCOUNT</span><span className="font-semibold text-red-600">{inv.discount}%{inv.discountAmount?' · − '+fmtAmt(inv.discountAmount):''}</span></div>}
               {inv.contactAddress&&<div className="bg-gray-50 rounded-xl p-3 col-span-2"><span className="text-xs font-bold text-gray-400 block mb-1">ADDRESS</span><span className="whitespace-pre-wrap">{inv.contactAddress}</span></div>}
             </div>
             <div className="border border-gray-200 rounded-xl overflow-hidden">
@@ -14507,16 +14508,19 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
                   </tr>
                 </thead>
                 <tbody>
-                  {(inv.lineItems||[]).map((l,i)=>(
-                    <tr key={i} className="border-t border-gray-100">
-                      <td className="px-3 py-2 text-gray-700">{l.description||'—'}</td>
+                  {(inv.lineItems||[]).map((l,i)=>{
+                    const lNeg = (parseFloat(l.unitAmount)||0) < 0;
+                    return (
+                    <tr key={i} className={`border-t border-gray-100 ${lNeg?'text-red-600':''}`}>
+                      <td className={`px-3 py-2 ${lNeg?'text-red-600':'text-gray-700'}`}>{l.description||'—'}</td>
                       <td className="px-3 py-2 text-center text-gray-600">{l.qty}</td>
-                      <td className="px-3 py-2 text-right text-gray-600">{fmtAmt(parseFloat(l.unitAmount||0))}</td>
+                      <td className={`px-3 py-2 text-right ${lNeg?'text-red-600':'text-gray-600'}`}>{lNeg?'− ':''}{fmtAmt(parseFloat(l.unitAmount||0))}</td>
                       <td className="px-3 py-2 text-center text-gray-400">{l.accountCode||'—'}</td>
                       <td className="px-3 py-2 text-center text-gray-500">{l.taxType||'—'}</td>
-                      <td className="px-3 py-2 text-right font-semibold text-gray-700">{fmtAmt(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0))}</td>
+                      <td className={`px-3 py-2 text-right font-semibold ${lNeg?'text-red-600':'text-gray-700'}`}>{lNeg?'− ':''}{fmtAmt(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0))}</td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
               <div className="bg-gray-50 border-t border-gray-200 px-4 py-2 flex justify-end gap-6 text-xs">
@@ -14744,6 +14748,30 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
       const dueDate = j.invoiceDue || new Date(new Date(invDate).getTime()+30*864e5).toISOString().slice(0,10);
       if(status!=='paid' && new Date()>new Date(dueDate)) status = (rec.invoiceStatus==='partial')?'partial':'overdue';
       const invNum = j.invoiceNum || ('INV-' + String(j.num||'').replace(/\D/g,'').padStart(5,'0'));
+      // ── Discount pull-through ──
+      // Any discount % applied on the job / invoice must be visible in Accounting.
+      // Where the job still has its original (pre-discount) line items we can
+      // reconstruct the exact pre-discount subtotal and break the discount out as
+      // its own GL line (6303 · Discount Allowed) so it shows on the invoice and
+      // rolls up into the P&L / totals correctly. Otherwise we fall back to just
+      // flagging the discount % on the invoice without altering the total.
+      const discPct   = parseFloat(j.discount) || 0;
+      const jLinesSub = (j.lines||[]).reduce((s,l)=>s+(parseFloat(l.subtotal)||0),0);
+      const setupFee  = parseFloat(j.setupFee) || 0;
+      const discAmt   = jLinesSub * (discPct/100);
+      const reconstructed = jLinesSub - discAmt + setupFee;
+      const canBreakOut = discPct>0 && jLinesSub>0 && Math.abs(reconstructed - valExVat) < 0.5;
+      const lineItems = canBreakOut ? [
+        { description: j.desc || 'Signage / Production Job', qty: 1, unitAmount: jLinesSub, accountCode: '4000', taxType: '15%' },
+        { description: `Discount (${discPct}%)`, qty: 1, unitAmount: -discAmt, accountCode: '6303', taxType: '15%' },
+        ...(setupFee>0 ? [{ description: 'Setup Fee', qty: 1, unitAmount: setupFee, accountCode: '4000', taxType: '15%' }] : [])
+      ] : [{
+        description: (j.desc || 'Signage / Production Job') + (discPct>0 ? ` (${discPct}% discount applied)` : ''),
+        qty: 1,
+        unitAmount: valExVat,
+        accountCode: '4000',
+        taxType: '15%'
+      }];
       return {
         id: 'job-'+j.id,
         number: invNum,
@@ -14754,15 +14782,11 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
         status: status,
         source: 'job',
         jobNum: j.num,
+        discount: discPct,
+        discountAmount: discAmt,
         paidDate: j.paidDate || (j.invoiceStatus==='paid'?j.paidAt:null) || null,
         payments: rec.payments,
-        lineItems: [{
-          description: j.desc || 'Signage / Production Job',
-          qty: 1,
-          unitAmount: valExVat,
-          accountCode: '4000',
-          taxType: '15%'
-        }]
+        lineItems: lineItems
       };
     });
   }
@@ -15239,7 +15263,10 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
                     const isJob = inv.source==='job';
                     return(
                       <tr key={inv.id} className={`border-b border-gray-50 transition-colors ${isJob?'hover:bg-purple-50 bg-purple-50/30':'hover:bg-blue-50'}`}>
-                        <td className="px-4 py-2.5 text-xs font-mono text-gray-600">{inv.number}</td>
+                        <td className="px-4 py-2.5 text-xs font-mono text-gray-600">
+                          {inv.number}
+                          {inv.discount>0&&<div className="mt-0.5"><span className="bg-red-50 text-red-600 rounded-full px-1.5 py-0.5 text-[10px] font-bold whitespace-nowrap">−{inv.discount}% disc</span></div>}
+                        </td>
                         <td className="px-4 py-2.5 text-xs font-semibold text-gray-800">{inv.contactName}</td>
                         <td className="px-4 py-2.5 text-xs text-gray-500">{fmtDate(inv.date)}</td>
                         <td className={`px-4 py-2.5 text-xs ${overdue?'text-red-600 font-bold':'text-gray-500'}`}>{fmtDate(inv.dueDate)}{overdue?' ⚠':''}</td>
