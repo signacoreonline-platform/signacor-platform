@@ -4827,10 +4827,11 @@ function EditInvoiceForm({ job, onSave, onClose }) {
   const [invoiceStatus,setInvoiceStatus]= useState(_invDraft?.invoiceStatus?? (job.invoiceStatus||'pending'));
   const [paidAt,       setPaidAt]       = useState(_invDraft?.paidAt       ?? (job.paidAt||''));
   const [lines,        setLines]        = useState(_invDraft?.lines || (job.lines ? job.lines.map(l=>({...l})) : []));
+  const [discount,     setDiscount]     = useState(_invDraft?.discount     ?? (job.discount||''));
   const [activeLineId, setActiveLineId] = useState(null);
 
   const linesSubtotal  = lines.reduce((s,l)=>s+(l.subtotal||0),0);
-  const linesDiscPct   = parseFloat(job.discount)||0;
+  const linesDiscPct   = parseFloat(discount)||0;
   const linesDiscAmt   = linesSubtotal*(linesDiscPct/100);
   const linesSetupFee  = parseFloat(job.setupFee)||0;
   const linesAfterDisc = linesSubtotal - linesDiscAmt + linesSetupFee;
@@ -4844,13 +4845,13 @@ function EditInvoiceForm({ job, onSave, onClose }) {
     const t = setTimeout(()=>{
       try {
         localStorage.setItem(_invDraftKey, JSON.stringify({
-          client, invoiceNum, invoiceDate, invoiceDue, value, notes, invoiceStatus, paidAt, lines,
+          client, invoiceNum, invoiceDate, invoiceDue, value, notes, invoiceStatus, paidAt, lines, discount,
           _draftAt: new Date().toISOString()
         }));
       } catch(e){}
     }, 1000);
     return ()=>clearTimeout(t);
-  }, [lines, client, invoiceNum, invoiceDate, invoiceDue, value, notes, invoiceStatus, paidAt]);
+  }, [lines, client, invoiceNum, invoiceDate, invoiceDue, value, notes, invoiceStatus, paidAt, discount]);
 
   function updateLine(id,field,v){
     setLines(prev=>prev.map(l=>{
@@ -4878,7 +4879,7 @@ function EditInvoiceForm({ job, onSave, onClose }) {
 
   function save(){
     const finalValue = hasLines ? linesTotal : parseFloat(value)||0;
-    onSave({...job, client, invoiceNum, invoiceDate, invoiceDue, value:finalValue, notes, invoiceStatus, paidAt, lines:hasLines?lines:job.lines});
+    onSave({...job, client, invoiceNum, invoiceDate, invoiceDue, value:finalValue, notes, invoiceStatus, paidAt, lines:hasLines?lines:job.lines, discount:hasLines?discount:job.discount});
     try { localStorage.removeItem(_invDraftKey); } catch(e){}
   }
 
@@ -5030,8 +5031,17 @@ function EditInvoiceForm({ job, onSave, onClose }) {
         {/* Totals */}
         {hasLines&&(
           <div className="flex justify-end mt-3">
-            <div className="w-64 space-y-1 border-t border-gray-200 pt-3">
+            <div className="w-64 space-y-2 border-t border-gray-200 pt-3">
+              <div className="flex justify-between items-center text-xs text-gray-500">
+                <span>Discount (any stage)</span>
+                <span className="flex items-center gap-1">
+                  <input type="number" min="0" max="100" step="0.5" value={discount} onChange={e=>setDiscount(e.target.value)}
+                    className="w-16 border border-gray-200 rounded-lg px-2 py-1 text-xs text-right"/>
+                  <span>%</span>
+                </span>
+              </div>
               <div className="flex justify-between text-xs text-gray-500"><span>Subtotal (excl. VAT)</span><span className="font-semibold">{zar(linesSubtotal)}</span></div>
+              {linesDiscAmt>0&&<div className="flex justify-between text-xs text-red-500"><span>Discount ({linesDiscPct}%)</span><span className="font-semibold">−{zar(linesDiscAmt)}</span></div>}
               <div className="flex justify-between text-xs text-gray-500"><span>VAT (15%)</span><span className="font-semibold">{zar(linesVat)}</span></div>
               <div className="flex justify-between text-sm font-black border-t border-gray-200 pt-1.5"><span>Total Due</span><span style={{color:'#06065c'}}>{zar(linesTotal)}</span></div>
             </div>
