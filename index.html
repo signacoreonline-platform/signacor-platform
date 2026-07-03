@@ -2648,8 +2648,18 @@ function htmlToPdfBase64(fullHtml) {
         // The footer is pinned with position:fixed for the browser print view.
         // In a single rasterised capture that would float/overlap, so let it
         // flow at the end of the content instead (and reclaim the reserved gap).
+        // We also HARD-LOCK the page to exactly 210mm wide (A4) with horizontal
+        // overflow clipped. Without this, a table/cell that's even slightly too
+        // wide (table-layout:auto lets columns grow past 100%) inflates
+        // body.scrollWidth beyond 210mm; html2canvas then renders at that wider
+        // "virtual" width, and squeezing the resulting image back down to fit a
+        // 210mm PDF page shrinks the CSS margins proportionally, so content
+        // appears to bleed toward/past the page edge — even though the exact
+        // same HTML prints perfectly on-screen (real browser pagination isn't
+        // affected by scrollWidth). Locking + clipping guarantees the 22mm
+        // margins render 1:1, identical to the on-screen "Print / Save" view.
         const ov = idoc.createElement('style');
-        ov.textContent = '.foot{position:static!important;left:auto!important;right:auto!important;margin-top:18px}body{padding-bottom:10mm!important}';
+        ov.textContent = '.foot{position:static!important;left:auto!important;right:auto!important;margin-top:18px}body{padding-bottom:10mm!important}html,body{width:210mm!important;max-width:210mm!important;overflow-x:hidden!important}';
         (idoc.head || idoc.documentElement).appendChild(ov);
 
         // Wait for fonts + the logo image to be ready so nothing renders blank.
@@ -2663,11 +2673,15 @@ function htmlToPdfBase64(fullHtml) {
 
         if (h2c) {
           // Preferred path: rasterise the styled iframe document directly.
+          // Use the LOCKED width (post width:210mm!important) rather than
+          // scrollWidth, so any overflowing content is clipped instead of
+          // inflating the capture width and squashing the page margins.
+          const capW = idoc.body.getBoundingClientRect().width;
           const canvas = await h2c(idoc.body, {
             scale: 2,
             useCORS: true,
             backgroundColor: '#ffffff',
-            windowWidth: idoc.body.scrollWidth,
+            windowWidth: capW,
             windowHeight: idoc.body.scrollHeight
           });
           const pdf = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
