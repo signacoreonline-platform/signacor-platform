@@ -1315,6 +1315,148 @@ function invoiceTermsList(refNum){
   ];
 }
 
+/* ═══════════════════════════════════════════
+   PRINT MARGIN PREVIEW
+   Shared by the Quote / Proforma / Invoice "Print" buttons. Printer margin
+   handling varies too much between browsers/printers for hard-coded CSS
+   margins to reliably fix overflow, so instead of guessing again, this shows
+   the document first and lets the margins be dragged to whatever actually
+   fits, then remembers that choice for next time.
+═══════════════════════════════════════════ */
+const SGR_PRINT_MARGIN_KEY = 'sgrPrintMargins_v1';
+const SGR_PRINT_MARGIN_DEFAULT = { top: 12, right: 15, bottom: 15, left: 15 };
+
+function sgrLoadPrintMargins(){
+  try {
+    const raw = localStorage.getItem(SGR_PRINT_MARGIN_KEY);
+    if (!raw) return Object.assign({}, SGR_PRINT_MARGIN_DEFAULT);
+    const p = JSON.parse(raw);
+    return {
+      top: Number.isFinite(Number(p.top)) ? Number(p.top) : SGR_PRINT_MARGIN_DEFAULT.top,
+      right: Number.isFinite(Number(p.right)) ? Number(p.right) : SGR_PRINT_MARGIN_DEFAULT.right,
+      bottom: Number.isFinite(Number(p.bottom)) ? Number(p.bottom) : SGR_PRINT_MARGIN_DEFAULT.bottom,
+      left: Number.isFinite(Number(p.left)) ? Number(p.left) : SGR_PRINT_MARGIN_DEFAULT.left
+    };
+  } catch (e) { return Object.assign({}, SGR_PRINT_MARGIN_DEFAULT); }
+}
+function sgrSavePrintMargins(m){
+  try { localStorage.setItem(SGR_PRINT_MARGIN_KEY, JSON.stringify(m)); } catch (e) {}
+}
+/* Injects a margin override <style> into a generated document's <head>,
+   overriding the body padding + any fixed footer inset so the printable
+   area matches what was chosen in the preview screen. Safe no-op on
+   documents that don't have a .foot element. */
+function sgrApplyPrintMargins(html, m){
+  const style = '<style id="sgr-margin-override">'+
+    'body{padding:'+m.top+'mm '+m.right+'mm '+m.bottom+'mm '+m.left+'mm !important}'+
+    '.foot{left:'+m.left+'mm !important;right:'+m.right+'mm !important}'+
+    '</style>';
+  return html.replace('</head>', style+'</head>');
+}
+function sgrMarginSliderHtml(key, label){
+  return (
+    '<div style="margin-bottom:16px;">'+
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">'+
+        '<label style="font-size:11px;font-weight:700;color:#374151;">'+label+' margin (mm)</label>'+
+        '<input id="sgr-pp-num-'+key+'" type="number" min="0" max="50" style="width:48px;font-size:11px;padding:2px 4px;border:1px solid #d1d5db;border-radius:5px;text-align:right;">'+
+      '</div>'+
+      '<input id="sgr-pp-range-'+key+'" type="range" min="0" max="50" step="1" style="width:100%;">'+
+    '</div>'
+  );
+}
+/* Opens an in-app preview overlay for a generated document (invoice / quote
+   / proforma HTML string). Lets the margins be adjusted with a live preview
+   before the real print window + window.print() is triggered. */
+function sgrOpenPrintPreview(rawHtml, docLabel){
+  const existing = document.getElementById('sgr-print-preview-overlay');
+  if (existing) existing.remove();
+
+  let margins = sgrLoadPrintMargins();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'sgr-print-preview-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(15,15,35,0.72);z-index:99999;display:flex;align-items:center;justify-content:center;font-family:Arial,sans-serif;';
+
+  const panel = document.createElement('div');
+  panel.style.cssText = 'background:#fff;border-radius:14px;width:min(1180px,96vw);height:min(880px,94vh);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,0.4);';
+
+  panel.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;background:#06065c;color:#fff;flex-shrink:0;">'+
+      '<div>'+
+        '<div style="font-weight:900;font-size:15px;letter-spacing:0.02em;">🖨️ Print Preview — '+docLabel+'</div>'+
+        '<div style="font-size:11px;opacity:0.75;margin-top:2px;">Adjust the margins below until nothing is cut off, then print. Your setting is remembered next time.</div>'+
+      '</div>'+
+      '<button id="sgr-pp-close" style="background:rgba(255,255,255,0.15);border:none;color:#fff;width:30px;height:30px;border-radius:8px;font-size:15px;cursor:pointer;">✕</button>'+
+    '</div>'+
+    '<div style="flex:1;display:flex;overflow:hidden;min-height:0;">'+
+      '<div style="width:220px;flex-shrink:0;border-right:1px solid #e5e7eb;padding:16px;overflow-y:auto;background:#f8f9ff;">'+
+        sgrMarginSliderHtml('top','Top')+
+        sgrMarginSliderHtml('right','Right')+
+        sgrMarginSliderHtml('bottom','Bottom')+
+        sgrMarginSliderHtml('left','Left')+
+        '<button id="sgr-pp-reset" style="width:100%;margin-top:6px;padding:8px;border-radius:8px;border:1px solid #d1d5db;background:#fff;font-size:12px;font-weight:700;color:#374151;cursor:pointer;">Reset to Default</button>'+
+      '</div>'+
+      '<div style="flex:1;background:#e5e7eb;display:flex;align-items:flex-start;justify-content:center;overflow:auto;padding:24px;">'+
+        '<div style="background:#fff;box-shadow:0 4px 18px rgba(0,0,0,0.25);width:794px;flex-shrink:0;">'+
+          '<iframe id="sgr-pp-frame" style="width:794px;height:1123px;border:0;display:block;"></iframe>'+
+        '</div>'+
+      '</div>'+
+    '</div>'+
+    '<div style="display:flex;justify-content:flex-end;gap:10px;padding:14px 20px;border-top:1px solid #e5e7eb;flex-shrink:0;">'+
+      '<button id="sgr-pp-cancel" style="padding:10px 18px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-weight:700;font-size:13px;color:#374151;cursor:pointer;">Cancel</button>'+
+      '<button id="sgr-pp-print" style="padding:10px 22px;border-radius:10px;border:none;background:#06065c;color:#fff;font-weight:800;font-size:13px;cursor:pointer;">🖨️ Print / Save PDF</button>'+
+    '</div>';
+
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+
+  const frame = panel.querySelector('#sgr-pp-frame');
+  function renderFrame(){ frame.srcdoc = sgrApplyPrintMargins(rawHtml, margins); }
+  function syncInputs(){
+    ['top','right','bottom','left'].forEach(function(k){
+      const num = panel.querySelector('#sgr-pp-num-'+k);
+      const rng = panel.querySelector('#sgr-pp-range-'+k);
+      if (num) num.value = margins[k];
+      if (rng) rng.value = margins[k];
+    });
+  }
+  ['top','right','bottom','left'].forEach(function(k){
+    const num = panel.querySelector('#sgr-pp-num-'+k);
+    const rng = panel.querySelector('#sgr-pp-range-'+k);
+    function update(v){
+      margins = Object.assign({}, margins);
+      margins[k] = Math.max(0, Math.min(50, Number(v)||0));
+      syncInputs();
+      renderFrame();
+    }
+    if (num) num.addEventListener('input', function(){ update(num.value); });
+    if (rng) rng.addEventListener('input', function(){ update(rng.value); });
+  });
+
+  panel.querySelector('#sgr-pp-reset').addEventListener('click', function(){
+    margins = Object.assign({}, SGR_PRINT_MARGIN_DEFAULT);
+    syncInputs();
+    renderFrame();
+  });
+  function closeOverlay(){ overlay.remove(); }
+  panel.querySelector('#sgr-pp-close').addEventListener('click', closeOverlay);
+  panel.querySelector('#sgr-pp-cancel').addEventListener('click', closeOverlay);
+  overlay.addEventListener('click', function(e){ if (e.target===overlay) closeOverlay(); });
+
+  panel.querySelector('#sgr-pp-print').addEventListener('click', function(){
+    sgrSavePrintMargins(margins);
+    const finalHtml = sgrApplyPrintMargins(rawHtml, margins)
+      .replace('</body></html>', '<script>window.onload=function(){window.print();}<\/script></body></html>');
+    const w = window.open('', '_blank', 'width=960,height=750');
+    if (!w) { alert('Pop-up blocked! Please allow pop-ups for this page.'); return; }
+    w.document.open(); w.document.write(finalHtml); w.document.close();
+    closeOverlay();
+  });
+
+  syncInputs();
+  renderFrame();
+}
+
 function buildQuoteHtml(q, companies, logoDataUrl) {
   const co = companies.find(c=>c.id===q.co)||{name:'Signacore',short:'SGR'};
   const sub = q.lines.reduce((s,l)=>s+(l.subtotal||0),0);
@@ -1532,16 +1674,8 @@ ${q.notes?(`<div class="notes"><div class="lbl">Notes</div><p>${q.notes}</p></di
 }
 
 function printQuoteWindow(q, companies, logoDataUrl) {
-  const html = buildQuoteHtml(q, companies, logoDataUrl)
-    .replace('</body></html>', '<script>window.onload=function(){window.print();}<\/script></body></html>');
-  const w = window.open('', '_blank', 'width=960,height=750');
-  if (!w) {
-    alert('Pop-up blocked! Please allow pop-ups for this page and try again.');
-    return;
-  }
-  w.document.open();
-  w.document.write(html);
-  w.document.close();
+  const html = buildQuoteHtml(q, companies, logoDataUrl);
+  sgrOpenPrintPreview(html, 'Quotation '+(q.num||''));
 }
 
 /* ═══════════════════════════════════════════
@@ -1869,6 +2003,9 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
   const setupFeeAmt = parseFloat(job.setupFee)||0;
   const afterDisc = sub - discAmt + setupFeeAmt;
   const vat = afterDisc*0.15; const total = afterDisc+vat;
+  const payments = Array.isArray(job.payments) ? job.payments : [];
+  const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+  const balanceDue = Math.max(0, total-totalPaid);
   const fmt = n=>'R\u00a0'+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const rows = lines.map((l,i)=>{
     const sz = lineSizeText(l);
@@ -1918,8 +2055,15 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
 '.tots td:last-child{text-align:right;font-weight:600}'+
 '.tots .vat-row td{color:#555}'+
 '.tots .total-row td{background:#06065c;color:#fff;font-size:13px;font-weight:900;border:none;padding:7px 6px;font-family:\'Barlow Condensed\',Arial,sans-serif;letter-spacing:0.04em}'+
+'.tots .paid-row td{color:#059669;font-weight:700}'+
+'.tots .bal-row td{background:#ED0101;color:#fff;font-size:13px;font-weight:900;border:none;padding:7px 6px;font-family:\'Barlow Condensed\',Arial,sans-serif;letter-spacing:0.04em}'+
 '.due-notice{background:#f0f4ff;border:1px solid #c7d2fe;border-left:3px solid #ED0101;border-radius:0 6px 6px 0;padding:9px 13px;margin-bottom:12px;clear:both;page-break-inside:avoid}'+
 '.due-notice p{font-size:10.5px;color:#06065c;font-weight:700}'+
+'.pay-hist{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 13px;margin-bottom:16px;clear:both;page-break-inside:avoid}'+
+'.pay-hist .lbl{font-size:8px;font-weight:700;color:#065f46;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}'+
+'.pay-hist table{width:100%;border-collapse:collapse}'+
+'.pay-hist td{padding:3px 4px;font-size:9.5px;color:#374151;border-bottom:1px solid #dcfce7}'+
+'.pay-hist td:last-child{text-align:right;font-weight:700;color:#059669}'+
 '.bank{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 13px;margin-bottom:16px;clear:both;page-break-inside:avoid}'+
 '.bank .lbl{font-size:8px;font-weight:700;color:#065f46;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}'+
 '.bank table td{padding:2px 0;font-size:9.5px;color:#374151}.bank table td:first-child{color:#6b7280;width:130px}'+
@@ -1994,8 +2138,19 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
 (discAmt>0?'<tr class="vat-row"><td>Discount ('+discPct+'%)</td><td>- '+fmt(discAmt)+'</td></tr>':'')+
 (setupFeeAmt>0?'<tr style="color:#4f46e5"><td>Design &amp; Setup Fee</td><td>+ '+fmt(setupFeeAmt)+'</td></tr>':'')+
 '<tr class="vat-row"><td>VAT (15%)</td><td>'+fmt(vat)+'</td></tr>'+
-'<tr class="total-row"><td>TOTAL DUE</td><td>'+fmt(total)+'</td></tr>'+
+'<tr class="total-row"><td>'+(totalPaid>0?'INVOICE TOTAL':'TOTAL DUE')+'</td><td>'+fmt(total)+'</td></tr>'+
+(totalPaid>0?'<tr class="paid-row"><td>Less: Payments Received</td><td>- '+fmt(totalPaid)+'</td></tr>':'')+
+(totalPaid>0?'<tr class="bal-row" style="background:'+(balanceDue<=0.005?'#059669':'#ED0101')+'"><td>'+(balanceDue<=0.005?'PAID IN FULL':'BALANCE DUE')+'</td><td>'+fmt(balanceDue)+'</td></tr>':'')+
 '</table></div></div>'+
+
+(totalPaid>0
+?'<div class="pay-hist no-break">'+
+  '<div class="lbl">Payments Received To Date</div>'+
+  '<table><tbody>'+
+  payments.map(p=>'<tr><td style="width:90px">'+(p.date||'—')+'</td><td>'+(p.method||'Payment')+(p.notes?' – '+p.notes:'')+'</td><td>'+fmt(parseFloat(p.amount)||0)+'</td></tr>').join('')+
+  '</tbody></table>'+
+'</div>'
+:'')+
 
 '<div class="tc no-break">'+
 '<div class="lbl">Terms &amp; Conditions</div>'+
@@ -2022,11 +2177,8 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
 }
 
 function printInvoice(job, companies, logoDataUrl) {
-  const html = buildInvoiceHtml(job, companies, logoDataUrl)
-    .replace('</body></html>', '<script>window.onload=function(){window.print();}<\/script></body></html>');
-  const w = window.open('','_blank','width=960,height=750');
-  if (!w) { alert('Pop-up blocked! Please allow pop-ups for this page.'); return; }
-  w.document.open(); w.document.write(html); w.document.close();
+  const html = buildInvoiceHtml(job, companies, logoDataUrl);
+  sgrOpenPrintPreview(html, 'Invoice '+(job.invoiceNum||job.num||''));
 }
 
 /* ═══════════════════════════════════════════
@@ -2148,11 +2300,8 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
 }
 
 function printProformaWindow(quote, proformaNum, companies, logoDataUrl) {
-  const html = buildProformaHtml(quote, proformaNum, companies, logoDataUrl)
-    .replace('</body></html>', '<script>window.onload=function(){window.print();}<\/script></body></html>');
-  const w = window.open('','_blank','width=960,height=750');
-  if (!w) { alert('Pop-up blocked! Please allow pop-ups for this page.'); return; }
-  w.document.open(); w.document.write(html); w.document.close();
+  const html = buildProformaHtml(quote, proformaNum, companies, logoDataUrl);
+  sgrOpenPrintPreview(html, 'Proforma '+(proformaNum||quote.num||''));
 }
 
 /* ═══════════════════════════════════════════
@@ -2734,6 +2883,10 @@ async function generateDocumentPdfFromHtml(type, data, companies, logoDataUrl) {
   if (type === 'quote')          fullHtml = buildQuoteHtml(data, companies, logoDataUrl);
   else if (type === 'proforma')  fullHtml = buildProformaHtml(data, data._proformaNum || data.num, companies, logoDataUrl);
   else                           fullHtml = buildInvoiceHtml(data, companies, logoDataUrl);
+  // Use the same margins chosen in the on-screen Print Preview so the emailed
+  // PDF matches what gets printed, instead of drifting back to the old
+  // hard-coded (and overflow-prone) defaults.
+  fullHtml = sgrApplyPrintMargins(fullHtml, sgrLoadPrintMargins());
   return await htmlToPdfBase64(fullHtml);
 }
 
