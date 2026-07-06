@@ -250,10 +250,48 @@ function breakdownTotal(bd){ return bd ? Object.values(bd).reduce((s,v)=>s+(pars
    EDITABLE DATA — change in Notepad if needed
 ═══════════════════════════════════════════════════════════ */
 const INITIAL_COMPANIES = [
-  { id:1, name:'Signacore Holdings SA',      short:'SGR Holdings',  color:'#6366f1', bg:'bg-indigo-100', text:'text-indigo-700' },
+  { id:1, name:'Signacore Holdings',         short:'SC Holdings', color:'#6366f1', bg:'bg-indigo-100', text:'text-indigo-700',
+    // Separate trading entity — same customer/supplier/inventory base as
+    // Signacore, but its own legal name, registration, VAT and bank account
+    // on its quotes/invoices/proforma/cover letters (see sgrCompanyLegal()).
+    legalName:'Signarama George (Pty) Ltd t/a Signacore Holdings',
+    regNo:'2021/908497/07',
+    vatNo:'4420302046',
+    bank:{ name:'Standard Bank', accName:'Signarama George trading as Signacore Holdings', accNo:'0-828-453-28', branch:'051001' },
+    logoSuffix:'HOLDINGS' },
   { id:2, name:'Signacore',                  short:'Signacore',  color:'#0000ff', bg:'bg-blue-100',   text:'text-blue-700'  },
   { id:4, name:'Cover X Transform',          short:'Cover X',    color:'#8b5cf6', bg:'bg-violet-100', text:'text-violet-700'},
 ];
+
+/* Returns the legal/banking identity to print on a company's documents,
+   falling back to Signacore's own long-standing details for any field a
+   company doesn't override. This lets a second trading entity (or any
+   future one) show its own registered name, VAT number, bank account and
+   logo wordmark on its own paperwork without touching anyone else's. */
+function sgrCompanyLegal(co){
+  const d = {
+    legalName: 'Hornet Honey (Pty) Ltd t/a Signacore',
+    regNo: '2022/4307/44/07',
+    vatNo: '4660306046',
+    bankName: 'Standard Bank',
+    bankAccName: 'Hornet Honey trading as Signacore',
+    bankAccNo: '2-825-229-72',
+    bankBranch: '051001',
+    logoSuffix: ''
+  };
+  if (!co) return d;
+  const b = co.bank || {};
+  return {
+    legalName: co.legalName || d.legalName,
+    regNo: co.regNo || d.regNo,
+    vatNo: co.vatNo || d.vatNo,
+    bankName: b.name || d.bankName,
+    bankAccName: b.accName || d.bankAccName,
+    bankAccNo: b.accNo || d.bankAccNo,
+    bankBranch: b.branch || d.bankBranch,
+    logoSuffix: co.logoSuffix || ''
+  };
+}
 
 const MONTHLY = [
   { m:'Nov', rev:285000, cost:178000 }, { m:'Dec', rev:195000, cost:125000 },
@@ -432,9 +470,20 @@ const USERS = [
   { email:'admin@signacore.co.za',    pw:'Eunice2026!',    role:'admin',     name:'Ockert Smit',    initials:'OS', title:'Administrator'   },
   { email:'accounts@signacore.co.za', pw:'Accounts2024!',  role:'accounts',  name:'Accountant',     initials:'AC', title:'Accounts'        },
   { email:'assist@signacore.co.za',   pw:'Assist2024!',    role:'assistant', name:'Sales Assistant', initials:'SA', title:'Sales / Quoting' },
+  // Signacore Holdings (co:1) logins — placeholder credentials, change the
+  // email/pw values below to whatever you'd like. Note: roles are still
+  // platform-wide (not walled per company), so these logins can currently
+  // see Signacore's data too, same as any other admin/assistant login.
+  { email:'admin@signacoreholdings.co.za',  pw:'Holdings2026!', role:'admin',     name:'Holdings Admin',      initials:'HA', title:'Administrator',   co:1 },
+  { email:'assist@signacoreholdings.co.za', pw:'HoldAssist2026!', role:'assistant', name:'Holdings Assistant', initials:'HS', title:'Sales / Quoting', co:1 },
 ];
-// Signacore Holdings company ID — blocked for assistant role
-const UNIONTECH_ID = 1;
+// Signacore Holdings company ID. Previously hard-excluded from the
+// Dashboard/Jobs/Reports views while the entity sat unused — now a fully
+// active, visible company (id:1 in INITIAL_COMPANIES), so this is set to a
+// sentinel that never matches a real id/co, making every old
+// "!==UNIONTECH_ID" filter below a harmless no-op. Kept (rather than
+// deleted) in case a future entity needs to be hidden the same way.
+const UNIONTECH_ID = null;
 
 /* ═══════════════════════════════════════════
    QUOTES — CONSTANTS & HELPERS
@@ -1459,6 +1508,7 @@ function sgrOpenPrintPreview(rawHtml, docLabel){
 
 function buildQuoteHtml(q, companies, logoDataUrl) {
   const co = companies.find(c=>c.id===q.co)||{name:'Signacore',short:'SGR'};
+  const legal = sgrCompanyLegal(co);
   const sub = q.lines.reduce((s,l)=>s+(l.subtotal||0),0);
   const disc = parseFloat(q.discount)||0;
   const setupFeeAmt = parseFloat(q.setupFee)||0;
@@ -1499,9 +1549,10 @@ function buildQuoteHtml(q, companies, logoDataUrl) {
       <td style="width:100px;text-align:right;font-size:10.5px;font-weight:700;color:#06065c;vertical-align:top;padding-top:9px;">${fmt(l.subtotal||0)}</td>
     </tr>`;
   }).join('');
-  const logoHtml = logoDataUrl
+  const logoHtml = (logoDataUrl
     ? `<img src="${logoDataUrl}" style="max-height:112px;max-width:322px;object-fit:contain;display:block;">`
-    : `<div style="font-family:'Barlow Condensed',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.08em;">SIGNACORE</div>`;
+    : `<div style="font-family:'Barlow Condensed',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.08em;">SIGNACORE</div>`)
+    + (legal.logoSuffix ? `<div style="font-family:'Barlow Condensed',Arial,sans-serif;font-size:1.1rem;font-weight:900;font-style:italic;color:#06065c;letter-spacing:0.1em;text-transform:uppercase;margin-top:2px;">${legal.logoSuffix}</div>` : '');
 
   const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Quotation_${q.num}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1589,7 +1640,7 @@ table.ln tfoot tr td{background:#06065c;color:#fff;font-size:8px;text-transform:
 <div class="tagline">
   <div>
     <div class="co">Applied Graphics &amp; Visual Displays</div>
-    <div class="reg">Hornet Honey (Pty) Ltd t/a Signacore &nbsp;&bull;&nbsp; Reg. No. 2022/4307/44/07 &nbsp;&bull;&nbsp; VAT No: 4660306046</div>
+    <div class="reg">${legal.legalName} &nbsp;&bull;&nbsp; Reg. No. ${legal.regNo} &nbsp;&bull;&nbsp; VAT No: ${legal.vatNo}</div>
   </div>
   <div style="font-size:9px;color:#ED0101;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;font-family:'Barlow Condensed',sans-serif">Mossel Bay</div>
 </div>
@@ -1644,10 +1695,10 @@ ${q.notes?(`<div class="notes"><div class="lbl">Notes</div><p>${q.notes}</p></di
 <div class="bank no-break">
   <div class="lbl">Banking Details — ${depRate===1?'100%':'80%'} Deposit: ${fmt(dep)}</div>
   <table><tbody>
-    <tr><td>Bank:</td><td>Standard Bank</td></tr>
-    <tr><td>Account Name:</td><td>Hornet Honey trading as Signacore</td></tr>
-    <tr><td>Account No:</td><td>2-825-229-72</td></tr>
-    <tr><td>Branch Code:</td><td>051001</td></tr>
+    <tr><td>Bank:</td><td>${legal.bankName}</td></tr>
+    <tr><td>Account Name:</td><td>${legal.bankAccName}</td></tr>
+    <tr><td>Account No:</td><td>${legal.bankAccNo}</td></tr>
+    <tr><td>Branch Code:</td><td>${legal.bankBranch}</td></tr>
     <tr><td>Reference:</td><td>${q.num} / ${q.client||''}</td></tr>
   </tbody></table>
 </div>
@@ -1996,6 +2047,7 @@ stageNames.map(function(s,i){
 ═══════════════════════════════════════════ */
 function buildInvoiceHtml(job, companies, logoDataUrl) {
   const co = companies.find(c=>c.id===job.co)||{name:'Signacore',short:'SGR'};
+  const legal = sgrCompanyLegal(co);
   const lines = job.lines||[];
   const sub = lines.reduce((s,l)=>s+(l.subtotal||0),0);
   const discPct = parseFloat(job.discount)||0;
@@ -2018,9 +2070,10 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
   const invDate = job.invoiceDate||(new Date().toISOString().slice(0,10));
   const due = job.invoiceDue||(new Date(Date.now()+30*864e5).toISOString().slice(0,10));
 
-  const logoHtml = logoDataUrl
+  const logoHtml = (logoDataUrl
     ? '<img src="'+logoDataUrl+'" style="max-height:112px;max-width:322px;object-fit:contain;display:block;">'
-    : '<div style="font-family:\'Barlow Condensed\',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.08em;">SIGNACORE</div>';
+    : '<div style="font-family:\'Barlow Condensed\',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.08em;">SIGNACORE</div>')
+    + (legal.logoSuffix ? '<div style="font-family:\'Barlow Condensed\',Arial,sans-serif;font-size:1.1rem;font-weight:900;font-style:italic;color:#06065c;letter-spacing:0.1em;text-transform:uppercase;margin-top:2px;">'+legal.logoSuffix+'</div>' : '');
 
   const css =
 '*{box-sizing:border-box;margin:0;padding:0}'+
@@ -2102,7 +2155,7 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
 '<div class="tagline">'+
 '<div>'+
 '<div class="co">Applied Graphics &amp; Visual Displays</div>'+
-'<div class="reg">Hornet Honey (Pty) Ltd t/a Signacore &nbsp;&bull;&nbsp; Reg. No. 2022/4307/44/07 &nbsp;&bull;&nbsp; VAT No: 4660306046</div>'+
+'<div class="reg">'+legal.legalName+' &nbsp;&bull;&nbsp; Reg. No. '+legal.regNo+' &nbsp;&bull;&nbsp; VAT No: '+legal.vatNo+'</div>'+
 '</div>'+
 '<div style="font-size:9px;color:#ED0101;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;font-family:\'Barlow Condensed\',sans-serif">Mossel Bay</div>'+
 '</div>'+
@@ -2160,10 +2213,10 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
 '<div class="bank no-break">'+
 '<div class="lbl">Banking Details</div>'+
 '<table><tbody>'+
-'<tr><td>Bank:</td><td>Standard Bank</td></tr>'+
-'<tr><td>Account Name:</td><td>Hornet Honey trading as Signacore</td></tr>'+
-'<tr><td>Account No:</td><td>2-825-229-72</td></tr>'+
-'<tr><td>Branch Code:</td><td>051001</td></tr>'+
+'<tr><td>Bank:</td><td>'+legal.bankName+'</td></tr>'+
+'<tr><td>Account Name:</td><td>'+legal.bankAccName+'</td></tr>'+
+'<tr><td>Account No:</td><td>'+legal.bankAccNo+'</td></tr>'+
+'<tr><td>Branch Code:</td><td>'+legal.bankBranch+'</td></tr>'+
 '<tr><td>Reference:</td><td>'+invNum+' / '+job.client+'</td></tr>'+
 '</tbody></table>'+
 '</div>'+
@@ -2186,6 +2239,7 @@ function printInvoice(job, companies, logoDataUrl) {
 ═══════════════════════════════════════════ */
 function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
   const co = companies.find(c=>c.id===quote.co)||{name:'Signacore',short:'SGR'};
+  const legal = sgrCompanyLegal(co);
   const lines = quote.lines||[];
   const sub = lines.reduce((s,l)=>s+(l.subtotal||0),0);
   const discPct = parseFloat(quote.discount)||0;
@@ -2204,9 +2258,10 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
     '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+lineItemCount(l)+'</td>'+
     '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(l.subtotal||0)+'</td></tr>';
   }).join('');
-  const logoHtml = logoDataUrl
+  const logoHtml = (logoDataUrl
     ? '<img src="'+logoDataUrl+'" style="max-height:112px;max-width:322px;object-fit:contain;display:block;">'
-    : "<div style=\"font-family:'Barlow Condensed',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.08em;\">SIGNACORE</div>";
+    : "<div style=\"font-family:'Barlow Condensed',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.08em;\">SIGNACORE</div>")
+    + (legal.logoSuffix ? "<div style=\"font-family:'Barlow Condensed',Arial,sans-serif;font-size:1.1rem;font-weight:900;font-style:italic;color:#06065c;letter-spacing:0.1em;text-transform:uppercase;margin-top:2px;\">"+legal.logoSuffix+"</div>" : '');
   const css =
 "*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Noto Sans SC',Arial,sans-serif;font-size:11.5px;color:#1a1a1a;padding:10mm 16mm 26mm 16mm;background:#fff}"+
 ".hdr{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:0}"+
@@ -2257,7 +2312,7 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
 '<div class="rule"></div>'+
 '<div class="tagline"><div>'+
 '<div class="co">Applied Graphics &amp; Visual Displays</div>'+
-'<div class="reg">Hornet Honey (Pty) Ltd t/a Signacore · Reg. No. 2022/4307/44/07 · VAT No: 4660306046</div>'+
+'<div class="reg">'+legal.legalName+' · Reg. No. '+legal.regNo+' · VAT No: '+legal.vatNo+'</div>'+
 '</div><div style="font-size:9px;color:#ED0101;font-weight:700;font-family:\'Barlow Condensed\',sans-serif;text-transform:uppercase;letter-spacing:0.08em">Mossel Bay</div></div>'+
 '<div class="parties">'+
 '<div class="box box-to"><div class="lbl">Billed To</div><div class="nm">'+quote.client+'</div>'+
@@ -2285,15 +2340,15 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
 '</table></div></div>'+
 '<div class="proforma-notice no-break"><p>This is a Proforma Invoice only. Payment is required before production commences. This document is not a VAT invoice. A Tax Invoice will be issued upon completion.</p></div>'+
 '<div class="bank no-break"><div class="lbl">Banking Details</div><table><tbody>'+
-'<tr><td>Bank:</td><td>Standard Bank</td></tr>'+
-'<tr><td>Account Name:</td><td>Hornet Honey trading as Signacore</td></tr>'+
-'<tr><td>Account No:</td><td>2-825-229-72</td></tr>'+
-'<tr><td>Branch Code:</td><td>051001</td></tr>'+
+'<tr><td>Bank:</td><td>'+legal.bankName+'</td></tr>'+
+'<tr><td>Account Name:</td><td>'+legal.bankAccName+'</td></tr>'+
+'<tr><td>Account No:</td><td>'+legal.bankAccNo+'</td></tr>'+
+'<tr><td>Branch Code:</td><td>'+legal.bankBranch+'</td></tr>'+
 '<tr><td>Reference:</td><td>'+proformaNum+' / '+quote.client+'</td></tr>'+
 '</tbody></table></div>'+
 (quote.notes?'<div style="border:1px solid #e5e7eb;border-radius:6px;padding:10px 13px;margin-bottom:12px;font-size:10px;color:#555;">'+quote.notes+'</div>':'')+
 '<div class="foot"><div class="foot-line"></div>'+
-'<p>Hornet Honey (Pty) Ltd t/a Signacore · 21 Voortrekker St, Mossdustria, Mossel Bay · 040-940-5555 · orders@snsg.co.za</p>'+
+'<p>'+legal.legalName+' · 21 Voortrekker St, Mossdustria, Mossel Bay · 040-940-5555 · orders@snsg.co.za</p>'+
 '</div>'+
 '</body></html>';
   return html;
@@ -2427,6 +2482,7 @@ async function generateCoverLetterPdf(data, companies, logoDataUrl, type) {
   const isQuote    = type === 'quote';
   const isProforma = type === 'proforma';
   const co       = companies.find(c=>c.id===data.co)||{name:'Signacore',short:'SGR'};
+  const legal    = sgrCompanyLegal(co);
   const refNum   = isQuote ? data.num : (isProforma ? (data._proformaNum||data.num) : (data.invoiceNum||data.num));
   const contact  = data.contact||data.client||'Sir/Madam';
   const today    = new Date().toLocaleDateString('en-ZA',{day:'numeric',month:'long',year:'numeric'});
@@ -2446,20 +2502,21 @@ async function generateCoverLetterPdf(data, companies, logoDataUrl, type) {
   if (logoDataUrl) { try {
     const ld = await getLogoDimensions(logoDataUrl, 60, 23);
     doc.addImage(logoDataUrl,'PNG',LM,y,ld.w,ld.h);
+    if (legal.logoSuffix) { doc.setFont('helvetica','bold'); doc.setFontSize(9); sc(C_DARK); doc.text(legal.logoSuffix, LM, y+ld.h+4); }
   } catch(e){
     doc.setFont('helvetica','bold'); doc.setFontSize(14); sc(C_RED); doc.text('SIGNACORE',LM,y+14);
   }}
   doc.setFont('helvetica','bold'); doc.setFontSize(13); sc(C_DARK);
   doc.text(co.short||co.name, RM, y+6, {align:'right'});
   doc.setFont('helvetica','normal'); doc.setFontSize(8); sc(C_GREY);
-  doc.text('VAT: 4660306046  ·  040-940-5555  ·  orders@snsg.co.za', RM, y+11, {align:'right'});
+  doc.text('VAT: '+legal.vatNo+'  ·  040-940-5555  ·  orders@snsg.co.za', RM, y+11, {align:'right'});
   y += 22;
 
   sd(C_RED); doc.setLineWidth(0.8); doc.line(LM,y,RM,y); y += 5;
   doc.setFont('helvetica','bold'); doc.setFontSize(8); sc(C_DARK);
   doc.text('Applied Graphics and Visual Displays', W/2, y+3, {align:'center'});
   doc.setFont('helvetica','normal'); doc.setFontSize(7); sc(C_GREY);
-  doc.text('Reg. No. 2022/4307/44/07', W/2, y+7.5, {align:'center'});
+  doc.text('Reg. No. '+legal.regNo, W/2, y+7.5, {align:'center'});
   y += 13;
 
   // Title + ref block
@@ -2520,7 +2577,7 @@ async function generateCoverLetterPdf(data, companies, logoDataUrl, type) {
     doc.setFont('helvetica','bold'); doc.setFontSize(8.5); sc(C_DARK);
     doc.text('Banking Details', LM, y); y += 4.5;
     doc.setFont('helvetica','normal'); doc.setFontSize(8); sc(C_GREY);
-    [['Bank','Standard Bank'],['Account Name','Hornet Honey trading as Signacore'],['Account No','2-825-229-72'],['Branch Code','051001'],['Reference',refNum+' / '+(data.client||'')]].forEach(([k,v])=>{
+    [['Bank',legal.bankName],['Account Name',legal.bankAccName],['Account No',legal.bankAccNo],['Branch Code',legal.bankBranch],['Reference',refNum+' / '+(data.client||'')]].forEach(([k,v])=>{
       doc.text(k+':', LM, y); sc(C_DARK); doc.text(v, LM+34, y); sc(C_GREY); y += 4;
     });
     y += 4;
@@ -2549,7 +2606,7 @@ async function generateCoverLetterPdf(data, companies, logoDataUrl, type) {
   const footY = 281;
   sd(C_RED); doc.setLineWidth(0.6); doc.line(LM,footY,RM,footY);
   doc.setFont('helvetica','normal'); doc.setFontSize(7.5); sc(C_GREY);
-  doc.text('Hornet Honey (Pty) Ltd t/a '+(co.short||co.name)+'  ·  21 Voortrekker St, Mossdustria, Mossel Bay  ·  orders@snsg.co.za  ·  040-940-5555     Directors: O T Smit  |  R O Smit', W/2, footY+5, {align:'center'});
+  doc.text(legal.legalName+'  ·  21 Voortrekker St, Mossdustria, Mossel Bay  ·  orders@snsg.co.za  ·  040-940-5555     Directors: O T Smit  |  R O Smit', W/2, footY+5, {align:'center'});
 
   return doc.output('datauristring').split(',')[1];
 }
@@ -3123,7 +3180,9 @@ function NumInput({ value, onChange, placeholder, disabled, small }) {
 ═══════════════════════════════════════════ */
 function AddJobModal({ companies, onClose, onAdd, nextNum }) {
   const [client,setClient]=useState(''); const [desc,setDesc]=useState('');
-  const [status,setStatus]=useState('lead'); const [co,setCo]=useState('3');
+  // Default to Signacore (id 2) — '3' was a stale default referencing a
+  // company id that no longer exists in INITIAL_COMPANIES.
+  const [status,setStatus]=useState('lead'); const [co,setCo]=useState('2');
   const [value,setValue]=useState(''); const [notes,setNotes]=useState('');
   function submit(e) {
     e.preventDefault();
@@ -3904,7 +3963,11 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   const [client,setClient]=useState(_draft?.client??eq?.client??id?.client??''); const [contact,setContact]=useState(_draft?.contact??eq?.contact??id?.contact??'');
   const [email,setEmail]=useState(_draft?.email??eq?.email??id?.email??''); const [tel,setTel]=useState(_draft?.tel??eq?.tel??id?.tel??'');
   const [address,setAddress]=useState(_draft?.address??eq?.address??id?.address??''); const [vatNum,setVatNum]=useState(_draft?.vatNum??eq?.vatNum??id?.vatNum??'');
-  const [co,setCo]=useState(String(_draft?.co||eq?.co||id?.co||companies[0]?.id||3));
+  // Default new quotes to Signacore (id 2), not companies[0] — company id 1
+  // is now the fully-active "Signacore Holdings" entity, so defaulting here
+  // could otherwise silently create new-company quotes unless the user
+  // explicitly picks a company.
+  const [co,setCo]=useState(String(_draft?.co||eq?.co||id?.co||2));
   const [date,setDate]=useState(_draft?.date||eq?.date||today); const [valid,setValid]=useState(_draft?.valid||eq?.validUntil||validDef);
   const [notes,setNotes]=useState(_draft?.notes??eq?.notes??id?.notes??'');
   const [salesperson,setSalesperson]=useState(_draft?.salesperson??eq?.salesperson??id?.salesperson??'');
@@ -8587,6 +8650,18 @@ function LoginPage({ onLogin }) {
               <span style={{color:'rgba(255,255,255,0.55)',wordBreak:'break-all'}}>accounts@signacore.co.za</span>
               <span className="font-mono shrink-0" style={{color:'rgba(255,255,255,0.45)'}}>Accounts2024!</span>
             </div>
+            {/* Signacore Holdings — Admin (password hidden) */}
+            <div className="flex items-center justify-between px-4 py-2.5 gap-4">
+              <span className="font-bold" style={{color:'rgba(255,255,255,0.85)',minWidth:'80px'}}>Holdings Admin</span>
+              <span style={{color:'rgba(255,255,255,0.55)',wordBreak:'break-all'}}>admin@signacoreholdings.co.za</span>
+              <span className="font-mono tracking-widest shrink-0" style={{color:'rgba(255,255,255,0.25)'}}>••••••••</span>
+            </div>
+            {/* Signacore Holdings — Assistant */}
+            <div className="flex items-center justify-between px-4 py-2.5 gap-4">
+              <span className="font-bold" style={{color:'rgba(255,255,255,0.85)',minWidth:'80px'}}>Holdings Asst.</span>
+              <span style={{color:'rgba(255,255,255,0.55)',wordBreak:'break-all'}}>assist@signacoreholdings.co.za</span>
+              <span className="font-mono shrink-0" style={{color:'rgba(255,255,255,0.45)'}}>HoldAssist2026!</span>
+            </div>
           </div>
         </div>
 
@@ -8751,7 +8826,7 @@ function StatusDonut({ jobs }) {
 ═══════════════════════════════════════════ */
 function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, accInvoices }) {
   const isAdmin = true; // All roles see full dashboard
-  // Always exclude SGR Holdings from Dashboard
+  // UNIONTECH_ID is now a no-op sentinel — Signacore Holdings shows normally.
   const visibleCompanies = companies.filter(c=>c.id!==UNIONTECH_ID);
   const visibleJobs      = jobs.filter(j=>j.co!==UNIONTECH_ID);
   // ── Current-month scope ── Dashboard financial figures reflect only this month.
@@ -9493,7 +9568,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
   },[highlightJobId]);
 
   const isAdmin = user.role !== 'assistant';
-  // Always exclude SGR Holdings from Jobs view
+  // UNIONTECH_ID is now a no-op sentinel — Signacore Holdings shows normally.
   const visibleJobs     = jobs.filter(j=>j.co!==UNIONTECH_ID);
   const filterCompanies = companies.filter(c=>c.id!==UNIONTECH_ID);
   const addableCompanies = filterCompanies;
@@ -16210,7 +16285,7 @@ function ReportsPage({ jobs, companies, user, logoDataUrl }) {
   const isAdmin = user.role !== 'assistant';
   // Invoice hover-preview (Payments tab) — {job, x, y} while hovering a blue invoice no.
   const [hoverInv, setHoverInv] = useState(null);
-  // Always exclude SGR Holdings from Reports — only Signacore and Cover X shown
+  // UNIONTECH_ID is now a no-op sentinel — Signacore Holdings shows normally.
   const visibleCompanies = companies.filter(c=>c.id!==UNIONTECH_ID);
   const visibleJobs      = jobs.filter(j=>j.co!==UNIONTECH_ID);
 
