@@ -501,6 +501,15 @@ const UNIONTECH_ID = null;
    — nothing needs to be migrated or back-tagged.
 ═══════════════════════════════════════════ */
 const HOLDINGS_CO_ID = 1;
+// Fixed, permanent Holdings company logo — served as a static file straight
+// from the repo root (holdings-logo.png), which Render publishes alongside
+// index.html. This is NOT user-editable: there is no upload/change control
+// for it anywhere in the app (see Sidebar). It is used everywhere the
+// Holdings company's branding appears — header/sidebar and every Holdings
+// quote/invoice/credit note/cover letter/email/PDF — via the brandingLogo
+// resolver near the bottom of App(). The original company's logo (logoDataUrl)
+// is completely separate and unaffected.
+const HOLDINGS_LOGO_URL = 'holdings-logo.png';
 // True when the logged-in user's account is scoped to Holdings (USERS
 // entries with co:1 — Holdings Admin / Holdings Assistant).
 function isHoldingsUser(user){ return !!user && user.co === HOLDINGS_CO_ID; }
@@ -3659,11 +3668,18 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
   );
 }
 
-function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoices=[], companies=[], logoDataUrl, onOpenQuote, onOpenInvoice }) {
+function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoices=[], companies=[], user, logoDataUrl, onOpenQuote, onOpenInvoice }) {
   const [showAdd,    setShowAdd]    = useState(false);
   const [editing,    setEditing]    = useState(null);
   const [search,     setSearch]     = useState('');
   const [showImport, setShowImport] = useState(false);
+  // Customers are shared across both companies, but their quotes/invoices are
+  // not — scope the per-customer dropdown to the logged-in user's company
+  // (see belongsToUserCompany()) so a shared customer never shows the other
+  // company's quotes/invoices here.
+  const myQuotes = (quotes||[]).filter(q=>belongsToUserCompany(q,user));
+  const myJobs = (jobs||[]).filter(j=>belongsToUserCompany(j,user));
+  const myAccInvoices = (accInvoices||[]).filter(i=>belongsToUserCompany(i,user));
   const filtered = customers.filter(c=>
     c.companyName.toLowerCase().includes(search.toLowerCase()) ||
     (c.contactPerson||'').toLowerCase().includes(search.toLowerCase()) ||
@@ -3683,11 +3699,11 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
     const cn = _norm(c.companyName); const cp = _norm(c.contactPerson);
     return (cn && (n===cn || n.includes(cn) || cn.includes(n))) || (cp && n===cp);
   }
-  function quotesFor(c){ return (quotes||[]).filter(q=>nameMatches(q.client,c)); }
+  function quotesFor(c){ return myQuotes.filter(q=>nameMatches(q.client,c)); }
   function invoicesFor(c){
-    const jobInv = (jobs||[]).filter(j=>j.invoiceNum && nameMatches(j.client,c))
+    const jobInv = myJobs.filter(j=>j.invoiceNum && nameMatches(j.client,c))
       .map(j=>({id:j.id, num:j.invoiceNum, date:j.invoiceDate, status:j.invoiceStatus||'pending', manual:false}));
-    const manualInv = (accInvoices||[]).filter(i=>i.status!=='void' && nameMatches(i.contactName,c))
+    const manualInv = myAccInvoices.filter(i=>i.status!=='void' && nameMatches(i.contactName,c))
       .map(i=>({id:i.id, num:i.number, date:i.date, status:i.status||'pending', manual:true}));
     return [...jobInv,...manualInv].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
   }
@@ -3700,9 +3716,9 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
   // (managed in Accounting) fall back to navigating to the Invoices tab.
   function openInvoiceDoc(inv){
     if(inv.manual){ onOpenInvoice&&onOpenInvoice(inv); return; }
-    const j=(jobs||[]).find(x=>x.id===inv.id);
+    const j=myJobs.find(x=>x.id===inv.id);
     if(!j){ onOpenInvoice&&onOpenInvoice(inv); return; }
-    const link=(quotes||[]).find(q=>q && q.num && j.quoteNum && q.num===j.quoteNum);
+    const link=myQuotes.find(q=>q && q.num && j.quoteNum && q.num===j.quoteNum);
     const pj=link ? {...j,
       lines:link.lines, discount:link.discount||'', setupFee:link.setupFee||'',
       client:link.client, contact:link.contact||j.contact||'', email:link.email||j.email||'',
@@ -5382,6 +5398,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const myQuotes = (quotes||[]).filter(q=>belongsToUserCompany(q,user));
   const myJobs = (jobs||[]).filter(j=>belongsToUserCompany(j,user));
   const myAccInvoices = (accInvoices||[]).filter(i=>belongsToUserCompany(i,user));
+  // Credit notes are company-specific too — a note issued under one company
+  // must not be shown as available against the other company's quotes.
+  const myCreditNotes = (creditNotes||[]).filter(c=>belongsToUserCompany(c,user));
   const _searchTerm = search.trim().toLowerCase();
   const displayed = (filter==='all' ? myQuotes : myQuotes.filter(q=>q.status===filter))
     .filter(q=>!_searchTerm || (q.client||'').toLowerCase().includes(_searchTerm));
@@ -5426,7 +5445,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   useEffect(()=>{
     if(!initialOpen) return;
     if(initialOpen.type==='quote'){
-      const q=(quotes||[]).find(x=>x.id===initialOpen.id);
+      const q=myQuotes.find(x=>x.id===initialOpen.id);
       if(q){ setSubTab('quotes'); setSearch(''); setFilter('all'); setViewQuote(q); }
     } else if(initialOpen.type==='invoice'){
       setSubTab('invoices'); setInvFilter('all'); setInvHighlight(initialOpen.id);
@@ -6166,7 +6185,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         companies={companies} logoDataUrl={logoDataUrl}
         onEdit={handleEditQuote}
         jobs={jobs}
-        creditNotes={creditNotes} setCreditNotes={setCreditNotes}
+        creditNotes={myCreditNotes} setCreditNotes={setCreditNotes}
       />}
       {/* ── Edit Invoice modal ── */}
       {editInvoice&&(
@@ -8743,13 +8762,6 @@ function Sidebar({ companies, page, setPage, open, setOpen, user, entityFilter, 
   const isAssistant = user.role === 'assistant';
   const isHolding = isHoldingsUser(user);
   const [hoveredNav, setHoveredNav] = useState(null);
-  function handleBrandLogoUpload(e) {
-    const file = e.target.files[0]; if(!file) return;
-    const reader = new FileReader();
-    reader.onload = ev => setLogoDataUrl(ev.target.result);
-    reader.readAsDataURL(file);
-    e.target.value = '';
-  }
   return (
     <>
       {open&&<div className="fixed inset-0 bg-black/50 z-30 lg:hidden" onClick={()=>setOpen(false)}/>}
@@ -8764,16 +8776,9 @@ function Sidebar({ companies, page, setPage, open, setOpen, user, entityFilter, 
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg>
           </button>
         </div>
-        {/* Holdings Admin-only: upload the dedicated Holdings company logo.
-            Writes to the Holdings-only logo slot (setLogoDataUrl here is
-            already the company-aware setter passed down from App()) — never
-            touches the original company's logo. */}
-        {isHolding && user.role==='admin' && (
-          <label className="flex items-center gap-2 px-4 py-2 border-b border-white/10 text-xs text-blue-200 hover:text-white cursor-pointer">
-            <span>🖼️ {logoDataUrl?'Change':'Upload'} Holdings logo</span>
-            <input type="file" accept="image/*" className="hidden" onChange={handleBrandLogoUpload}/>
-          </label>
-        )}
+        {/* Holdings logo is fixed/permanent (HOLDINGS_LOGO_URL) — there is
+            intentionally no upload/change control for it here or anywhere
+            else in the app. */}
         <nav className="flex-1 overflow-y-auto p-3 space-y-0.5">
           {nav.map(n=>(
             <div key={n.id} className="flex items-center gap-0.5"
@@ -9007,7 +9012,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
         {isAdmin&&(
           <div className="lg:col-span-3 bg-white rounded-2xl border border-gray-200 p-4">
             <h3 className="text-sm font-bold mb-3" style={{color:'#06065c'}}>Total Revenue — Last 6 Months</h3>
-            <div className="h-52"><RevenueChart jobs={visibleJobs} accInvoices={accInvoices}/></div>
+            <div className="h-52"><RevenueChart jobs={visibleJobs} accInvoices={visibleAccInvoices}/></div>
           </div>
         )}
         <div className={`${isAdmin?'lg:col-span-2':''} bg-white rounded-2xl border border-gray-200 p-4`}>
@@ -9020,7 +9025,8 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
       {isAdmin&&(()=>{
         const qTotal = q => { const sub=q.lines.reduce((s,l)=>s+(l.subtotal||0),0); const disc=parseFloat(q.discount)||0; const setup=parseFloat(q.setupFee)||0; return (sub-sub*(disc/100)+setup)*1.15; };
         // This-month scope: quotes dated in the current calendar month.
-        const allQuotes      = (quotes||[]).filter(q=>inCurrentMonth(q.date));
+        // Company-scoped: visibleQuotes only (see belongsToUserCompany()).
+        const allQuotes      = visibleQuotes.filter(q=>inCurrentMonth(q.date));
         const convertedQuotes= allQuotes.filter(q=>q.status==='converted');
         const quotesMadeTotal    = allQuotes.reduce((s,q)=>s+qTotal(q),0);
         const quotesAcceptedTotal= convertedQuotes.reduce((s,q)=>s+qTotal(q),0);
@@ -9051,7 +9057,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
           <h3 className="text-sm font-bold text-white" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'0.95rem'}}>RECENT JOBS</h3>
         </div>
         <div className="overflow-x-auto p-4">
-          {(!quotes||quotes.length===0)?(
+          {(!visibleQuotes||visibleQuotes.length===0)?(
             <p className="text-xs text-gray-400 text-center py-6">No quotes yet — create one in Sales.</p>
           ):(
             <table className="w-full text-sm min-w-[480px]">
@@ -9063,7 +9069,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
                 </tr>
               </thead>
               <tbody>
-                {(quotes||[]).map(q=>{
+                {visibleQuotes.map(q=>{
                   const sub=q.lines.reduce((s,l)=>s+(l.subtotal||0),0);
                   const disc=parseFloat(q.discount)||0;
                   const setup=parseFloat(q.setupFee)||0;
@@ -9617,11 +9623,14 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
   const [newProposal,  setNewProposal]  = useState('');
 
   // ── Proposed Projects (manual list of unquoted work needing attention) ──
+  // Company-specific like Tasks: tagged by the creating user's company and
+  // filtered the same way as jobs/quotes (see belongsToUserCompany()).
+  const visibleProposals = (proposedProjects||[]).filter(p=>belongsToUserCompany(p,user));
   const addProposal = () => {
     const name = newProposal.trim();
     if(!name || !setProposedProjects) return;
     const id = Date.now().toString(36) + Math.random().toString(36).slice(2,7);
-    setProposedProjects(prev=>[...(prev||[]), { id, name, note:'' }]);
+    setProposedProjects(prev=>[...(prev||[]), { id, name, note:'', co: isHoldingsUser(user) ? HOLDINGS_CO_ID : null }]);
     setNewProposal('');
   };
   const updateProposal = (id, field, val) =>
@@ -9703,7 +9712,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
             <span className="text-base">📌</span>
             <h3 className="text-sm font-black text-gray-800">Proposed Projects</h3>
             <span className="text-xs text-gray-400">not yet quoted — need attention</span>
-            <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 font-black">{proposedProjects.length}</span>
+            <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 font-black">{visibleProposals.length}</span>
           </div>
           <div className="flex flex-col sm:flex-row gap-2 mb-3">
             <input value={newProposal} onChange={e=>setNewProposal(e.target.value)}
@@ -9714,10 +9723,10 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
               className="bg-amber-500 hover:bg-amber-600 text-white rounded-xl px-4 py-2.5 text-sm font-bold whitespace-nowrap">＋ Add</button>
           </div>
           <div className="space-y-2">
-            {proposedProjects.length===0&&(
+            {visibleProposals.length===0&&(
               <p className="text-xs text-gray-400 italic text-center py-3">No proposed projects yet. Add ones that aren't quoted but need attention.</p>
             )}
-            {proposedProjects.map(p=>(
+            {visibleProposals.map(p=>(
               <div key={p.id} className="flex items-start gap-2 bg-amber-50/60 border border-amber-100 rounded-xl p-2.5">
                 <div className="flex-1 min-w-0 space-y-1">
                   <input value={p.name} onChange={e=>updateProposal(p.id,'name',e.target.value)}
@@ -16406,7 +16415,9 @@ function ReportsPage({ jobs, companies, user, logoDataUrl }) {
   const _jobBalance = j => (parseFloat(j.value)||0) - _jobPaid(j);
   const _lastPayDate = j => { const ps=j.payments||[]; if(j.paidAt) return j.paidAt; if(ps.length){ const ds=ps.map(p=>p.date).filter(Boolean).sort(); if(ds.length) return ds[ds.length-1]; } return j.invoiceDate||null; };
   const _isJobFullyPaid = j => { const tot=parseFloat(j.value)||0; return tot>0 && _jobPaid(j)>=tot-0.005; };
-  const invoicedJobs = jobs.filter(j=>j.invoiceNum);
+  // Company-scoped: visibleJobs only, so the Payments tab (paid/outstanding/
+  // calendar) never mixes Holdings and original-company invoices.
+  const invoicedJobs = visibleJobs.filter(j=>j.invoiceNum);
   // Paid Invoices list = every invoice that has actually received money (deposits included),
   // newest receipt first.
   const paidJobs = invoicedJobs.filter(j=>_jobPaid(j)>0.005).sort((a,b)=>new Date(_lastPayDate(b)||0)-new Date(_lastPayDate(a)||0));
@@ -17203,19 +17214,17 @@ function App() {
   const safePage = (user.role==='assistant' && assistantBlocked.includes(page)) ? 'dashboard' : page;
 
   // Company-aware branding resolver — used for the header, sidebar, and
-  // every document-generating page below. Holdings users (co:1) get the
-  // dedicated Holdings logo (or a blank placeholder until one is uploaded —
-  // NEVER the original company's logo); everyone else keeps the original
-  // logo exactly as before. The upload control (in Sidebar) is wired the
-  // same way, so uploading while logged in as Holdings Admin writes to the
-  // Holdings-only slot instead of overwriting the original company's logo.
-  const brandingLogo = isHoldingsUser(user) ? holdingsLogoDataUrl : logoDataUrl;
-  const brandingLogoSetter = isHoldingsUser(user) ? setHoldingsLogoDataUrl : setLogoDataUrl;
+  // every document-generating page below. Holdings users (co:1) always get
+  // the fixed HOLDINGS_LOGO_URL asset — never the original company's logo,
+  // and never user-editable; everyone else keeps the original logo exactly
+  // as before.
+  const brandingLogo = isHoldingsUser(user) ? HOLDINGS_LOGO_URL : logoDataUrl;
+  const brandingLogoSetter = isHoldingsUser(user) ? undefined : setLogoDataUrl;
 
   const pageMap = {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={accInvoices}/>,
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} creditNotes={creditNotes} setCreditNotes={setCreditNotes}/>,
-    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} logoDataUrl={brandingLogo} onOpenQuote={(q)=>{ setSalesOpen({type:'quote', id:q.id}); setPage('sales'); }} onOpenInvoice={(inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); }}/>,
+    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={(q)=>{ setSalesOpen({type:'quote', id:q.id}); setPage('sales'); }} onOpenInvoice={(inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); }}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
