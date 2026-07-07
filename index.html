@@ -5787,7 +5787,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   }
 
   const statusFilters=['all','draft','sent','approved','declined','converted'];
-  const countOf=s=>quotes.filter(q=>q.status===s).length;
+  // Company-scoped counts — must mirror myQuotes (belongsToUserCompany), not
+  // the raw `quotes` prop, or Holdings would see the original company's
+  // counts/records mixed into these Sales-section totals.
+  const countOf=s=>myQuotes.filter(q=>q.status===s).length;
 
   return (
     <div className="p-4 md:p-6 space-y-4 max-w-5xl mx-auto">
@@ -5795,7 +5798,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-xl font-black text-gray-900">💰 Sales</h2>
-          <p className="text-xs text-gray-400 mt-0.5">{quotes.length} quote{quotes.length!==1?'s':''} · {invoicedJobs.length} invoice{invoicedJobs.length!==1?'s':''}</p>
+          <p className="text-xs text-gray-400 mt-0.5">{myQuotes.length} quote{myQuotes.length!==1?'s':''} · {invoicedJobs.length} invoice{invoicedJobs.length!==1?'s':''}</p>
         </div>
         {subTab==='quotes'&&(
           <button onClick={()=>setShowCreate(true)}
@@ -5832,7 +5835,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           {statusFilters.map(s=>(
             <button key={s} onClick={()=>setFilter(s)}
               className={`text-xs rounded-lg px-3 py-1.5 border font-semibold capitalize transition-all ${filter===s?'bg-gray-900 text-white border-gray-900':'bg-white border-gray-200 text-gray-500 hover:border-gray-400'}`}>
-              {s==='all'?`All (${quotes.length})`:
+              {s==='all'?`All (${myQuotes.length})`:
                `${QUOTE_STATUS_META[s]?.label||s} (${countOf(s)})`}
             </button>
           ))}
@@ -5897,7 +5900,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       {/* ── ACCEPTED QUOTES SUB-TAB ── */}
       {subTab==='accepted'&&(<>
         {(()=>{
-          const acceptedQuotes=[...quotes.filter(q=>q.status==='converted')].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
+          // Company-scoped — must use myQuotes (belongsToUserCompany), not the
+          // raw `quotes` prop, so Holdings never sees the original company's
+          // accepted quotes (and vice versa) in this Accepted sub-tab.
+          const acceptedQuotes=[...myQuotes.filter(q=>q.status==='converted')].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
           if(acceptedQuotes.length===0) return (
             <div className="bg-white rounded-2xl border border-gray-200 p-12 text-center">
               <div className="text-4xl mb-3">✅</div>
