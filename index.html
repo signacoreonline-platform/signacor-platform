@@ -471,9 +471,9 @@ const USERS = [
   { email:'accounts@signacore.co.za', pw:'Accounts2024!',  role:'accounts',  name:'Accountant',     initials:'AC', title:'Accounts'        },
   { email:'assist@signacore.co.za',   pw:'Assist2024!',    role:'assistant', name:'Sales Assistant', initials:'SA', title:'Sales / Quoting' },
   // Signacore Holdings (co:1) logins — placeholder credentials, change the
-  // email/pw values below to whatever you'd like. Note: roles are still
-  // platform-wide (not walled per company), so these logins can currently
-  // see Signacore's data too, same as any other admin/assistant login.
+  // email/pw values below to whatever you'd like. These logins are now
+  // walled to the Holdings company context — see HOLDINGS_CO_ID /
+  // isHoldingsUser() / belongsToUserCompany() below.
   { email:'admin@signacoreholdings.co.za',  pw:'Holdings2026!', role:'admin',     name:'Holdings Admin',      initials:'HA', title:'Administrator',   co:1 },
   { email:'assist@signacoreholdings.co.za', pw:'HoldAssist2026!', role:'assistant', name:'Holdings Assistant', initials:'HS', title:'Sales / Quoting', co:1 },
 ];
@@ -484,6 +484,44 @@ const USERS = [
 // "!==UNIONTECH_ID" filter below a harmless no-op. Kept (rather than
 // deleted) in case a future entity needs to be hidden the same way.
 const UNIONTECH_ID = null;
+
+/* ═══════════════════════════════════════════
+   COMPANY CONTEXT — Signacore Holdings separation
+   ─────────────────────────────────────────
+   Signacore Holdings (Signarama George (Pty) Ltd t/a Signacore Holdings,
+   INITIAL_COMPANIES id:1) is a legally separate business sharing this same
+   platform/database. Only inventory, customers and suppliers are shared
+   globally between it and the original Signacore company/roles — quotes,
+   jobs, invoices, bills, credit notes, purchase orders, bank transactions,
+   accounting, reports and dashboards must stay separated per company.
+
+   A record with no `co` field (or any `co` other than HOLDINGS_CO_ID) is
+   treated as belonging to the ORIGINAL company by default, so all existing
+   data keeps working exactly as it does today for Admin/Assistant/Accounts
+   — nothing needs to be migrated or back-tagged.
+═══════════════════════════════════════════ */
+const HOLDINGS_CO_ID = 1;
+// True when the logged-in user's account is scoped to Holdings (USERS
+// entries with co:1 — Holdings Admin / Holdings Assistant).
+function isHoldingsUser(user){ return !!user && user.co === HOLDINGS_CO_ID; }
+// True when a company-tagged record belongs to Holdings.
+function isHoldingsRecord(rec){ return !!rec && rec.co === HOLDINGS_CO_ID; }
+// Company-scoped visibility for non-shared records (jobs, quotes, invoices,
+// bills, credit notes, purchase orders, bank transactions, …). Holdings
+// users see ONLY records tagged co:1; original-company users (Admin,
+// Assistant, Accounts) see everything NOT tagged co:1 — i.e. every existing
+// record with no `co`, plus any co:2/3/4 record, exactly as before.
+function belongsToUserCompany(rec, user){
+  return isHoldingsUser(user) ? isHoldingsRecord(rec) : !isHoldingsRecord(rec);
+}
+// Companies a given user is allowed to create new records under — Holdings
+// users may only create Holdings (co:1) records; original-company users may
+// pick any non-Holdings company (Signacore, Cover X, etc), exactly as
+// before Holdings existed, just without the Holdings option.
+function creatableCompanies(companies, user){
+  const list = (companies||[]).filter(c=>c.id!==UNIONTECH_ID);
+  return isHoldingsUser(user) ? list.filter(c=>c.id===HOLDINGS_CO_ID) : list.filter(c=>c.id!==HOLDINGS_CO_ID);
+}
 
 /* ═══════════════════════════════════════════
    QUOTES — CONSTANTS & HELPERS
@@ -3180,9 +3218,11 @@ function NumInput({ value, onChange, placeholder, disabled, small }) {
 ═══════════════════════════════════════════ */
 function AddJobModal({ companies, onClose, onAdd, nextNum }) {
   const [client,setClient]=useState(''); const [desc,setDesc]=useState('');
-  // Default to Signacore (id 2) — '3' was a stale default referencing a
-  // company id that no longer exists in INITIAL_COMPANIES.
-  const [status,setStatus]=useState('lead'); const [co,setCo]=useState('2');
+  // Default to the first company this user is allowed to create under
+  // (companies is already scoped by creatableCompanies() at the call site —
+  // Holdings users only ever see Holdings here, original users never see
+  // Holdings). Falls back to Signacore (id 2) if the list is ever empty.
+  const [status,setStatus]=useState('lead'); const [co,setCo]=useState(String((companies&&companies[0]&&companies[0].id)||2));
   const [value,setValue]=useState(''); const [notes,setNotes]=useState('');
   function submit(e) {
     e.preventDefault();
@@ -3963,11 +4003,11 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   const [client,setClient]=useState(_draft?.client??eq?.client??id?.client??''); const [contact,setContact]=useState(_draft?.contact??eq?.contact??id?.contact??'');
   const [email,setEmail]=useState(_draft?.email??eq?.email??id?.email??''); const [tel,setTel]=useState(_draft?.tel??eq?.tel??id?.tel??'');
   const [address,setAddress]=useState(_draft?.address??eq?.address??id?.address??''); const [vatNum,setVatNum]=useState(_draft?.vatNum??eq?.vatNum??id?.vatNum??'');
-  // Default new quotes to Signacore (id 2), not companies[0] — company id 1
-  // is now the fully-active "Signacore Holdings" entity, so defaulting here
-  // could otherwise silently create new-company quotes unless the user
-  // explicitly picks a company.
-  const [co,setCo]=useState(String(_draft?.co||eq?.co||id?.co||2));
+  // Default new quotes to the first company this user is allowed to create
+  // under (companies is scoped by creatableCompanies() at the call site —
+  // Holdings users only ever see Holdings here, original users never see
+  // Holdings), falling back to Signacore (id 2).
+  const [co,setCo]=useState(String(_draft?.co||eq?.co||id?.co||(companies&&companies[0]&&companies[0].id)||2));
   const [date,setDate]=useState(_draft?.date||eq?.date||today); const [valid,setValid]=useState(_draft?.valid||eq?.validUntil||validDef);
   const [notes,setNotes]=useState(_draft?.notes??eq?.notes??id?.notes??'');
   const [salesperson,setSalesperson]=useState(_draft?.salesperson??eq?.salesperson??id?.salesperson??'');
@@ -5336,8 +5376,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [invHighlight,setInvHighlight]=useState(null); // invoice id to highlight when opened from elsewhere
   const [jobPayModal,setJobPayModal]=useState(null); // job being viewed in payment history modal
   const nonUtech = companies.filter(c=>c.id!==UNIONTECH_ID);
+  // Company-context filter: Holdings users see only Holdings (co:1)
+  // quotes/jobs/invoices; original-company users see everything else,
+  // unchanged (see belongsToUserCompany()).
+  const myQuotes = (quotes||[]).filter(q=>belongsToUserCompany(q,user));
+  const myJobs = (jobs||[]).filter(j=>belongsToUserCompany(j,user));
+  const myAccInvoices = (accInvoices||[]).filter(i=>belongsToUserCompany(i,user));
   const _searchTerm = search.trim().toLowerCase();
-  const displayed = (filter==='all' ? quotes : quotes.filter(q=>q.status===filter))
+  const displayed = (filter==='all' ? myQuotes : myQuotes.filter(q=>q.status===filter))
     .filter(q=>!_searchTerm || (q.client||'').toLowerCase().includes(_searchTerm));
   const isAdmin = user.role === 'admin';
   // Invoices sub-tab: all jobs with an invoiceNum + manual accounting invoices.
@@ -5345,8 +5391,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // the quotation (line items, discount, setup fee, total incl. VAT and contact
   // details). This is display-layer only — when a payment is later saved the
   // corrected value is what gets persisted.
-  const jobInvItems = jobs.filter(j=>j.invoiceNum).map(j=>{
-    const link = (quotes||[]).find(q=>q && q.num && j.quoteNum && q.num===j.quoteNum);
+  const jobInvItems = myJobs.filter(j=>j.invoiceNum).map(j=>{
+    const link = myQuotes.find(q=>q && q.num && j.quoteNum && q.num===j.quoteNum);
     let job = j;
     if(link){
       const _sub      = (link.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
@@ -5365,11 +5411,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const rec = reconcileJobInvoice(job, quotes);
     return {...job, payments:rec.payments, invoiceStatus:rec.invoiceStatus};
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
-  const manualInvItems = (accInvoices||[]).filter(i=>i.status!=='void').map(i=>{
+  const manualInvItems = myAccInvoices.filter(i=>i.status!=='void').map(i=>{
     const sub=(i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
     const vat=(i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
     const normStatus=i.status==='paid'?'paid':i.status==='partial'?'partial':'pending';
-    return {id:i.id,invoiceNum:i.number,invoiceStatus:normStatus,client:i.contactName||'',value:sub+vat,invoiceDate:i.date,invoiceDue:i.dueDate,paidAt:i.paidDate,reference:i.reference,payments:i.payments||[],num:'manual',co:null,_isManual:true};
+    return {id:i.id,invoiceNum:i.number,invoiceStatus:normStatus,client:i.contactName||'',value:sub+vat,invoiceDate:i.date,invoiceDue:i.dueDate,paidAt:i.paidDate,reference:i.reference,payments:i.payments||[],num:'manual',co:i.co??null,_isManual:true};
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const invoicedJobs = [...jobInvItems,...manualInvItems].sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const _invSearch = searchInv.trim().toLowerCase();
@@ -5511,6 +5557,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         supplierId: sid==='none'?null:parseInt(sid),
         jobNum: jobNum,
         quoteNum: q.num,
+        co: q.co, // tag with the source quote's company so it stays on that company's PO list
         date: today,
         status: 'draft',
         items,
@@ -6082,7 +6129,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       {/* ── New Quote modal ── */}
       {showCreate&&<CreateQuoteModal
         onClose={()=>setShowCreate(false)} onSave={handleSave}
-        inventory={inventory} setInventory={setInventory} companies={nonUtech}
+        inventory={inventory} setInventory={setInventory} companies={creatableCompanies(companies,user)}
         nextNum={getNextQuoteNum(quotes)} preparedBy={user.name}
         customers={customers||[]} setCustomers={setCustomers}
         savedCalcs={savedCalcs||[]}
@@ -6092,7 +6139,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       {/* ── Edit Quote modal ── */}
       {editQuote&&<CreateQuoteModal
         onClose={()=>setEditQuote(null)} onSave={handleSave}
-        inventory={inventory} setInventory={setInventory} companies={nonUtech}
+        inventory={inventory} setInventory={setInventory} companies={creatableCompanies(companies,user)}
         nextNum={editQuote.num} preparedBy={user.name}
         customers={customers||[]} setCustomers={setCustomers}
         savedCalcs={savedCalcs||[]}
@@ -6103,7 +6150,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       {/* ── Copy Quote modal (new quote pre-filled from source) ── */}
       {copyQuote&&<CreateQuoteModal
         onClose={()=>setCopyQuote(null)} onSave={q=>{ handleSave(q); setCopyQuote(null); }}
-        inventory={inventory} setInventory={setInventory} companies={nonUtech}
+        inventory={inventory} setInventory={setInventory} companies={creatableCompanies(companies,user)}
         nextNum={getNextQuoteNum(quotes)} preparedBy={user.name}
         customers={customers||[]} setCustomers={setCustomers}
         savedCalcs={savedCalcs||[]}
@@ -8694,21 +8741,39 @@ const NAV_ALL=[
 function Sidebar({ companies, page, setPage, open, setOpen, user, entityFilter, onEntitySelect, logoDataUrl, setLogoDataUrl }) {
   const nav = NAV_ALL.filter(n=>n.roles.includes(user.role));
   const isAssistant = user.role === 'assistant';
+  const isHolding = isHoldingsUser(user);
   const [hoveredNav, setHoveredNav] = useState(null);
+  function handleBrandLogoUpload(e) {
+    const file = e.target.files[0]; if(!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => setLogoDataUrl(ev.target.result);
+    reader.readAsDataURL(file);
+    e.target.value = '';
+  }
   return (
     <>
       {open&&<div className="fixed inset-0 bg-black/50 z-30 lg:hidden" onClick={()=>setOpen(false)}/>}
       <aside className={`fixed top-0 left-0 h-full w-64 z-40 flex flex-col transition-transform duration-300 ${open?'translate-x-0':'-translate-x-full'} lg:static lg:translate-x-0 lg:z-auto lg:flex-shrink-0`} style={{background:'#06065c'}}>
         <div className="flex items-center gap-3 px-4 py-4 border-b border-white/10">
           {logoDataUrl
-            ? <img src={logoDataUrl} alt="Signacore" className="h-10 w-10 object-contain rounded-lg flex-shrink-0"/>
-            : <div className="w-9 h-9 bg-brand-500 rounded-xl flex items-center justify-center flex-shrink-0"><span className="text-white font-black text-lg">S</span></div>
+            ? <img src={logoDataUrl} alt={isHolding?'Signacore Holdings':'Signacore'} className="h-10 w-10 object-contain rounded-lg flex-shrink-0"/>
+            : <div className="w-9 h-9 bg-brand-500 rounded-xl flex items-center justify-center flex-shrink-0"><span className="text-white font-black text-lg">{isHolding?'H':'S'}</span></div>
           }
-          <div className="flex-1 min-w-0"><p className="text-white font-black text-sm tracking-wide" style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'1rem',letterSpacing:'0.08em'}}>SNSG Holdings</p><p className="text-blue-300 text-xs opacity-70">Business Platform</p></div>
+          <div className="flex-1 min-w-0"><p className="text-white font-black text-sm tracking-wide" style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'1rem',letterSpacing:'0.08em'}}>{isHolding?'Signacore Holdings':'SNSG Holdings'}</p><p className="text-blue-300 text-xs opacity-70">{isHolding?'Signarama George (Pty) Ltd':'Business Platform'}</p></div>
           <button onClick={()=>setOpen(false)} className="lg:hidden text-gray-500 hover:text-white">
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg>
           </button>
         </div>
+        {/* Holdings Admin-only: upload the dedicated Holdings company logo.
+            Writes to the Holdings-only logo slot (setLogoDataUrl here is
+            already the company-aware setter passed down from App()) — never
+            touches the original company's logo. */}
+        {isHolding && user.role==='admin' && (
+          <label className="flex items-center gap-2 px-4 py-2 border-b border-white/10 text-xs text-blue-200 hover:text-white cursor-pointer">
+            <span>🖼️ {logoDataUrl?'Change':'Upload'} Holdings logo</span>
+            <input type="file" accept="image/*" className="hidden" onChange={handleBrandLogoUpload}/>
+          </label>
+        )}
         <nav className="flex-1 overflow-y-auto p-3 space-y-0.5">
           {nav.map(n=>(
             <div key={n.id} className="flex items-center gap-0.5"
@@ -8827,8 +8892,13 @@ function StatusDonut({ jobs }) {
 function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, accInvoices }) {
   const isAdmin = true; // All roles see full dashboard
   // UNIONTECH_ID is now a no-op sentinel — Signacore Holdings shows normally.
+  // Company-context filter: Holdings users see only Holdings-tagged (co:1)
+  // records; original-company users see everything else (dashboards are a
+  // company-specific view — see belongsToUserCompany()).
   const visibleCompanies = companies.filter(c=>c.id!==UNIONTECH_ID);
-  const visibleJobs      = jobs.filter(j=>j.co!==UNIONTECH_ID);
+  const visibleJobs      = jobs.filter(j=>j.co!==UNIONTECH_ID && belongsToUserCompany(j,user));
+  const visibleQuotes    = (quotes||[]).filter(q=>belongsToUserCompany(q,user));
+  const visibleAccInvoices = (accInvoices||[]).filter(i=>belongsToUserCompany(i,user));
   // ── Current-month scope ── Dashboard financial figures reflect only this month.
   const _now = new Date();
   const _curMonthLabel = _now.toLocaleString('default',{month:'long',year:'numeric'});
@@ -8843,7 +8913,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   const totalJobs=visibleJobs.length;
   const quoteJobs=visibleJobs.filter(j=>['lead','brief','design','quote_sent','quote_approved'].includes(j.status)).length;
   // ── Percentage Converted ── share of this-month quotes that were accepted (converted to jobs)
-  const monthQuotes    = (quotes||[]).filter(q=>inCurrentMonth(q.date));
+  const monthQuotes    = visibleQuotes.filter(q=>inCurrentMonth(q.date));
   const monthConverted = monthQuotes.filter(q=>q.status==='converted');
   const convPct        = monthQuotes.length>0 ? Math.round(monthConverted.length/monthQuotes.length*100) : 0;
   const convColor      = convPct>=75 ? '#10b981' : convPct>=50 ? '#0000ff' : convPct>=25 ? '#f59e0b' : '#ED0101';
@@ -8895,11 +8965,11 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
             // Job invoices (j.value is already incl. VAT) + manual accounting invoices
             // dated in the current month, excluding any job already linked to a
             // manual invoice by reference.
-            const manualRefs = new Set((accInvoices||[]).map(i=>i.reference).filter(Boolean));
-            const jobInv = (jobs||[])
+            const manualRefs = new Set(visibleAccInvoices.map(i=>i.reference).filter(Boolean));
+            const jobInv = visibleJobs
               .filter(j=>([7,8,9].includes(j.stage)||j.invoiceNum) && !manualRefs.has(j.num) && inCurrentMonth(j.invoiceDate||j.id))
               .reduce((s,j)=>s+(parseFloat(j.value)||0),0);
-            const accInv = (accInvoices||[])
+            const accInv = visibleAccInvoices
               .filter(i=>inCurrentMonth(i.date))
               .reduce((s,i)=>{
                 const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
@@ -9569,9 +9639,11 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
 
   const isAdmin = user.role !== 'assistant';
   // UNIONTECH_ID is now a no-op sentinel — Signacore Holdings shows normally.
-  const visibleJobs     = jobs.filter(j=>j.co!==UNIONTECH_ID);
+  // Company-context filter: Holdings users see/create only Holdings (co:1)
+  // jobs; original-company users see/create everything else, unchanged.
+  const visibleJobs     = jobs.filter(j=>j.co!==UNIONTECH_ID && belongsToUserCompany(j,user));
   const filterCompanies = companies.filter(c=>c.id!==UNIONTECH_ID);
-  const addableCompanies = filterCompanies;
+  const addableCompanies = creatableCompanies(companies, user);
 
   // Split by tab first
   const tabJobs = useMemo(()=>visibleJobs.filter(j=>
@@ -11684,7 +11756,7 @@ function CreateCustomPOModal({ onClose, onSave, suppliers }) {
 /* ═══════════════════════════════════════════
    PURCHASE ORDERS PAGE
 ═══════════════════════════════════════════ */
-function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers }) {
+function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user }) {
   const [viewPO, setViewPO] = useState(null);
   const [filter, setFilter] = useState('all');
   const [search, setSearch] = useState('');
@@ -11698,11 +11770,15 @@ function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers }) {
     declined: 'bg-red-100 text-red-700 border-red-200',
   };
 
+  // Company-context filter: purchase orders are company-specific — Holdings
+  // users see only Holdings (co:1) POs; original-company users see
+  // everything else (incl. existing POs with no `co`), unchanged.
+  const myPOs = (purchaseOrders||[]).filter(p=>belongsToUserCompany(p,user));
   const _poSearch = search.trim().toLowerCase();
   const _supName = id => (suppliers.find(s=>s.id===parseInt(id))||{}).name||'';
-  const filtered = (filter==='all' ? purchaseOrders : purchaseOrders.filter(p=>p.status===filter))
+  const filtered = (filter==='all' ? myPOs : myPOs.filter(p=>p.status===filter))
     .filter(p=>!_poSearch || [p.num,_supName(p.supplierId),p.jobNum].some(v=>(v||'').toString().toLowerCase().includes(_poSearch)));
-  const counts = statuses.reduce((a,s)=>({...a,[s]:s==='all'?purchaseOrders.length:purchaseOrders.filter(p=>p.status===s).length}),{});
+  const counts = statuses.reduce((a,s)=>({...a,[s]:s==='all'?myPOs.length:myPOs.filter(p=>p.status===s).length}),{});
   const fmt = n=>'R '+Number(n||0).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,',');
 
   function updatePO(updated) {
@@ -11711,9 +11787,10 @@ function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers }) {
   }
 
   function handleCreateCustomPO(po) {
+    const coTag = isHoldingsUser(user) ? HOLDINGS_CO_ID : (po.co ?? null);
     setPurchaseOrders(prev=>{
       const num = getNextPONum(prev);
-      return [{...po, num}, ...prev];
+      return [{...po, co:coTag, num}, ...prev];
     });
   }
 
@@ -14094,7 +14171,22 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 /* ═══════════════════════════════════════════
    ACCOUNTING PAGE
 ═══════════════════════════════════════════ */
-function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices, setAccInvoices, accBills, setAccBills, creditNotes, setCreditNotes, suppliers, customers, companies, logoDataUrl, user }) {
+function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices:accInvoicesAll, setAccInvoices, accBills:accBillsAll, setAccBills, creditNotes:creditNotesAll, setCreditNotes, suppliers, customers, companies, logoDataUrl, user }) {
+  // Company-context filter for DISPLAY, applied by shadowing the prop names
+  // — every plain read of jobs/bankTxns/accInvoices/accBills/creditNotes
+  // below this line is already company-scoped throughout this component.
+  // Holdings users see only Holdings (co:1) records; original-company users
+  // see everything else (incl. existing records with no `co`), unchanged.
+  // The setters (setAccInvoices etc) and the *All variables still refer to
+  // the FULL, unfiltered arrays, so: (1) autosave always persists every
+  // company's records untouched, and (2) numbering functions/duplicate-
+  // number checks below deliberately read the *All arrays so document
+  // numbers stay globally unique across both companies.
+  const jobs        = (jobsAll||[]).filter(j=>belongsToUserCompany(j,user));
+  const bankTxns     = (bankTxnsAll||[]).filter(t=>belongsToUserCompany(t,user));
+  const accInvoices = (accInvoicesAll||[]).filter(i=>belongsToUserCompany(i,user));
+  const accBills     = (accBillsAll||[]).filter(b=>belongsToUserCompany(b,user));
+  const creditNotes = (creditNotesAll||[]).filter(c=>belongsToUserCompany(c,user));
   const [accTab, setAccTab] = useState('dashboard');
   const [showImport, setShowImport] = useState(false);
   const [showAddAccount, setShowAddAccount] = useState(false);
@@ -14160,6 +14252,7 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
         vatCode: '',
         reconciled: false,
         ref: '',
+        co: isHoldingsUser(user) ? HOLDINGS_CO_ID : null, // tag by the importing user's company context
       };
     }).filter(t=>t.debit>0||t.credit>0);
   }
@@ -14374,29 +14467,36 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
   const isAdmin = user?.role !== 'assistant';
 
   function nextInvNum() {
-    // Use same INV-XXXXX format as job invoices, pulling max from both sources
-    const accNums = accInvoices.map(i=>parseInt((i.number||'').replace(/\D/g,''))||0);
-    const jobNums = (jobs||[]).map(j=>parseInt((j.invoiceNum||'').replace(/\D/g,''))||0);
+    // Use same INV-XXXXX format as job invoices, pulling max from both sources.
+    // Reads the FULL (unfiltered) arrays so Holdings and original-company
+    // invoice numbers can never collide — see AccountingPage top comment.
+    const accNums = (accInvoicesAll||[]).map(i=>parseInt((i.number||'').replace(/\D/g,''))||0);
+    const jobNums = (jobsAll||[]).map(j=>parseInt((j.invoiceNum||'').replace(/\D/g,''))||0);
     const allNums = [...accNums, ...jobNums];
     return 'INV-' + String((Math.max(0,...allNums)+1)).padStart(5,'0');
   }
   function nextBillNum() {
-    const nums = accBills.map(b=>parseInt((b.number||'').replace(/\D/g,''))||0);
+    const nums = (accBillsAll||[]).map(b=>parseInt((b.number||'').replace(/\D/g,''))||0);
     return 'SNS-BILL-' + String((Math.max(0,...nums)+1)).padStart(4,'0');
   }
 
   function saveInvoice(inv) {
     // Duplicate invoice number check — number must not exist on any OTHER invoice
-    const duplicate = accInvoices.find(i=>i.id!==inv.id && i.number && i.number.trim().toLowerCase()===(inv.number||'').trim().toLowerCase());
+    // (checked against the FULL array — a number must be globally unique).
+    const duplicate = (accInvoicesAll||[]).find(i=>i.id!==inv.id && i.number && i.number.trim().toLowerCase()===(inv.number||'').trim().toLowerCase());
     if(duplicate){
       alert('⚠ Invoice number "'+inv.number+'" is already used by another invoice. Please choose a unique number.');
       return;
     }
-    setAccInvoices(prev => prev.find(i=>i.id===inv.id) ? prev.map(i=>i.id===inv.id?inv:i) : [inv,...prev]);
+    // Tag with the logged-in user's company on create; preserve the existing
+    // company tag on edit (never re-tag an existing record).
+    const tagged = { ...inv, co: inv.co !== undefined ? inv.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : null) };
+    setAccInvoices(prev => prev.find(i=>i.id===tagged.id) ? prev.map(i=>i.id===tagged.id?tagged:i) : [tagged,...prev]);
     setShowInvModal(false); setEditInv(null);
   }
   function saveBill(bill) {
-    setAccBills(prev => prev.find(b=>b.id===bill.id) ? prev.map(b=>b.id===bill.id?bill:b) : [bill,...prev]);
+    const tagged = { ...bill, co: bill.co !== undefined ? bill.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : null) };
+    setAccBills(prev => prev.find(b=>b.id===tagged.id) ? prev.map(b=>b.id===tagged.id?tagged:b) : [tagged,...prev]);
     setShowBillModal(false); setEditBill(null);
   }
   function deleteInvoice(id){ if(window.confirm('Delete this invoice?')) setAccInvoices(prev=>prev.filter(i=>i.id!==id)); }
@@ -14416,11 +14516,13 @@ function AccountingPage({ jobs, quotes, bankTxns, setBankTxns, chartOfAccounts, 
   const [showCnModal, setShowCnModal] = useState(false);
   const [editCn,      setEditCn]      = useState(null);
   function nextCnNum(){
-    const nums = cnotes.map(c=>parseInt((c.number||'').replace(/\D/g,''))||0);
+    // Reads the FULL (unfiltered) array so numbers stay globally unique.
+    const nums = (creditNotesAll||[]).map(c=>parseInt((c.number||'').replace(/\D/g,''))||0);
     return 'CN-' + String((Math.max(0,...nums)+1)).padStart(4,'0');
   }
   function saveCreditNote(cn){
-    setCreditNotes(prev => prev.find(c=>c.id===cn.id) ? prev.map(c=>c.id===cn.id?cn:c) : [cn,...prev]);
+    const tagged = { ...cn, co: cn.co !== undefined ? cn.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : null) };
+    setCreditNotes(prev => prev.find(c=>c.id===tagged.id) ? prev.map(c=>c.id===tagged.id?tagged:c) : [tagged,...prev]);
     setShowCnModal(false); setEditCn(null);
   }
   function deleteCreditNote(id){
@@ -16286,8 +16388,11 @@ function ReportsPage({ jobs, companies, user, logoDataUrl }) {
   // Invoice hover-preview (Payments tab) — {job, x, y} while hovering a blue invoice no.
   const [hoverInv, setHoverInv] = useState(null);
   // UNIONTECH_ID is now a no-op sentinel — Signacore Holdings shows normally.
-  const visibleCompanies = companies.filter(c=>c.id!==UNIONTECH_ID);
-  const visibleJobs      = jobs.filter(j=>j.co!==UNIONTECH_ID);
+  // Company-context filter: reports are company-specific — Holdings users
+  // see only Holdings (co:1) jobs/companies; original-company users see
+  // everything else, unchanged.
+  const visibleCompanies = creatableCompanies(companies, user);
+  const visibleJobs      = jobs.filter(j=>j.co!==UNIONTECH_ID && belongsToUserCompany(j,user));
 
   const [reportTab, setReportTab] = useState('overview'); // 'overview' | 'payments'
   const [active,setActive]=useState(0);
@@ -16640,6 +16745,13 @@ function App() {
   const [savedImports,   setSavedImports]   = useState(_saved ? (_saved.savedImports||[])    : INITIAL_SAVED_IMPORTS);
   const [logoDataUrl,    setLogoDataUrl]    = useState(_saved ? (_saved.logo||INITIAL_LOGO)   : INITIAL_LOGO);
   const [utLogoDataUrl,  setUtLogoDataUrl]  = useState(_saved ? (_saved.utLogo||null)         : null);
+  // Signacore Holdings company logo — separate from the original company's
+  // `logoDataUrl` above. Used ONLY for Holdings users' header/sidebar and
+  // Holdings-branded documents (see brandingLogo/brandingLogoSetter below).
+  // Upload it via the sidebar while logged in as Holdings Admin. Until
+  // uploaded, Holdings users see a generic placeholder (never the original
+  // company's logo — see the company-aware resolver near the bottom of App()).
+  const [holdingsLogoDataUrl, setHoldingsLogoDataUrl] = useState(_saved ? (_saved.holdingsLogo||null) : null);
   const [sigOTSmit,      setSigOTSmit]      = useState(_saved ? (_saved.sigOTSmit||null)    : null);
   const [bankTxns,         setBankTxns]         = useState(_saved ? (_saved.bankTxns||[])           : []);
   const [chartOfAccounts,  setChartOfAccounts]  = useState(_saved ? (_saved.chartOfAccounts&&_saved.chartOfAccounts.length>5?_saved.chartOfAccounts:INITIAL_ACCOUNTS) : INITIAL_ACCOUNTS);
@@ -16737,6 +16849,7 @@ function App() {
     if (Array.isArray(dbData.creditNotes))      setCreditNotes(dbData.creditNotes);
     if (typeof dbData.logo === 'string')        setLogoDataUrl(dbData.logo);
     if (typeof dbData.utLogo === 'string')      setUtLogoDataUrl(dbData.utLogo);
+    if (typeof dbData.holdingsLogo === 'string') setHoldingsLogoDataUrl(dbData.holdingsLogo);
     if (dbData.sigOTSmit)                       setSigOTSmit(dbData.sigOTSmit);
     if (dbData.savedAt)                         setLastSaved(dbData.savedAt);
   }
@@ -16750,6 +16863,7 @@ function App() {
     }
     if (local.logo      !== baseline.logo)                                           changed.logo      = true;
     if (JSON.stringify(local.utLogo)    !== JSON.stringify(baseline.utLogo))         changed.utLogo    = true;
+    if (JSON.stringify(local.holdingsLogo) !== JSON.stringify(baseline.holdingsLogo)) changed.holdingsLogo = true;
     if (JSON.stringify(local.sigOTSmit) !== JSON.stringify(baseline.sigOTSmit))      changed.sigOTSmit = true;
     return changed;
   }
@@ -16817,14 +16931,15 @@ function App() {
         // Overlay only the sections we changed; untouched sections keep the fresh
         // server values (which now include other users' concurrent work).
         for (const k of STATE_SECTIONS) { if (changed[k]) payload[k] = snapshot[k]; }
-        if (changed.logo)      payload.logo      = snapshot.logo;
-        if (changed.utLogo)    payload.utLogo    = snapshot.utLogo;
-        if (changed.sigOTSmit) payload.sigOTSmit = snapshot.sigOTSmit;
+        if (changed.logo)         payload.logo         = snapshot.logo;
+        if (changed.utLogo)       payload.utLogo       = snapshot.utLogo;
+        if (changed.holdingsLogo) payload.holdingsLogo = snapshot.holdingsLogo;
+        if (changed.sigOTSmit)    payload.sigOTSmit    = snapshot.sigOTSmit;
       } else {
         // No baseline to diff against (first save this session) — push our full
         // snapshot sections.
         for (const k of STATE_SECTIONS) { if (snapshot[k] !== undefined) payload[k] = snapshot[k]; }
-        payload.logo = snapshot.logo; payload.utLogo = snapshot.utLogo; payload.sigOTSmit = snapshot.sigOTSmit;
+        payload.logo = snapshot.logo; payload.utLogo = snapshot.utLogo; payload.holdingsLogo = snapshot.holdingsLogo; payload.sigOTSmit = snapshot.sigOTSmit;
       }
       // ALWAYS union-merge creditNotes — regardless of whether THIS save's own
       // local snapshot differs from ITS OWN baseline for that section. Credit
@@ -16919,6 +17034,7 @@ function App() {
                 }
                 if (!changedLocally.logo      && typeof dbData.logo === 'string')  selective.logo      = dbData.logo;
                 if (!changedLocally.utLogo    && typeof dbData.utLogo === 'string') selective.utLogo    = dbData.utLogo;
+                if (!changedLocally.holdingsLogo && typeof dbData.holdingsLogo === 'string') selective.holdingsLogo = dbData.holdingsLogo;
                 if (!changedLocally.sigOTSmit && dbData.sigOTSmit)                  selective.sigOTSmit = dbData.sigOTSmit;
                 // Never let this selective apply drop a credit note the running
                 // session already knows about — union instead of a raw overwrite
@@ -16990,6 +17106,7 @@ function App() {
         for (const k of STATE_SECTIONS) { if (!changed[k] && Array.isArray(dbData[k])) selective[k] = dbData[k]; }
         if (!changed.logo      && typeof dbData.logo === 'string')   selective.logo      = dbData.logo;
         if (!changed.utLogo    && typeof dbData.utLogo === 'string')  selective.utLogo    = dbData.utLogo;
+        if (!changed.holdingsLogo && typeof dbData.holdingsLogo === 'string') selective.holdingsLogo = dbData.holdingsLogo;
         if (!changed.sigOTSmit && dbData.sigOTSmit)                   selective.sigOTSmit = dbData.sigOTSmit;
         // Credit notes are shared financial records any role can create at any
         // time — never let a routine poll silently drop one this client already
@@ -17011,7 +17128,7 @@ function App() {
   //    Merges locally-changed sections onto the server baseline before writing,
   //    so two users editing different sections never overwrite each other.
   useEffect(()=>{
-    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, logo:logoDataUrl, utLogo:utLogoDataUrl, sigOTSmit, savedAt:lastSaved};
+    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, logo:logoDataUrl, utLogo:utLogoDataUrl, holdingsLogo:holdingsLogoDataUrl, sigOTSmit, savedAt:lastSaved};
     currentSnapshotRef.current = snapshot; // keep ref current for poll effect
     // Backup to localStorage (safety net — DB is source of truth)
     try { localStorage.setItem('sgr_platform_data', JSON.stringify(snapshot)); } catch(e) {}
@@ -17085,25 +17202,35 @@ function App() {
   const assistantBlocked = []; // imports removed from nav; assets & hr open to all roles
   const safePage = (user.role==='assistant' && assistantBlocked.includes(page)) ? 'dashboard' : page;
 
+  // Company-aware branding resolver — used for the header, sidebar, and
+  // every document-generating page below. Holdings users (co:1) get the
+  // dedicated Holdings logo (or a blank placeholder until one is uploaded —
+  // NEVER the original company's logo); everyone else keeps the original
+  // logo exactly as before. The upload control (in Sidebar) is wired the
+  // same way, so uploading while logged in as Holdings Admin writes to the
+  // Holdings-only slot instead of overwriting the original company's logo.
+  const brandingLogo = isHoldingsUser(user) ? holdingsLogoDataUrl : logoDataUrl;
+  const brandingLogoSetter = isHoldingsUser(user) ? setHoldingsLogoDataUrl : setLogoDataUrl;
+
   const pageMap = {
-    dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} creditNotes={creditNotes} setCreditNotes={setCreditNotes}/>,
-    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} logoDataUrl={logoDataUrl} onOpenQuote={(q)=>{ setSalesOpen({type:'quote', id:q.id}); setPage('sales'); }} onOpenInvoice={(inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); }}/>,
+    dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={accInvoices}/>,
+    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} creditNotes={creditNotes} setCreditNotes={setCreditNotes}/>,
+    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} logoDataUrl={brandingLogo} onOpenQuote={(q)=>{ setSalesOpen({type:'quote', id:q.id}); setPage('sales'); }} onOpenInvoice={(inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); }}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
-    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={logoDataUrl} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects}/>,
+    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
-    purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>,
+    purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
-    inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={logoDataUrl} quickRates={quickRates} setQuickRates={setQuickRates}/>,
+    inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
-    reports:     <ReportsPage     jobs={jobs} companies={companies} user={user} logoDataUrl={logoDataUrl}/>,
-    accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={logoDataUrl} user={user}/>,
-    hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={logoDataUrl} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
+    reports:     <ReportsPage     jobs={jobs} companies={companies} user={user} logoDataUrl={brandingLogo}/>,
+    accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user}/>,
+    hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={brandingLogo} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
   };
 
   return (
     <div className="flex h-screen overflow-hidden">
-      <Sidebar companies={companies} page={safePage} setPage={setPage} open={sidebarOpen} setOpen={setSidebarOpen} user={user} entityFilter={entityFilter} onEntitySelect={handleEntitySelect} logoDataUrl={logoDataUrl} setLogoDataUrl={setLogoDataUrl}/>
+      <Sidebar companies={companies} page={safePage} setPage={setPage} open={sidebarOpen} setOpen={setSidebarOpen} user={user} entityFilter={entityFilter} onEntitySelect={handleEntitySelect} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter}/>
       {apiMsg && (
         <div style={{
           position:'fixed', top:'14px', right:'14px', zIndex:1000,
@@ -17114,7 +17241,7 @@ function App() {
         }}>{apiMsg}</div>
       )}
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
-        <Header page={safePage} onMenu={()=>setSidebarOpen(true)} onLogout={handleLogout} user={user} onSave={saveFile} saveMsg={saveMsg} onShare={()=>setShowShare(true)} lastSaved={lastSaved} logoDataUrl={logoDataUrl}/>
+        <Header page={safePage} onMenu={()=>setSidebarOpen(true)} onLogout={handleLogout} user={user} onSave={saveFile} saveMsg={saveMsg} onShare={()=>setShowShare(true)} lastSaved={lastSaved} logoDataUrl={brandingLogo}/>
         {showShare&&<ShareGuideModal onClose={()=>setShowShare(false)} lastSaved={lastSaved}/>}
         <main className="flex-1 overflow-y-auto bg-gray-50 relative">
           {safePage!=='dashboard'&&(
