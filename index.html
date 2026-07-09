@@ -2018,10 +2018,10 @@ function printJobCard(job, companies) {
 '.stages .dot.done{background:#0000ff;color:#fff;border-color:#0000ff}'+
 '.stages .dot.cur{background:#eff6ff;color:#0000ff;border:2px solid #0000ff}'+
 '.stages .dot.pend{background:#f8f9fa;color:#333}'+
-'.sign{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:16px}'+
-'.sign-box{border-top:2px solid #111;padding-top:6px}'+
+'.sign{display:grid;grid-template-columns:1fr 1fr;gap:22px 26px;margin-top:20px}'+
+'.sign-box{border-top:2px solid #111;padding-top:8px}'+
 '.sign-box .lbl{font-size:9px;color:#333;font-weight:700;text-transform:uppercase;letter-spacing:1px}'+
-'.sign-box .line{height:32px}'+
+'.sign-box .line{height:58px}'+
 '.notes-box{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 13px;margin-bottom:14px}'+
 '.notes-box .lbl{font-size:9px;font-weight:700;color:#1e40af;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}'+
 '.notes-box p{font-size:10px;color:#555}'+
@@ -2034,14 +2034,10 @@ function printJobCard(job, companies) {
 '<div class="hdr-l">'+
 '<div class="badge">Job Card</div>'+
 '<h1>'+job.client+'</h1>'+
-'<div class="sub">'+job.desc+'</div>'+
 '</div>'+
 '<div class="hdr-r">'+
-'<div class="num">'+job.num+'</div>'+
 '<table><tbody>'+
-'<tr><td>Entity:</td><td><strong>'+co.name+'</strong></td></tr>'+
-'<tr><td>Status:</td><td>'+currentStage+'</td></tr>'+
-(job.quoteNum?'<tr><td>Quote Ref:</td><td>'+job.quoteNum+'</td></tr>':'')+
+'<tr><td>Reference:</td><td><strong>'+(job.reference||job.quoteNum||'—')+'</strong></td></tr>'+
 '</tbody></table>'+
 '</div>'+
 '</div>'+
@@ -2073,8 +2069,9 @@ stageNames.map(function(s,i){
 
 '<div class="sign">'+
 '<div class="sign-box"><div class="lbl">Prepared by</div><div class="line"></div></div>'+
-'<div class="sign-box"><div class="lbl">Production sign-off</div><div class="line"></div></div>'+
-'<div class="sign-box"><div class="lbl">Date completed</div><div class="line"></div></div>'+
+'<div class="sign-box"><div class="lbl">Production Sign-off</div><div class="line"></div></div>'+
+'<div class="sign-box"><div class="lbl">Operations Manager</div><div class="line"></div></div>'+
+'<div class="sign-box"><div class="lbl">Date Completed</div><div class="line"></div></div>'+
 '</div>'+
 
 '<div class="foot">'+
