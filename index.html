@@ -8845,14 +8845,26 @@ function Header({ page, onMenu, onLogout, user, onSave, saveMsg, lastSaved, logo
 function RevenueChart({ jobs=[], accInvoices=[] }) {
   const ref=useRef(null);
   useEffect(()=>{
-    // Build last-3-months buckets from actual invoiced data.
+    // Build 6-month buckets from actual invoiced data.
     // Revenue definition matches the "Monthly Revenue" KPI: job invoices (stage
     // 7/8/9 or with an invoice number, value incl. VAT) plus manual accounting
     // invoices, so the monthly bars reconcile with the headline figure.
+    // Window: anchored to start May 2026 and run 6 months forward (May–Oct
+    // 2026), so it always includes May even before the business has traded
+    // through it. Once "today" passes the anchor window (i.e. after Oct
+    // 2026), it becomes a normal trailing-6-months-ending-today window, so
+    // the chart keeps rolling forward month by month from then on.
     const now=new Date();
+    const ANCHOR_MONTHS=6;
+    const anchorStart=new Date(2026,4,1); // May 2026
+    const anchorEnd=new Date(anchorStart.getFullYear(),anchorStart.getMonth()+ANCHOR_MONTHS-1,1); // Oct 2026
+    const nowMonthStart=new Date(now.getFullYear(),now.getMonth(),1);
+    const firstMonth = nowMonthStart<=anchorEnd
+      ? anchorStart
+      : new Date(now.getFullYear(),now.getMonth()-(ANCHOR_MONTHS-1),1);
     const months=[];
-    for(let i=2;i>=0;i--){
-      const d=new Date(now.getFullYear(),now.getMonth()-i,1);
+    for(let i=0;i<ANCHOR_MONTHS;i++){
+      const d=new Date(firstMonth.getFullYear(),firstMonth.getMonth()+i,1);
       months.push({m:d.toLocaleString('default',{month:'short'}),year:d.getFullYear(),month:d.getMonth(),rev:0,cost:0});
     }
     const manualRefs=new Set((accInvoices||[]).map(i=>i.reference).filter(Boolean));
@@ -8900,7 +8912,7 @@ function MonthlyConversionStrip({ data }) {
     <div className="bg-white rounded-2xl border border-gray-200 p-4 flex flex-col" style={{minHeight:'140px'}}>
       <div className="flex items-center justify-between mb-3 flex-wrap gap-1">
         <h3 className="text-sm font-bold" style={{color:'#06065c'}}>📅 Percentage Converted — Every Month Since the Start</h3>
-        <span className="text-xs text-gray-400">{data.length} month{data.length!==1?'s':''} tracked</span>
+        <span className="text-xs text-gray-400">{data[0]&&`${data[0].label} '${String(data[0].year).slice(2)} – ${data[data.length-1].label} '${String(data[data.length-1].year).slice(2)}`}</span>
       </div>
       <div className="flex gap-2 flex-1 items-end">
         {data.map(m=>{
@@ -8939,16 +8951,18 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   const _now = new Date();
   const _curMonthLabel = _now.toLocaleString('default',{month:'long',year:'numeric'});
   const inCurrentMonth = d => { if(!d) return false; const dt=new Date(d); return !isNaN(dt) && dt.getFullYear()===_now.getFullYear() && dt.getMonth()===_now.getMonth(); };
-  // ── Monthly Conversion History ── % of quotes converted, for every month since the first quote.
-  // Grows by one unit every time a new month starts — never resets, always comparable month-on-month.
+  // ── Monthly Conversion History ── % of quotes converted, per month.
+  // Rolling 12-pill window: always the current month plus the next 11 months
+  // forward. Months that haven't happened yet naturally have no quotes, so
+  // they render as empty (0/0, pct=null) via the same logic as real months.
   const monthlyConversion = (()=>{
     const ymOf = d => { const dt=new Date(d); return isNaN(dt) ? null : dt.getFullYear()*12+dt.getMonth(); };
     const stamped = visibleQuotes.map(q=>({ q, ym: ymOf(q.date) })).filter(x=>x.ym!=null);
-    if (!stamped.length) return [];
     const nowYM   = _now.getFullYear()*12 + _now.getMonth();
-    const startYM = Math.min(...stamped.map(x=>x.ym));
+    const PILL_COUNT = 12;
     const out = [];
-    for (let ym=startYM; ym<=nowYM; ym++){
+    for (let i=0;i<PILL_COUNT;i++){
+      const ym = nowYM + i;
       const y=Math.floor(ym/12), m=((ym%12)+12)%12;
       const mQuotes    = stamped.filter(x=>x.ym===ym).map(x=>x.q);
       const mConverted = mQuotes.filter(q=>q.status==='converted');
@@ -9066,7 +9080,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
       <div className={`grid gap-4 ${isAdmin?'grid-cols-1 lg:grid-cols-5':'grid-cols-1'}`}>
         {isAdmin&&(
           <div className="lg:col-span-3 bg-white rounded-2xl border border-gray-200 p-4">
-            <h3 className="text-sm font-bold mb-3" style={{color:'#06065c'}}>Total Revenue — Last 3 Months</h3>
+            <h3 className="text-sm font-bold mb-3" style={{color:'#06065c'}}>Total Revenue — Last 6 Months</h3>
             <div className="h-52"><RevenueChart jobs={visibleJobs} accInvoices={visibleAccInvoices}/></div>
           </div>
         )}
