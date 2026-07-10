@@ -8845,13 +8845,13 @@ function Header({ page, onMenu, onLogout, user, onSave, saveMsg, lastSaved, logo
 function RevenueChart({ jobs=[], accInvoices=[] }) {
   const ref=useRef(null);
   useEffect(()=>{
-    // Build last-6-months buckets from actual invoiced data.
+    // Build last-3-months buckets from actual invoiced data.
     // Revenue definition matches the "Monthly Revenue" KPI: job invoices (stage
     // 7/8/9 or with an invoice number, value incl. VAT) plus manual accounting
     // invoices, so the monthly bars reconcile with the headline figure.
     const now=new Date();
     const months=[];
-    for(let i=5;i>=0;i--){
+    for(let i=2;i>=0;i--){
       const d=new Date(now.getFullYear(),now.getMonth()-i,1);
       months.push({m:d.toLocaleString('default',{month:'short'}),year:d.getFullYear(),month:d.getMonth(),rev:0,cost:0});
     }
@@ -8895,21 +8895,19 @@ function StatusDonut({ jobs }) {
 }
 
 function MonthlyConversionStrip({ data }) {
-  const scrollRef = useRef(null);
-  useEffect(()=>{ if(scrollRef.current) scrollRef.current.scrollLeft = scrollRef.current.scrollWidth; }, [data.length]);
   if (!data.length) return null;
   return (
-    <div className="bg-white rounded-2xl border border-gray-200 p-4">
+    <div className="bg-white rounded-2xl border border-gray-200 p-4 flex flex-col" style={{minHeight:'140px'}}>
       <div className="flex items-center justify-between mb-3 flex-wrap gap-1">
         <h3 className="text-sm font-bold" style={{color:'#06065c'}}>📅 Percentage Converted — Every Month Since the Start</h3>
-        <span className="text-xs text-gray-400">{data.length} month{data.length!==1?'s':''} tracked · scroll for history →</span>
+        <span className="text-xs text-gray-400">{data.length} month{data.length!==1?'s':''} tracked</span>
       </div>
-      <div ref={scrollRef} className="flex gap-2 overflow-x-auto pb-1">
+      <div className="flex gap-2 flex-1 items-end">
         {data.map(m=>{
           const color = m.pct==null ? '#d1d5db' : m.pct>=75?'#10b981':m.pct>=50?'#0000ff':m.pct>=25?'#f59e0b':'#ED0101';
           return (
-            <div key={m.ym} className="flex-shrink-0 flex flex-col items-center justify-end rounded-xl p-2"
-              style={{width:'64px', border: m.isCurrent?`2px solid ${color}`:'1px solid #e5e7eb', background: m.isCurrent?`${color}14`:'#fafafa'}}>
+            <div key={m.ym} className="flex flex-col items-center justify-end rounded-xl p-2"
+              style={{flex:'1 1 0', minWidth:0, border: m.isCurrent?`2px solid ${color}`:'1px solid #e5e7eb', background: m.isCurrent?`${color}14`:'#fafafa'}}>
               <p className="text-[10px] font-black" style={{color}}>{m.pct==null?'—':m.pct+'%'}</p>
               <div className="w-full bg-gray-100 rounded-full overflow-hidden mt-1 flex flex-col justify-end" style={{height:'56px'}}>
                 <div className="w-full rounded-full transition-all" style={{height:(m.pct||0)+'%', background:color}}/>
@@ -9068,7 +9066,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
       <div className={`grid gap-4 ${isAdmin?'grid-cols-1 lg:grid-cols-5':'grid-cols-1'}`}>
         {isAdmin&&(
           <div className="lg:col-span-3 bg-white rounded-2xl border border-gray-200 p-4">
-            <h3 className="text-sm font-bold mb-3" style={{color:'#06065c'}}>Total Revenue — Last 6 Months</h3>
+            <h3 className="text-sm font-bold mb-3" style={{color:'#06065c'}}>Total Revenue — Last 3 Months</h3>
             <div className="h-52"><RevenueChart jobs={visibleJobs} accInvoices={visibleAccInvoices}/></div>
           </div>
         )}
