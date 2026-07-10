@@ -8952,17 +8952,23 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   const _curMonthLabel = _now.toLocaleString('default',{month:'long',year:'numeric'});
   const inCurrentMonth = d => { if(!d) return false; const dt=new Date(d); return !isNaN(dt) && dt.getFullYear()===_now.getFullYear() && dt.getMonth()===_now.getMonth(); };
   // ── Monthly Conversion History ── % of quotes converted, per month.
-  // Rolling 12-pill window: always the current month plus the next 11 months
-  // forward. Months that haven't happened yet naturally have no quotes, so
-  // they render as empty (0/0, pct=null) via the same logic as real months.
+  // 12-pill window anchored to start May 2026 (so May/Jun real history stays
+  // visible), running through Apr 2027. Months that haven't happened yet
+  // naturally have no quotes, so they render as empty (0/0, pct=null) via
+  // the same logic as real months. Once "today" passes the anchor window
+  // (after Apr 2027), it becomes a normal trailing-12-months-ending-today
+  // window, so the strip keeps rolling forward from then on.
   const monthlyConversion = (()=>{
     const ymOf = d => { const dt=new Date(d); return isNaN(dt) ? null : dt.getFullYear()*12+dt.getMonth(); };
     const stamped = visibleQuotes.map(q=>({ q, ym: ymOf(q.date) })).filter(x=>x.ym!=null);
     const nowYM   = _now.getFullYear()*12 + _now.getMonth();
     const PILL_COUNT = 12;
+    const anchorStartYM = 2026*12 + 4; // May 2026
+    const anchorEndYM   = anchorStartYM + PILL_COUNT - 1; // Apr 2027
+    const firstYM = nowYM<=anchorEndYM ? anchorStartYM : nowYM-(PILL_COUNT-1);
     const out = [];
     for (let i=0;i<PILL_COUNT;i++){
-      const ym = nowYM + i;
+      const ym = firstYM + i;
       const y=Math.floor(ym/12), m=((ym%12)+12)%12;
       const mQuotes    = stamped.filter(x=>x.ym===ym).map(x=>x.q);
       const mConverted = mQuotes.filter(q=>q.status==='converted');
