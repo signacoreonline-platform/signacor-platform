@@ -3195,8 +3195,8 @@ function StageBar({ stage }) {
 
 function Modal({ onClose, children, wide, xl, screen }) {
   return (
-    <div className="fixed inset-0 bg-black/50 modal-backdrop z-50 flex items-center justify-center p-2 overflow-y-auto" onClick={onClose}>
-      <div className={`bg-white rounded-2xl shadow-2xl w-full my-4 ${screen?'max-w-[97vw]':xl?'max-w-6xl':wide?'max-w-3xl':'max-w-md'}`} onClick={e=>e.stopPropagation()}>
+    <div className={`fixed inset-0 bg-black/50 modal-backdrop z-50 flex items-center justify-center overflow-y-auto ${screen?'px-0 py-2':'p-2'}`} onClick={onClose}>
+      <div className={`bg-white rounded-2xl shadow-2xl w-full my-4 ${screen?'max-w-full':xl?'max-w-6xl':wide?'max-w-3xl':'max-w-md'}`} onClick={e=>e.stopPropagation()}>
         {children}
       </div>
     </div>
@@ -8894,6 +8894,36 @@ function StatusDonut({ jobs }) {
   return <canvas ref={ref}/>;
 }
 
+function MonthlyConversionStrip({ data }) {
+  const scrollRef = useRef(null);
+  useEffect(()=>{ if(scrollRef.current) scrollRef.current.scrollLeft = scrollRef.current.scrollWidth; }, [data.length]);
+  if (!data.length) return null;
+  return (
+    <div className="bg-white rounded-2xl border border-gray-200 p-4">
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-1">
+        <h3 className="text-sm font-bold" style={{color:'#06065c'}}>📅 Percentage Converted — Every Month Since the Start</h3>
+        <span className="text-xs text-gray-400">{data.length} month{data.length!==1?'s':''} tracked · scroll for history →</span>
+      </div>
+      <div ref={scrollRef} className="flex gap-2 overflow-x-auto pb-1">
+        {data.map(m=>{
+          const color = m.pct==null ? '#d1d5db' : m.pct>=75?'#10b981':m.pct>=50?'#0000ff':m.pct>=25?'#f59e0b':'#ED0101';
+          return (
+            <div key={m.ym} className="flex-shrink-0 flex flex-col items-center justify-end rounded-xl p-2"
+              style={{width:'64px', border: m.isCurrent?`2px solid ${color}`:'1px solid #e5e7eb', background: m.isCurrent?`${color}14`:'#fafafa'}}>
+              <p className="text-[10px] font-black" style={{color}}>{m.pct==null?'—':m.pct+'%'}</p>
+              <div className="w-full bg-gray-100 rounded-full overflow-hidden mt-1 flex flex-col justify-end" style={{height:'56px'}}>
+                <div className="w-full rounded-full transition-all" style={{height:(m.pct||0)+'%', background:color}}/>
+              </div>
+              <p className="text-[10px] font-bold text-gray-600 mt-1.5 whitespace-nowrap">{m.label} '{String(m.year).slice(2)}</p>
+              <p className="text-[9px] text-gray-400">{m.converted}/{m.total}</p>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /* ═══════════════════════════════════════════
    DASHBOARD
 ═══════════════════════════════════════════ */
@@ -8911,6 +8941,27 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   const _now = new Date();
   const _curMonthLabel = _now.toLocaleString('default',{month:'long',year:'numeric'});
   const inCurrentMonth = d => { if(!d) return false; const dt=new Date(d); return !isNaN(dt) && dt.getFullYear()===_now.getFullYear() && dt.getMonth()===_now.getMonth(); };
+  // ── Monthly Conversion History ── % of quotes converted, for every month since the first quote.
+  // Grows by one unit every time a new month starts — never resets, always comparable month-on-month.
+  const monthlyConversion = (()=>{
+    const ymOf = d => { const dt=new Date(d); return isNaN(dt) ? null : dt.getFullYear()*12+dt.getMonth(); };
+    const stamped = visibleQuotes.map(q=>({ q, ym: ymOf(q.date) })).filter(x=>x.ym!=null);
+    if (!stamped.length) return [];
+    const nowYM   = _now.getFullYear()*12 + _now.getMonth();
+    const startYM = Math.min(...stamped.map(x=>x.ym));
+    const out = [];
+    for (let ym=startYM; ym<=nowYM; ym++){
+      const y=Math.floor(ym/12), m=((ym%12)+12)%12;
+      const mQuotes    = stamped.filter(x=>x.ym===ym).map(x=>x.q);
+      const mConverted = mQuotes.filter(q=>q.status==='converted');
+      const pct = mQuotes.length>0 ? Math.round(mConverted.length/mQuotes.length*100) : null;
+      out.push({
+        ym, label: new Date(y,m,1).toLocaleString('default',{month:'short'}), year:y,
+        pct, total:mQuotes.length, converted:mConverted.length, isCurrent: ym===nowYM
+      });
+    }
+    return out;
+  })();
   const active=visibleJobs.filter(j=>!['completed','invoiced'].includes(j.status)).length;
   // Gross margin: invoiced jobs invoiced in the current month
   const invJobs=visibleJobs.filter(j=>j.status==='invoiced' && inCurrentMonth(j.invoiceDate||j.id));
@@ -8964,6 +9015,9 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
           </div>
         </div>
       </div>
+
+      {/* Monthly Conversion strip — sits directly below the hero banner */}
+      {isAdmin&&<MonthlyConversionStrip data={monthlyConversion}/>}
 
       {/* KPIs — admin sees financials; assistant sees job-only stats */}
       <div className={`grid gap-3 ${isAdmin?'grid-cols-2 lg:grid-cols-4':'grid-cols-2 lg:grid-cols-3'}`}>
