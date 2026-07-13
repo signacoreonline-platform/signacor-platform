@@ -16858,6 +16858,12 @@ function App() {
   const apiSaveTimerRef  = useRef(null);
   const serverBaselineRef = useRef(null);  // last full state received from server
   const currentSnapshotRef = useRef(null); // always-current local snapshot (avoids stale closures in poll)
+  // True only once THIS session's own initial GET directly confirmed the
+  // database is genuinely empty (a brand-new install). Used as the sole
+  // permission slip for ever pushing a full-state save with no merge base —
+  // see mergeAndSave() below. Guards against a transient/failed fetch being
+  // mistaken for "empty database" and silently wiping real data.
+  const dbConfirmedEmptyRef = useRef(false);
   const [apiMsg, setApiMsg] = useState('');
 
   // ── Auto-action system-controlled lifecycle stages ──────────────
@@ -16977,6 +16983,35 @@ function App() {
     return addedElsewhere.length ? [...local, ...addedElsewhere] : local;
   }
 
+  // Generic version of mergeCreditNotes() above, applied to EVERY array-type
+  // platform_state section (jobs, quotes, customers, suppliers, inventory,
+  // invoices, etc.) — not just credit notes.
+  //
+  // DATA-LOSS FIX (2026-07-13): a session/browser tab whose local copy of a
+  // section is older than the server (e.g. a tab left open over a weekend, or
+  // simply a slower session that last synced earlier in the day) previously
+  // had its entire array blindly written over the fresh server copy whenever
+  // `changed[k]` was true for that section — silently deleting every record
+  // another user/company had added to that SAME section in the meantime. That
+  // is the confirmed mechanism behind whole days of work disappearing after
+  // appearing to save successfully. Union-merging by id (this client's own
+  // edits/deletes still win for records it knows about) closes that hole for
+  // every section, the same way it was already closed for credit notes.
+  // Falls back to returning `local` unchanged if any record lacks a stable
+  // `id` — never worse than the previous behaviour.
+  function mergeSectionArray(local, remote, knownBefore) {
+    local = Array.isArray(local) ? local : [];
+    remote = Array.isArray(remote) ? remote : [];
+    knownBefore = Array.isArray(knownBefore) ? knownBefore : [];
+    const idsOk = local.every(x => x && x.id !== undefined && x.id !== null)
+               && remote.every(x => x && x.id !== undefined && x.id !== null);
+    if (!idsOk) return local;
+    const localIds = new Set(local.map(x => x.id));
+    const knownIds = new Set(knownBefore.map(x => x && x.id));
+    const addedElsewhere = remote.filter(x => x && !localIds.has(x.id) && !knownIds.has(x.id));
+    return addedElsewhere.length ? [...local, ...addedElsewhere] : local;
+  }
+
   // Merge-save with a FRESH server baseline.
   // Before writing, re-fetch the latest server state and overlay ONLY the sections
   // this user actually changed (relative to the state they last synced from). This
@@ -17016,15 +17051,28 @@ function App() {
       if (changed) {
         // Overlay only the sections we changed; untouched sections keep the fresh
         // server values (which now include other users' concurrent work).
-        for (const k of STATE_SECTIONS) { if (changed[k]) payload[k] = snapshot[k]; }
+        // Array sections are union-merged by id (mergeSectionArray) rather than
+        // blindly overwritten — this client's own snapshot can be built from an
+        // older server fetch and so can be missing records another user/company
+        // added to the SAME section since then. creditNotes is handled by its own
+        // dedicated merge below, so it's skipped here.
+        for (const k of STATE_SECTIONS) {
+          if (!changed[k] || k === 'creditNotes') continue;
+          payload[k] = mergeSectionArray(snapshot[k], mergeBase[k], ownBaseline ? ownBaseline[k] : null);
+        }
         if (changed.logo)         payload.logo         = snapshot.logo;
         if (changed.utLogo)       payload.utLogo       = snapshot.utLogo;
         if (changed.holdingsLogo) payload.holdingsLogo = snapshot.holdingsLogo;
         if (changed.sigOTSmit)    payload.sigOTSmit    = snapshot.sigOTSmit;
       } else {
-        // No baseline to diff against (first save this session) — push our full
-        // snapshot sections.
-        for (const k of STATE_SECTIONS) { if (snapshot[k] !== undefined) payload[k] = snapshot[k]; }
+        // No baseline to diff against (first save this session) — merge our full
+        // snapshot sections onto the fresh server data instead of overwriting it,
+        // in case the server already has records (from other users) this session
+        // never loaded.
+        for (const k of STATE_SECTIONS) {
+          if (snapshot[k] === undefined || k === 'creditNotes') continue;
+          payload[k] = mergeSectionArray(snapshot[k], mergeBase[k], null);
+        }
         payload.logo = snapshot.logo; payload.utLogo = snapshot.utLogo; payload.holdingsLogo = snapshot.holdingsLogo; payload.sigOTSmit = snapshot.sigOTSmit;
       }
       // ALWAYS union-merge creditNotes — regardless of whether THIS save's own
@@ -17049,6 +17097,17 @@ function App() {
       payload._autoSavedAt = new Date().toISOString();
       payload.savedAt      = snapshot.savedAt;
     } else {
+      // No merge baseline at all — this session has never successfully loaded
+      // server data (offline, or a GET returned nothing both at startup and just
+      // now). Only ever push the raw local snapshot as a full-state replacement
+      // when THIS session's own initial load directly confirmed the database is
+      // genuinely empty. Otherwise refuse: a full-state overwrite here could
+      // silently wipe real data with local defaults or a stale browser cache.
+      // A refused save surfaces as "Save failed — kept locally" and is retried
+      // automatically on the next edit or poll once connectivity/data returns.
+      if (!dbConfirmedEmptyRef.current) {
+        throw new Error('No trusted merge baseline — refusing full-state save to protect existing data.');
+      }
       payload = Object.assign({}, snapshot, { _autoSavedAt: new Date().toISOString() });
     }
     await saveToServer(payload);
@@ -17139,6 +17198,10 @@ function App() {
           serverBaselineRef.current = dbData;
           setApiMsg('Loaded from database');
         } else {
+          // This session's own GET directly confirmed the database has no data
+          // yet — the only circumstance in which mergeAndSave() is allowed to
+          // push a full-state save with no merge base (see dbConfirmedEmptyRef).
+          dbConfirmedEmptyRef.current = true;
           setApiMsg('Database empty — using defaults');
         }
         apiReadyRef.current = true;
