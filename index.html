@@ -8821,10 +8821,14 @@ function Sidebar({ companies, page, setPage, open, setOpen, user, entityFilter, 
 /* ═══════════════════════════════════════════
    HEADER
 ═══════════════════════════════════════════ */
-function Header({ page, onMenu, onLogout, user, onSave, saveMsg, lastSaved, logoDataUrl }) {
+function Header({ page, onMenu, onLogout, user, onSave, saveMsg, lastSaved, logoDataUrl, onExportBackup }) {
   const titles={dashboard:'Dashboard',jobs:'Jobs',calculators:'Calculators & Costing',inventory:'Inventory',imports:'Import Costing',reports:'Reports',sales:'Sales',quotes:'Sales',customers:'Customers',suppliers:'Suppliers',assets:'Assets',hr:'HR',purchase_orders:'Purchase Orders',accounting:'Accounting'};
   const today=new Date().toLocaleDateString('en-ZA',{weekday:'short',day:'numeric',month:'short',year:'numeric'});
   const isAssistant = user.role === 'assistant';
+  // Admin-only, both companies — Original Admin and Holdings Admin both have
+  // role==='admin' (co only distinguishes which company they belong to).
+  // Assistant, Holdings Assistant and Accounts all use a different role value.
+  const canExportBackup = user.role === 'admin';
   return (
     <header className="bg-white border-b px-4 py-2.5 flex items-center gap-3 flex-shrink-0" style={{borderBottomColor:'#e5e7eb',borderBottomWidth:'2px',borderImage:'linear-gradient(90deg,#06065c 0%,#0000ff 60%,transparent 100%) 1'}}>
       <button onClick={onMenu} className="lg:hidden p-2 rounded-xl hover:bg-gray-100" style={{color:'#06065c'}}>
@@ -8834,6 +8838,7 @@ function Header({ page, onMenu, onLogout, user, onSave, saveMsg, lastSaved, logo
       <h1 className="text-base font-bold flex-1" style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'1.1rem',letterSpacing:'0.05em',color:'#06065c',textTransform:'uppercase'}}>{titles[page]||page}</h1>
       <span className="text-xs text-gray-400 hidden sm:block">{today}</span>
       {isAssistant&&<span className="hidden sm:inline-flex items-center gap-1 text-xs rounded-lg px-2 py-1 font-semibold" style={{background:'#e6e6ff',border:'1px solid #9999ff',color:'#06065c'}}>👤 {user.title}</span>}
+      {canExportBackup&&<button onClick={onExportBackup} title="Downloads a full, unfiltered JSON backup of both companies' data" className="hidden sm:inline-flex items-center gap-1 text-xs text-gray-500 border border-gray-200 rounded-lg px-3 py-1.5 hover:bg-gray-50">⬇ Export Full Backup</button>}
       <button onClick={onLogout} className="text-xs text-gray-500 border border-gray-200 rounded-lg px-3 py-1.5 hover:bg-gray-50">Sign Out</button>
     </header>
   );
@@ -17362,6 +17367,103 @@ function App() {
     }
   }
 
+  // ── Admin-only: Export Full Platform Backup (JSON, download-only) ──────
+  // Built directly from this component's own top-level state — the same
+  // arrays every page's filtered views are derived FROM, never the other
+  // way around — so this is always the full, unfiltered, both-companies
+  // source of truth regardless of which page/company/role view is on
+  // screen right now. Read-only: never calls saveToServer/mergeAndSave,
+  // never touches platform_state, never mutates any state here.
+  function exportFullBackup() {
+    // Defense in depth: the button is already hidden for non-admins, but the
+    // function itself must also refuse, in case it's ever invoked another way.
+    if (!user || user.role !== 'admin') {
+      console.error('Export Full Backup blocked: current user is not an Admin.', user && user.role);
+      alert('Only Admin users can export a full platform backup.');
+      return;
+    }
+    try {
+      const now = new Date();
+      // signacore-platform-full-backup-YYYY-MM-DD-HHMMSS.json
+      const pad = (n) => String(n).padStart(2, '0');
+      const fileStamp = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+
+      // Full, unfiltered platform state — every section, both companies,
+      // exactly as stored/synced with the backend (see STATE_SECTIONS above).
+      const fullState = {
+        v: DATA_VERSION,
+        companies, jobs, inventory, quotes, customers, suppliers, assets,
+        employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders,
+        savedImports, bankTxns, chartOfAccounts, accInvoices, accBills,
+        completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes,
+        logo: logoDataUrl, utLogo: utLogoDataUrl, holdingsLogo: holdingsLogoDataUrl,
+        sigOTSmit, savedAt: lastSaved,
+      };
+
+      // Simple, best-effort counts — not a substitute for the full `data` export above.
+      const countByCo = (list) => {
+        const out = { co1: 0, co2: 0, unspecified: 0 };
+        (Array.isArray(list) ? list : []).forEach((r) => {
+          if (!r) return;
+          if (r.co === 1) out.co1++;
+          else if (r.co === 2) out.co2++;
+          else out.unspecified++;
+        });
+        return out;
+      };
+      const companyTaggedSections = [jobs, quotes, accInvoices, accBills, creditNotes, purchaseOrders, proposedProjects];
+      const byCompany = companyTaggedSections.reduce((acc, list) => {
+        const c = countByCo(list);
+        acc.co1 += c.co1; acc.co2 += c.co2; acc.unspecified += c.unspecified;
+        return acc;
+      }, { co1: 0, co2: 0, unspecified: 0 });
+
+      const sumPayments = (list) => (Array.isArray(list) ? list : [])
+        .reduce((s, r) => s + (Array.isArray(r && r.payments) ? r.payments.length : 0), 0);
+
+      const backup = {
+        backupMeta: {
+          type: 'manual-full-platform-export',
+          exportedAt: now.toISOString(),
+          exportedByRole: user.role + (isHoldingsUser(user) ? ' (Holdings)' : ' (Original)'),
+          includes: 'full-platform-state-both-companies',
+          version: 1,
+        },
+        recordCounts: {
+          jobs: (jobs||[]).length,
+          quotes: (quotes||[]).length,
+          invoices: (accInvoices||[]).length,
+          bills: (accBills||[]).length,
+          payments: sumPayments(jobs) + sumPayments(accInvoices) + sumPayments(accBills),
+          creditNotes: (creditNotes||[]).length,
+          customers: (customers||[]).length,
+          suppliers: (suppliers||[]).length,
+          inventory: (inventory||[]).length,
+          // Not tracked as separate platform_state sections in this version —
+          // included for forward-compatibility with the requested shape.
+          tasks: 0,
+          documents: 0,
+          reports: 0,
+          byCompany,
+        },
+        data: fullState,
+      };
+
+      const json = JSON.stringify(backup, null, 2);
+      const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href     = url;
+      a.download = `signacore-platform-full-backup-${fileStamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert('Full backup export failed: ' + e.message);
+    }
+  }
+
   if (!user) return <LoginPage onLogin={handleLogin}/>;
 
   const assistantBlocked = []; // imports removed from nav; assets & hr open to all roles
@@ -17404,7 +17506,7 @@ function App() {
         }}>{apiMsg}</div>
       )}
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
-        <Header page={safePage} onMenu={()=>setSidebarOpen(true)} onLogout={handleLogout} user={user} onSave={saveFile} saveMsg={saveMsg} onShare={()=>setShowShare(true)} lastSaved={lastSaved} logoDataUrl={brandingLogo}/>
+        <Header page={safePage} onMenu={()=>setSidebarOpen(true)} onLogout={handleLogout} user={user} onSave={saveFile} saveMsg={saveMsg} onShare={()=>setShowShare(true)} lastSaved={lastSaved} logoDataUrl={brandingLogo} onExportBackup={exportFullBackup}/>
         {showShare&&<ShareGuideModal onClose={()=>setShowShare(false)} lastSaved={lastSaved}/>}
         <main className="flex-1 overflow-y-auto bg-gray-50 relative">
           {safePage!=='dashboard'&&(
