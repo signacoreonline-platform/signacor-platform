@@ -16907,7 +16907,19 @@ function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ data: payload })
     });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) {
+      // The backend now rejects saves that look like an accidental wipe
+      // (empty/default/partial state, or a whole section/company vanishing)
+      // with a 409 and a plain-English `reason`. Surface that reason instead
+      // of a bare HTTP status so a blocked save is actually visible/useful —
+      // never silently treated the same as a normal success.
+      let detail = '';
+      try {
+        const errBody = await res.json();
+        detail = (errBody && (errBody.reason || errBody.error)) || '';
+      } catch (_) { /* response wasn't JSON — fall back to status below */ }
+      throw new Error(detail || ('HTTP ' + res.status));
+    }
   }
 
   // Save-ordering stamp used to compare two platform_state snapshots.
@@ -17216,7 +17228,7 @@ function App() {
             const saved = await enqueueMergeAndSave(snapshot);
             if (saved) setApiMsg('Saved ✓');
           } catch(e) {
-            setApiMsg('Save failed — kept locally');
+            setApiMsg(e && e.message ? ('Save failed — ' + e.message) : 'Save failed — kept locally');
           }
           setTimeout(() => setApiMsg(''), 2500);
         }, 300);
@@ -17293,7 +17305,11 @@ function App() {
         const saved = await enqueueMergeAndSave(snapshot);
         if (saved) setApiMsg('Saved ✓');
       } catch (e) {
-        setApiMsg('Save failed — kept locally');
+        // A blocked/failed save must never look like a successful one — the
+        // local in-browser copy (localStorage snapshot above) is still safe,
+        // but the backend did not accept this write, so make that visible
+        // instead of silently retrying invisibly.
+        setApiMsg(e && e.message ? ('Save failed — ' + e.message) : 'Save failed — kept locally');
       }
       setTimeout(() => setApiMsg(''), 2500);
     }, 800);
