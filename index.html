@@ -17382,6 +17382,16 @@ function App() {
       alert('Only Admin users can export a full platform backup.');
       return;
     }
+    // Guard: refuse to export until the initial GET from the backend has
+    // succeeded. Before that, App()'s state may still be a localStorage
+    // fallback or the INITIAL_* seed/demo constants rather than the real
+    // database — exporting it and calling it a "full platform backup" would
+    // be misleading. This never triggers a save/PUT and never changes data.
+    if (!apiReadyRef.current) {
+      console.warn('Export Full Backup blocked: apiReadyRef.current is false — live data has not finished loading from the server yet.');
+      alert('Backup export blocked. The platform has not finished loading live data from the server yet. Please wait until the platform is fully loaded and saved data is visible, then try again.');
+      return;
+    }
     try {
       const now = new Date();
       // signacore-platform-full-backup-YYYY-MM-DD-HHMMSS.json
