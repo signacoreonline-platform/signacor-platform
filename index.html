@@ -1945,6 +1945,144 @@ function getNextInvoiceNum(jobs) {
   return 'INV-'+String((nums.length>0?Math.max(...nums):0)+1).padStart(5,'0');
 }
 
+/* ═══════════════════════════════════════════
+   PARALLEL ACCOUNTING HELPERS
+   Single source of truth used by Dashboard, Sales and Accounting so all
+   three pages always show the same totals and the same list order, and
+   agree on where the quote → job → invoice → payment chain breaks.
+═══════════════════════════════════════════ */
+
+// Sort any list ascending by the numeric part of a field like "SQ-00007",
+// "SNS-00014" or "INV-00003" — lets Quotes / Jobs / Invoices lists be
+// scanned top-to-bottom for gaps or out-of-sequence records.
+function numSort(list, field) {
+  return [...(list||[])].sort((a,b)=>{
+    const na = parseInt(String((a&&a[field])||'').replace(/\D/g,''),10) || 0;
+    const nb = parseInt(String((b&&b[field])||'').replace(/\D/g,''),10) || 0;
+    if(na!==nb) return na-nb;
+    return String((a&&a[field])||'').localeCompare(String((b&&b[field])||''));
+  });
+}
+
+// Merge job-derived invoices + manual accInvoices into one clean, de-duped,
+// numerically-sorted list. Mirrors the merge logic already used inside
+// QuotesPage / AccountingPage so every page that calls this sees the exact
+// same invoice set (same records, same statuses, same order).
+function getAllInvoicesUnified(jobs, quotes, accInvoices) {
+  const jobInv = (jobs||[]).filter(j=>j.invoiceNum).map(j=>{
+    const rec = reconcileJobInvoice(j, quotes||[]);
+    return {
+      id:'job-'+j.id, number:j.invoiceNum, source:'job', jobNum:j.num, quoteNum:j.quoteNum||'',
+      client:j.client||'', date:j.invoiceDate||j.date||'', dueDate:j.invoiceDue||'',
+      amount:parseFloat(j.value)||0, status:rec.invoiceStatus||'pending', payments:rec.payments||[],
+    };
+  });
+  const jobRefs = new Set(jobInv.map(j=>j.jobNum).filter(Boolean));
+  const manualInv = (accInvoices||[]).filter(i=>i.status!=='void' && !jobRefs.has(i.reference)).map(i=>{
+    const sub=(i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+    const vat=(i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+    return {
+      id:i.id, number:i.number, source:'manual', jobNum:'', quoteNum:'',
+      client:i.contactName||'', date:i.date||'', dueDate:i.dueDate||'',
+      amount:sub+vat, status:i.status||'draft', payments:i.payments||[],
+    };
+  });
+  return numSort([...jobInv, ...manualInv], 'number');
+}
+
+// Flag every place where the quote → job → invoice → payment chain breaks.
+// Returns the same issues regardless of which page calls this, so
+// Dashboard / Sales / Accounting always agree on what's inconsistent.
+function getConsistencyIssues(quotes, jobs, accInvoices) {
+  const issues = [];
+  (quotes||[]).forEach(q=>{
+    if(q.status!=='approved') return; // 'converted' quotes already have a job by definition
+    const hasJob = (jobs||[]).some(j=>j.id===q.convertedJobId || (q.num && j.quoteNum===q.num));
+    if(!hasJob) issues.push({type:'quote_no_job', severity:'high', ref:q.num,
+      message:`Quote ${q.num||'—'} (${q.client||'—'}) is approved but has no job registered. Use "Convert to Job" on this quote.`});
+  });
+  (jobs||[]).forEach(j=>{
+    if(j.quoteNum && !(quotes||[]).some(q=>q.num===j.quoteNum)){
+      issues.push({type:'job_orphan_quote', severity:'medium', ref:j.num,
+        message:`Job ${j.num||'—'} (${j.client||'—'}) references quote ${j.quoteNum}, which no longer exists.`});
+    }
+    if(j.status==='completed' && !j.invoiceNum){
+      issues.push({type:'job_no_invoice', severity:'high', ref:j.num,
+        message:`Job ${j.num||'—'} (${j.client||'—'}) is completed but has not been invoiced yet.`});
+    }
+  });
+  getAllInvoicesUnified(jobs, quotes, accInvoices).forEach(inv=>{
+    if(inv.status==='paid' && (!inv.payments || inv.payments.length===0)){
+      issues.push({type:'invoice_no_payment_trail', severity:'medium', ref:inv.number,
+        message:`Invoice ${inv.number||'—'} (${inv.client||'—'}) is marked paid but has no payment recorded against it.`});
+    }
+  });
+  return issues;
+}
+
+// One set of totals shared by Dashboard, Sales and Accounting — computed
+// from the exact same quotes/jobs/accInvoices arrays so the "overall
+// picture" can never drift between the three pages.
+function getBusinessSummary(quotes, jobs, accInvoices) {
+  const invoices = getAllInvoicesUnified(jobs, quotes, accInvoices);
+  return {
+    totalQuotes: (quotes||[]).length,
+    approvedQuotes: (quotes||[]).filter(q=>q.status==='approved'||q.status==='converted').length,
+    totalJobs: (jobs||[]).length,
+    activeJobs: (jobs||[]).filter(j=>!DONE_STATUSES.includes(j.status)).length,
+    completedJobs: (jobs||[]).filter(j=>DONE_STATUSES.includes(j.status)).length,
+    totalInvoices: invoices.length,
+    paidInvoices: invoices.filter(i=>i.status==='paid').length,
+    outstandingValue: invoices.filter(i=>i.status!=='paid').reduce((s,i)=>s+(i.amount||0),0),
+    issues: getConsistencyIssues(quotes, jobs, accInvoices),
+  };
+}
+
+// Shared "parallel picture" panel — identical on Dashboard, Sales and
+// Accounting because it's driven entirely by getBusinessSummary() above.
+function ConsistencyPanel({ quotes, jobs, accInvoices }) {
+  const summary = useMemo(()=>getBusinessSummary(quotes, jobs, accInvoices), [quotes, jobs, accInvoices]);
+  const [open, setOpen] = useState(false);
+  const money = n => 'R ' + Number(Math.abs(n)||0).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const stat = (label, value, cls) => (
+    <div className="min-w-[100px]">
+      <div className="text-[10px] font-bold text-gray-400 uppercase tracking-wide">{label}</div>
+      <div className={`text-lg font-black ${cls||'text-gray-800'}`}>{value}</div>
+    </div>
+  );
+  return (
+    <div className="bg-white rounded-2xl border border-gray-200 p-4">
+      <div className="flex flex-wrap items-center gap-5">
+        {stat('Quotes', summary.totalQuotes)}
+        {stat('Approved', summary.approvedQuotes, 'text-green-600')}
+        {stat('Active Jobs', summary.activeJobs, 'text-blue-600')}
+        {stat('Completed Jobs', summary.completedJobs)}
+        {stat('Invoices', summary.totalInvoices)}
+        {stat('Paid', summary.paidInvoices, 'text-emerald-600')}
+        {stat('Outstanding', money(summary.outstandingValue), 'text-amber-600')}
+        <div className="flex-1 text-right">
+          {summary.issues.length>0 ? (
+            <button onClick={()=>setOpen(o=>!o)} className="text-xs font-bold px-3 py-1.5 rounded-full bg-red-100 text-red-700 whitespace-nowrap">
+              ⚠ {summary.issues.length} inconsistenc{summary.issues.length===1?'y':'ies'} {open?'▲':'▼'}
+            </button>
+          ) : (
+            <span className="text-xs font-bold px-3 py-1.5 rounded-full bg-green-100 text-green-700 whitespace-nowrap">✓ Quotes, Jobs &amp; Invoices line up</span>
+          )}
+        </div>
+      </div>
+      {open && summary.issues.length>0 && (
+        <div className="mt-3 border-t border-gray-100 pt-3 space-y-1.5">
+          {summary.issues.map((iss,idx)=>(
+            <div key={idx} className={`text-xs rounded-lg px-3 py-2 ${iss.severity==='high'?'bg-red-50 text-red-700':'bg-amber-50 text-amber-700'}`}>
+              {iss.message}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* Build a human-readable "size" string for a line item, shown beneath the
    description on invoices / proformas. Derived from the L×W (mm) calculator
    fields and the unit, plus a custom size field if present. */
@@ -5399,8 +5537,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // must not be shown as available against the other company's quotes.
   const myCreditNotes = (creditNotes||[]).filter(c=>belongsToUserCompany(c,user));
   const _searchTerm = search.trim().toLowerCase();
-  const displayed = (filter==='all' ? myQuotes : myQuotes.filter(q=>q.status===filter))
-    .filter(q=>!_searchTerm || (q.client||'').toLowerCase().includes(_searchTerm));
+  const displayed = numSort((filter==='all' ? myQuotes : myQuotes.filter(q=>q.status===filter))
+    .filter(q=>!_searchTerm || (q.client||'').toLowerCase().includes(_searchTerm)), 'num');
   const isAdmin = user.role === 'admin';
   // Invoices sub-tab: all jobs with an invoiceNum + manual accounting invoices.
   // Each job-invoice is re-synced from its linked quote so its values always match
@@ -5433,7 +5571,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const normStatus=i.status==='paid'?'paid':i.status==='partial'?'partial':'pending';
     return {id:i.id,invoiceNum:i.number,invoiceStatus:normStatus,client:i.contactName||'',value:sub+vat,invoiceDate:i.date,invoiceDue:i.dueDate,paidAt:i.paidDate,reference:i.reference,payments:i.payments||[],num:'manual',co:i.co??null,_isManual:true};
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
-  const invoicedJobs = [...jobInvItems,...manualInvItems].sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
+  const invoicedJobs = numSort([...jobInvItems,...manualInvItems], 'invoiceNum');
   const _invSearch = searchInv.trim().toLowerCase();
   const displayedInvoices = (invFilter==='all' ? invoicedJobs : invoicedJobs.filter(j=>(j.invoiceStatus||'pending')===invFilter))
     .filter(j=>!_invSearch || [j.invoiceNum,j.client,j.reference,j.num].some(v=>(v||'').toString().toLowerCase().includes(_invSearch)));
@@ -5805,6 +5943,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         )}
       </div>
 
+      {/* Parallel Quotes / Jobs / Invoices picture — identical panel also shown
+          on Dashboard and Accounting, driven by the same getBusinessSummary(). */}
+      <ConsistencyPanel quotes={myQuotes} jobs={myJobs} accInvoices={myAccInvoices}/>
+
       {/* Sub-tabs */}
       <div className="flex gap-1 bg-gray-100 rounded-2xl p-1 w-fit">
         {[{k:'quotes',label:'📋 Quotes'},{k:'accepted',label:'✅ Accepted'},{k:'invoices',label:'🧾 Invoices'}].map(({k,label})=>(
@@ -5900,7 +6042,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           // Company-scoped — must use myQuotes (belongsToUserCompany), not the
           // raw `quotes` prop, so Holdings never sees the original company's
           // accepted quotes (and vice versa) in this Accepted sub-tab.
-          const acceptedQuotes=[...myQuotes.filter(q=>q.status==='converted')].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
+          const acceptedQuotes=numSort(myQuotes.filter(q=>q.status==='converted'), 'num');
           if(acceptedQuotes.length===0) return (
             <div className="bg-white rounded-2xl border border-gray-200 p-12 text-center">
               <div className="text-4xl mb-3">✅</div>
@@ -9039,6 +9181,10 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
         </div>
       </div>
 
+      {/* Parallel Quotes / Jobs / Invoices picture — identical panel also shown
+          on Sales and Accounting, driven by the same getBusinessSummary(). */}
+      <ConsistencyPanel quotes={visibleQuotes} jobs={visibleJobs} accInvoices={visibleAccInvoices}/>
+
       {/* Monthly Conversion strip — sits directly below the hero banner */}
       {isAdmin&&<MonthlyConversionStrip data={monthlyConversion}/>}
 
@@ -9739,12 +9885,12 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
     jobTab==='active' ? !DONE_STATUSES.includes(j.status) : DONE_STATUSES.includes(j.status)
   ),[visibleJobs, jobTab]);
 
-  const filtered = useMemo(()=>tabJobs.filter(j=>{
+  const filtered = useMemo(()=>numSort(tabJobs.filter(j=>{
     if(statusFilter!=='all' && j.status!==statusFilter) return false;
     const q=search.toLowerCase();
     if(q&&!j.client.toLowerCase().includes(q)&&!j.num.toLowerCase().includes(q)&&!j.desc.toLowerCase().includes(q)) return false;
     return true;
-  }),[tabJobs, statusFilter, search]);
+  }), 'num'),[tabJobs, statusFilter, search]);
 
   // Reset status filter when tab changes
   const switchTab = t => { setJobTab(t); setStatusFilter('all'); };
@@ -15229,8 +15375,25 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   const manualRefs = new Set(accInvoices.map(i=>i.reference).filter(Boolean));
   const jobInvsFiltered = jobInvoices.filter(j=>!manualRefs.has(j.jobNum));
   const allInvoices = [...accInvoices.map(i=>({...i,source:i.source||'manual'})), ...jobInvsFiltered];
-  // Sort by date descending
-  allInvoices.sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
+  // Sort by invoice number ascending — keeps the list in document order so
+  // gaps or out-of-sequence numbers are easy to spot at a glance.
+  allInvoices.sort((a,b)=>{
+    const na=parseInt(String(a.number||'').replace(/\D/g,''),10)||0;
+    const nb=parseInt(String(b.number||'').replace(/\D/g,''),10)||0;
+    return na-nb || String(a.number||'').localeCompare(String(b.number||''));
+  });
+  // Clean, exportable invoice list (Excel / Xero) — combined job + manual
+  // invoices, one row per invoice, ready to download from the Invoices tab.
+  function exportInvoiceListCSV(){
+    const rows=[['Invoice Number','Date','Due Date','Customer','Source','Job/Ref','Excl. VAT','VAT','Total (Incl. VAT)','Status']];
+    allInvoices.forEach(inv=>{
+      const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+      const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+      rows.push([inv.number||'', inv.date||'', inv.dueDate||'', inv.contactName||'', inv.source==='job'?'Job':'Manual', inv.source==='job'?(inv.jobNum||''):(inv.reference||''), sub.toFixed(2), vat.toFixed(2), (sub+vat).toFixed(2), inv.status||'']);
+    });
+    if(rows.length<2){ alert('No invoices to export.'); return; }
+    downloadCSV(rows, 'signacore-invoices-'+new Date().toISOString().slice(0,10)+'.csv');
+  }
   // Contact-name lists for Statements & Credit Notes — declared after allInvoices so it is initialised first (fixes TDZ crash)
   const customerNames = Array.from(new Set([...(customers||[]).map(c=>c.company).filter(Boolean), ...allInvoices.map(i=>i.contactName).filter(Boolean)])).sort((a,b)=>a.localeCompare(b));
   const supplierNames = Array.from(new Set([...(suppliers||[]).map(s=>s.name).filter(Boolean), ...accBills.map(b=>b.supplierName).filter(Boolean)])).sort((a,b)=>a.localeCompare(b));
@@ -15448,6 +15611,10 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
       {/* ── DASHBOARD ── */}
       {accTab==='dashboard'&&(
         <div className="space-y-4">
+          {/* Parallel Quotes / Jobs / Invoices picture — identical panel also
+              shown on Dashboard and Sales, driven by the same getBusinessSummary(). */}
+          <ConsistencyPanel quotes={quotes} jobs={jobs} accInvoices={accInvoices}/>
+
           {/* KPI row 1 — financials */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
@@ -15655,6 +15822,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
         <div className="space-y-3">
           <div className="flex flex-wrap gap-2 items-center">
             <button onClick={()=>{setEditInv(null);setShowInvModal(true);}} className="flex items-center gap-2 text-white font-bold text-sm px-4 py-2.5 rounded-xl" style={{background:'#06065c'}}>＋ New Invoice</button>
+            <button onClick={exportInvoiceListCSV} className="flex items-center gap-2 font-bold text-sm px-4 py-2.5 rounded-xl border border-gray-200 bg-white text-gray-700 hover:bg-gray-50">⬇ Export List (CSV)</button>
             <div className="flex gap-2 ml-auto flex-wrap text-xs">
               {['draft','sent','partial','paid','overdue'].map(s=>(
                 <span key={s} className="px-2 py-1 rounded-full font-bold" style={{background:STATUS_COLORS[s]+'22',color:STATUS_COLORS[s]}}>
