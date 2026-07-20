@@ -9893,6 +9893,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
   const [jobTab,       setJobTab]       = useState('active'); // 'active' | 'completed'
   const [statusFilter, setStatusFilter] = useState('all');
   const [search,       setSearch]       = useState('');
+  const [sortOrder,    setSortOrder]    = useState('asc'); // 'asc' = oldest→newest, 'desc' = newest→oldest
   const [detail,       setDetail]       = useState(null);
   const [showAdd,      setShowAdd]      = useState(false);
   const [newProposal,  setNewProposal]  = useState('');
@@ -9934,12 +9935,15 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
     jobTab==='active' ? !DONE_STATUSES.includes(j.status) : DONE_STATUSES.includes(j.status)
   ),[visibleJobs, jobTab]);
 
-  const filtered = useMemo(()=>numSort(tabJobs.filter(j=>{
-    if(statusFilter!=='all' && j.status!==statusFilter) return false;
-    const q=search.toLowerCase();
-    if(q&&!j.client.toLowerCase().includes(q)&&!j.num.toLowerCase().includes(q)&&!j.desc.toLowerCase().includes(q)) return false;
-    return true;
-  }), 'num'),[tabJobs, statusFilter, search]);
+  const filtered = useMemo(()=>{
+    const sorted = numSort(tabJobs.filter(j=>{
+      if(statusFilter!=='all' && j.status!==statusFilter) return false;
+      const q=search.toLowerCase();
+      if(q&&!j.client.toLowerCase().includes(q)&&!j.num.toLowerCase().includes(q)&&!j.desc.toLowerCase().includes(q)) return false;
+      return true;
+    }), 'num');
+    return sortOrder==='desc' ? sorted.slice().reverse() : sorted;
+  },[tabJobs, statusFilter, search, sortOrder]);
 
   // Reset status filter when tab changes
   const switchTab = t => { setJobTab(t); setStatusFilter('all'); };
@@ -9977,6 +9981,11 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
           className="border border-gray-300 rounded-xl px-3 py-2.5 text-sm focus:ring-2 focus:ring-brand-400 bg-white">
           <option value="all">All {jobTab==='active'?'WIP':'Completed'} Statuses</option>
           {statusOpts.map(s=><option key={s} value={s}>{STATUS_META[s]?.label||s}</option>)}
+        </select>
+        <select value={sortOrder} onChange={e=>setSortOrder(e.target.value)}
+          className="border border-gray-300 rounded-xl px-3 py-2.5 text-sm focus:ring-2 focus:ring-brand-400 bg-white">
+          <option value="asc">Oldest → Newest</option>
+          <option value="desc">Newest → Oldest</option>
         </select>
       </div>
 
