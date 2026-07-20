@@ -14891,13 +14891,17 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
       allInvoices.filter(i=>i.status!=='void' && norm(i.contactName)===norm(name)).forEach(i=>{
         ev.push({date:i.date, sort:0, docType:'Invoice', ref:i.number||'', desc:(i.lineItems&&i.lineItems[0]?.description)||'Invoice', debit:inclTotal(i.lineItems), credit:0});
         // Credit-note allocations (method exactly "Credit", or the old buggy
-        // "Credit (R ... available)" display-string format) are shown for
-        // visibility but must NOT count as a fresh credit here — the credit
-        // note itself already contributes its full face value once, below.
-        // Counting the allocation again as well double-counts the same money.
+        // "Credit (R ... available)" display-string format) still display
+        // their real amount in the Credit column for visibility — but must
+        // NOT count again toward the running balance, since the credit note
+        // itself already contributes its full face value once, below.
+        // `credit` = what's shown on the statement row. `balanceCredit` = what
+        // actually moves the running balance; when they differ (credit
+        // allocations only), the row is informational and balance-neutral.
         (i.payments||[]).forEach(p=>{
           const isCreditAlloc = String(p.method||'').trim().toLowerCase().startsWith('credit');
-          ev.push({date:p.date||i.paidDate||i.date, sort:1, docType:'Payment', ref:i.number||'', desc:(p.method||'Payment received'), debit:0, credit:isCreditAlloc?0:(parseFloat(p.amount)||0)});
+          const amt = parseFloat(p.amount)||0;
+          ev.push({date:p.date||i.paidDate||i.date, sort:1, docType:'Payment', ref:i.number||'', desc:(p.method||'Payment received'), debit:0, credit:amt, balanceCredit:isCreditAlloc?0:amt});
         });
       });
     }
@@ -14905,10 +14909,16 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
       ev.push({date:c.date, sort:2, docType:'Credit Note', ref:c.number||'', desc:c.reason||'Credit note', debit:0, credit:parseFloat(c.amount)||0});
     });
     ev.sort((a,b)=>{const d=new Date(a.date||0)-new Date(b.date||0); return d!==0?d:a.sort-b.sort;});
+    // balanceCredit/balanceDebit (when present on an event) are what actually
+    // move the running total; plain debit/credit are always what's displayed
+    // on the row. They differ only for credit-allocation rows, which show
+    // their real amount but must not move the balance a second time.
+    const bd = e => (typeof e.balanceDebit==='number'?e.balanceDebit:e.debit);
+    const bc = e => (typeof e.balanceCredit==='number'?e.balanceCredit:e.credit);
     let opening=0;
-    ev.forEach(e=>{ const t=new Date(e.date||0).getTime(); if(t<fromT) opening += (e.debit-e.credit); });
+    ev.forEach(e=>{ const t=new Date(e.date||0).getTime(); if(t<fromT) opening += (bd(e)-bc(e)); });
     let running=opening; const rows=[];
-    ev.forEach(e=>{ const t=new Date(e.date||0).getTime(); if(t>=fromT && t<=toT){ running += (e.debit-e.credit); rows.push({...e, balance:running}); } });
+    ev.forEach(e=>{ const t=new Date(e.date||0).getTime(); if(t>=fromT && t<=toT){ running += (bd(e)-bc(e)); rows.push({...e, balance:running}); } });
     return {openingBalance:opening, rows, closingBalance:running};
   }
 
