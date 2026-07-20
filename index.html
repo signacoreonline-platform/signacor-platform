@@ -938,7 +938,12 @@ function printStatement(opts, logoDataUrl) {
   const logoTag = logoDataUrl
     ? `<img src="${logoDataUrl}" style="max-height:64px;max-width:200px;object-fit:contain;" alt="Signacore"/>`
     : `<div style="font-family:'Barlow Condensed',Arial,sans-serif;font-size:26px;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.04em;">SIGNACORE</div>`;
-  const oweWord = contactType==='supplier' ? 'Balance we owe' : 'Balance due to us';
+  const stmtIsSettled = Math.abs(closingBalance) < 0.005;
+  const oweWord = stmtIsSettled
+    ? 'Account settled'
+    : (contactType==='supplier'
+        ? (closingBalance>0 ? 'Balance we owe' : 'Credit balance — this supplier owes us')
+        : (closingBalance>0 ? 'Balance due to us' : 'Credit balance — we owe this customer'));
   const rowsHtml = rows.length ? rows.map(r=>`
     <tr>
       <td style="white-space:nowrap">${esc(r.date)}</td>
@@ -1011,7 +1016,7 @@ tr:nth-child(even) td{background:#f8f9ff}
 </table>
 <div class="summary">
   <div><span>Opening balance</span><span>${R(openingBalance)}</span></div>
-  <div class="total"><span>${oweWord}</span><span>${R(closingBalance)}</span></div>
+  <div class="total"><span>${oweWord}</span><span>${R(Math.abs(closingBalance))}</span></div>
 </div>
 <div class="foot">
   Debit = invoices / bills raised. &nbsp; Credit = payments received & credit notes. &nbsp; All amounts include VAT @ 15% where applicable.<br>
@@ -14885,7 +14890,15 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     } else {
       allInvoices.filter(i=>i.status!=='void' && norm(i.contactName)===norm(name)).forEach(i=>{
         ev.push({date:i.date, sort:0, docType:'Invoice', ref:i.number||'', desc:(i.lineItems&&i.lineItems[0]?.description)||'Invoice', debit:inclTotal(i.lineItems), credit:0});
-        (i.payments||[]).forEach(p=>ev.push({date:p.date||i.paidDate||i.date, sort:1, docType:'Payment', ref:i.number||'', desc:(p.method||'Payment received'), debit:0, credit:parseFloat(p.amount)||0}));
+        // Credit-note allocations (method exactly "Credit", or the old buggy
+        // "Credit (R ... available)" display-string format) are shown for
+        // visibility but must NOT count as a fresh credit here — the credit
+        // note itself already contributes its full face value once, below.
+        // Counting the allocation again as well double-counts the same money.
+        (i.payments||[]).forEach(p=>{
+          const isCreditAlloc = String(p.method||'').trim().toLowerCase().startsWith('credit');
+          ev.push({date:p.date||i.paidDate||i.date, sort:1, docType:'Payment', ref:i.number||'', desc:(p.method||'Payment received'), debit:0, credit:isCreditAlloc?0:(parseFloat(p.amount)||0)});
+        });
       });
     }
     cnotes.filter(c=>c.type===type && norm(c.contactName)===norm(name)).forEach(c=>{
@@ -16670,7 +16683,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                   <p className="text-xs text-gray-400">{stmtType==='supplier'?'Supplier account':'Customer account'} · {st.rows.length} transactions in period</p>
                 </div>
                 <div className="text-right">
-                  <p className="text-xs text-gray-400">{stmtType==='supplier'?'Balance we owe':'Balance due to us'}</p>
+                  <p className="text-xs text-gray-400">{Math.abs(st.closingBalance)<0.005?'Account settled':(stmtType==='supplier'?(st.closingBalance>0?'Balance we owe':'Credit balance — this supplier owes us'):(st.closingBalance>0?'Balance due to us':'Credit balance — we owe this customer'))}</p>
                   <p className={`text-xl font-black ${st.closingBalance>0?'text-red-600':'text-green-600'}`}>{fmtAmt(st.closingBalance)}</p>
                 </div>
               </div>
@@ -16703,7 +16716,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                     ))}
                     {st.rows.length===0&&<tr><td colSpan="7" className="px-3 py-8 text-center text-gray-400">No transactions in this period.</td></tr>}
                     <tr className="border-t-2" style={{borderColor:'#06065c',background:'#f8f9ff'}}>
-                      <td className="px-3 py-2.5 font-black text-gray-800" colSpan="6">Closing balance — {stmtType==='supplier'?'we owe':'due to us'}</td>
+                      <td className="px-3 py-2.5 font-black text-gray-800" colSpan="6">Closing balance — {Math.abs(st.closingBalance)<0.005?'account settled':(stmtType==='supplier'?(st.closingBalance>0?'we owe':'credit, they owe us'):(st.closingBalance>0?'due to us':'credit, we owe them'))}</td>
                       <td className="px-3 py-2.5 text-right font-black" style={{color:'#06065c'}}>{fmtAmt(st.closingBalance)}</td>
                     </tr>
                   </tbody>
