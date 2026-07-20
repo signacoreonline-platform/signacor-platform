@@ -4980,7 +4980,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setC
             <div className="grid grid-cols-2 gap-3">
               <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
               <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
-                <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>{['EFT','Cash','Card','Cheque','Credit','Other'].map(m=><option key={m} disabled={m==='Credit'&&availableCredit<=0.005}>{m==='Credit'?`Credit${availableCredit>0.005?' ('+zr(availableCredit)+' available)':' (none available)'}`:m}</option>)}</select>
+                <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>{['EFT','Cash','Card','Cheque','Credit','Other'].map(m=><option key={m} value={m} disabled={m==='Credit'&&availableCredit<=0.005}>{m==='Credit'?`Credit${availableCredit>0.005?' ('+zr(availableCredit)+' available)':' (none available)'}`:m}</option>)}</select>
               </div>
               <div><label className="text-xs font-bold text-gray-500 block mb-1">Amount (R)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} placeholder={balance>0?balance.toFixed(2):'0.00'} min="0.01" step="0.01"/></div>
               <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes (optional)</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="Deposit, partial payment, etc."/></div>
@@ -5978,7 +5978,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
                   <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>
-                    {['EFT','Cash','Card','Cheque','Credit','Other'].map(m=><option key={m} disabled={m==='Credit'&&availableCredit<=0.005}>{m==='Credit'?`Credit${availableCredit>0.005?' ('+zr(availableCredit)+' available)':' (none available)'}`:m}</option>)}
+                    {['EFT','Cash','Card','Cheque','Credit','Other'].map(m=><option key={m} value={m} disabled={m==='Credit'&&availableCredit<=0.005}>{m==='Credit'?`Credit${availableCredit>0.005?' ('+zr(availableCredit)+' available)':' (none available)'}`:m}</option>)}
                   </select>
                 </div>
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Amount (R)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} placeholder={balance>0?balance.toFixed(2):'0.00'} min="0.01" step="0.01"/></div>
@@ -15716,7 +15716,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
                   <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>
-                    {['EFT','Cash','Card','Cheque','Credit','Other'].map(m=><option key={m} disabled={m==='Credit'&&availableCredit<=0.005}>{m==='Credit'?`Credit${availableCredit>0.005?' ('+fmtAmt(availableCredit)+' available)':' (none available)'}`:m}</option>)}
+                    {['EFT','Cash','Card','Cheque','Credit','Other'].map(m=><option key={m} value={m} disabled={m==='Credit'&&availableCredit<=0.005}>{m==='Credit'?`Credit${availableCredit>0.005?' ('+fmtAmt(availableCredit)+' available)':' (none available)'}`:m}</option>)}
                   </select>
                 </div>
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Amount (R)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} placeholder={balance>0?balance.toFixed(2):'0.00'} min="0.01" step="0.01"/></div>
