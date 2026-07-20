@@ -4997,7 +4997,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setC
   );
 }
 
-function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs, creditNotes, setCreditNotes }) {
+function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs, creditNotes, setCreditNotes, isAdmin }) {
   const [showEmailFlow, setShowEmailFlow] = useState(false);
   const [showProformaEmail, setShowProformaEmail] = useState(false);
   const [showPayments, setShowPayments] = useState(false);
@@ -5135,6 +5135,18 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
                 <QuoteBadge status={quote.status}/>
                 <span className="text-xs text-gray-500">🔒 This status is <strong>permanent</strong> and cannot be changed.</span>
               </div>
+              {quote.status==='declined'&&isAdmin&&(
+                <div className="mt-2 flex items-center gap-3 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+                  <span className="text-xs text-amber-700 flex-1">Declined by mistake? Reinstating sets this quote back to <strong>Approved</strong> so it can be converted to a Job and advanced to an invoice again.</span>
+                  <button onClick={()=>{
+                      if(!window.confirm('Reinstate this quote?\n\nThis sets it back to APPROVED, overriding the normal "declined is permanent" rule. Only do this to correct a mistaken decline. Continue?')) return;
+                      onUpdate({...quote, status:'approved', convertedJobId:null});
+                    }}
+                    className="flex-shrink-0 text-xs bg-amber-500 hover:bg-amber-600 text-white rounded-xl px-3 py-1.5 font-bold">
+                    🔁 Reinstate Quote
+                  </button>
+                </div>
+              )}
             </div>
           ) : (
             <div>
@@ -5569,6 +5581,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [editInvoice, setEditInvoice] = useState(null); // job open in invoice edit modal
   const [emailInvoiceJob, setEmailInvoiceJob] = useState(null); // job for email flow modal
   const [filter,setFilter]=useState('all');
+  const [sortOrder,setSortOrder]=useState('asc');  // 'asc' = oldest→newest, 'desc' = newest→oldest (Quotes sub-tab)
   const [search,setSearch]=useState('');           // client-name search (Quotes sub-tab)
   const [searchAcc,setSearchAcc]=useState('');     // search (Accepted Quotes sub-tab)
   const [searchInv,setSearchInv]=useState('');     // search (Invoices sub-tab)
@@ -5586,8 +5599,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // must not be shown as available against the other company's quotes.
   const myCreditNotes = (creditNotes||[]).filter(c=>belongsToUserCompany(c,user));
   const _searchTerm = search.trim().toLowerCase();
-  const displayed = numSort((filter==='all' ? myQuotes : myQuotes.filter(q=>q.status===filter))
+  const _sortedQuotes = numSort((filter==='all' ? myQuotes : myQuotes.filter(q=>q.status===filter))
     .filter(q=>!_searchTerm || (q.client||'').toLowerCase().includes(_searchTerm)), 'num');
+  const displayed = sortOrder==='desc' ? _sortedQuotes.slice().reverse() : _sortedQuotes;
   const isAdmin = user.role === 'admin';
   // Invoices sub-tab: all jobs with an invoiceNum + manual accounting invoices.
   // Each job-invoice is re-synced from its linked quote so its values always match
@@ -5781,6 +5795,19 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     setViewQuote(null); // close the quote view
     // Navigate directly to Jobs and open the new job
     if(onJobCreated) onJobCreated(newJob.id);
+  }
+
+  // ── Manually create the tax invoice for a converted quote's linked job,
+  // straight from the Accepted sub-tab — no need to open the job and wait
+  // for it to reach the Installation stage. Mirrors the same update the
+  // "Create Invoice" button performs on the Job Detail page, so the
+  // resulting record is identical either way (same fields, same numbering).
+  function createInvoiceNow(job){
+    if(!job || job.invoiceCreated || (job.invoiceNum && job.stage>=9)) return;
+    const today=new Date().toISOString().slice(0,10);
+    const due=new Date(Date.now()+30*864e5).toISOString().slice(0,10);
+    setJobs(prev=>prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:(j.invoiceNum||getNextInvoiceNum(prev)), invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j));
+    setSubTab('invoices');
   }
 
   // ── Job Invoice Payment History Modal ──
@@ -6019,7 +6046,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
               className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700 text-sm">✕</button>
           )}
         </div>
-        <div className="flex gap-2 flex-wrap">
+        <div className="flex gap-2 flex-wrap items-center">
           {statusFilters.map(s=>(
             <button key={s} onClick={()=>setFilter(s)}
               className={`text-xs rounded-lg px-3 py-1.5 border font-semibold capitalize transition-all ${filter===s?'bg-gray-900 text-white border-gray-900':'bg-white border-gray-200 text-gray-500 hover:border-gray-400'}`}>
@@ -6027,6 +6054,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                `${QUOTE_STATUS_META[s]?.label||s} (${countOf(s)})`}
             </button>
           ))}
+          <select value={sortOrder} onChange={e=>setSortOrder(e.target.value)}
+            className="ml-auto text-xs border border-gray-200 rounded-lg px-2.5 py-1.5 bg-white font-semibold text-gray-600 focus:ring-2 focus:ring-brand-400">
+            <option value="asc">Oldest → Newest</option>
+            <option value="desc">Newest → Oldest</option>
+          </select>
         </div>
         {_searchTerm&&(
           <p className="text-xs text-gray-400">{displayed.length} result{displayed.length!==1?'s':''} for "{search}"</p>
@@ -6190,6 +6222,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       <button onClick={()=>setCopyQuote(q)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 transition-colors">
                         📋 Copy to New Quote
                       </button>
+                      {linkedJob&&!linkedJob.invoiceCreated&&!(linkedJob.invoiceNum&&linkedJob.stage>=9)&&(
+                        <button onClick={()=>createInvoiceNow(linkedJob)}
+                          title="Create the tax invoice now, without waiting for the job to reach the Installation stage"
+                          className="text-xs font-bold px-3 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 transition-colors">
+                          🧾 Create Invoice Now
+                        </button>
+                      )}
                       {linkedJob&&<span className="text-xs text-gray-400 ml-auto">Job: <strong className="text-gray-700">{linkedJob.num}</strong></span>}
                     </div>
                   </div>
@@ -6380,6 +6419,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         onEdit={handleEditQuote}
         jobs={jobs}
         creditNotes={myCreditNotes} setCreditNotes={setCreditNotes}
+        isAdmin={isAdmin}
       />}
       {/* ── Edit Invoice modal ── */}
       {editInvoice&&(
