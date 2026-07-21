@@ -4365,17 +4365,65 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
     e.preventDefault();
     if(!client.trim()){ setClientOpen(true); return; }
     const isEdit = !!eq;
-    onSave({
-      id: isEdit ? eq.id : Date.now(),
-      num: isEdit ? eq.num : nextNum,
+
+    // ── Overpayment guard (edit only) ──────────────────────────────────────
+    // quote.payments is never touched by this form — it's owned by
+    // QuotePaymentsModal — so eq.payments is always the authoritative,
+    // currently-allocated payment total. If the edit has brought the
+    // revised total below what's already been paid, stop the save rather
+    // than let an incomplete payload silently drop/cap the payment.
+    if(isEdit){
+      const allocated = (eq.payments||[]).reduce((s,p)=>s+(parseFloat(p&&p.amount)||0),0);
+      if(allocated > total + 0.005){
+        const zr = n => 'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+        alert(
+          'Payments already allocated to this quotation exceed the revised quotation total.\n\n'+
+          'Revised total: '+zr(total)+'\n'+
+          'Allocated payments: '+zr(allocated)+'\n'+
+          'Excess payment: '+zr(allocated-total)+'\n\n'+
+          'The quotation has not been saved. Captured payments cannot be removed automatically. '+
+          'Please cancel or adjust the edit, or handle the excess payment through customer credit, '+
+          'reallocation, refund, or a credit-note process.'
+        );
+        return; // stop the save — form stays open, nothing changed
+      }
+    }
+
+    // ── Fields this form intentionally edits ───────────────────────────────
+    const formFields = {
       client:client.trim(), contact, email, tel, address, vatNum,
       co:parseInt(co), date, validUntil:valid, notes,
-      status: isEdit ? eq.status : 'draft',
       lines, preparedBy, salesperson, discount, setupFee,
-      convertedJobId: eq?.convertedJobId||null,
       poRef, reference, attachments,
       _savedAt: new Date().toISOString(),
-    });
+    };
+
+    let payload;
+    if(isEdit){
+      // Start from the COMPLETE existing quote so any field this form doesn't
+      // touch — payments, convertedJobId, proformaNum, approval/status
+      // metadata, etc. — survives the edit untouched. Only overlay fields the
+      // form actually produced a defined value for, so a stray undefined
+      // never clobbers a valid existing value.
+      payload = {...eq};
+      Object.keys(formFields).forEach(k=>{ if(formFields[k]!==undefined) payload[k]=formFields[k]; });
+      // These are never changed by editing the quote — reassert explicitly.
+      payload.id = eq.id;
+      payload.num = eq.num;
+      payload.status = eq.status;
+      payload.convertedJobId = eq.convertedJobId||null;
+      payload.payments = eq.payments||[];
+    } else {
+      // New quote (or Copy Quote, which also has no `eq`) — build fresh,
+      // never inheriting another quote's payments/conversion state.
+      payload = {
+        id: Date.now(), num: nextNum, status:'draft',
+        convertedJobId: null, payments: [],
+        ...formFields,
+      };
+    }
+
+    onSave(payload);
     try { localStorage.removeItem(_draftKey); } catch(e){}
     onClose();
   }
