@@ -14,6 +14,7 @@ import dashboardRoutes from './routes/dashboard';
 import inventoryRoutes from './routes/inventory';
 import importsRoutes from './routes/imports';
 import platformStateRoutes from './routes/platformState';
+import documentNumbersRoutes from './routes/documentNumbers';
 import { errorHandler, notFound } from './middleware/errorHandler';
 
 dotenv.config();
@@ -51,6 +52,7 @@ app.use('/api/dashboard',     dashboardRoutes);
 app.use('/api/inventory',     inventoryRoutes);
 app.use('/api/imports',       importsRoutes);
 app.use('/api/platform-state', platformStateRoutes);
+app.use('/api/document-numbers', documentNumbersRoutes);
 
 // ── Error handling ────────────────────────────────────────────
 app.use(notFound);

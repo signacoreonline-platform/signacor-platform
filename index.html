@@ -125,6 +125,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 ═══════════════════════════════════════════════════════════ */
 const DATA_VERSION = 4; // bump this to wipe stale localStorage caches
 const API_STATE_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/platform-state';
+const API_DOC_NUMBER_RESERVE_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/document-numbers/reserve';
 const STORAGE_KEY = 'sgr_platform_data';
 
 function validState(d) {
@@ -1994,9 +1995,46 @@ function emailQuoteViaOutlook(q, companies) {
 /* ═══════════════════════════════════════════
    GET NEXT INVOICE NUMBER
 ═══════════════════════════════════════════ */
-function getNextInvoiceNum(jobs) {
-  const nums = jobs.map(j=>j.invoiceNum).filter(n=>n&&/^INV-\d+$/.test(n)).map(n=>parseInt(n.replace('INV-',''),10));
-  return 'INV-'+String((nums.length>0?Math.max(...nums):0)+1).padStart(5,'0');
+/* ═══════════════════════════════════════════
+   ATOMIC INVOICE NUMBER RESERVATION
+   Backend-authoritative replacement for the old client-side max()+1
+   invoice-number generators. Those were not atomic across simultaneous
+   users/sessions and produced a confirmed duplicate (INV-00057, issued to
+   two different jobs). Every real invoice number — job-derived or manual
+   accounting — must be obtained through reserveInvoiceNumber(), which
+   calls the backend's atomic, per-company counter. Never fall back to a
+   local max()+1 if the reservation fails. A proforma is NOT a final
+   invoice and must never call this — see QuoteViewModal, which uses the
+   quote's own number as its printable reference instead.
+═══════════════════════════════════════════ */
+async function reserveInvoiceNumber(co) {
+  try {
+    const res = await fetch(API_DOC_NUMBER_RESERVE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ company: co, docType: 'invoice' }),
+    });
+    if (!res.ok) return null;
+    const result = await res.json();
+    return (result && result.number) ? result.number : null;
+  } catch (e) {
+    console.warn('Invoice number reservation failed', e);
+    return null;
+  }
+}
+
+// Final frontend safeguard in addition to the backend's own atomic
+// reservation + duplicate check: confirm a just-reserved number doesn't
+// already exist among this company's job-derived invoices or accInvoices
+// in the CURRENT master state before it is actually used. Should not
+// normally trigger — the backend already checked — but invoice creation
+// must stop rather than proceed if it ever does.
+function invoiceNumberExists(number, co, jobs, accInvoices) {
+  const target = (number||'').trim().toUpperCase();
+  if (!target) return false;
+  const inJobs = (jobs||[]).some(j=>j && String(j.co)===String(co) && (j.invoiceNum||'').trim().toUpperCase()===target);
+  if (inJobs) return true;
+  return (accInvoices||[]).some(i=>i && String(i.co)===String(co) && (i.number||'').trim().toUpperCase()===target);
 }
 
 /* ═══════════════════════════════════════════
@@ -5064,10 +5102,17 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
   const total = subAfterDisc+vat;
   const depRate = total<=5000 ? 1.0 : 0.80;
   const dep = total*depRate;
-  // Proforma uses the SAME number that will become the Tax Invoice number.
-  // Assigned once and stored on the quote so proforma + invoice always match.
-  const proformaNum = quote.proformaNum || getNextInvoiceNum(jobs||[]);
-  const ensureProformaNum = ()=>{ if(!quote.proformaNum) onUpdate({...quote, proformaNum}); };
+  // A proforma is a preview reference only — it is NOT the final tax
+  // invoice and must never consume/pre-empt a real invoice number. It uses
+  // the quote's own number (SQ-xxxxx) as its printable reference, so it
+  // never touches invoice numbering at all. If an older quote already has
+  // a proformaNum stored from before this rule (a previously client-
+  // generated INV-xxxxx-style value), that historical reference is kept
+  // for document-history continuity — it is not regenerated, and it is no
+  // longer used to seed or become the final invoice number (see
+  // handleConvertToJob and createInvoiceNow, which always reserve a fresh
+  // number atomically from the backend when the real invoice is created).
+  const proformaNum = quote.proformaNum || quote.num;
   // Payments recorded against this quote / proforma (deposits, partials)
   const quotePayments = quote.payments || [];
   const quotePaid     = quotePayments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
@@ -5278,7 +5323,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
             </button>
           )}
           {quote.status!=='declined'&&(
-            <button onClick={()=>{ ensureProformaNum(); printProformaWindow(quote,proformaNum,companies,logoDataUrl); }}
+            <button onClick={()=>{ printProformaWindow(quote,proformaNum,companies,logoDataUrl); }}
               className="flex items-center gap-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded-xl px-4 py-2.5 font-bold">
               📄 Proforma Invoice
             </button>
@@ -5323,7 +5368,6 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
           type="proforma" data={{...quote, _proformaNum: proformaNum}}
           companies={companies} logoDataUrl={logoDataUrl}
           onClose={()=>setShowProformaEmail(false)}
-          onMarkSent={ensureProformaNum}
         />
       )}
       {showPayments&&(
@@ -5769,8 +5813,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // job went missing. On restore we skip inventory deduction / PO generation
   // because those side-effects already ran during the original conversion.
   function handleConvertToJob(q, restore){
+    // Converting a quote only creates the JOB — it is not itself the
+    // creation of a final tax invoice, so no invoice number is assigned
+    // here (not from a proforma, not from the old max()+1 generator). The
+    // job intentionally has no invoiceNum until the user genuinely clicks
+    // "Create Invoice" (JobDetail / createInvoiceNow), which reserves one
+    // atomically from the backend at that moment.
     const jobNum = getNextJobNum(jobs);
-    const invNum = q.proformaNum || getNextInvoiceNum(jobs);
     const today  = new Date().toISOString().slice(0,10);
     const dueDate= new Date(Date.now()+30*864e5).toISOString().slice(0,10);
     const _qSub      = q.lines.reduce(function(s,l){return s+(l.subtotal||0);},0);
@@ -5793,7 +5842,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       setupFee: q.setupFee||'', discount: q.discount||'',
       salesperson: q.salesperson||'', preparedBy: q.preparedBy||'',
       poRef: q.poRef||'', reference: q.reference||'',
-      invoiceNum: invNum, invoiceDate: today, invoiceDue: dueDate,
+      invoiceDate: today, invoiceDue: dueDate,
       // Carry any deposits/partials already recorded on the quote/proforma
       payments: (q.payments||[]).map(p=>({...p})),
       invoiceStatus: (()=>{ const paid=(q.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0); const tot=_qAfterDisc*1.15; return paid>=tot&&tot>0?'paid':paid>0?'partial':'pending'; })(),
@@ -5855,11 +5904,38 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // for it to reach the Installation stage. Mirrors the same update the
   // "Create Invoice" button performs on the Job Detail page, so the
   // resulting record is identical either way (same fields, same numbering).
-  function createInvoiceNow(job){
+  async function createInvoiceNow(job){
     if(!job || job.invoiceCreated || (job.invoiceNum && job.stage>=9)) return;
     const today=new Date().toISOString().slice(0,10);
     const due=new Date(Date.now()+30*864e5).toISOString().slice(0,10);
-    setJobs(prev=>prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:(j.invoiceNum||getNextInvoiceNum(prev)), invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j));
+
+    // Job already carries an invoice number (e.g. a historical job invoiced
+    // before this fix) — just flip the invoice flags, no new number needed.
+    if(job.invoiceNum){
+      setJobs(prev=>{
+        const cur = prev.find(j=>j.id===job.id);
+        if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
+        return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
+      });
+      setSubTab('invoices');
+      return;
+    }
+
+    // Reserve a brand-new number from the backend-atomic counter. Never
+    // falls back to a local max()+1 generator if this fails.
+    const reserved = await reserveInvoiceNumber(job.co);
+    if(!reserved || invoiceNumberExists(reserved, job.co, jobs, accInvoices)){
+      alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
+      return;
+    }
+    setJobs(prev=>{
+      const cur = prev.find(j=>j.id===job.id);
+      // Recheck: the job may have become invoiced by another action while
+      // we were waiting on the network. If so, leave it untouched — the
+      // reserved number simply goes unused (acceptable, per project rules).
+      if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
+      return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
+    });
     setSubTab('invoices');
   }
 
@@ -9464,7 +9540,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
 /* ═══════════════════════════════════════════
    JOB DETAIL  (with editable cost breakdown)
 ═══════════════════════════════════════════ */
-function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack, user, logoDataUrl }) {
+function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack, user, logoDataUrl, accInvoices }) {
   const [showInvoiceEmail, setShowInvoiceEmail] = useState(false);
   const job=jobs.find(j=>j.id===jobId);
   const [editingCosts, setEditingCosts]=useState(false);
@@ -9913,13 +9989,37 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
             const canCreateInvoice= job.stage>=INSTALL_STAGE;
             if(!invoiceCreated){
               return canCreateInvoice ? (
-                <button onClick={()=>{
+                <button onClick={async ()=>{
                     const today=new Date().toISOString().slice(0,10);
                     const due=new Date(Date.now()+30*864e5).toISOString().slice(0,10);
                     // Creating the tax invoice advances the job to its final
                     // lifecycle stage, Invoiced (9). Final payment is recorded
                     // afterwards via Payments / Payment History.
-                    setJobs(prev=>prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:(j.invoiceNum||getNextInvoiceNum(prev)), invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j));
+                    if(job.invoiceNum){
+                      // Already carries a number (e.g. a historical job
+                      // invoiced before this fix) — just flip the flags.
+                      setJobs(prev=>{
+                        const cur = prev.find(j=>j.id===job.id);
+                        if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
+                        return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
+                      });
+                      return;
+                    }
+                    // Reserve a brand-new number from the backend-atomic
+                    // counter. Never falls back to a local max()+1 generator.
+                    const reserved = await reserveInvoiceNumber(job.co);
+                    if(!reserved || invoiceNumberExists(reserved, job.co, jobs, accInvoices)){
+                      alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
+                      return;
+                    }
+                    setJobs(prev=>{
+                      const cur = prev.find(j=>j.id===job.id);
+                      // Recheck: the job may have become invoiced while we
+                      // were waiting on the network — if so, leave it
+                      // untouched; the reserved number simply goes unused.
+                      if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
+                      return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
+                    });
                   }}
                   className="flex items-center gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl px-4 py-2.5 font-bold">
                   🧾 Create Invoice
@@ -9982,7 +10082,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 const DONE_STATUSES = ['completed','invoiced'];
 const WIP_STATUSES  = STAGE_STATUSES.filter(s=>!DONE_STATUSES.includes(s));
 
-function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared, proposedProjects=[], setProposedProjects }) {
+function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared, proposedProjects=[], setProposedProjects, accInvoices }) {
   const [jobTab,       setJobTab]       = useState('active'); // 'active' | 'completed'
   const [statusFilter, setStatusFilter] = useState('all');
   const [search,       setSearch]       = useState('');
@@ -10045,7 +10145,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
   const completedCount = visibleJobs.filter(j=> DONE_STATUSES.includes(j.status)).length;
   const statusOpts     = jobTab==='active' ? WIP_STATUSES : DONE_STATUSES;
 
-  if(detail!==null) return <JobDetail jobId={detail} jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} onBack={()=>setDetail(null)} user={user} logoDataUrl={logoDataUrl}/>;
+  if(detail!==null) return <JobDetail jobId={detail} jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} onBack={()=>setDetail(null)} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices}/>;
 
   return (
     <div className="p-4 space-y-4">
@@ -14852,31 +14952,44 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   const [payModalInv,   setPayModalInv]   = useState(null);
   const isAdmin = user?.role !== 'assistant';
 
-  function nextInvNum() {
-    // Use same INV-XXXXX format as job invoices, pulling max from both sources.
-    // Reads the FULL (unfiltered) arrays so Holdings and original-company
-    // invoice numbers can never collide — see AccountingPage top comment.
-    const accNums = (accInvoicesAll||[]).map(i=>parseInt((i.number||'').replace(/\D/g,''))||0);
-    const jobNums = (jobsAll||[]).map(j=>parseInt((j.invoiceNum||'').replace(/\D/g,''))||0);
-    const allNums = [...accNums, ...jobNums];
-    return 'INV-' + String((Math.max(0,...allNums)+1)).padStart(5,'0');
-  }
   function nextBillNum() {
     const nums = (accBillsAll||[]).map(b=>parseInt((b.number||'').replace(/\D/g,''))||0);
     return 'SNS-BILL-' + String((Math.max(0,...nums)+1)).padStart(4,'0');
   }
 
-  function saveInvoice(inv) {
+  async function saveInvoice(inv) {
+    if(!inv.contactName){ alert('Contact name is required.'); return; }
+
+    // New invoice (no number yet — InvoiceModal leaves it blank for a new
+    // record) → reserve one atomically from the backend before creating
+    // anything. Never falls back to a local max()+1 generator. Editing an
+    // existing invoice always already has a number, so this never runs on
+    // edit — the existing number is preserved untouched.
+    let working = inv;
+    if(!working.number){
+      // Explicit company id for the reservation/scoping — co:1 Holdings,
+      // co:2 Original Signacore. (Some older manual invoices were tagged
+      // co:null for original-company users; new invoices are tagged with
+      // the explicit id below so company-scoped numbering stays reliable.)
+      const co = isHoldingsUser(user) ? HOLDINGS_CO_ID : 2;
+      const reserved = await reserveInvoiceNumber(co);
+      if(!reserved || invoiceNumberExists(reserved, co, jobsAll, accInvoicesAll)){
+        alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
+        return;
+      }
+      working = { ...working, number: reserved, co };
+    }
+
     // Duplicate invoice number check — number must not exist on any OTHER invoice
     // (checked against the FULL array — a number must be globally unique).
-    const duplicate = (accInvoicesAll||[]).find(i=>i.id!==inv.id && i.number && i.number.trim().toLowerCase()===(inv.number||'').trim().toLowerCase());
+    const duplicate = (accInvoicesAll||[]).find(i=>i.id!==working.id && i.number && i.number.trim().toLowerCase()===(working.number||'').trim().toLowerCase());
     if(duplicate){
-      alert('⚠ Invoice number "'+inv.number+'" is already used by another invoice. Please choose a unique number.');
+      alert('⚠ Invoice number "'+working.number+'" is already used by another invoice. Please choose a unique number.');
       return;
     }
     // Tag with the logged-in user's company on create; preserve the existing
     // company tag on edit (never re-tag an existing record).
-    const tagged = { ...inv, co: inv.co !== undefined ? inv.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : null) };
+    const tagged = { ...working, co: working.co !== undefined ? working.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : null) };
     setAccInvoices(prev => prev.find(i=>i.id===tagged.id) ? prev.map(i=>i.id===tagged.id?tagged:i) : [tagged,...prev]);
     setShowInvModal(false); setEditInv(null);
   }
@@ -15290,12 +15403,16 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   // ── Invoice Modal ──
   function InvoiceModal({ inv, onSave, onClose }) {
     const isNew = !inv;
+    // A new invoice gets its number reserved atomically from the backend at
+    // save time (see saveInvoice) — never pre-computed here client-side, and
+    // never editable by the user (no input field for it exists below).
     const [form, setForm] = useState(inv || {
-      id: Date.now(), number: nextInvNum(), date: new Date().toISOString().slice(0,10),
+      id: Date.now(), number: '', date: new Date().toISOString().slice(0,10),
       dueDate: new Date(Date.now()+30*864e5).toISOString().slice(0,10),
       contactName:'', contactEmail:'', contactAddress:'', reference:'',
       status:'draft', lineItems:[{description:'',qty:1,unitAmount:0,accountCode:'4000',taxType:'15%'}]
     });
+    const [saving, setSaving] = useState(false);
     const upd = k => v => setForm(p=>({...p,[k]:v}));
     const updLine = (i,k,v) => setForm(p=>({...p,lineItems:p.lineItems.map((l,idx)=>idx===i?{...l,[k]:v}:l)}));
     const addLine = () => setForm(p=>({...p,lineItems:[...p.lineItems,{description:'',qty:1,unitAmount:0,accountCode:'4000',taxType:'15%'}]}));
@@ -15303,12 +15420,17 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     const subtotal = (form.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0)),0);
     const vat = (form.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0)*0.15):s,0);
     const iCls="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
-    function save(){ if(!form.contactName){ alert('Contact name is required.'); return; } onSave(form); }
+    async function save(){
+      if(!form.contactName){ alert('Contact name is required.'); return; }
+      if(saving) return; // guard against double-click firing two reservations
+      setSaving(true);
+      try { await onSave(form); } finally { setSaving(false); }
+    }
     return (
       <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
         <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[95vh] overflow-y-auto">
           <div className="px-5 py-4 flex items-center justify-between" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
-            <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>{isNew?'NEW INVOICE':'EDIT INVOICE'} — {form.number}</p>
+            <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>{isNew?'NEW INVOICE':'EDIT INVOICE'} — {form.number||'(number auto-reserved on save)'}</p>
             <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
           </div>
           <div className="p-5 space-y-4">
@@ -15373,8 +15495,8 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
               </div>
             </div>
             <div className="flex gap-3 pt-2">
-              <button onClick={save} className="flex-1 text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#06065c'}}>💾 Save Invoice</button>
-              <button onClick={()=>{ save(); }} className="px-4 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600 hover:bg-gray-50">Save &amp; Close</button>
+              <button disabled={saving} onClick={save} className="flex-1 text-white font-bold py-2.5 rounded-xl text-sm disabled:opacity-50" style={{background:'#06065c'}}>{saving?'Reserving number…':'💾 Save Invoice'}</button>
+              <button disabled={saving} onClick={()=>{ save(); }} className="px-4 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50">Save &amp; Close</button>
               <button onClick={onClose} className="px-4 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600">Cancel</button>
             </div>
           </div>
@@ -17896,7 +18018,7 @@ function App() {
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} creditNotes={creditNotes} setCreditNotes={setCreditNotes}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={(q)=>{ setSalesOpen({type:'quote', id:q.id}); setPage('sales'); }} onOpenInvoice={(inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); }}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
-    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects}/>,
+    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} accInvoices={accInvoices}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
