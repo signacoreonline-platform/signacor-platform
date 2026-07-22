@@ -5678,7 +5678,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [editInvoice, setEditInvoice] = useState(null); // job open in invoice edit modal
   const [emailInvoiceJob, setEmailInvoiceJob] = useState(null); // job for email flow modal
   const [filter,setFilter]=useState('all');
-  const [sortOrder,setSortOrder]=useState('asc');  // 'asc' = oldest→newest, 'desc' = newest→oldest (Quotes sub-tab)
+  const [sortOrder,setSortOrder]=useState('desc');  // 'asc' = oldest→newest, 'desc' = newest→oldest (Quotes sub-tab) — newest-first default
   const [search,setSearch]=useState('');           // client-name search (Quotes sub-tab)
   const [searchAcc,setSearchAcc]=useState('');     // search (Accepted Quotes sub-tab)
   const [searchInv,setSearchInv]=useState('');     // search (Invoices sub-tab)
@@ -10086,7 +10086,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
   const [jobTab,       setJobTab]       = useState('active'); // 'active' | 'completed'
   const [statusFilter, setStatusFilter] = useState('all');
   const [search,       setSearch]       = useState('');
-  const [sortOrder,    setSortOrder]    = useState('asc'); // 'asc' = oldest→newest, 'desc' = newest→oldest
+  const [sortOrder,    setSortOrder]    = useState('desc'); // 'asc' = oldest→newest, 'desc' = newest→oldest — newest-first default
   const [detail,       setDetail]       = useState(null);
   const [showAdd,      setShowAdd]      = useState(false);
   const [newProposal,  setNewProposal]  = useState('');
