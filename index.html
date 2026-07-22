@@ -7868,7 +7868,7 @@ section{margin-bottom:14px}
 .footer{border-top:2px solid #06065c;padding-top:8px;margin-top:18px;display:flex;justify-content:space-between;align-items:center}
 .footer-left{font-size:8px;color:#333;line-height:1.6}
 .footer-right{font-size:8px;color:#ED0101;font-weight:700;letter-spacing:0.05em}
-@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}.hdr-cell{padding:40mm 12mm 14mm}.body-cell{padding:4mm 12mm 28mm}.ftr-cell{padding:0 12mm 8mm;background:#fff}.footer{border-top:2px solid #06065c;padding:8px 0 0;margin:0}}
+@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}.hdr-cell{padding:40mm 12mm 14mm}.hdr-cell.compact-hdr{padding:12mm 12mm 14mm}.body-cell{padding:4mm 12mm 28mm}.ftr-cell{padding:0 12mm 8mm;background:#fff}.footer{border-top:2px solid #06065c;padding:8px 0 0;margin:0}}
 `;
 }
 
@@ -8366,7 +8366,7 @@ ${data.subject ? `<section style="margin-bottom:16px;"><div style="font-size:12p
 <style>${hrLetterheadStyles()}</style>
 </head><body>
 <table class="print-wrap">
-  <thead><tr><td class="hdr-cell">${hrLetterhead(logoDataUrl, docTitle, ref)}</td></tr></thead>
+  <thead><tr><td class="hdr-cell${formId==='business_letter'?' compact-hdr':''}">${hrLetterhead(logoDataUrl, docTitle, ref)}</td></tr></thead>
   <tfoot><tr><td class="ftr-cell">${hrFooter()}</td></tr></tfoot>
   <tbody><tr><td class="body-cell">${bodyHtml}</td></tr></tbody>
 </table>
