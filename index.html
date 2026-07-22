@@ -7869,6 +7869,12 @@ section{margin-bottom:14px}
 .footer-left{font-size:8px;color:#333;line-height:1.6}
 .footer-right{font-size:8px;color:#ED0101;font-weight:700;letter-spacing:0.05em}
 @media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}.hdr-cell{padding:40mm 12mm 14mm}.hdr-cell.compact-hdr{padding:12mm 12mm 14mm}.body-cell{padding:4mm 12mm 28mm}.ftr-cell{padding:0 12mm 8mm;background:#fff}.footer{border-top:2px solid #06065c;padding:8px 0 0;margin:0}}
+.compact-letter .hdr{padding-bottom:8px;margin-bottom:4px}
+.compact-letter .red-accent{margin-bottom:8px}
+.compact-letter .doc-title-bar{margin-bottom:8px;padding:7px 14px}
+.compact-letter section{margin-bottom:8px}
+.compact-letter .footer{margin-top:10px}
+.compact-letter .body-cell{padding-bottom:6mm}
 `;
 }
 
@@ -8318,11 +8324,11 @@ function printHRForm(formId, data, emp, logoDataUrl, sigOTSmit) {
       ref = data.refNo || 'SNS-BUSS-CORR-001';
       docTitle = data.subject ? `Re: ${data.subject}` : 'Business Correspondence';
       bodyHtml = `
-<section style="margin-bottom:18px;">
+<section style="margin-bottom:10px;">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;">
     <div>
       <div class="lbl" style="margin-bottom:4px;">To</div>
-      <div style="font-size:12px;line-height:1.8;color:#1a1a1a;">
+      <div style="font-size:12px;line-height:1.6;color:#1a1a1a;">
         ${data.recipientName   ? `<strong>${data.recipientName}</strong><br>` : ''}
         ${data.recipientTitle  ? `${data.recipientTitle}<br>` : ''}
         ${data.recipientCompany? `${data.recipientCompany}<br>` : ''}
@@ -8337,23 +8343,24 @@ function printHRForm(formId, data, emp, logoDataUrl, sigOTSmit) {
   </div>
 </section>
 
-${data.subject ? `<section style="margin-bottom:16px;"><div style="font-size:12px;"><strong>Re: ${data.subject}</strong></div></section>` : ''}
+${data.subject ? `<section style="margin-bottom:8px;"><div style="font-size:12px;"><strong>Re: ${data.subject}</strong></div></section>` : ''}
 
-<section>
-  <div class="body-text" style="white-space:pre-wrap;min-height:220px;line-height:1.9;font-size:12px;">
-    <p style="margin-bottom:14px;">${data.salutation || `Dear ${data.recipientName || 'Sir / Madam'},`}</p>
-    <p style="margin-bottom:24px;white-space:pre-wrap;">${data.body || ''}</p>
+<section style="margin-bottom:8px;">
+  <div class="body-text" style="white-space:pre-wrap;line-height:1.6;font-size:12px;">
+    <p style="margin-bottom:8px;">${data.salutation || `Dear ${data.recipientName || 'Sir / Madam'},`}</p>
+    <p style="margin-bottom:12px;white-space:pre-wrap;">${data.body || ''}</p>
     <p>${data.closing || 'Yours sincerely,'}</p>
   </div>
 </section>
 
-<section style="margin-top:32px;">
-  <div style="margin-top:14px;display:inline-block;text-align:left;">
+<section style="margin-top:10px;margin-bottom:0;">
+  <div style="margin-top:6px;display:inline-block;text-align:left;">
     ${sigOTSmit ? `<img src="${sigOTSmit}" style="max-height:56px;max-width:160px;object-fit:contain;display:block;margin-bottom:2px;" alt="Signature"/>` : '<div style="height:40px;border-bottom:1.5px solid #1a1a1a;width:160px;margin-bottom:4px;"></div>'}
     <div style="font-size:12px;font-weight:600;color:#1a1a1a;">O T Smit</div>
     <div style="font-size:10px;color:#222;">Director · Signacore</div>
   </div>
-</section>`;
+</section>
+${hrFooter()}`;
       break;
 
     default:
@@ -8365,9 +8372,9 @@ ${data.subject ? `<section style="margin-bottom:16px;"><div style="font-size:12p
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,700;0,800;1,800&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
 <style>${hrLetterheadStyles()}</style>
 </head><body>
-<table class="print-wrap">
+<table class="print-wrap${formId==='business_letter'?' compact-letter':''}">
   <thead><tr><td class="hdr-cell${formId==='business_letter'?' compact-hdr':''}">${hrLetterhead(logoDataUrl, docTitle, ref)}</td></tr></thead>
-  <tfoot><tr><td class="ftr-cell">${hrFooter()}</td></tr></tfoot>
+  ${formId==='business_letter' ? '' : `<tfoot><tr><td class="ftr-cell">${hrFooter()}</td></tr></tfoot>`}
   <tbody><tr><td class="body-cell">${bodyHtml}</td></tr></tbody>
 </table>
 <script>window.onload=function(){window.print();}<\/script>
