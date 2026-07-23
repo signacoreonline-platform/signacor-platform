@@ -1771,7 +1771,7 @@ table.ln tfoot tr td{background:#06065c;color:#fff;font-size:8px;text-transform:
 <table class="ln"><thead><tr>
   <th style="width:24px">#</th>
   <th>Description &amp; Specifications</th>
-  <th style="width:80px;text-align:center">Qty</th>
+  <th style="width:80px;text-align:center">Item Qty</th>
   <th style="width:100px;text-align:right">Sub Total</th>
 </tr></thead><tbody>${rows}</tbody></table>
 
@@ -2248,10 +2248,12 @@ function printJobCard(job, companies) {
   const co = companies.find(c=>c.id===job.co)||{name:'Signacore',short:'SGR'};
   const lines = job.lines||[];
   const rows = lines.map(function(l,i){
-    var dimStr='';
-    if(l.sqmL){
-      dimStr = l.sqmW ? l.sqmL+'m \xd7 '+l.sqmW+'m' : l.sqmL+'m';
-    }
+    // Uses the same lineSizeText() helper as quotes/invoices \u2014 was
+    // previously building its own dimension string here that mislabelled
+    // the stored millimetre length/width as metres (e.g. "1200m" for a
+    // 1200mm length) and never showed item quantity. lineSizeText() shows
+    // the correct "\u2026mm" units and appends "\u00b7 N off" (Item Qty) when >1.
+    var dimStr = lineSizeText(l);
     var descCell = (l.desc||'\u2014') + (dimStr ? '<br><span style="font-size:9px;color:#666;">'+dimStr+'</span>' : '');
     var qtyCell = l.qty||'';
     var unitCell = l.unit||'';
@@ -2327,7 +2329,7 @@ stageNames.map(function(s,i){
 (lines.length>0?
 '<table class="ln"><thead><tr>'+
 '<th style="width:28px">#</th><th>Description / Item</th>'+
-'<th class="c" style="width:60px">Qty</th><th class="c" style="width:70px">Unit</th>'+
+'<th class="c" style="width:60px">Material</th><th class="c" style="width:70px">Unit</th>'+
 '</tr></thead><tbody>'+rows+'</tbody></table>'
 :'<div style="border:1px solid #e5e7eb;border-radius:8px;padding:16px;text-align:center;color:#333;font-size:11px;margin-bottom:14px;">No line items recorded.</div>')+
 
@@ -2496,7 +2498,7 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
 (rows.length>0
 ?'<table class="ln"><thead><tr>'+
 '<th style="width:42px">Item No</th><th>Description</th>'+
-'<th style="width:60px;text-align:center">Qty</th>'+
+'<th style="width:60px;text-align:center">Item Qty</th>'+
 '<th style="width:120px;text-align:right">Total</th>'+
 '</tr></thead><tbody>'+rows+'</tbody></table>'
 :'<div style="border:1px solid #e5e7eb;border-radius:6px;padding:14px;text-align:center;color:#4b5563;font-size:11px;margin-bottom:12px;">No line items on record.</div>')+
@@ -4239,9 +4241,9 @@ function SaveAsInventoryModal({ line, inventory, setInventory, onClose, onSaved 
               <input required className={iCls} value={f.name} onChange={upd('name')} placeholder="e.g. 3M Gloss White Vinyl 1220mm"/>
             </div>
             <div>
-              <label className={lCls}>Unit</label>
+              <label className={lCls}>Unit Type</label>
               <select className={iCls} value={f.unit} onChange={upd('unit')}>
-                {['unit','each','m','m²','m (linear)','sheet','roll','pack','litre','kg','box','set','hour','day'].map(u=><option key={u} value={u}>{u}</option>)}
+                {UNIT_TYPE_OPTIONS.map(u=><option key={u} value={u}>{u}</option>)}
               </select>
             </div>
             <div>
@@ -4277,6 +4279,16 @@ function SaveAsInventoryModal({ line, inventory, setInventory, onClose, onSaved 
     </div>
   );
 }
+
+// Shared "Unit Type" option list — one canonical list used everywhere a unit
+// is chosen (quote lines, invoice lines, inventory, quick rates), so every
+// screen offers the same consistent choices. This is the union of every
+// value previously used across those separate lists, so no existing saved
+// record's unit ever becomes "missing" from a dropdown. 'm' and 'm (linear)'
+// are intentionally both kept as distinct options — 'm' is a plain typed
+// metre quantity, 'm (linear)' triggers the length (mm) calculator — merging
+// their behaviour would change how 100+ existing inventory items behave.
+const UNIT_TYPE_OPTIONS = ['each','unit','m','m (linear)','m²','sheet','roll','panel','pack','box','litre','kg','set','hour','day','item','job','visit'];
 
 function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies, nextNum, preparedBy, customers, setCustomers, savedCalcs, completeProducts, existingQuote, quickRates, initialData }) {
   const eq = existingQuote;
@@ -4317,7 +4329,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   const [salesperson,setSalesperson]=useState(_draft?.salesperson??eq?.salesperson??id?.salesperson??'');
   const SALESPEOPLE = ['Ockert Smit','Reinhart Smit','Janique Bettini'];
   const spDropVal = SALESPEOPLE.includes(salesperson) ? salesperson : (salesperson ? 'custom' : '');
-  const UNIT_OPTIONS = ['m²','m (linear)','unit','each','set','hour','day','sheet','pack','kg'];
+  const UNIT_OPTIONS = UNIT_TYPE_OPTIONS;
   const [discount,setDiscount]=useState(_draft?.discount??eq?.discount??id?.discount??'');
   const [setupFee,setSetupFee]=useState(_draft?.setupFee??eq?.setupFee??id?.setupFee??'');
   const [lines,setLines]=useState(_draft?.lines||eq?.lines||(id?.lines?.map(l=>({...l,id:Date.now()+Math.random(),cpLinked:false,cpId:undefined})))||[{id:1,itemId:null,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]);
@@ -4813,12 +4825,12 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
 
                   {/* Unit */}
                   <div className="flex-shrink-0 w-32">
-                    <label className="block text-xs font-semibold text-gray-400 mb-1">Unit</label>
+                    <label className="block text-xs font-semibold text-gray-400 mb-1">Unit Type</label>
                     <select value={unitDropVal}
                       onChange={e=>updateLine(line.id,'unitSelect',e.target.value)}
                       onFocus={()=>setActiveLineId(line.id)}
                       className="w-full border border-gray-300 rounded-xl px-2 py-2.5 text-sm bg-white focus:ring-2 focus:ring-brand-400">
-                      <option value="">— Unit —</option>
+                      <option value="">— Unit Type —</option>
                       {UNIT_OPTIONS.map(u=><option key={u} value={u}>{u}</option>)}
                       <option value="custom">✏️ Custom…</option>
                     </select>
@@ -4841,10 +4853,10 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                     </div>
                   )}
 
-                  {/* No. Items summary — read-only display on inactive lines that have dimension data */}
+                  {/* Item Qty summary — read-only display on inactive lines that have dimension data */}
                   {activeLineId!==line.id && line.sqmL && (line.unit==='m²'||line.unit==='m (linear)') && (
                     <div className="flex-shrink-0 w-22">
-                      <label className="block text-xs font-semibold text-amber-500 mb-1">No. Items</label>
+                      <label className="block text-xs font-semibold text-amber-500 mb-1">Item Qty</label>
                       <div className="w-full border border-amber-200 bg-amber-50 rounded-xl px-2 py-2.5 text-sm text-center text-amber-700 font-semibold">
                         {line.pQty||1}
                       </div>
@@ -4883,22 +4895,22 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                     </div>
                   )}
 
-                  {/* Product Qty — only shown when dimension calculator is active (active line only) */}
+                  {/* Item Qty — only shown when dimension calculator is active (active line only) */}
                   {activeLineId===line.id && (line.unit==='m²'||line.unit==='m (linear)')&&(
                     <div className="flex-shrink-0 w-24">
-                      <label className="block text-xs font-semibold text-amber-600 mb-1">No. Items</label>
+                      <label className="block text-xs font-semibold text-amber-600 mb-1">Item Qty</label>
                       <input type="number" min="1" step="1" value={line.pQty||1}
                         onChange={e=>updateLine(line.id,'pQty',e.target.value)}
                         className="w-full border border-amber-300 rounded-xl px-2 py-2.5 text-sm text-center bg-amber-50 focus:ring-2 focus:ring-amber-400"/>
                     </div>
                   )}
 
-                  {/* Qty — size qty (auto-filled from dimensions) or plain qty for non-size units */}
+                  {/* Material Qty — size qty (auto-filled from dimensions) or plain material qty for non-size units */}
                   <div className="flex-shrink-0 w-24">
                     <label className="block text-xs font-semibold text-gray-400 mb-1">
                       {activeLineId===line.id && (line.unit==='m²'||line.unit==='m (linear)')
-                        ? <span className="text-indigo-500">{line.unit==='m²'?'m² each':'m each'}</span>
-                        : 'Qty'}
+                        ? <span className="text-indigo-500">{line.unit==='m²'?'Material Qty (m² each)':'Material Qty (m each)'}</span>
+                        : 'Material Qty'}
                     </label>
                     <input type="number" min="0" step="0.0001" value={line.qty}
                       onChange={e=>updateLine(line.id,'qty',e.target.value)}
@@ -5445,7 +5457,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
 /* ═══════════════════════════════════════════
    EDIT INVOICE FORM (inline inside modal)
 ═══════════════════════════════════════════ */
-function EditInvoiceForm({ job, onSave, onClose }) {
+function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[] }) {
   const iCls = "w-full border border-gray-200 rounded-xl px-3 py-2 text-sm";
   // ── Restore unsaved draft if one exists ──
   const _invDraftKey0 = 'sgr_inv_draft_' + (job.invoiceNum||job.id);
@@ -5497,17 +5509,23 @@ function EditInvoiceForm({ job, onSave, onClose }) {
     setLines(prev=>prev.map(l=>{
       if(l.id!==id) return l;
       const u={...l,[field]:v};
-      if(field==='sqmL'||field==='sqmW'){
-        const ll=parseFloat(field==='sqmL'?v:u.sqmL)||0;
-        const w=parseFloat(field==='sqmW'?v:u.sqmW)||0;
-        if(u.unit==='m²') u.qty=parseFloat(((ll*w/1000000)*(parseFloat(u.pQty)||1)).toFixed(4));
-        if(u.unit==='m (linear)') u.qty=parseFloat((ll/1000*(parseFloat(u.pQty)||1)).toFixed(4));
+      // qty always represents the material used PER ITEM (matches the
+      // quote-editor model) — recomputed fresh from the stored L×W/length
+      // (mm) whenever dimension data is present, regardless of which field
+      // was actually edited. Item quantity (pQty) is then applied separately
+      // in the subtotal below on every single update, so it can never be
+      // silently dropped by editing an unrelated field (fixes a real bug:
+      // previously pQty was only folded into qty on a sqmL/sqmW/pQty edit,
+      // so editing price/description afterwards undercharged multi-piece
+      // m²/linear lines). This also self-heals any line's qty the moment
+      // the user touches it, without changing anything on lines the user
+      // doesn't edit.
+      if(u.unit==='m²' && u.sqmL && u.sqmW){
+        u.qty=parseFloat(((parseFloat(u.sqmL)||0)*(parseFloat(u.sqmW)||0)/1000000).toFixed(4));
+      } else if(u.unit==='m (linear)' && u.sqmL){
+        u.qty=parseFloat((parseFloat(u.sqmL)/1000).toFixed(4));
       }
-      if(field==='pQty'){
-        if(u.unit==='m²'&&u.sqmL&&u.sqmW) u.qty=parseFloat(((parseFloat(u.sqmL)||0)*(parseFloat(u.sqmW)||0)/1000000*(parseFloat(v)||1)).toFixed(4));
-        if(u.unit==='m (linear)'&&u.sqmL) u.qty=parseFloat(((parseFloat(u.sqmL)||0)/1000*(parseFloat(v)||1)).toFixed(4));
-      }
-      u.subtotal=(parseFloat(u.qty)||0)*(parseFloat(u.unitPrice)||0);
+      u.subtotal=(parseFloat(u.pQty)||1)*(parseFloat(u.qty)||0)*(parseFloat(u.unitPrice)||0);
       return u;
     }));
   }
@@ -5515,16 +5533,48 @@ function EditInvoiceForm({ job, onSave, onClose }) {
   function addLine(){ const nid=Date.now(); setLines(prev=>[...prev,{id:nid,desc:'',qty:1,pQty:1,unit:'',unitPrice:0,subtotal:0,sqmL:'',sqmW:''}]); setActiveLineId(nid); }
   function removeLine(id){ setLines(prev=>prev.filter(l=>l.id!==id)); }
 
-  const UNIT_OPT = ['unit','m²','m (linear)','set','day','hour','sheet','roll','panel','item'];
+  const UNIT_OPT = UNIT_TYPE_OPTIONS;
+
+  const hasPayments = (job.payments||[]).length>0;
 
   function save(){
     const finalValue = hasLines ? linesTotal : parseFloat(value)||0;
+
+    // ── Block silent duplicate invoice numbers ──
+    // Only checked when the number was actually changed — mirrors the
+    // safeguard the manual-invoice path already has (reserveInvoiceNumber /
+    // invoiceNumberExists), but here it's a synchronous check against the
+    // in-memory jobs/accInvoices already loaded, excluding this job itself.
+    const newNum = (invoiceNum||'').trim();
+    const oldNum = (job.invoiceNum||'').trim();
+    if (newNum && newNum.toUpperCase()!==oldNum.toUpperCase()) {
+      const target = newNum.toUpperCase();
+      const dupJob = (jobs||[]).some(j=>j && j.id!==job.id && String(j.co)===String(job.co) && (j.invoiceNum||'').trim().toUpperCase()===target);
+      const dupAcc = (accInvoices||[]).some(i=>i && String(i.co)===String(job.co) && (i.number||'').trim().toUpperCase()===target);
+      if (dupJob || dupAcc) {
+        alert(`Invoice number ${newNum} already exists for this company. Choose a different number — duplicate invoice numbers are not allowed.`);
+        return;
+      }
+    }
+
+    // ── Warn before saving a total-affecting change on an invoice that already has payments ──
+    const totalChanged = Math.abs((parseFloat(finalValue)||0) - (parseFloat(job.value)||0)) > 0.01;
+    if (hasPayments && totalChanged) {
+      const ok = window.confirm('This invoice already has payment(s) recorded against it. Changing the total may affect the paid/balance amounts, invoice status and any statement that includes it.\n\nSave anyway?');
+      if (!ok) return;
+    }
+
     onSave({...job, client, invoiceNum, invoiceDate, invoiceDue, value:finalValue, notes, invoiceStatus, paidAt, lines:hasLines?lines:job.lines, discount:hasLines?discount:job.discount});
     try { localStorage.removeItem(_invDraftKey); } catch(e){}
   }
 
   return (
     <div className="p-5 space-y-4 max-h-[80vh] overflow-y-auto">
+      {hasPayments&&(
+        <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-xl px-3 py-2.5 text-xs font-semibold">
+          ⚠ This invoice already has {job.payments.length} payment{job.payments.length>1?'s':''} recorded. Changing line items, discount or value will prompt a confirmation before saving, since it may affect the balance, status and statements.
+        </div>
+      )}
       {/* Header fields */}
       <div className="grid grid-cols-2 gap-3">
         <div className="col-span-2"><label className="text-xs font-bold text-gray-500 block mb-1">Client / Customer</label><input value={client} onChange={e=>setClient(e.target.value)} className={iCls}/></div>
@@ -5571,12 +5621,12 @@ function EditInvoiceForm({ job, onSave, onClose }) {
 
                   {/* Unit */}
                   <div className="flex-shrink-0 w-28">
-                    <label className="block text-xs font-semibold text-gray-400 mb-1">Unit</label>
+                    <label className="block text-xs font-semibold text-gray-400 mb-1">Unit Type</label>
                     <select value={UNIT_OPT.includes(line.unit)?line.unit:(line.unit?'custom':'')}
                       onChange={e=>{ const v=e.target.value; if(v!=='custom') updateLine(line.id,'unit',v); }}
                       onFocus={()=>setActiveLineId(line.id)}
                       className="w-full border border-gray-300 rounded-xl px-2 py-2.5 text-sm bg-white focus:ring-2">
-                      <option value="">— Unit —</option>
+                      <option value="">— Unit Type —</option>
                       {UNIT_OPT.map(u=><option key={u} value={u}>{u}</option>)}
                       <option value="custom">✏️ Custom…</option>
                     </select>
@@ -5596,10 +5646,10 @@ function EditInvoiceForm({ job, onSave, onClose }) {
                     </div>
                   )}
 
-                  {/* No. Items summary (inactive) */}
+                  {/* Item Qty summary (inactive) */}
                   {activeLineId!==line.id && line.sqmL && (line.unit==='m²'||line.unit==='m (linear)') && (
                     <div className="flex-shrink-0 w-20">
-                      <label className="block text-xs font-semibold text-amber-500 mb-1">No. Items</label>
+                      <label className="block text-xs font-semibold text-amber-500 mb-1">Item Qty</label>
                       <div className="w-full border border-amber-200 bg-amber-50 rounded-xl px-2 py-2.5 text-sm text-center text-amber-700 font-semibold">{line.pQty||1}</div>
                     </div>
                   )}
@@ -5626,21 +5676,21 @@ function EditInvoiceForm({ job, onSave, onClose }) {
                     </div>
                   )}
 
-                  {/* No. Items (active, m²/m linear) */}
+                  {/* Item Qty (active, m²/m linear) */}
                   {activeLineId===line.id && (line.unit==='m²'||line.unit==='m (linear)') && (
                     <div className="flex-shrink-0 w-20">
-                      <label className="block text-xs font-semibold text-amber-600 mb-1">No. Items</label>
+                      <label className="block text-xs font-semibold text-amber-600 mb-1">Item Qty</label>
                       <input type="number" min="1" step="1" value={line.pQty||1} onChange={e=>updateLine(line.id,'pQty',e.target.value)}
                         className="w-full border border-amber-300 rounded-xl px-2 py-2.5 text-sm text-center bg-amber-50 focus:ring-2 focus:ring-amber-400"/>
                     </div>
                   )}
 
-                  {/* Qty */}
+                  {/* Material Qty */}
                   <div className="flex-shrink-0 w-20">
                     <label className="block text-xs font-semibold text-gray-400 mb-1">
                       {activeLineId===line.id && (line.unit==='m²'||line.unit==='m (linear)')
-                        ? <span className="text-indigo-500">{line.unit==='m²'?'m² each':'m each'}</span>
-                        : 'Qty'}
+                        ? <span className="text-indigo-500">{line.unit==='m²'?'Material (m² ea.)':'Material (m ea.)'}</span>
+                        : 'Material Qty'}
                     </label>
                     <input type="number" min="0" step="0.0001" value={line.qty} onChange={e=>updateLine(line.id,'qty',e.target.value)} onFocus={()=>setActiveLineId(line.id)}
                       className={`w-full border rounded-xl px-2 py-2.5 text-sm text-center bg-white focus:ring-2 ${(line.unit==='m²'||line.unit==='m (linear)')&&line.sqmL?'border-indigo-300':'border-gray-300'}`}/>
@@ -6652,7 +6702,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
               <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>✏️ EDIT INVOICE — {editInvoice.invoiceNum}</p>
               <button onClick={()=>setEditInvoice(null)} className="text-white/60 hover:text-white text-xl">✕</button>
             </div>
-            <EditInvoiceForm job={editInvoice} onSave={updated=>{ setJobs(prev=>prev.map(j=>j.id===updated.id?updated:j)); setEditInvoice(null); }} onClose={()=>setEditInvoice(null)}/>
+            <EditInvoiceForm job={editInvoice} jobs={jobs} accInvoices={accInvoices} onSave={updated=>{ setJobs(prev=>prev.map(j=>j.id===updated.id?updated:j)); setEditInvoice(null); }} onClose={()=>setEditInvoice(null)}/>
           </div>
         </div>
       )}
@@ -12533,9 +12583,9 @@ function AddEditInventoryItemModal({ item, suppliers, onClose, onSave, allCats }
             </div>
             <div className="col-span-2"><label className={lCls}>Item Name *</label><input className={iCls} value={f.name} onChange={upd('name')}/></div>
             <div><label className={lCls}>Stock Qty</label><input type="number" min="0" className={iCls} value={f.stock} onChange={upd('stock')}/></div>
-            <div><label className={lCls}>Unit</label>
+            <div><label className={lCls}>Unit Type</label>
               <select className={iCls} value={f.unit} onChange={upd('unit')}>
-                {['unit','m','m²','sheet','roll','pack','litre','kg','box'].map(u=><option key={u}>{u}</option>)}
+                {UNIT_TYPE_OPTIONS.map(u=><option key={u}>{u}</option>)}
               </select>
             </div>
             <div><label className={lCls}>Reorder Level</label><input type="number" min="0" className={iCls} value={f.reorder} onChange={upd('reorder')}/></div>
@@ -12605,9 +12655,9 @@ function AddEditQuickRateModal({ item, suppliers, allCats, onClose, onSave }) {
             </div>
             <div className="col-span-2"><label className={lCls}>Item Name *</label><input className={iCls} value={f.name} onChange={upd('name')}/></div>
             <div><label className={lCls}>Stock Qty</label><input type="number" min="0" className={iCls} value={f.stock} onChange={upd('stock')}/></div>
-            <div><label className={lCls}>Unit</label>
+            <div><label className={lCls}>Unit Type</label>
               <select className={iCls} value={f.unit} onChange={upd('unit')}>
-                {['unit','m','m²','sheet','roll','pack','litre','kg','box','hour','day','job','visit','set'].map(u=><option key={u}>{u}</option>)}
+                {UNIT_TYPE_OPTIONS.map(u=><option key={u}>{u}</option>)}
               </select>
             </div>
             <div><label className={lCls}>Reorder Level</label><input type="number" min="0" className={iCls} value={f.reorder} onChange={upd('reorder')}/></div>
