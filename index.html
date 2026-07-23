@@ -2102,13 +2102,54 @@ function getConsistencyIssues(quotes, jobs, accInvoices) {
       issues.push({type:'job_no_invoice', severity:'high', ref:j.num,
         message:`Job ${j.num||'—'} (${j.client||'—'}) is completed but has not been invoiced yet.`});
     }
+    // A job should always stay tagged to the same company as the quote it came from.
+    if(j.quoteNum){
+      const linkedQuote = (quotes||[]).find(q=>q.num===j.quoteNum);
+      if(linkedQuote && (linkedQuote.co??null) !== (j.co??null)){
+        issues.push({type:'job_quote_company_mismatch', severity:'high', ref:j.num,
+          message:`Job ${j.num||'—'} is tagged to a different company than its source quote ${j.quoteNum} — please review which company this record belongs to.`});
+      }
+    }
   });
-  getAllInvoicesUnified(jobs, quotes, accInvoices).forEach(inv=>{
+  // Duplicate document numbers — same quote/job number reused by more than one record.
+  function flagDuplicateNumbers(records, field, label, type){
+    const seen = {};
+    (records||[]).forEach(r=>{ const n=r&&r[field]; if(n) seen[n]=(seen[n]||0)+1; });
+    Object.keys(seen).forEach(n=>{ if(seen[n]>1) issues.push({type, severity:'high', ref:n,
+      message:`${label} ${n} is used by ${seen[n]} different records — check for a duplicate.`}); });
+  }
+  flagDuplicateNumbers(quotes, 'num', 'Quote number', 'duplicate_quote_number');
+  flagDuplicateNumbers(jobs, 'num', 'Job number', 'duplicate_job_number');
+
+  const unifiedInvoices = getAllInvoicesUnified(jobs, quotes, accInvoices);
+  unifiedInvoices.forEach(inv=>{
     if(inv.status==='paid' && (!inv.payments || inv.payments.length===0)){
       issues.push({type:'invoice_no_payment_trail', severity:'medium', ref:inv.number,
         message:`Invoice ${inv.number||'—'} (${inv.client||'—'}) is marked paid but has no payment recorded against it.`});
     }
   });
+  flagDuplicateNumbers(unifiedInvoices, 'number', 'Invoice number', 'duplicate_invoice_number');
+
+  // Duplicate payments — the same amount/date/method repeated within one
+  // job or quote's payment history (the pattern behind past real incidents).
+  function flagDuplicatePayments(records, kind){
+    (records||[]).forEach(r=>{
+      const pays = r.payments||[];
+      if(pays.length<2) return;
+      const seen = {};
+      pays.forEach(p=>{ const key=[p.amount,p.date,p.method].join('|'); seen[key]=(seen[key]||0)+1; });
+      Object.keys(seen).forEach(key=>{
+        if(seen[key]>1){
+          const [amt,date] = key.split('|');
+          issues.push({type:'duplicate_payment', severity:'medium', ref:r.num,
+            message:`${kind} ${r.num||'—'} (${r.client||'—'}) has ${seen[key]} payments of the same amount (R${parseFloat(amt||0).toFixed(2)}) on the same date (${date||'—'}) — check it wasn't recorded twice.`});
+        }
+      });
+    });
+  }
+  flagDuplicatePayments(jobs, 'Job');
+  flagDuplicatePayments(quotes, 'Quote');
+
   return issues;
 }
 
@@ -3589,7 +3630,7 @@ function BulkImportModal({ inventory, onClose, onImport }) {
 /* ═══════════════════════════════════════════
    CUSTOMERS
 ═══════════════════════════════════════════ */
-function AddEditCustomerModal({ customer, onClose, onSave }) {
+function AddEditCustomerModal({ customer, onClose, onSave, customers=[] }) {
   const [companyName, setCompanyName] = useState(customer?.companyName||'');
   const [contactPerson, setContactPerson] = useState(customer?.contactPerson||'');
   const [vatNumber, setVatNumber] = useState(customer?.vatNumber||'');
@@ -3597,10 +3638,30 @@ function AddEditCustomerModal({ customer, onClose, onSave }) {
   const [email, setEmail] = useState(customer?.email||'');
   const [tel, setTel] = useState(customer?.tel||'');
   const [notes, setNotes] = useState(customer?.notes||'');
+  const [saving, setSaving] = useState(false); // guards against a double-click/double-submit creating two records
   const iCls = "w-full border border-gray-300 rounded-xl px-3 py-2.5 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 bg-white";
   function submit(e) {
     e.preventDefault();
-    if (!companyName.trim()) return;
+    if (!companyName.trim() || saving) return;
+    // Warn (but don't block) if an existing customer looks like the same
+    // company by name / email / VAT number / phone — never auto-merge or
+    // auto-delete, just let the user decide.
+    const cnVal = companyName.trim().toLowerCase();
+    const emVal = email.trim().toLowerCase();
+    const vtVal = vatNumber.trim().toLowerCase();
+    const tlVal = tel.trim().toLowerCase();
+    const dupe = (customers||[]).find(c=>{
+      if (customer && c.id===customer.id) return false; // ignore the record being edited
+      const cn = (c.companyName||'').trim().toLowerCase();
+      const em = (c.email||'').trim().toLowerCase();
+      const vt = (c.vatNumber||'').trim().toLowerCase();
+      const tl = (c.tel||'').trim().toLowerCase();
+      return (cn && cn===cnVal) || (em && emVal && em===emVal) || (vt && vtVal && vt===vtVal) || (tl && tlVal && tl===tlVal);
+    });
+    if (dupe && !window.confirm(`A customer matching this name, email, VAT number or phone already exists: "${dupe.companyName}".\n\nAdd this as a new, separate customer anyway?`)) {
+      return;
+    }
+    setSaving(true);
     onSave({ ...(customer||{}), id:customer?.id||Date.now(),
       companyName:companyName.trim(), contactPerson, vatNumber, address, email, tel, notes });
     onClose();
@@ -3645,8 +3706,8 @@ function AddEditCustomerModal({ customer, onClose, onSave }) {
         </div>
         <div className="flex gap-3 pt-2">
           <button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Cancel</button>
-          <button type="submit" className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold">
-            {customer?'Save Changes':'Add Customer'}
+          <button type="submit" disabled={saving} className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed">
+            {saving ? 'Saving…' : (customer?'Save Changes':'Add Customer')}
           </button>
         </div>
       </form>
@@ -4074,7 +4135,7 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
           {filtered.map(c=>(<CustomerRow key={c.id} c={c}/>))}
         </div>
       )}
-      {showAdd&&<AddEditCustomerModal customer={editing} onClose={()=>{setShowAdd(false);setEditing(null);}} onSave={handleSave}/>}
+      {showAdd&&<AddEditCustomerModal customer={editing} customers={customers} onClose={()=>{setShowAdd(false);setEditing(null);}} onSave={handleSave}/>}
       {showImport&&<BulkImportCustomersModal
         existingCustomers={customers}
         onImport={handleBulkImport}
@@ -5051,7 +5112,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setC
                     <tr><th className="px-3 py-2 text-left text-gray-500 font-bold">Date</th><th className="px-3 py-2 text-left text-gray-500 font-bold">Method</th><th className="px-3 py-2 text-right text-gray-500 font-bold">Amount</th><th className="px-3 py-2 text-left text-gray-500 font-bold">Notes</th><th className="w-10"/></tr>
                   </thead>
                   <tbody>
-                    {payments.map(p=>(
+                    {[...payments].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0)||(b.id||0)-(a.id||0)).map(p=>(
                       <tr key={p.id} className="border-t border-gray-100">
                         <td className="px-3 py-2 text-gray-700">{p.date}</td>
                         <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold">{p.method}</span></td>
@@ -5685,6 +5746,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [invFilter,setInvFilter]=useState('all'); // 'all' | 'paid' | 'partial' | 'pending'
   const [invHighlight,setInvHighlight]=useState(null); // invoice id to highlight when opened from elsewhere
   const [jobPayModal,setJobPayModal]=useState(null); // job being viewed in payment history modal
+  const [convertedInfo,setConvertedInfo]=useState(null); // {jobId,jobNum} after a quote→job conversion, awaiting the user's "Open Job" choice
   const nonUtech = companies.filter(c=>c.id!==UNIONTECH_ID);
   // Company-context filter: Holdings users see only Holdings (co:1)
   // quotes/jobs/invoices; original-company users see everything else,
@@ -5731,7 +5793,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const normStatus=i.status==='paid'?'paid':i.status==='partial'?'partial':'pending';
     return {id:i.id,invoiceNum:i.number,invoiceStatus:normStatus,client:i.contactName||'',value:sub+vat,invoiceDate:i.date,invoiceDue:i.dueDate,paidAt:i.paidDate,reference:i.reference,payments:i.payments||[],num:'manual',co:i.co??null,_isManual:true};
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
-  const invoicedJobs = numSort([...jobInvItems,...manualInvItems], 'invoiceNum');
+  const invoicedJobs = numSort([...jobInvItems,...manualInvItems], 'invoiceNum').reverse(); // newest-first by default
   const _invSearch = searchInv.trim().toLowerCase();
   const displayedInvoices = (invFilter==='all' ? invoicedJobs : invoicedJobs.filter(j=>(j.invoiceStatus||'pending')===invFilter))
     .filter(j=>!_invSearch || [j.invoiceNum,j.client,j.reference,j.num].some(v=>(v||'').toString().toLowerCase().includes(_invSearch)));
@@ -5813,6 +5875,22 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // job went missing. On restore we skip inventory deduction / PO generation
   // because those side-effects already ran during the original conversion.
   function handleConvertToJob(q, restore){
+    // Guard against converting the same quote twice — if a job already
+    // exists for this quote (by convertedJobId or by quoteNum back-link),
+    // don't silently create a second one. Offer to open the existing job
+    // instead. (Skipped when restore=true, which is specifically for
+    // rebuilding a job that no longer exists.)
+    if(!restore){
+      const existingJob = (q.convertedJobId ? jobs.find(j=>j.id===q.convertedJobId) : null)
+        || jobs.find(j=>j.quoteNum && j.quoteNum===q.num);
+      if(existingJob){
+        if(window.confirm(`Quote ${q.num||''} has already been converted to Job ${existingJob.num}. Open the existing job instead of creating a new one?`)){
+          setViewQuote(null);
+          if(onJobCreated) onJobCreated(existingJob.id);
+        }
+        return;
+      }
+    }
     // Converting a quote only creates the JOB — it is not itself the
     // creation of a final tax invoice, so no invoice number is assigned
     // here (not from a proforma, not from the old max()+1 generator). The
@@ -5895,8 +5973,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const updated={...q,status:'converted',convertedJobId:newJob.id};
     setQuotes(prev=>prev.map(qx=>qx.id===q.id?updated:qx));
     setViewQuote(null); // close the quote view
-    // Navigate directly to Jobs and open the new job
-    if(onJobCreated) onJobCreated(newJob.id);
+    // Show a confirmation with the new job number instead of silently
+    // auto-navigating away — the user chooses whether to open it now.
+    setConvertedInfo({jobId:newJob.id, jobNum:jobNum});
   }
 
   // ── Manually create the tax invoice for a converted quote's linked job,
@@ -6072,7 +6151,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       </tr>
                     </thead>
                     <tbody>
-                      {payments.map(p=>(
+                      {[...payments].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0)||(b.id||0)-(a.id||0)).map(p=>(
                         <tr key={p.id} className="border-t border-gray-100">
                           <td className="px-3 py-2 text-gray-700">{p.date}</td>
                           <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold">{p.method}</span></td>
@@ -6252,7 +6331,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           // Company-scoped — must use myQuotes (belongsToUserCompany), not the
           // raw `quotes` prop, so Holdings never sees the original company's
           // accepted quotes (and vice versa) in this Accepted sub-tab.
-          const acceptedQuotes=numSort(myQuotes.filter(q=>q.status==='converted'), 'num');
+          const acceptedQuotes=numSort(myQuotes.filter(q=>q.status==='converted'), 'num').reverse(); // newest-first by default
           if(acceptedQuotes.length===0) return (
             <div className="bg-white rounded-2xl border border-gray-200 p-12 text-center">
               <div className="text-4xl mb-3">✅</div>
@@ -6498,6 +6577,21 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
 
       {/* ── Job Payment History Modal ── */}
       {jobPayModal&&<JobPaymentHistoryModal job={jobPayModal} onClose={()=>setJobPayModal(null)}/>}
+
+      {/* ── Quote → Job conversion confirmation ── */}
+      {convertedInfo&&(
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&setConvertedInfo(null)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 text-center">
+            <div className="text-4xl mb-3">✅</div>
+            <h3 className="text-lg font-black text-gray-900 mb-1">Job {convertedInfo.jobNum} created successfully.</h3>
+            <p className="text-xs text-gray-500 mb-5">The quote has been converted. You can open the new job now or stay here.</p>
+            <div className="flex gap-3">
+              <button onClick={()=>setConvertedInfo(null)} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Stay Here</button>
+              <button onClick={()=>{ const id=convertedInfo.jobId; setConvertedInfo(null); if(onJobCreated) onJobCreated(id); }} className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl py-2.5 text-sm font-bold">Open Job →</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Email Invoice Modal ── */}
       {emailInvoiceJob&&(
@@ -9592,7 +9686,16 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     setJobs(prev=>prev.map(j=>j.id===job.id?{...j,stage:ns,status:STAGE_STATUSES[ns]}:j));
   }
   function deleteJob(){
-    if(window.confirm(`Delete job ${job.num} — ${job.client}? This cannot be undone.`)){
+    // Warn clearly if this job has an invoice number and/or recorded
+    // payments — deleting the job discards that history too. Delete logic
+    // itself (below) is unchanged.
+    const linkBits = [];
+    if(job.invoiceNum) linkBits.push(`invoice ${job.invoiceNum}`);
+    if((job.payments||[]).length>0) linkBits.push(`${job.payments.length} recorded payment${job.payments.length>1?'s':''}`);
+    const deleteWarning = linkBits.length>0
+      ? `Delete job ${job.num} — ${job.client}?\n\nThis job has ${linkBits.join(' and ')} linked to it — deleting the job will permanently remove that history too, and may affect statements and accounting totals.\n\nThis cannot be undone.`
+      : `Delete job ${job.num} — ${job.client}? This cannot be undone.`;
+    if(window.confirm(deleteWarning)){
       setJobs(prev=>prev.filter(j=>j.id!==job.id));
       // Unlink the source quote so it no longer points at a deleted job
       if(setQuotes && (job.quoteNum || job.id)){
@@ -12269,8 +12372,8 @@ function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user
   const myPOs = (purchaseOrders||[]).filter(p=>belongsToUserCompany(p,user));
   const _poSearch = search.trim().toLowerCase();
   const _supName = id => (suppliers.find(s=>s.id===parseInt(id))||{}).name||'';
-  const filtered = (filter==='all' ? myPOs : myPOs.filter(p=>p.status===filter))
-    .filter(p=>!_poSearch || [p.num,_supName(p.supplierId),p.jobNum].some(v=>(v||'').toString().toLowerCase().includes(_poSearch)));
+  const filtered = numSort((filter==='all' ? myPOs : myPOs.filter(p=>p.status===filter))
+    .filter(p=>!_poSearch || [p.num,_supName(p.supplierId),p.jobNum].some(v=>(v||'').toString().toLowerCase().includes(_poSearch))), 'num').reverse(); // newest-first by default
   const counts = statuses.reduce((a,s)=>({...a,[s]:s==='all'?myPOs.length:myPOs.filter(p=>p.status===s).length}),{});
   const fmt = n=>'R '+Number(n||0).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,',');
 
@@ -15005,7 +15108,16 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     setAccBills(prev => prev.find(b=>b.id===tagged.id) ? prev.map(b=>b.id===tagged.id?tagged:b) : [tagged,...prev]);
     setShowBillModal(false); setEditBill(null);
   }
-  function deleteInvoice(id){ if(window.confirm('Delete this invoice?')) setAccInvoices(prev=>prev.filter(i=>i.id!==id)); }
+  function deleteInvoice(id){
+    // Warn clearly if this invoice has payment history attached — deleting
+    // it discards that history too. Delete logic itself is unchanged.
+    const inv = accInvoices.find(i=>i.id===id);
+    const payCount = inv ? (inv.payments||[]).length : 0;
+    const warn = payCount>0
+      ? `This invoice has ${payCount} recorded payment${payCount>1?'s':''} against it. Deleting the invoice will permanently remove that payment history too, and may affect statements and accounting totals.\n\nDelete anyway?`
+      : 'Delete this invoice? This cannot be undone.';
+    if(window.confirm(warn)) setAccInvoices(prev=>prev.filter(i=>i.id!==id));
+  }
   function deleteBill(id){ if(window.confirm('Delete this bill?')) setAccBills(prev=>prev.filter(b=>b.id!==id)); }
   function markInvPaid(inv){
     const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
@@ -15736,12 +15848,12 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     return out;
   }
 
-  // Sort by invoice number ascending — keeps the list in document order so
-  // gaps or out-of-sequence numbers are easy to spot at a glance.
+  // Sort by invoice number descending — newest invoices first by default
+  // (feeds both the main Invoices table and the "Recent Invoices" widget).
   allInvoices.sort((a,b)=>{
     const na=parseInt(String(a.number||'').replace(/\D/g,''),10)||0;
     const nb=parseInt(String(b.number||'').replace(/\D/g,''),10)||0;
-    return na-nb || String(a.number||'').localeCompare(String(b.number||''));
+    return nb-na || String(b.number||'').localeCompare(String(a.number||''));
   });
   // Clean, exportable invoice list (Excel / Xero) — combined job + manual
   // invoices, one row per invoice, ready to download from the Invoices tab.
@@ -15883,7 +15995,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                       </tr>
                     </thead>
                     <tbody>
-                      {payments.map((p,idx)=>(
+                      {[...payments].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0)||(b.id||0)-(a.id||0)).map((p,idx)=>(
                         <tr key={p.id} className="border-t border-gray-100">
                           <td className="px-3 py-2 text-gray-700">{fmtDate(p.date)}</td>
                           <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold text-xs">{p.method}</span></td>
@@ -16961,7 +17073,8 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                   <th className="px-3 py-2 text-center font-bold">Actions</th>
                 </tr></thead>
                 <tbody>
-                  {cnotes.map(c=>{
+                  {numSort(cnotes, 'number').reverse().map(c=>{
+                    // newest-first by default
                     const used = parseFloat(c.used)||0;
                     const remaining = Math.max(0,(parseFloat(c.amount)||0)-used);
                     // Invoice(s) raised after this note for the same customer that it has
