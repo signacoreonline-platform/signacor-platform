@@ -15256,8 +15256,11 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   const _now = new Date();
   const [stmtType,    setStmtType]    = useState('customer');
   const [stmtContact, setStmtContact] = useState('');
-  const [stmtFrom,    setStmtFrom]    = useState(new Date(_now.getFullYear(), _now.getMonth(), 1).toISOString().slice(0,10));
-  const [stmtTo,      setStmtTo]      = useState(new Date(_now.getFullYear(), _now.getMonth()+1, 0).toISOString().slice(0,10));
+  // Default = no date filter, so a statement shows ALL transactions for the
+  // chosen contact until the user deliberately picks a range (see buildStatement,
+  // which already treats '' as unbounded on both ends).
+  const [stmtFrom,    setStmtFrom]    = useState('');
+  const [stmtTo,      setStmtTo]      = useState('');
   function contactMetaFor(name, type){
     if(type==='supplier'){ const s=(suppliers||[]).find(s=>norm(s.name)===norm(name)); return s?{contactPerson:s.contactPerson, email:s.email, tel:s.phone, address:[s.address,s.city,s.postalCode].filter(Boolean).join(', '), vatNumber:s.vatNumber}:{}; }
     const c=(customers||[]).find(c=>norm(c.company)===norm(name)); return c?{contactPerson:c.contactPerson, email:c.email, tel:c.tel, address:c.address, vatNumber:c.vatNumber}:{};
@@ -15266,9 +15269,16 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     if(!stmtContact){alert('Please choose a '+(stmtType==='supplier'?'supplier':'customer')+' first.');return;}
     const st = buildStatement(stmtContact, stmtType, stmtFrom, stmtTo);
     const fmtD = d => new Date(d).toLocaleDateString('en-ZA',{day:'2-digit',month:'short',year:'numeric'});
+    const todayLabel = fmtD(new Date().toISOString().slice(0,10));
+    // Empty stmtFrom/stmtTo = no filter chosen → label the printed statement
+    // as covering all transactions instead of formatting empty strings into
+    // "Invalid Date".
+    const periodLabel = (!stmtFrom && !stmtTo)
+      ? 'All transactions'
+      : (stmtFrom?fmtD(stmtFrom):'Earliest')+' – '+(stmtTo?fmtD(stmtTo):todayLabel);
     printStatement({
       contactName: stmtContact, contactType: stmtType, contactMeta: contactMetaFor(stmtContact, stmtType),
-      periodLabel: fmtD(stmtFrom)+' – '+fmtD(stmtTo), asAtLabel: fmtD(stmtTo),
+      periodLabel, asAtLabel: stmtTo?fmtD(stmtTo):todayLabel,
       openingBalance: st.openingBalance,
       rows: st.rows.map(r=>({...r, date:fmtD(r.date)})),
       closingBalance: st.closingBalance,
@@ -16991,7 +17001,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
               <p className="font-black text-gray-800">📄 Account Statements</p>
               <button onClick={doPrintStatement} disabled={!stmtContact} className={`text-white font-bold px-4 py-2.5 rounded-xl text-sm ${!stmtContact?'opacity-40 cursor-not-allowed':''}`} style={{background:'#06065c'}}>🖨️ Print / Save PDF</button>
             </div>
-            <p className="text-xs text-gray-500 mb-3">Generate a monthly statement for any customer or supplier. It pulls every invoice / bill, payment and credit note automatically and shows the running balance.</p>
+            <p className="text-xs text-gray-500 mb-3">Generate a statement for any customer or supplier. By default it shows <strong>every</strong> invoice / bill, payment and credit note on record — pick a date range below only if you want to filter it.</p>
             <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
               <div>
                 <label className="text-xs font-bold text-gray-500">Account type</label>
@@ -17014,11 +17024,16 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                 <input type="date" className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm" value={stmtTo} onChange={e=>setStmtTo(e.target.value)} />
               </div>
             </div>
-            <div className="flex flex-wrap gap-2 mt-3">
+            <div className="flex flex-wrap items-center gap-2 mt-3">
               <button onClick={()=>setMonth(0)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:border-blue-400">This month</button>
               <button onClick={()=>setMonth(-1)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:border-blue-400">Last month</button>
               <button onClick={()=>{const y=new Date().getFullYear();setStmtFrom(y+'-01-01');setStmtTo(y+'-12-31');}} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:border-blue-400">This year</button>
-              <button onClick={()=>{setStmtFrom('2000-01-01');setStmtTo(new Date().toISOString().slice(0,10));}} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:border-blue-400">All time</button>
+              <button onClick={()=>{setStmtFrom('');setStmtTo('');}} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:border-blue-400">All time</button>
+              {(stmtFrom||stmtTo) ? (
+                <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200">🔎 Filter active: {stmtFrom||'earliest'} → {stmtTo||'today'}</span>
+              ) : (
+                <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">✓ Showing all transactions</span>
+              )}
             </div>
           </div>
 
@@ -17029,7 +17044,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
               <div className="px-4 py-3 border-b flex items-center justify-between flex-wrap gap-2" style={{background:'#f8f9ff'}}>
                 <div>
                   <p className="font-black text-gray-800">{stmtContact}</p>
-                  <p className="text-xs text-gray-400">{stmtType==='supplier'?'Supplier account':'Customer account'} · {st.rows.length} transactions in period</p>
+                  <p className="text-xs text-gray-400">{stmtType==='supplier'?'Supplier account':'Customer account'} · {st.rows.length} transaction{st.rows.length===1?'':'s'} {(stmtFrom||stmtTo)?'in selected period':'(all time)'}</p>
                 </div>
                 <div className="text-right">
                   <p className="text-xs text-gray-400">{Math.abs(st.closingBalance)<0.005?'Account settled':(stmtType==='supplier'?(st.closingBalance>0?'Balance we owe':'Credit balance — this supplier owes us'):(st.closingBalance>0?'Balance due to us':'Credit balance — we owe this customer'))}</p>
