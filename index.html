@@ -10413,6 +10413,18 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
                   {isAdmin&&<p className="text-sm font-black text-gray-800">{zar(job.value)}</p>}
                   {mg!==null&&<p className={`text-xs mt-0.5 ${parseFloat(mg)>0?'text-emerald-600':'text-red-500'}`}>{mg}% margin</p>}
                   <p className="text-xs text-gray-300 mt-1">tap to view →</p>
+                  <div onClick={e=>e.stopPropagation()} className="mt-1.5 flex justify-end">
+                    <input type="date" value={job.dueDate||''}
+                      onClick={e=>e.stopPropagation()}
+                      onChange={e=>setJobs(prev=>prev.map(j=>j.id===job.id?{...j,dueDate:e.target.value}:j))}
+                      title="Due date"
+                      className={`text-[11px] font-semibold rounded-full px-2.5 py-1 border cursor-pointer focus:ring-2 focus:ring-brand-400 focus:outline-none
+                        ${job.dueDate
+                          ? (jobTab==='active' && new Date(job.dueDate) < new Date(new Date().toDateString())
+                              ? 'bg-red-50 text-red-600 border-red-200'
+                              : 'bg-brand-50 text-brand-700 border-brand-200')
+                          : 'bg-gray-50 text-gray-400 border-gray-200'}`}/>
+                  </div>
                 </div>
               </div>
             </div>
