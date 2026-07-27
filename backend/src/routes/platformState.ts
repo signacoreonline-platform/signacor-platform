@@ -45,7 +45,13 @@ const STATE_ARRAY_KEYS = [
 // Sections whose sudden loss is most consequential for the business — used
 // for the "obvious wipe" guard. Smaller/optional lists are intentionally left
 // out so trimming them never trips the guard.
-const CRITICAL_KEYS = ['jobs', 'customers', 'suppliers', 'inventory', 'quotes', 'accInvoices', 'accBills', 'creditNotes'];
+// `proposedProjects` (the "📌 Proposed Projects" notes on the Jobs page) was
+// added 2026-07-27 after a report that notes typed there don't reliably
+// stick — this section previously had no wipe protection at all, so a stale
+// client save (e.g. an old browser tab syncing after being left open) could
+// silently overwrite newer notes with nothing blocking it, unlike every
+// other section here.
+const CRITICAL_KEYS = ['jobs', 'customers', 'suppliers', 'inventory', 'quotes', 'accInvoices', 'accBills', 'creditNotes', 'proposedProjects'];
 
 function arr(v: unknown): any[] {
   return Array.isArray(v) ? v : [];
