@@ -10250,6 +10250,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
   const [detail,       setDetail]       = useState(null);
   const [showAdd,      setShowAdd]      = useState(false);
   const [newProposal,  setNewProposal]  = useState('');
+  const [jobCalOpen,   setJobCalOpen]   = useState(true); // collapsible due-date calendar
 
   // ── Proposed Projects (manual list of unquoted work needing attention) ──
   // Company-specific like Tasks: tagged by the creating user's company and
@@ -10282,6 +10283,24 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
   const visibleJobs     = jobs.filter(j=>j.co!==UNIONTECH_ID && belongsToUserCompany(j,user));
   const filterCompanies = companies.filter(c=>c.id!==UNIONTECH_ID);
   const addableCompanies = creatableCompanies(companies, user);
+
+  // ── Job Due-Date Calendar data (last / this / next calendar month) ──
+  const jobCalToday = new Date();
+  const jobsByDueDate = useMemo(()=>{
+    const m={};
+    visibleJobs.forEach(j=>{
+      if(j.dueDate){ if(!m[j.dueDate]) m[j.dueDate]=[]; m[j.dueDate].push(j); }
+    });
+    return m;
+  },[visibleJobs]);
+  const jobCalMonths = useMemo(()=>{
+    const base = new Date(jobCalToday.getFullYear(), jobCalToday.getMonth(), 1);
+    return [-1,0,1].map(off=>{
+      const d = new Date(base.getFullYear(), base.getMonth()+off, 1);
+      return { year: d.getFullYear(), month: d.getMonth() };
+    });
+  },[]);
+  const jobCalDueCount = useMemo(()=>Object.values(jobsByDueDate).reduce((s,a)=>s+a.length,0),[jobsByDueDate]);
 
   // Split by tab first
   const tabJobs = useMemo(()=>visibleJobs.filter(j=>
@@ -10380,6 +10399,66 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
           </div>
         </div>
       )}
+
+      {/* ── Job Due-Date Calendar (collapsible — last / this / next month) ── */}
+      <div className="bg-white rounded-2xl border border-gray-200 p-4">
+        <button onClick={()=>setJobCalOpen(o=>!o)} className="w-full flex items-center gap-2 text-left">
+          <span className="text-base">📅</span>
+          <h3 className="text-sm font-black text-gray-800">Job Due Dates</h3>
+          <span className="text-xs text-gray-400 hidden sm:inline">last · this · next month</span>
+          <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-brand-100 text-brand-700 font-black">{jobCalDueCount}</span>
+          <span className={`text-gray-400 text-sm transition-transform ${jobCalOpen?'rotate-180':''}`}>▾</span>
+        </button>
+        {jobCalOpen&&(
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 mt-4">
+            {jobCalMonths.map(({year,month})=>{
+              const monthLabel = new Date(year,month,1).toLocaleString('en-ZA',{month:'long',year:'numeric'});
+              const firstDay = new Date(year,month,1).getDay();
+              const daysInMonth = new Date(year,month+1,0).getDate();
+              const isCurrentMonth = month===jobCalToday.getMonth() && year===jobCalToday.getFullYear();
+              return (
+                <div key={`${year}-${month}`} className={`border rounded-xl p-2 ${isCurrentMonth?'border-brand-200':'border-gray-100'}`}>
+                  <p className={`text-xs font-black text-center mb-2 ${isCurrentMonth?'text-brand-600':'text-gray-600'}`}>{monthLabel}</p>
+                  <div className="grid grid-cols-7 gap-0.5 mb-1">
+                    {['S','M','T','W','T','F','S'].map((d,di)=>(
+                      <div key={di} className="text-center text-[10px] font-semibold text-gray-400">{d}</div>
+                    ))}
+                  </div>
+                  <div className="grid grid-cols-7 gap-0.5">
+                    {Array.from({length:firstDay}).map((_,i)=><div key={'e'+i}/>)}
+                    {Array.from({length:daysInMonth}).map((_,i)=>{
+                      const day=i+1;
+                      const dateStr=`${year}-${String(month+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+                      const dueJobs=jobsByDueDate[dateStr]||[];
+                      const isToday=day===jobCalToday.getDate()&&month===jobCalToday.getMonth()&&year===jobCalToday.getFullYear();
+                      const isOverdue = new Date(dateStr) < new Date(new Date().toDateString());
+                      const hasOverdueActive = dueJobs.some(j=>!DONE_STATUSES.includes(j.status)) && isOverdue;
+                      return (
+                        <div key={day} title={dueJobs.map(j=>`${j.client} — ${j.num}`).join('\n')}
+                          className={`min-h-[3.75rem] rounded-md p-0.5 border text-[9px] overflow-hidden
+                            ${isToday?'border-brand-400 bg-brand-50':'border-gray-100'}
+                            ${dueJobs.length>0 && !hasOverdueActive ? 'bg-emerald-50 border-emerald-200':''}
+                            ${hasOverdueActive?'bg-red-50 border-red-200':''}`}>
+                          <span className={`font-bold ${isToday?'text-brand-600':dueJobs.length?'text-gray-600':'text-gray-300'}`}>{day}</span>
+                          {dueJobs.slice(0,2).map(j=>(
+                            <div key={j.id} onClick={()=>setDetail(j.id)}
+                              className={`leading-tight font-semibold mt-0.5 cursor-pointer hover:underline overflow-hidden
+                                ${!DONE_STATUSES.includes(j.status) && isOverdue?'text-red-600':'text-emerald-700'}`}
+                              style={{display:'-webkit-box',WebkitLineClamp:2,WebkitBoxOrient:'vertical'}}>
+                              {j.client}
+                            </div>
+                          ))}
+                          {dueJobs.length>2&&<div className="text-gray-400 font-semibold">+{dueJobs.length-2} more</div>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
 
       {/* ── Job cards ── */}
       <div className="space-y-2">
