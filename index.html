@@ -477,6 +477,11 @@ const USERS = [
   // isHoldingsUser() / belongsToUserCompany() below.
   { email:'admin@signacoreholdings.co.za',  pw:'Holdings2026!', role:'admin',     name:'Holdings Admin',      initials:'HA', title:'Administrator',   co:1 },
   { email:'assist@signacoreholdings.co.za', pw:'HoldAssist2026!', role:'assistant', name:'Holdings Assistant', initials:'HS', title:'Sales / Quoting', co:1 },
+  // Manufacturing logins — Jobs menu only, no Rand values, view/print the
+  // Job Card. No password required: these sign in via the one-tap buttons
+  // on the login screen (see LoginPage) rather than the email/password form.
+  { email:'factory@signacore.co.za',    pw:'', role:'factory', name:'Factory',    initials:'FA', title:'Manufacturing' },
+  { email:'printroom@signacore.co.za',  pw:'', role:'factory', name:'Print Room', initials:'PR', title:'Manufacturing' },
 ];
 // Signacore Holdings company ID. Previously hard-excluded from the
 // Dashboard/Jobs/Reports views while the entity sat unused — now a fully
@@ -9245,6 +9250,22 @@ function LoginPage({ onLogin }) {
           </div>
         </div>
 
+        {/* ── Manufacturing — one-tap sign-in, no password ── */}
+        <div className="mt-3 rounded-2xl overflow-hidden text-xs" style={{background:'rgba(255,255,255,0.07)',border:'1px solid rgba(255,255,255,0.12)'}}>
+          <div className="px-4 py-2 border-b" style={{borderColor:'rgba(255,255,255,0.1)'}}>
+            <p className="text-center font-bold tracking-widest uppercase" style={{color:'rgba(255,255,255,0.5)',fontSize:'0.65rem'}}>Manufacturing — Tap to Sign In</p>
+          </div>
+          <div className="p-3 flex gap-2">
+            {USERS.filter(u=>u.role==='factory').map(u=>(
+              <button key={u.email} type="button" onClick={()=>onLogin(u)}
+                className="flex-1 text-white font-bold rounded-xl py-2.5 text-xs transition-all hover:opacity-90"
+                style={{background:'rgba(255,255,255,0.12)',border:'1px solid rgba(255,255,255,0.25)'}}>
+                {u.name} →
+              </button>
+            ))}
+          </div>
+        </div>
+
       </div>
     </div>
   );
@@ -9258,7 +9279,7 @@ const NAV_ALL=[
   {id:'dashboard',      label:'Dashboard',       icon:'📊', roles:ALL_ROLES},
   {id:'sales',          label:'Sales',           icon:'💰', roles:ALL_ROLES},
   {id:'customers',      label:'Customers',       icon:'🏢', roles:ALL_ROLES},
-  {id:'jobs',           label:'Jobs',            icon:'💼', roles:ALL_ROLES},
+  {id:'jobs',           label:'Jobs',            icon:'💼', roles:[...ALL_ROLES,'factory']},
   {id:'calculators',    label:'Calculators',     icon:'🧮', roles:ALL_ROLES},
   {id:'purchase_orders',label:'Purchase Orders', icon:'🛒', roles:ALL_ROLES},
   {id:'suppliers',      label:'Suppliers',       icon:'🏭', roles:ALL_ROLES},
@@ -9709,6 +9730,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   if (!job) return <div className="p-4"><button onClick={onBack} className="text-brand-500 text-sm">← Back</button></div>;
 
   const isAdmin = user.role === 'admin';
+  const isFactory = user.role === 'factory'; // Manufacturing — Job Card view only, no Rand values, no invoicing
   const co=companies.find(c=>c.id===job.co)||companies[0];
   const totalCost=breakdownTotal(job.breakdown);
   const profit=totalCost>0?job.value-totalCost:null;
@@ -9936,8 +9958,8 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
         </div>
       </div>
 
-      {/* ─── SOURCE QUOTE ─── */}
-      {job.quoteNum&&(()=>{
+      {/* ─── SOURCE QUOTE — pricing document, hidden from Manufacturing (no Rand values) ─── */}
+      {job.quoteNum&&!isFactory&&(()=>{
         const srcQ=(quotes||[]).find(q=>q.num===job.quoteNum);
         const sub=srcQ?(srcQ.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0):0;
         const disc=srcQ?parseFloat(srcQ.discount)||0:0;
@@ -10137,6 +10159,10 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
             className="flex items-center gap-1.5 text-xs bg-gray-800 hover:bg-gray-900 text-white rounded-xl px-4 py-2.5 font-bold">
             🖨️ Print Job Card
           </button>
+          {/* Proforma Invoice / Create Invoice / Print & Email Invoice / Write-off — all pricing
+              & billing actions, hidden from Manufacturing (Factory / Print Room). They only
+              need the Job Card above. */}
+          {!isFactory&&(<>
           {/* Proforma Invoice — available at any stage; uses the same number that becomes the Tax Invoice */}
           <button onClick={()=>printProformaWindow(job, job.invoiceNum||('PRO-'+String(job.num||'')), companies, logoDataUrl)}
             className="flex items-center gap-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded-xl px-4 py-2.5 font-bold">
@@ -10223,6 +10249,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
             </>
             );
           })()}
+          </>)}
         </div>
       </div>
 
@@ -10276,7 +10303,8 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
     }
   },[highlightJobId]);
 
-  const isAdmin = user.role !== 'assistant';
+  const isFactory = user.role === 'factory'; // Manufacturing (Factory / Print Room) — Jobs list + Job Card only, no Rand values
+  const isAdmin = user.role !== 'assistant' && !isFactory;
   // UNIONTECH_ID is now a no-op sentinel — Signacore Holdings shows normally.
   // Company-context filter: Holdings users see/create only Holdings (co:1)
   // jobs; original-company users see/create everything else, unchanged.
@@ -10342,7 +10370,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
           ✅ Completed Jobs
           <span className={`text-xs px-1.5 py-0.5 rounded-full font-black ${jobTab==='completed'?'bg-white/30 text-white':'bg-emerald-100 text-emerald-700'}`}>{completedCount}</span>
         </button>
-        <button onClick={()=>setShowAdd(true)} className="ml-auto flex items-center gap-2 bg-gray-800 hover:bg-gray-900 text-white rounded-xl px-4 py-2 text-sm font-bold whitespace-nowrap">＋ New Job</button>
+        {!isFactory&&<button onClick={()=>setShowAdd(true)} className="ml-auto flex items-center gap-2 bg-gray-800 hover:bg-gray-900 text-white rounded-xl px-4 py-2 text-sm font-bold whitespace-nowrap">＋ New Job</button>}
       </div>
 
       {/* ── Search + status filter ── */}
@@ -10362,7 +10390,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
       </div>
 
       {/* ── Proposed Projects (manual list of unquoted work needing attention) ── */}
-      {jobTab==='active'&&(
+      {jobTab==='active'&&!isFactory&&(
         <div className="bg-white rounded-2xl border border-amber-200 p-4">
           <div className="flex items-center gap-2 mb-3 flex-wrap">
             <span className="text-base">📌</span>
@@ -10465,7 +10493,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
         {filtered.length===0&&(
           <div className="bg-white rounded-2xl border border-dashed border-gray-300 p-10 text-center text-gray-400">
             <p className="text-sm">{jobTab==='active'?'No active jobs match your filters.':'No completed jobs yet.'}</p>
-            {jobTab==='active'&&<button onClick={()=>setShowAdd(true)} className="block mx-auto mt-3 text-brand-500 font-semibold text-sm">+ Add a job</button>}
+            {jobTab==='active'&&!isFactory&&<button onClick={()=>setShowAdd(true)} className="block mx-auto mt-3 text-brand-500 font-semibold text-sm">+ Add a job</button>}
           </div>
         )}
         {filtered.map(job=>{
@@ -18279,7 +18307,15 @@ function App() {
   if (!user) return <LoginPage onLogin={handleLogin}/>;
 
   const assistantBlocked = []; // imports removed from nav; assets & hr open to all roles
-  const safePage = (user.role==='assistant' && assistantBlocked.includes(page)) ? 'dashboard' : page;
+  // Generalized fallback: if the current `page` isn't one this user's role
+  // can see in the sidebar (e.g. a Factory/Print Room user landing on the
+  // default 'dashboard' page, which isn't in their nav), fall back to the
+  // first page their role does have access to. Preserves prior behaviour
+  // for admin/accounts/assistant, who always have 'dashboard' in their nav.
+  const userNavIds = NAV_ALL.filter(n=>n.roles.includes(user.role)).map(n=>n.id);
+  const safePage = (user.role==='assistant' && assistantBlocked.includes(page))
+    ? 'dashboard'
+    : (userNavIds.includes(page) ? page : (userNavIds[0] || 'dashboard'));
 
   // Company-aware branding resolver — used for the header, sidebar, and
   // every document-generating page below. Holdings users (co:1) always get
