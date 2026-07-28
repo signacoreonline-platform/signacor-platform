@@ -2155,7 +2155,29 @@ function getConsistencyIssues(quotes, jobs, accInvoices) {
   flagDuplicatePayments(jobs, 'Job');
   flagDuplicatePayments(quotes, 'Quote');
 
-  return issues;
+  // More than one job linked to the very same quote number — a possible sign
+  // a quote was converted twice (e.g. a double-click). Display-only: never
+  // auto-merges, deletes or picks one job over the other. A person must
+  // review Jobs and decide which record is correct.
+  {
+    const byQuoteNum = {};
+    (jobs||[]).forEach(j=>{ if(j.quoteNum){ (byQuoteNum[j.quoteNum]=byQuoteNum[j.quoteNum]||[]).push(j); } });
+    Object.keys(byQuoteNum).forEach(qn=>{
+      const list = byQuoteNum[qn];
+      if(list.length>1){
+        issues.push({type:'duplicate_job_for_quote', severity:'high', ref:qn,
+          message:`Quote ${qn} is linked to ${list.length} jobs (${list.map(j=>j.num).join(', ')}) — please review which job is correct. Nothing has been merged, relinked or deleted automatically.`});
+      }
+    });
+  }
+
+  // Attach a stable id to every issue so the dashboard can remember which
+  // warnings a person has dismissed (display-only — see ConsistencyPanel).
+  // The id is derived from the issue's own type/ref/message, so if the
+  // underlying message ever changes (e.g. a different amount, a different
+  // job number) it becomes a "new" issue and reappears even if a similarly-
+  // worded past version of it was dismissed.
+  return issues.map(iss=>({...iss, id: iss.type+'|'+(iss.ref||'')+'|'+iss.message}));
 }
 
 // One set of totals shared by Dashboard, Sales and Accounting — computed
@@ -2181,6 +2203,29 @@ function getBusinessSummary(quotes, jobs, accInvoices) {
 function ConsistencyPanel({ quotes, jobs, accInvoices }) {
   const summary = useMemo(()=>getBusinessSummary(quotes, jobs, accInvoices), [quotes, jobs, accInvoices]);
   const [open, setOpen] = useState(false);
+  // ── Dismissed-warning tracking ──
+  // Display-only: dismissing a warning never changes, fixes, relinks or
+  // deletes any quote/job/invoice data — it only hides that message from
+  // this panel. Stored in localStorage (existing frontend-state pattern
+  // already used for quote drafts elsewhere in this file) so it survives
+  // page navigation, but is purely local to this browser. Because each
+  // issue's id is derived from its own message text (see getConsistencyIssues),
+  // a dismissed warning automatically reappears the moment the underlying
+  // issue changes in any way, or a genuinely new issue shows up.
+  const DISMISS_KEY = 'sgr_dismissed_issues';
+  const [dismissed, setDismissed] = useState(()=>{
+    try { const v = JSON.parse(localStorage.getItem(DISMISS_KEY)||'[]'); return Array.isArray(v)?v:[]; } catch(e){ return []; }
+  });
+  const persistDismissed = (arr) => {
+    const deduped = [...new Set(arr)];
+    setDismissed(deduped);
+    try { localStorage.setItem(DISMISS_KEY, JSON.stringify(deduped)); } catch(e){}
+  };
+  const visibleIssues = summary.issues.filter(iss=>!dismissed.includes(iss.id));
+  const dismissedCount = summary.issues.length - visibleIssues.length;
+  const dismissOne = (id) => persistDismissed([...dismissed, id]);
+  const dismissAllVisible = () => persistDismissed([...dismissed, ...visibleIssues.map(i=>i.id)]);
+  const restoreDismissed = () => persistDismissed([]);
   const money = n => 'R ' + Number(Math.abs(n)||0).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const stat = (label, value, cls) => (
     <div className="min-w-[100px]">
@@ -2199,22 +2244,44 @@ function ConsistencyPanel({ quotes, jobs, accInvoices }) {
         {stat('Paid', summary.paidInvoices, 'text-emerald-600')}
         {stat('Outstanding', money(summary.outstandingValue), 'text-amber-600')}
         <div className="flex-1 text-right">
-          {summary.issues.length>0 ? (
+          {visibleIssues.length>0 ? (
             <button onClick={()=>setOpen(o=>!o)} className="text-xs font-bold px-3 py-1.5 rounded-full bg-red-100 text-red-700 whitespace-nowrap">
-              ⚠ {summary.issues.length} inconsistenc{summary.issues.length===1?'y':'ies'} {open?'▲':'▼'}
+              ⚠ {visibleIssues.length} inconsistenc{visibleIssues.length===1?'y':'ies'} {open?'▲':'▼'}
+            </button>
+          ) : dismissedCount>0 ? (
+            <button onClick={()=>setOpen(o=>!o)} className="text-xs font-bold px-3 py-1.5 rounded-full bg-gray-100 text-gray-500 whitespace-nowrap">
+              🔕 {dismissedCount} dismissed {open?'▲':'▼'}
             </button>
           ) : (
             <span className="text-xs font-bold px-3 py-1.5 rounded-full bg-green-100 text-green-700 whitespace-nowrap">✓ Quotes, Jobs &amp; Invoices line up</span>
           )}
         </div>
       </div>
-      {open && summary.issues.length>0 && (
+      {open && (visibleIssues.length>0 || dismissedCount>0) && (
         <div className="mt-3 border-t border-gray-100 pt-3 space-y-1.5">
-          {summary.issues.map((iss,idx)=>(
-            <div key={idx} className={`text-xs rounded-lg px-3 py-2 ${iss.severity==='high'?'bg-red-50 text-red-700':'bg-amber-50 text-amber-700'}`}>
-              {iss.message}
+          {visibleIssues.map(iss=>(
+            <div key={iss.id} className={`text-xs rounded-lg px-3 py-2 flex items-start gap-2 ${iss.severity==='high'?'bg-red-50 text-red-700':'bg-amber-50 text-amber-700'}`}>
+              <span className="flex-1">{iss.message}</span>
+              <button onClick={()=>dismissOne(iss.id)}
+                title="Hide this warning — does not change, fix or relink any data. It will reappear if the underlying issue changes."
+                className="flex-shrink-0 text-[10px] font-bold px-2 py-0.5 rounded-full border border-current opacity-60 hover:opacity-100 whitespace-nowrap">
+                Dismiss
+              </button>
             </div>
           ))}
+          {visibleIssues.length>0 && (
+            <div className="flex justify-end">
+              <button onClick={dismissAllVisible} className="text-[10px] font-bold text-gray-400 hover:text-gray-600 underline">
+                Dismiss all shown
+              </button>
+            </div>
+          )}
+          {dismissedCount>0 && (
+            <div className="text-[10px] text-gray-500 bg-gray-50 rounded-lg px-3 py-2 flex items-center justify-between gap-3">
+              <span>🔕 {dismissedCount} warning{dismissedCount!==1?'s':''} dismissed on this browser — hidden from view only, nothing was fixed or changed. A dismissed warning comes back automatically if the underlying issue changes.</span>
+              <button onClick={restoreDismissed} className="flex-shrink-0 font-bold underline hover:text-gray-700 whitespace-nowrap">Show dismissed</button>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -5166,10 +5233,12 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setC
   );
 }
 
-function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs, creditNotes, setCreditNotes, isAdmin }) {
+function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs, creditNotes, setCreditNotes, isAdmin, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob }) {
   const [showEmailFlow, setShowEmailFlow] = useState(false);
   const [showProformaEmail, setShowProformaEmail] = useState(false);
   const [showPayments, setShowPayments] = useState(false);
+  const [showRelink, setShowRelink] = useState(false);
+  const [relinkTarget, setRelinkTarget] = useState('');
   const co = companies.find(c=>c.id===quote.co)||{short:'?',name:'—'};
   const sub = quote.lines.reduce((s,l)=>s+(l.subtotal||0),0);
   const disc = parseFloat(quote.discount)||0;
@@ -5201,8 +5270,20 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
   // the normal Convert button is hidden and the quote becomes a dead-end — you
   // can't reach the job to invoice it. Detect that and offer a safe Restore.
   const isConverted    = !!quote.convertedJobId || quote.status==='converted';
-  const linkedJobFound = (jobs||[]).some(j=> j.id===quote.convertedJobId || (quote.num && j.quoteNum===quote.num));
+  const matchingJobs   = (jobs||[]).filter(j=> j.id===quote.convertedJobId || (quote.num && j.quoteNum===quote.num));
+  const linkedJobFound = matchingJobs.length>0;
   const orphanedJob    = isConverted && !linkedJobFound;
+  const multipleJobsLinked = matchingJobs.length>1;
+  // Prefer the job convertedJobId actually points at; fall back to the
+  // quoteNum back-link match. Display/action purposes only — never mutates.
+  const linkedJob = matchingJobs.find(j=>j.id===quote.convertedJobId) || matchingJobs[0] || null;
+  const linkedJobHasInvoice = !!linkedJob && (!!linkedJob.invoiceCreated || (!!linkedJob.invoiceNum && linkedJob.stage>=9));
+  // Candidate jobs for manual relinking — company-scoped list passed down
+  // from QuotesPage (myJobs), so relinking can never cross into the other
+  // company's jobs. Excludes jobs already linked to this or another quote's
+  // convertedJobId to keep the picker focused on genuinely free records,
+  // but still lets the user pick any job if none look obviously free.
+  const relinkCandidates = (companyJobs||[]).slice().sort((a,b)=>String(b.num||'').localeCompare(String(a.num||'')));
   return (
     <Modal onClose={onClose} wide>
       <ModalHeader title={`${quote.num} — ${quote.client}`} onClose={onClose}/>
@@ -5216,9 +5297,18 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
             <span className="text-xs font-semibold text-purple-700 bg-purple-50 border border-purple-200 rounded-full px-2.5 py-0.5">✅ Converted to Job</span>
           )}
           {orphanedJob&&(
-            <span className="text-xs font-semibold text-red-700 bg-red-50 border border-red-200 rounded-full px-2.5 py-0.5">⚠ Job missing — restore below</span>
+            <span className="text-xs font-semibold text-red-700 bg-red-50 border border-red-200 rounded-full px-2.5 py-0.5">⚠ Job missing — see options below</span>
+          )}
+          {multipleJobsLinked&&(
+            <span className="text-xs font-semibold text-red-700 bg-red-50 border border-red-200 rounded-full px-2.5 py-0.5">⚠ Linked to {matchingJobs.length} jobs — review below</span>
           )}
         </div>
+
+        {multipleJobsLinked&&(
+          <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-xs text-red-700">
+            ⚠ This quote matches <strong>{matchingJobs.length} different jobs</strong> ({matchingJobs.map(j=>j.num).join(', ')}) — most likely from a duplicate conversion. Nothing has been merged, deleted or chosen automatically. Please open <strong>Jobs</strong> and check each one before creating an invoice, so the invoice is raised against the correct job.
+          </div>
+        )}
 
         {/* Client & Quote Details Grid */}
         <div className="grid grid-cols-2 gap-3">
@@ -5425,14 +5515,72 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
               💼 Convert to Job
             </button>
           )}
+          {/* ── Linked job found (and not ambiguous) — open it directly ── */}
+          {linkedJob&&!multipleJobsLinked&&onOpenJob&&(
+            <button onClick={()=>onOpenJob(linkedJob.id)}
+              className="flex items-center gap-1.5 text-xs bg-brand-600 hover:bg-brand-700 text-white rounded-xl px-4 py-2.5 font-bold">
+              📂 Open Job {linkedJob.num}
+            </button>
+          )}
+          {/* ── Invoice shortcut on the linked job: create if none exists,
+                otherwise open the existing one instead of risking a duplicate ── */}
+          {linkedJob&&!multipleJobsLinked&&!linkedJobHasInvoice&&onCreateInvoice&&(
+            <button onClick={()=>{ onClose(); onCreateInvoice(linkedJob); }}
+              title="Create the final tax invoice for this job — not a proforma"
+              className="flex items-center gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl px-4 py-2.5 font-bold">
+              🧾 Create Invoice
+            </button>
+          )}
+          {linkedJob&&!multipleJobsLinked&&linkedJobHasInvoice&&onOpenInvoice&&(
+            <button onClick={()=>{ onClose(); onOpenInvoice(linkedJob); }}
+              title="An invoice already exists for this job — opening it instead of creating a duplicate"
+              className="flex items-center gap-1.5 text-xs bg-blue-700 hover:bg-blue-800 text-white rounded-xl px-4 py-2.5 font-bold">
+              🧾 View Invoice {linkedJob.invoiceNum||''}
+            </button>
+          )}
+          {/* ── Job missing: recreate (with confirmation) or relink to an existing job ── */}
           {orphanedJob&&(
-            <button onClick={()=>onConvertToJob(quote, true)}
+            <button onClick={()=>{
+                if(!window.confirm(`Recreate a new job from quote ${quote.num||''}?\n\nThis creates a brand-new job from this quote's current details. It will NOT touch, overwrite or delete any other job. Only do this if you're confident no existing job for this quote can be found or relinked below.\n\nContinue?`)) return;
+                onConvertToJob(quote, true);
+              }}
               className="flex items-center gap-1.5 text-xs bg-orange-500 hover:bg-orange-600 text-white rounded-xl px-4 py-2.5 font-bold">
-              🔁 Restore Job
+              🔁 Recreate Job from Quote
+            </button>
+          )}
+          {orphanedJob&&onRelinkJob&&(
+            <button onClick={()=>setShowRelink(v=>!v)}
+              className="flex items-center gap-1.5 text-xs bg-white hover:bg-orange-50 text-orange-700 border border-orange-300 rounded-xl px-4 py-2.5 font-bold">
+              🔗 Relink to Existing Job
             </button>
           )}
           <button onClick={onClose} className="ml-auto text-xs border border-gray-200 text-gray-600 rounded-xl px-4 py-2.5 font-semibold hover:bg-gray-50">Close</button>
         </div>
+
+        {/* ── Relink picker — only ever changes the quote↔job link, never any
+              other field, and only after an explicit confirmation ── */}
+        {orphanedJob&&showRelink&&onRelinkJob&&(
+          <div className="bg-orange-50 border border-orange-200 rounded-xl p-4 space-y-2">
+            <p className="text-xs font-bold text-orange-800">Relink this quote to an existing job</p>
+            <p className="text-xs text-orange-700">Pick the job this quote actually belongs to. This only updates the link between the quote and the job — no line items, amounts, payments or statuses are changed on either record.</p>
+            <select value={relinkTarget} onChange={e=>setRelinkTarget(e.target.value)}
+              className="w-full border border-orange-300 rounded-xl px-3 py-2 text-sm bg-white">
+              <option value="">— Select a job —</option>
+              {relinkCandidates.map(j=><option key={j.id} value={j.id}>{j.num} — {j.client}{j.quoteNum?` (currently linked to ${j.quoteNum})`:''}</option>)}
+            </select>
+            <div className="flex gap-2">
+              <button disabled={!relinkTarget}
+                onClick={()=>{ onRelinkJob(quote, parseInt(relinkTarget)); setShowRelink(false); setRelinkTarget(''); }}
+                className="text-xs font-bold px-3 py-1.5 rounded-lg bg-orange-500 hover:bg-orange-600 text-white disabled:opacity-40 disabled:cursor-not-allowed">
+                Confirm Relink
+              </button>
+              <button onClick={()=>{ setShowRelink(false); setRelinkTarget(''); }}
+                className="text-xs font-bold px-3 py-1.5 rounded-lg border border-orange-300 text-orange-700 hover:bg-orange-100">
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
       </div>
       {showEmailFlow&&(
         <EmailFlowModal
@@ -5802,6 +5950,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [invHighlight,setInvHighlight]=useState(null); // invoice id to highlight when opened from elsewhere
   const [jobPayModal,setJobPayModal]=useState(null); // job being viewed in payment history modal
   const [convertedInfo,setConvertedInfo]=useState(null); // {jobId,jobNum} after a quote→job conversion, awaiting the user's "Open Job" choice
+  const convertingRef = useRef(false); // re-entrancy lock — blocks double-click duplicate job creation in handleConvertToJob
   const nonUtech = companies.filter(c=>c.id!==UNIONTECH_ID);
   // Company-context filter: Holdings users see only Holdings (co:1)
   // quotes/jobs/invoices; original-company users see everything else,
@@ -5926,18 +6075,56 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     setViewQuote(updated);
   }
   function handleEditQuote(q){ setViewQuote(null); setEditQuote(q); }
+  // Close the quote view and hand off to the normal Jobs navigation (same
+  // callback used everywhere else a job needs to be opened) — never creates
+  // or changes anything, purely a navigation shortcut from QuoteViewModal.
+  function openJobFromQuote(jobId){ setViewQuote(null); if(onJobCreated) onJobCreated(jobId); }
+  // Manually relink a quote to a different existing job. Only ever touches
+  // the link fields (quote.convertedJobId/status and, if it was blank or
+  // pointed elsewhere, job.quoteNum) — never line items, amounts, payments,
+  // or any other record. Requires explicit confirmation, and a stronger
+  // warning if the job is currently linked to a different quote (so nothing
+  // is silently detached from that other quote).
+  function handleRelinkJob(q, jobId){
+    const job = jobs.find(j=>j.id===jobId);
+    if(!job){ alert('Could not find that job — nothing was changed.'); return; }
+    const jobLinkedElsewhere = job.quoteNum && job.quoteNum!==q.num;
+    const msg = jobLinkedElsewhere
+      ? `Job ${job.num} is currently linked to a different quote (${job.quoteNum}).\n\nRelinking it to ${q.num} will change that job's quote reference. No quote, job, invoice or payment data is deleted — only the link changes. Continue?`
+      : `Relink quote ${q.num} to existing job ${job.num}?\n\nThis only updates the link between the quote and the job — no line items, amounts or payment history are changed on either record. Continue?`;
+    if(!window.confirm(msg)) return;
+    setJobs(prev=>prev.map(j=>j.id===job.id?{...j, quoteNum:q.num}:j));
+    setQuotes(prev=>prev.map(qx=>qx.id===q.id?{...qx, convertedJobId:job.id, status:'converted'}:qx));
+    setViewQuote(null);
+    alert(`Quote ${q.num} is now linked to Job ${job.num}.`);
+  }
   // restore=true rebuilds a job for a quote that was already converted but whose
   // job went missing. On restore we skip inventory deduction / PO generation
   // because those side-effects already ran during the original conversion.
   function handleConvertToJob(q, restore){
+    // Re-entrancy lock — a ref (not state) so it takes effect immediately,
+    // even for two calls fired back-to-back before React re-renders. Blocks
+    // a rapid double-click from slipping past the existing-job check below
+    // and creating two jobs off the same quote.
+    if(convertingRef.current) return;
+    convertingRef.current = true;
+    try{
     // Guard against converting the same quote twice — if a job already
     // exists for this quote (by convertedJobId or by quoteNum back-link),
     // don't silently create a second one. Offer to open the existing job
     // instead. (Skipped when restore=true, which is specifically for
     // rebuilding a job that no longer exists.)
     if(!restore){
-      const existingJob = (q.convertedJobId ? jobs.find(j=>j.id===q.convertedJobId) : null)
-        || jobs.find(j=>j.quoteNum && j.quoteNum===q.num);
+      // Collect EVERY job that matches this quote, not just the first —
+      // if more than one exists (e.g. a past double-click already created
+      // a duplicate) we must not silently pick one; warn instead and let
+      // a person sort it out in Jobs.
+      const matches = jobs.filter(j=> j.id===q.convertedJobId || (j.quoteNum && j.quoteNum===q.num));
+      if(matches.length>1){
+        alert(`Quote ${q.num||''} appears linked to ${matches.length} jobs (${matches.map(j=>j.num).join(', ')}).\n\nNo job has been created or changed. Please open Jobs and review these records to work out which one is correct before converting again.`);
+        return;
+      }
+      const existingJob = matches[0];
       if(existingJob){
         if(window.confirm(`Quote ${q.num||''} has already been converted to Job ${existingJob.num}. Open the existing job instead of creating a new one?`)){
           setViewQuote(null);
@@ -6031,6 +6218,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // Show a confirmation with the new job number instead of silently
     // auto-navigating away — the user chooses whether to open it now.
     setConvertedInfo({jobId:newJob.id, jobNum:jobNum});
+    } finally {
+      convertingRef.current = false;
+    }
   }
 
   // ── Manually create the tax invoice for a converted quote's linked job,
@@ -6038,8 +6228,23 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // for it to reach the Installation stage. Mirrors the same update the
   // "Create Invoice" button performs on the Job Detail page, so the
   // resulting record is identical either way (same fields, same numbering).
+  // Jump the Invoices sub-tab to and briefly highlight a just-created (or
+  // already-existing) job invoice, so the user is shown exactly where the
+  // record landed instead of it merely appearing to vanish off-screen.
+  function revealJobInvoice(job){
+    setSubTab('invoices'); setInvFilter('all'); setInvHighlight(job.id);
+    setTimeout(()=>{ const el=document.getElementById('inv-row-'+job.id); if(el) el.scrollIntoView({behavior:'smooth',block:'center'}); }, 80);
+    setTimeout(()=>setInvHighlight(null), 4000);
+  }
   async function createInvoiceNow(job){
-    if(!job || job.invoiceCreated || (job.invoiceNum && job.stage>=9)) return;
+    if(!job) return;
+    if(job.invoiceCreated || (job.invoiceNum && job.stage>=9)){
+      // Already invoiced — warn instead of silently doing nothing, and take
+      // the user straight to the existing invoice rather than a dead click.
+      alert(`Job ${job.num||''} already has an invoice${job.invoiceNum?' ('+job.invoiceNum+')':''}. Opening the existing invoice instead of creating another one.`);
+      revealJobInvoice(job);
+      return;
+    }
     const today=new Date().toISOString().slice(0,10);
     const due=new Date(Date.now()+30*864e5).toISOString().slice(0,10);
 
@@ -6051,7 +6256,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
         return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
       });
-      setSubTab('invoices');
+      alert(`Invoice ${job.invoiceNum} created for Job ${job.num}.\n\nIt now appears in Sales → Invoices and in Accounting. This job has moved from Active to the Completed tab in Jobs (status: Invoiced).`);
+      revealJobInvoice(job);
       return;
     }
 
@@ -6070,7 +6276,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
       return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
     });
-    setSubTab('invoices');
+    alert(`Invoice ${reserved} created for Job ${job.num}.\n\nIt now appears in Sales → Invoices and in Accounting. This job has moved from Active to the Completed tab in Jobs (status: Invoiced).`);
+    revealJobInvoice(job);
   }
 
   // ── Job Invoice Payment History Modal ──
@@ -6696,6 +6903,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         companies={companies} logoDataUrl={logoDataUrl}
         onEdit={handleEditQuote}
         jobs={jobs}
+        companyJobs={myJobs}
+        onOpenJob={openJobFromQuote}
+        onCreateInvoice={createInvoiceNow}
+        onOpenInvoice={revealJobInvoice}
+        onRelinkJob={handleRelinkJob}
         creditNotes={myCreditNotes} setCreditNotes={setCreditNotes}
         isAdmin={isAdmin}
       />}
@@ -10189,6 +10401,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                         if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
                         return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
                       });
+                      alert(`Invoice ${job.invoiceNum} created for Job ${job.num}.\n\nIt now appears in Sales → Invoices and in Accounting. This job has moved from Active to the Completed tab in Jobs (status: Invoiced) — you're still looking at it here on the Job Detail page.`);
                       return;
                     }
                     // Reserve a brand-new number from the backend-atomic
@@ -10206,6 +10419,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                       if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
                       return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
                     });
+                    alert(`Invoice ${reserved} created for Job ${job.num}.\n\nIt now appears in Sales → Invoices and in Accounting. This job has moved from Active to the Completed tab in Jobs (status: Invoiced) — you're still looking at it here on the Job Detail page.`);
                   }}
                   className="flex items-center gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl px-4 py-2.5 font-bold">
                   🧾 Create Invoice
