@@ -2043,6 +2043,44 @@ function invoiceNumberExists(number, co, jobs, accInvoices) {
 }
 
 /* ═══════════════════════════════════════════
+   ATOMIC QUOTE NUMBER RESERVATION (2026-07-29)
+   Same fix as reserveInvoiceNumber() above, applied to quotes. Replaces the
+   old client-side getNextQuoteNum(quotes) max()+1 generator, which was not
+   atomic across simultaneous users/sessions/companies and produced a
+   confirmed duplicate (SQ-00130, issued to both a Cut & Style quote and a
+   Hennies quote). Every new quote number must be obtained through
+   reserveQuoteNumber(), which calls the same backend atomic, per-company
+   counter used for invoices (doc_type: 'quote'). Never fall back to a local
+   max()+1 if the reservation fails — quote creation must stop instead.
+   Editing an EXISTING quote never calls this; its number is preserved as-is.
+═══════════════════════════════════════════ */
+async function reserveQuoteNumber(co) {
+  try {
+    const res = await fetch(API_DOC_NUMBER_RESERVE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ company: co, docType: 'quote' }),
+    });
+    if (!res.ok) return null;
+    const result = await res.json();
+    return (result && result.number) ? result.number : null;
+  } catch (e) {
+    console.warn('Quote number reservation failed', e);
+    return null;
+  }
+}
+
+// Final frontend safeguard in addition to the backend's own atomic
+// reservation + duplicate check — mirrors invoiceNumberExists() above.
+// Should not normally trigger; quote creation must stop rather than proceed
+// if it ever does.
+function quoteNumberExists(number, co, quotes) {
+  const target = (number||'').trim().toUpperCase();
+  if (!target) return false;
+  return (quotes||[]).some(q=>q && String(q.co)===String(co) && (q.num||'').trim().toUpperCase()===target);
+}
+
+/* ═══════════════════════════════════════════
    PARALLEL ACCOUNTING HELPERS
    Single source of truth used by Dashboard, Sales and Accounting so all
    three pages always show the same totals and the same list order, and
@@ -4362,8 +4400,12 @@ function SaveAsInventoryModal({ line, inventory, setInventory, onClose, onSaved 
 // their behaviour would change how 100+ existing inventory items behave.
 const UNIT_TYPE_OPTIONS = ['each','unit','m','m (linear)','m²','sheet','roll','panel','pack','box','litre','kg','set','hour','day','item','job','visit'];
 
-function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies, nextNum, preparedBy, customers, setCustomers, savedCalcs, completeProducts, existingQuote, quickRates, initialData }) {
+function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies, nextNum, preparedBy, customers, setCustomers, savedCalcs, completeProducts, existingQuote, quickRates, initialData, quotes }) {
   const eq = existingQuote;
+  // Guards against a double-click/double-submit reserving two quote numbers
+  // for the same click, and disables the Save button while the atomic
+  // reservation call to the backend is in flight.
+  const [saving, setSaving] = useState(false);
   const today = new Date().toISOString().slice(0,10);
   const validDef = new Date(Date.now()+14*24*3600*1000).toISOString().slice(0,10);
 
@@ -4544,9 +4586,10 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   }
   function removeAttachment(id){ setAttachments(prev=>prev.filter(a=>a.id!==id)); }
 
-  function submit(e){
+  async function submit(e){
     e.preventDefault();
     if(!client.trim()){ setClientOpen(true); return; }
+    if(saving) return; // guard against a double-click firing two submits/reservations
     const isEdit = !!eq;
 
     // ── Overpayment guard (edit only) ──────────────────────────────────────
@@ -4597,10 +4640,26 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       payload.convertedJobId = eq.convertedJobId||null;
       payload.payments = eq.payments||[];
     } else {
-      // New quote (or Copy Quote, which also has no `eq`) — build fresh,
-      // never inheriting another quote's payments/conversion state.
+      // New quote (or Copy Quote, which also has no `eq`) — the number is
+      // reserved atomically from the backend, immediately before saving,
+      // instead of using the stale client-side max()+1 nextNum that used to
+      // be assigned when the modal first opened. That old approach let two
+      // people creating quotes around the same time (even in different
+      // companies, since the old generator wasn't company-scoped either)
+      // receive the identical "next" number — confirmed as the cause of the
+      // SQ-00130 duplicate (Cut & Style / Hennies). Never falls back to a
+      // local max()+1 if the reservation fails; the quote is simply not
+      // created and the person sees a clear error instead.
+      const quoteCo = parseInt(co);
+      setSaving(true);
+      const reserved = await reserveQuoteNumber(quoteCo);
+      if(!reserved || quoteNumberExists(reserved, quoteCo, quotes)){
+        setSaving(false);
+        alert('A quote number could not be reserved. The quote was not created. Please check your connection and try again.');
+        return;
+      }
       payload = {
-        id: Date.now(), num: nextNum, status:'draft',
+        id: Date.now(), num: reserved, status:'draft',
         convertedJobId: null, payments: [],
         ...formFields,
       };
@@ -4630,7 +4689,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
 
   return (
     <Modal onClose={onClose} screen>
-      <ModalHeader title={eq ? `✏️ Edit Quote — ${eq.num}` : `📋 New Quotation — ${nextNum}`} onClose={onClose}/>
+      <ModalHeader title={eq ? `✏️ Edit Quote — ${eq.num}` : `📋 New Quotation — (number reserved on save)`} onClose={onClose}/>
       <form onSubmit={submit} className="px-6 py-5 space-y-5 overflow-y-auto max-h-[92vh]">
 
         {/* Client */}
@@ -5081,8 +5140,8 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
         </div>
 
         <div className="flex gap-3 pt-1 pb-1">
-          <button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Cancel</button>
-          <button type="submit" className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold">{eq?'💾 Save Changes':'💾 Save Quote'}</button>
+          <button type="button" onClick={onClose} disabled={saving} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed">Cancel</button>
+          <button type="submit" disabled={saving} className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed">{saving?'Reserving number…':(eq?'💾 Save Changes':'💾 Save Quote')}</button>
         </div>
       </form>
       {showCPPicker&&<ProductPickerModal
@@ -6872,6 +6931,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         savedCalcs={savedCalcs||[]}
         completeProducts={completeProducts||[]}
         quickRates={quickRates||[]}
+        quotes={quotes}
       />}
       {/* ── Edit Quote modal ── */}
       {editQuote&&<CreateQuoteModal
@@ -6883,6 +6943,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         completeProducts={completeProducts||[]}
         quickRates={quickRates||[]}
         existingQuote={editQuote}
+        quotes={quotes}
       />}
       {/* ── Copy Quote modal (new quote pre-filled from source) ── */}
       {copyQuote&&<CreateQuoteModal
@@ -6894,6 +6955,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         completeProducts={completeProducts||[]}
         quickRates={quickRates||[]}
         initialData={copyQuote}
+        quotes={quotes}
       />}
       {/* ── View Quote modal ── */}
       {viewQuote&&<QuoteViewModal
@@ -18154,6 +18216,25 @@ function App() {
       // is itself stale relative to another session's concurrent save (see
       // backend/src/routes/platformState.ts for why this is needed).
       payload._knownCreditNoteIds = (ownBaseline && Array.isArray(ownBaseline.creditNotes)) ? ownBaseline.creditNotes.map(c=>c.id) : [];
+      // Generalized counterpart to _knownCreditNoteIds above (2026-07-29):
+      // tells the backend which ids THIS client already knew about, per
+      // section, before this edit — for every section most exposed to the
+      // "two sessions both add one new record, whichever PUT commits last
+      // wins and the other session's brand-new record silently vanishes"
+      // race (see backend/src/routes/platformState.ts). Closes the same
+      // residual race the client-side mergeSectionArray() above cannot: this
+      // client's own "fresh" fetchFromServer() call a few lines up can
+      // itself already be stale relative to another session's save that
+      // commits in the moments between that fetch and this PUT landing.
+      // Confirmed as the mechanism behind the Hennies SQ-00130 quote
+      // disappearing on 2026-07-29.
+      const BACKEND_MERGE_SECTIONS = ['quotes','jobs','customers','suppliers','inventory',
+        'accInvoices','accBills','purchaseOrders','quickRates','employees','leaveRequests','disciplinary'];
+      payload._knownSectionIds = {};
+      BACKEND_MERGE_SECTIONS.forEach(k=>{
+        const base = ownBaseline && Array.isArray(ownBaseline[k]) ? ownBaseline[k] : [];
+        payload._knownSectionIds[k] = base.map(x=>x && x.id).filter(id=>id!==undefined && id!==null);
+      });
       payload.v            = DATA_VERSION;
       payload._autoSavedAt = new Date().toISOString();
       payload.savedAt      = snapshot.savedAt;

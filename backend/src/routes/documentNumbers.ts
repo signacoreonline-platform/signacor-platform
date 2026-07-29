@@ -6,9 +6,9 @@ import pool from '../db/pool';
  *
  * Backend-authoritative, atomic document-number reservation.
  *
- * Phase 1 (this file): invoice numbers only ("invoice" doc type), scoped
- * per company — Signacore Holdings (co:1) and Original Signacore (co:2)
- * each have their own independent counter (see
+ * Phase 1: invoice numbers ("invoice" doc type), scoped per company —
+ * Signacore Holdings (co:1) and Original Signacore (co:2) each have their
+ * own independent counter (see
  * database/migrations/003_document_number_counters.sql). This deliberately
  * replaces the old frontend max(existing)+1 generators (getNextInvoiceNum,
  * nextInvNum in index.html), which were not atomic across simultaneous
@@ -16,18 +16,28 @@ import pool from '../db/pool';
  * two different co:2 jobs. That historical duplicate is left untouched by
  * this change; it is not renumbered or repaired.
  *
- * The frontend calls POST /reserve, gets back a number, and uses it when
- * creating the invoice. Nothing else about invoice creation, editing, or
- * the quote/job workflow is changed by this route.
+ * Phase 2 (2026-07-29): quote numbers ("quote" doc type) added on the same
+ * table/pattern, for the same reason — the frontend's client-side
+ * getNextQuoteNum(quotes) max()+1 generator was not atomic across
+ * simultaneous users/sessions either, and produced a confirmed duplicate
+ * (SQ-00130, issued to both a Cut & Style quote and a Hennies quote). No new
+ * table or migration was needed: document_number_counters was already
+ * generic on (company, doc_type). That historical SQ-00130 duplicate is
+ * left untouched by this change; it is not renumbered or repaired here.
+ *
+ * The frontend calls POST /reserve with { company, docType }, gets back a
+ * number, and uses it when creating the invoice/quote. Nothing else about
+ * invoice/quote creation, editing, or the job workflow is changed by this
+ * route.
  */
 
 const router = Router();
 
 const VALID_COMPANIES = ['1', '2'];
-const VALID_DOC_TYPES = ['invoice'] as const;
+const VALID_DOC_TYPES = ['invoice', 'quote'] as const;
 type DocType = (typeof VALID_DOC_TYPES)[number];
 
-const PREFIX: Record<DocType, string> = { invoice: 'INV-' };
+const PREFIX: Record<DocType, string> = { invoice: 'INV-', quote: 'SQ-' };
 
 function formatNumber(docType: DocType, n: number): string {
   return PREFIX[docType] + String(n).padStart(5, '0');
@@ -38,25 +48,35 @@ function escapeForRegex(s: string): string {
 }
 
 // Scans the live platform_state for every existing number already used by
-// this company for this doc type, across BOTH invoice sources (job-derived
-// invoices and manual accInvoices). Only records whose `co` field strictly
-// equals the requested company are counted — a record with a missing/null
-// company marker is never silently claimed by either company here.
+// this company for this doc type. For invoices this covers BOTH sources
+// (job-derived invoices and manual accInvoices); for quotes it covers the
+// `quotes` array. Only records whose `co` field strictly equals the
+// requested company are counted — a record with a missing/null company
+// marker is never silently claimed by either company here.
 function scanExistingNumbers(data: Record<string, any> | null | undefined, company: string, docType: DocType): Set<string> {
   const found = new Set<string>();
-  if (!data || docType !== 'invoice') return found;
+  if (!data) return found;
 
-  const jobs = Array.isArray(data.jobs) ? data.jobs : [];
-  for (const j of jobs) {
-    if (j && String(j.co) === company && typeof j.invoiceNum === 'string' && j.invoiceNum.trim()) {
-      found.add(j.invoiceNum.trim().toUpperCase());
+  if (docType === 'invoice') {
+    const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+    for (const j of jobs) {
+      if (j && String(j.co) === company && typeof j.invoiceNum === 'string' && j.invoiceNum.trim()) {
+        found.add(j.invoiceNum.trim().toUpperCase());
+      }
     }
-  }
 
-  const accInvoices = Array.isArray(data.accInvoices) ? data.accInvoices : [];
-  for (const i of accInvoices) {
-    if (i && String(i.co) === company && typeof i.number === 'string' && i.number.trim()) {
-      found.add(i.number.trim().toUpperCase());
+    const accInvoices = Array.isArray(data.accInvoices) ? data.accInvoices : [];
+    for (const i of accInvoices) {
+      if (i && String(i.co) === company && typeof i.number === 'string' && i.number.trim()) {
+        found.add(i.number.trim().toUpperCase());
+      }
+    }
+  } else if (docType === 'quote') {
+    const quotes = Array.isArray(data.quotes) ? data.quotes : [];
+    for (const q of quotes) {
+      if (q && String(q.co) === company && typeof q.num === 'string' && q.num.trim()) {
+        found.add(q.num.trim().toUpperCase());
+      }
     }
   }
 
@@ -77,7 +97,7 @@ function highestNumericValue(numbers: Set<string>, docType: DocType): number {
 }
 
 // POST /api/document-numbers/reserve
-// body: { company: 1 | 2 | '1' | '2', docType?: 'invoice' }
+// body: { company: 1 | 2 | '1' | '2', docType?: 'invoice' | 'quote' }
 // → 200 { number: 'INV-00066', company: '1', docType: 'invoice' }
 // → 400 invalid company/docType
 // → 500 reservation failed (no number issued, nothing to roll back on the caller's side)
@@ -93,7 +113,7 @@ router.post('/reserve', async (req: Request, res: Response): Promise<void> => {
     return;
   }
   if (!(VALID_DOC_TYPES as readonly string[]).includes(docType)) {
-    res.status(400).json({ error: `Unsupported docType "${docType}". Only "invoice" is supported.` });
+    res.status(400).json({ error: `Unsupported docType "${docType}". Must be "invoice" or "quote".` });
     return;
   }
 

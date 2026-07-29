@@ -163,9 +163,13 @@ router.get('/', async (_req: Request, res: Response): Promise<void> => {
 // PUT /api/platform-state — body: { data: <any-json> }
 //
 // Every section of `data` is stored as a plain last-write-wins replace,
-// EXCEPT `creditNotes`, which gets a small atomic merge below. Credit notes
-// are a shared financial record any logged-in role (Admin, Accounts,
-// Assistant) can create at any moment, and the frontend's optimistic save
+// EXCEPT `creditNotes` and the sections listed in MERGE_SECTIONS below
+// (quotes, jobs, customers, suppliers, inventory, accInvoices, accBills,
+// purchaseOrders, quickRates, employees, leaveRequests, disciplinary),
+// which each get a small atomic id-based merge — see the two merge blocks
+// further down. Credit notes were the first, original case: a shared
+// financial record any logged-in role (Admin, Accounts, Assistant) can
+// create at any moment, and the frontend's optimistic save
 // flow (GET latest → merge locally → PUT full state) has an unavoidable
 // race: if two browsers/devices save around the same time, the second PUT
 // can be built from a GET that was issued before the first PUT committed,
@@ -201,6 +205,12 @@ router.put('/', async (req: Request, res: Response): Promise<void> => {
     const data = { ...(body.data || {}) };
     const knownCreditNoteIds = Array.isArray(data._knownCreditNoteIds) ? data._knownCreditNoteIds : null;
     delete data._knownCreditNoteIds;
+    // Generalized counterpart to _knownCreditNoteIds above — see the merge
+    // block near the bottom of this handler for what it's used for.
+    const knownSectionIds: Record<string, any[]> = (data._knownSectionIds && typeof data._knownSectionIds === 'object' && !Array.isArray(data._knownSectionIds))
+      ? data._knownSectionIds
+      : {};
+    delete data._knownSectionIds;
 
     await client.query('BEGIN');
 
@@ -272,6 +282,69 @@ router.put('/', async (req: Request, res: Response): Promise<void> => {
       );
       if (addedElsewhere.length) {
         data.creditNotes = [...data.creditNotes, ...addedElsewhere];
+      }
+    }
+
+    // ── Generalized non-destructive merge for other concurrently-editable
+    //    sections (2026-07-29) ────────────────────────────────────────────
+    // Same technique as the creditNotes merge directly above, and for the
+    // same reason (see that block's history) — generalized to every other
+    // section that more than one person can add records to at the same
+    // time: quotes, jobs, customers, suppliers, inventory, accInvoices,
+    // accBills, purchaseOrders, quickRates, employees, leaveRequests,
+    // disciplinary. Without this, a plain last-write-wins replace of these
+    // arrays let one session's save silently drop a record another session
+    // had just added a few seconds earlier — the same defect already fixed
+    // for credit notes, just never closed for these. This is the confirmed
+    // mechanism behind the Hennies SQ-00130 quote disappearing on
+    // 2026-07-29 when a near-simultaneous save (which created Cut & Style's
+    // own SQ-00130) committed afterward and silently overwrote it.
+    //
+    // `data._knownSectionIds` (optional) is a map of section name → array of
+    // record ids the saving client already knew about before this edit —
+    // the same idea as `_knownCreditNoteIds`, generalized. A record id
+    // present in the CURRENT database row (locked above, so this reads the
+    // true live state, not a possibly-stale earlier fetch) but absent from
+    // both the incoming array and that section's known-ids was added by a
+    // different session since this client last synced, and is preserved. An
+    // id the client used to know about but omitted from the incoming array
+    // was a deliberate delete by that client and stays deleted. If the
+    // caller omits `_knownSectionIds` entirely (older cached frontend, or
+    // any other caller), this fails safe toward never losing data —
+    // everything currently stored for that section is preserved unless the
+    // incoming array already re-includes it, exactly like the creditNotes
+    // fallback above.
+    //
+    // Matched on each record's stable `id` only — deliberately never on
+    // display numbers like quoteNum/invoiceNum, which this investigation
+    // found are not reliably unique and must not be used as an identity key.
+    //
+    // Never invents, deletes, renumbers, or picks one duplicate over
+    // another — this only decides which existing records survive being
+    // included in the array that gets saved.
+    const MERGE_SECTIONS = ['quotes', 'jobs', 'customers', 'suppliers', 'inventory',
+      'accInvoices', 'accBills', 'purchaseOrders', 'quickRates', 'employees',
+      'leaveRequests', 'disciplinary'];
+    for (const key of MERGE_SECTIONS) {
+      if (!Array.isArray(data[key])) continue; // section not part of this save — leave untouched
+      const incoming = data[key];
+      const existingList = arr(existingData && existingData[key]);
+      if (existingList.length === 0) continue; // nothing live to protect for this section
+
+      // Safety fallback: if any record (incoming or existing) lacks a
+      // stable `id`, skip the merge for this section on this save rather
+      // than risk matching/duplicating records incorrectly. Never worse
+      // than the previous plain-replace behaviour — the section is simply
+      // saved as sent, with no extra protection this time.
+      const idsOk = incoming.every((x: any) => x && x.id !== undefined && x.id !== null)
+                 && existingList.every((x: any) => x && x.id !== undefined && x.id !== null);
+      if (!idsOk) continue;
+
+      const incomingIds = new Set(incoming.map((x: any) => x.id));
+      const knownIds = new Set(Array.isArray(knownSectionIds[key]) ? knownSectionIds[key] : []);
+      const addedElsewhere = existingList.filter((x: any) => x && !incomingIds.has(x.id) && !knownIds.has(x.id));
+      if (addedElsewhere.length) {
+        data[key] = [...incoming, ...addedElsewhere];
       }
     }
 
