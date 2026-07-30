@@ -9908,7 +9908,11 @@ function RevenueChart({ jobs=[], accInvoices=[] }) {
       const d=new Date(firstMonth.getFullYear(),firstMonth.getMonth()+i,1);
       months.push({m:d.toLocaleString('default',{month:'short'}),year:d.getFullYear(),month:d.getMonth(),rev:0,cost:0});
     }
-    const manualRefs=new Set((accInvoices||[]).map(i=>i.reference).filter(Boolean));
+    // Same shared dedup rule as getAllInvoicesUnified (getManualInvoiceJobRefs)
+    // instead of a separate local Set — also correctly ignores void manual
+    // invoices, so a voided invoice can no longer suppress a job's real
+    // revenue bar here, nor still count as revenue itself below.
+    const manualRefs=getManualInvoiceJobRefs(accInvoices);
     jobs.forEach(j=>{
       if(!j.value)return;
       if(!([7,8,9].includes(j.stage)||j.invoiceNum))return;
@@ -9919,6 +9923,7 @@ function RevenueChart({ jobs=[], accInvoices=[] }) {
       bucket.rev+=(j.value||0);
     });
     (accInvoices||[]).forEach(inv=>{
+      if(inv.status==='void')return;
       const sub=(inv.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
       const vat=(inv.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
       const val=sub+vat;
@@ -10089,13 +10094,17 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
             // Total invoiced THIS MONTH (incl. VAT).
             // Job invoices (j.value is already incl. VAT) + manual accounting invoices
             // dated in the current month, excluding any job already linked to a
-            // manual invoice by reference.
-            const manualRefs = new Set(visibleAccInvoices.map(i=>i.reference).filter(Boolean));
+            // manual invoice by reference. Uses the same shared dedup rule as
+            // getAllInvoicesUnified (getManualInvoiceJobRefs) — which also
+            // correctly ignores void manual invoices — instead of a separate
+            // local calculation, so a voided invoice can no longer (a) hide a
+            // job's real revenue here or (b) still count as revenue itself.
+            const manualRefs = getManualInvoiceJobRefs(visibleAccInvoices);
             const jobInv = visibleJobs
               .filter(j=>([7,8,9].includes(j.stage)||j.invoiceNum) && !manualRefs.has(j.num) && inCurrentMonth(j.invoiceDate||j.id))
               .reduce((s,j)=>s+(parseFloat(j.value)||0),0);
             const accInv = visibleAccInvoices
-              .filter(i=>inCurrentMonth(i.date))
+              .filter(i=>i.status!=='void' && inCurrentMonth(i.date))
               .reduce((s,i)=>{
                 const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
                 const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
