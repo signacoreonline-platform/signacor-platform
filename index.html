@@ -466,22 +466,29 @@ const zarK = n => 'R ' + (Number(n)/1000).toFixed(0) + 'k';
 
 /* ═══════════════════════════════════════════
    USER ACCOUNTS
+   ─────────────────────────────────────────
+   Default/seed accounts. On first load (empty database) these become the
+   live `userAccounts` app state (see App()), which is what the login screen
+   and the Admin-only "User Roles" page actually read/edit from then on —
+   this constant itself is never mutated at runtime. Each entry needs a
+   stable `id` (its email) so userAccounts can ride the same platform_state
+   save/merge machinery as every other section.
 ═══════════════════════════════════════════ */
-const USERS = [
-  { email:'admin@signacore.co.za',    pw:'Eunice2026!',    role:'admin',     name:'Ockert Smit',    initials:'OS', title:'Administrator'   },
-  { email:'accounts@signacore.co.za', pw:'Accounts2024!',  role:'accounts',  name:'Accountant',     initials:'AC', title:'Accounts'        },
-  { email:'assist@signacore.co.za',   pw:'Assist2024!',    role:'assistant', name:'Sales Assistant', initials:'SA', title:'Sales / Quoting' },
+const INITIAL_USERS = [
+  { id:'admin@signacore.co.za',    email:'admin@signacore.co.za',    pw:'Eunice2026!',    role:'admin',     name:'Ockert Smit',    initials:'OS', title:'Administrator'   },
+  { id:'accounts@signacore.co.za', email:'accounts@signacore.co.za', pw:'Accounts2024!',  role:'accounts',  name:'Accountant',     initials:'AC', title:'Accounts'        },
+  { id:'assist@signacore.co.za',   email:'assist@signacore.co.za',   pw:'Assist2024!',    role:'assistant', name:'Sales Assistant', initials:'SA', title:'Sales / Quoting' },
   // Signacore Holdings (co:1) logins — placeholder credentials, change the
   // email/pw values below to whatever you'd like. These logins are now
   // walled to the Holdings company context — see HOLDINGS_CO_ID /
   // isHoldingsUser() / belongsToUserCompany() below.
-  { email:'admin@signacoreholdings.co.za',  pw:'Holdings2026!', role:'admin',     name:'Holdings Admin',      initials:'HA', title:'Administrator',   co:1 },
-  { email:'assist@signacoreholdings.co.za', pw:'HoldAssist2026!', role:'assistant', name:'Holdings Assistant', initials:'HS', title:'Sales / Quoting', co:1 },
+  { id:'admin@signacoreholdings.co.za',  email:'admin@signacoreholdings.co.za',  pw:'Holdings2026!', role:'admin',     name:'Holdings Admin',      initials:'HA', title:'Administrator',   co:1 },
+  { id:'assist@signacoreholdings.co.za', email:'assist@signacoreholdings.co.za', pw:'HoldAssist2026!', role:'assistant', name:'Holdings Assistant', initials:'HS', title:'Sales / Quoting', co:1 },
   // Manufacturing logins — Jobs menu only, no Rand values, view/print the
   // Job Card. No password required: these sign in via the one-tap buttons
   // on the login screen (see LoginPage) rather than the email/password form.
-  { email:'factory@signacore.co.za',    pw:'', role:'factory', name:'Factory',    initials:'FA', title:'Manufacturing' },
-  { email:'printroom@signacore.co.za',  pw:'', role:'factory', name:'Print Room', initials:'PR', title:'Manufacturing' },
+  { id:'factory@signacore.co.za',    email:'factory@signacore.co.za',    pw:'', role:'factory', name:'Factory',    initials:'FA', title:'Manufacturing' },
+  { id:'printroom@signacore.co.za',  email:'printroom@signacore.co.za',  pw:'', role:'factory', name:'Print Room', initials:'PR', title:'Manufacturing' },
 ];
 // Signacore Holdings company ID. Previously hard-excluded from the
 // Dashboard/Jobs/Reports views while the entity sat unused — now a fully
@@ -9722,15 +9729,14 @@ function HRPage({ employees, setEmployees, leaveRequests, setLeaveRequests, disc
 /* ═══════════════════════════════════════════
    LOGIN
 ═══════════════════════════════════════════ */
-function LoginPage({ onLogin }) {
-  const assistUser = USERS.find(u=>u.role==='assistant');
-  const [em,setEm]=useState(assistUser?assistUser.email:'');
-  const [pw,setPw]=useState(assistUser?assistUser.pw:'');
+function LoginPage({ onLogin, userAccounts }) {
+  const [em,setEm]=useState('');
+  const [pw,setPw]=useState('');
   const [err,setErr]=useState('');
   const inputCls="w-full border border-gray-200 rounded-xl px-4 py-3 text-sm";
   function submit(e){
     e.preventDefault();
-    const u=USERS.find(u=>u.email===em.trim().toLowerCase()&&u.pw===pw);
+    const u=userAccounts.find(u=>u.email===em.trim().toLowerCase()&&u.pw===pw);
     if(u){onLogin(u);}else{setErr('Incorrect email or password.');}
   }
   return (
@@ -9762,52 +9768,13 @@ function LoginPage({ onLogin }) {
           <p className="text-center text-xs text-gray-400 mt-4">Applied Graphics and Visual Displays</p>
         </div>
 
-        {/* ── Login credentials reference ── */}
-        <div className="mt-5 rounded-2xl overflow-hidden text-xs" style={{background:'rgba(255,255,255,0.07)',border:'1px solid rgba(255,255,255,0.12)'}}>
-          <div className="px-4 py-2 border-b" style={{borderColor:'rgba(255,255,255,0.1)'}}>
-            <p className="text-center font-bold tracking-widest uppercase" style={{color:'rgba(255,255,255,0.5)',fontSize:'0.65rem'}}>Login Credentials</p>
-          </div>
-          <div className="divide-y" style={{borderColor:'rgba(255,255,255,0.08)'}}>
-            {/* Assistant — default / primary */}
-            <div className="flex items-center justify-between px-4 py-2.5 gap-4">
-              <span className="font-bold" style={{color:'rgba(255,255,255,0.85)',minWidth:'80px'}}>Assistant</span>
-              <span style={{color:'rgba(255,255,255,0.55)',wordBreak:'break-all'}}>assist@signacore.co.za</span>
-              <span className="font-mono shrink-0" style={{color:'rgba(255,255,255,0.45)'}}>Assist2024!</span>
-            </div>
-            {/* Admin — password hidden */}
-            <div className="flex items-center justify-between px-4 py-2.5 gap-4">
-              <span className="font-bold" style={{color:'rgba(255,255,255,0.85)',minWidth:'80px'}}>Admin</span>
-              <span style={{color:'rgba(255,255,255,0.55)',wordBreak:'break-all'}}>admin@signacore.co.za</span>
-              <span className="font-mono tracking-widest shrink-0" style={{color:'rgba(255,255,255,0.25)'}}>••••••••</span>
-            </div>
-            {/* Accountant */}
-            <div className="flex items-center justify-between px-4 py-2.5 gap-4">
-              <span className="font-bold" style={{color:'rgba(255,255,255,0.85)',minWidth:'80px'}}>Accounts</span>
-              <span style={{color:'rgba(255,255,255,0.55)',wordBreak:'break-all'}}>accounts@signacore.co.za</span>
-              <span className="font-mono shrink-0" style={{color:'rgba(255,255,255,0.45)'}}>Accounts2024!</span>
-            </div>
-            {/* Signacore Holdings — Admin (password hidden) */}
-            <div className="flex items-center justify-between px-4 py-2.5 gap-4">
-              <span className="font-bold" style={{color:'rgba(255,255,255,0.85)',minWidth:'80px'}}>Holdings Admin</span>
-              <span style={{color:'rgba(255,255,255,0.55)',wordBreak:'break-all'}}>admin@signacoreholdings.co.za</span>
-              <span className="font-mono tracking-widest shrink-0" style={{color:'rgba(255,255,255,0.25)'}}>••••••••</span>
-            </div>
-            {/* Signacore Holdings — Assistant */}
-            <div className="flex items-center justify-between px-4 py-2.5 gap-4">
-              <span className="font-bold" style={{color:'rgba(255,255,255,0.85)',minWidth:'80px'}}>Holdings Asst.</span>
-              <span style={{color:'rgba(255,255,255,0.55)',wordBreak:'break-all'}}>assist@signacoreholdings.co.za</span>
-              <span className="font-mono shrink-0" style={{color:'rgba(255,255,255,0.45)'}}>HoldAssist2026!</span>
-            </div>
-          </div>
-        </div>
-
         {/* ── Manufacturing — one-tap sign-in, no password ── */}
-        <div className="mt-3 rounded-2xl overflow-hidden text-xs" style={{background:'rgba(255,255,255,0.07)',border:'1px solid rgba(255,255,255,0.12)'}}>
+        <div className="mt-5 rounded-2xl overflow-hidden text-xs" style={{background:'rgba(255,255,255,0.07)',border:'1px solid rgba(255,255,255,0.12)'}}>
           <div className="px-4 py-2 border-b" style={{borderColor:'rgba(255,255,255,0.1)'}}>
             <p className="text-center font-bold tracking-widest uppercase" style={{color:'rgba(255,255,255,0.5)',fontSize:'0.65rem'}}>Manufacturing — Tap to Sign In</p>
           </div>
           <div className="p-3 flex gap-2">
-            {USERS.filter(u=>u.role==='factory').map(u=>(
+            {userAccounts.filter(u=>u.role==='factory').map(u=>(
               <button key={u.email} type="button" onClick={()=>onLogin(u)}
                 className="flex-1 text-white font-bold rounded-xl py-2.5 text-xs transition-all hover:opacity-90"
                 style={{background:'rgba(255,255,255,0.12)',border:'1px solid rgba(255,255,255,0.25)'}}>
@@ -9817,6 +9784,71 @@ function LoginPage({ onLogin }) {
           </div>
         </div>
 
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════
+   USER ROLES  (Admin-only)
+   ─────────────────────────────────────────
+   Lets the main Admin (never Holdings Admin, Accounts, Assistant, Holdings
+   Assistant or Factory — enforced in App()/Sidebar, not here) view and edit
+   the platform's login accounts. Only display name, email and password are
+   editable — role/company are shown read-only so access restrictions can
+   never be reassigned from this screen. Saves through the same userAccounts
+   app state as everything else (see App() → STATE_SECTIONS).
+═══════════════════════════════════════════ */
+function UserRolesPage({ userAccounts, setUserAccounts }) {
+  const [visiblePw, setVisiblePw] = useState({});
+  function updateField(id, field, value) {
+    setUserAccounts(prev => prev.map(u => u.id===id ? {...u, [field]: value} : u));
+  }
+  function roleLabel(u) {
+    if (u.role==='admin')     return isHoldingsUser(u) ? 'Holdings Admin' : 'Admin';
+    if (u.role==='assistant') return isHoldingsUser(u) ? 'Holdings Assistant' : 'Assistant';
+    if (u.role==='accounts')  return 'Accounts';
+    if (u.role==='factory')   return 'Manufacturing';
+    return u.role;
+  }
+  return (
+    <div className="p-6 max-w-4xl mx-auto">
+      <div className="mb-6">
+        <h2 className="text-lg font-bold" style={{color:'#06065c'}}>User Roles</h2>
+        <p className="text-sm text-gray-500 mt-1">Admin-only. Edit the login name, email and password for each account below — changes save automatically, the same way the rest of the platform saves.</p>
+      </div>
+      <div className="space-y-4">
+        {(userAccounts||[]).map(u=>(
+          <div key={u.id} className="bg-white border border-gray-200 rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-3">
+              <span className="font-bold text-sm" style={{color:'#06065c'}}>{roleLabel(u)}</span>
+              <span className="text-xs text-gray-400">{isHoldingsUser(u) ? 'Signacore Holdings' : 'Signacore'}</span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-widest text-gray-500 mb-1">Display Name</label>
+                <input className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm" value={u.name||''} onChange={e=>updateField(u.id,'name',e.target.value)}/>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-widest text-gray-500 mb-1">Username / Email</label>
+                <input type="email" className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm" value={u.email||''} onChange={e=>updateField(u.id,'email',e.target.value.toLowerCase())}/>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-widest text-gray-500 mb-1">Password</label>
+                {u.role==='factory'
+                  ? <input className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm bg-gray-50 text-gray-400" value="No password — one-tap sign in" disabled/>
+                  : <div className="flex gap-2">
+                      <input type={visiblePw[u.id]?'text':'password'} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono" value={u.pw||''} onChange={e=>updateField(u.id,'pw',e.target.value)}/>
+                      <button type="button" onClick={()=>setVisiblePw(v=>({...v,[u.id]:!v[u.id]}))} className="shrink-0 text-xs text-gray-500 border border-gray-200 rounded-lg px-3 hover:bg-gray-50">{visiblePw[u.id]?'Hide':'Show'}</button>
+                    </div>}
+              </div>
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-widest text-gray-500 mb-1">Role / Company</label>
+                <input className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm bg-gray-50 text-gray-500" value={`${roleLabel(u)} — ${isHoldingsUser(u)?'Signacore Holdings':'Signacore'}`} disabled/>
+              </div>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -9883,6 +9915,18 @@ function Sidebar({ companies, page, setPage, open, setOpen, user, entityFilter, 
               </button>
             </div>
           ))}
+          {/* Admin-only — deliberately NOT part of NAV_ALL/ALL_ROLES: those
+              role arrays can't distinguish the main Admin from Holdings Admin
+              (both use role==='admin', only `co` differs), and User Roles
+              must be visible to the main Admin only. */}
+          {user.role==='admin' && !isHoldingsUser(user) && (
+            <div className="flex items-center gap-0.5 mt-2 pt-2 border-t border-white/10">
+              <button onClick={()=>{setPage('user_roles');setOpen(false);}}
+                className={`flex-1 flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm text-left transition-all ${page==='user_roles'?'text-white font-semibold':'text-blue-200 hover:bg-white/10 hover:text-white'}`} style={page==='user_roles'?{background:'rgba(0,0,255,0.45)',borderLeft:'3px solid #ED0101'}:{}}>
+                <span className="w-5 text-center">🔑</span><span>User Roles</span>
+              </button>
+            </div>
+          )}
         </nav>
         {/* bottom spacer */}
         <div className="px-5 py-4 border-t border-white/10">
@@ -9905,7 +9949,7 @@ function Sidebar({ companies, page, setPage, open, setOpen, user, entityFilter, 
    HEADER
 ═══════════════════════════════════════════ */
 function Header({ page, onMenu, onLogout, user, onSave, saveMsg, lastSaved, logoDataUrl, onExportBackup }) {
-  const titles={dashboard:'Dashboard',jobs:'Jobs',calculators:'Calculators & Costing',inventory:'Inventory',imports:'Import Costing',reports:'Reports',sales:'Sales',quotes:'Sales',customers:'Customers',suppliers:'Suppliers',assets:'Assets',hr:'HR',purchase_orders:'Purchase Orders',accounting:'Accounting'};
+  const titles={dashboard:'Dashboard',jobs:'Jobs',calculators:'Calculators & Costing',inventory:'Inventory',imports:'Import Costing',reports:'Reports',sales:'Sales',quotes:'Sales',customers:'Customers',suppliers:'Suppliers',assets:'Assets',hr:'HR',purchase_orders:'Purchase Orders',accounting:'Accounting',user_roles:'User Roles'};
   const today=new Date().toLocaleDateString('en-ZA',{weekday:'short',day:'numeric',month:'short',year:'numeric'});
   const isAssistant = user.role === 'assistant';
   // Admin-only, both companies — Original Admin and Holdings Admin both have
@@ -18359,6 +18403,17 @@ function App() {
   const [quickRates,       setQuickRates]       = useState(_saved ? (_saved.quickRates||[])        : INITIAL_QUICK_RATES);
   const [proposedProjects, setProposedProjects] = useState(_saved ? (_saved.proposedProjects||[])  : []);
   const [creditNotes,      setCreditNotes]      = useState(_saved ? (_saved.creditNotes||[])         : []);
+  // Login accounts — Admin-editable via the "User Roles" page (see
+  // UserRolesPage/Sidebar). Seeded from INITIAL_USERS, merged the same way
+  // `inventory` merges in newly-added default items so an admin's saved
+  // edits are never overwritten by future default-account additions.
+  const [userAccounts,     setUserAccounts]     = useState(()=>{
+    if(!_saved || !Array.isArray(_saved.userAccounts) || !_saved.userAccounts.length) return INITIAL_USERS;
+    const saved = _saved.userAccounts;
+    const savedIds = new Set(saved.map(u=>u.id));
+    const newOnes = INITIAL_USERS.filter(u=>!savedIds.has(u.id));
+    return newOnes.length ? [...saved, ...newOnes] : saved;
+  });
 
   // ── DATABASE-BACKED PERSISTENCE ────────────────────────────────
   // Database (PostgreSQL via backend API) is the shared source of truth for ALL users.
@@ -18401,7 +18456,7 @@ function App() {
   // All array/object sections stored in platform_state
   const STATE_SECTIONS = ['jobs','inventory','quotes','customers','suppliers','assets',
     'employees','leaveRequests','disciplinary','savedCalcs','purchaseOrders','savedImports',
-    'bankTxns','chartOfAccounts','accInvoices','accBills','completeProducts','payrollRecords','quickRates','proposedProjects','creditNotes'];
+    'bankTxns','chartOfAccounts','accInvoices','accBills','completeProducts','payrollRecords','quickRates','proposedProjects','creditNotes','userAccounts'];
 
   // Fetch latest state from the backend
   async function fetchFromServer() {
@@ -18462,6 +18517,7 @@ function App() {
     if (Array.isArray(dbData.quickRates))       setQuickRates(dbData.quickRates);
     if (Array.isArray(dbData.proposedProjects)) setProposedProjects(dbData.proposedProjects);
     if (Array.isArray(dbData.creditNotes))      setCreditNotes(dbData.creditNotes);
+    if (Array.isArray(dbData.userAccounts) && dbData.userAccounts.length) setUserAccounts(dbData.userAccounts);
     if (typeof dbData.logo === 'string')        setLogoDataUrl(dbData.logo);
     if (typeof dbData.utLogo === 'string')      setUtLogoDataUrl(dbData.utLogo);
     if (typeof dbData.holdingsLogo === 'string') setHoldingsLogoDataUrl(dbData.holdingsLogo);
@@ -18819,7 +18875,7 @@ function App() {
   //    Merges locally-changed sections onto the server baseline before writing,
   //    so two users editing different sections never overwrite each other.
   useEffect(()=>{
-    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, logo:logoDataUrl, utLogo:utLogoDataUrl, holdingsLogo:holdingsLogoDataUrl, sigOTSmit, savedAt:lastSaved};
+    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, logo:logoDataUrl, utLogo:utLogoDataUrl, holdingsLogo:holdingsLogoDataUrl, sigOTSmit, savedAt:lastSaved};
     currentSnapshotRef.current = snapshot; // keep ref current for poll effect
     // Backup to localStorage (safety net — DB is source of truth)
     try { localStorage.setItem('sgr_platform_data', JSON.stringify(snapshot)); } catch(e) {}
@@ -18843,7 +18899,7 @@ function App() {
       }
       setTimeout(() => setApiMsg(''), 2500);
     }, 800);
-  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, logoDataUrl, utLogoDataUrl, sigOTSmit]);
+  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, logoDataUrl, utLogoDataUrl, sigOTSmit]);
 
   function handleLogin(u){ try{localStorage.setItem('sgr_user',JSON.stringify(u));}catch(e){} setUser(u); setPage('dashboard'); setEntityFilter(null); }
   function handleLogout(){ try{localStorage.removeItem('sgr_user');}catch(e){} setUser(null); setPage('dashboard'); setEntityFilter(null); }
@@ -18999,7 +19055,7 @@ function App() {
     }
   }
 
-  if (!user) return <LoginPage onLogin={handleLogin}/>;
+  if (!user) return <LoginPage onLogin={handleLogin} userAccounts={userAccounts}/>;
 
   const assistantBlocked = []; // imports removed from nav; assets & hr open to all roles
   // Generalized fallback: if the current `page` isn't one this user's role
@@ -19008,9 +19064,15 @@ function App() {
   // first page their role does have access to. Preserves prior behaviour
   // for admin/accounts/assistant, who always have 'dashboard' in their nav.
   const userNavIds = NAV_ALL.filter(n=>n.roles.includes(user.role)).map(n=>n.id);
+  // Main Admin only (never Holdings Admin — see isHoldingsUser). 'user_roles'
+  // is deliberately kept out of NAV_ALL/userNavIds since that array's
+  // role-only filter can't express "admin but not Holdings admin".
+  const isMainAdmin = user.role==='admin' && !isHoldingsUser(user);
   const safePage = (user.role==='assistant' && assistantBlocked.includes(page))
     ? 'dashboard'
-    : (userNavIds.includes(page) ? page : (userNavIds[0] || 'dashboard'));
+    : (page==='user_roles'
+        ? (isMainAdmin ? 'user_roles' : 'dashboard')
+        : (userNavIds.includes(page) ? page : (userNavIds[0] || 'dashboard')));
 
   // Company-aware branding resolver — used for the header, sidebar, and
   // every document-generating page below. Holdings users (co:1) always get
@@ -19048,6 +19110,10 @@ function App() {
     reports:     <ReportsPage     jobs={jobs} companies={companies} user={user} logoDataUrl={brandingLogo}/>,
     accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user} onOpenJob={openJobRecord} onOpenQuote={openQuoteRecord} onOpenCustomer={openCustomerRecord} onOpenJobPayments={openJobPaymentsRecord} initialStatementContact={accountingOpen&&accountingOpen.contact} onInitialStatementHandled={()=>setAccountingOpen(null)}/>,
     hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={brandingLogo} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
+    // Admin-only (main Admin, never Holdings Admin) — guarded again here in
+    // addition to the Sidebar link and safePage above, so this can never
+    // render for any other role/company even if `page` were forced somehow.
+    user_roles:  isMainAdmin ? <UserRolesPage userAccounts={userAccounts} setUserAccounts={setUserAccounts}/> : null,
   };
 
   return (
