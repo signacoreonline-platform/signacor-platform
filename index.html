@@ -6459,7 +6459,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       setupFee: q.setupFee||'', discount: q.discount||'',
       salesperson: q.salesperson||'', preparedBy: q.preparedBy||'',
       poRef: q.poRef||'', reference: q.reference||'',
-      invoiceDate: today, invoiceDue: dueDate,
+      // invoiceDate is deliberately NOT pre-seeded here — it used to be set to
+      // this job-creation date and then silently kept as the invoice's date
+      // once a real tax invoice was created later. invoiceDate is now only
+      // ever set at the moment the invoice is actually created (see
+      // createInvoiceNow / "Create Invoice"). invoiceDue is still pre-seeded
+      // as a planning default for the eventual due date.
+      invoiceDue: dueDate,
       // Carry any deposits/partials already recorded on the quote/proforma
       payments: (q.payments||[]).map(p=>({...p})),
       invoiceStatus: (()=>{ const paid=(q.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0); const tot=_qAfterDisc*1.15; return paid>=tot&&tot>0?'paid':paid>0?'partial':'pending'; })(),
@@ -6570,7 +6576,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // we were waiting on the network. If so, leave it untouched — the
       // reserved number simply goes unused (acceptable, per project rules).
       if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
-      return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
+      // invoiceDate is set to the actual moment of invoice creation here —
+      // never preserved from an earlier value pre-seeded at quote→job
+      // conversion time (that used to make the invoice date silently equal
+      // the job-creation date instead of the real invoice-creation date).
+      return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:today, invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
     });
     setInvoiceCreatedInfo({ job, invoiceNum: reserved });
   }
@@ -10488,9 +10498,14 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
             : nextLocked
               ? <div className="bg-gray-50 border border-dashed border-gray-300 rounded-xl px-4 py-3 flex items-start gap-2">
                   <span className="text-lg">🔒</span>
-                  <div>
+                  <div className="flex-1">
                     <p className="text-sm font-bold text-gray-600">{STAGE_NAMES[nextStage]} — activates automatically</p>
                     <p className="text-xs text-gray-400 mt-0.5">{nextStage===5?'Record a deposit / partial payment on the linked quote, proforma or invoice and this stage advances on its own.':'Activates automatically once this job carries a tax invoice (quote converted to an invoice).'}</p>
+                    {nextStage===5&&onOpenJobPayments&&(
+                      <button onClick={()=>onOpenJobPayments(job)} className="mt-2 flex items-center gap-1.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl px-3 py-1.5 text-xs font-bold transition-colors">
+                        <span>💳</span><span>Go to Payments</span>
+                      </button>
+                    )}
                   </div>
                 </div>
               : <button onClick={advanceStage} className="flex items-center gap-2 bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-5 py-2.5 text-sm font-bold transition-colors">
@@ -10827,7 +10842,10 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                       // were waiting on the network — if so, leave it
                       // untouched; the reserved number simply goes unused.
                       if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
-                      return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
+                      // invoiceDate is set to the actual moment of invoice creation
+                      // here — never preserved from an earlier value pre-seeded at
+                      // quote→job conversion time.
+                      return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:today, invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
                     });
                     setInvoiceCreatedInfo({ invoiceNum: reserved });
                   }}
@@ -15606,6 +15624,11 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   const [txnFilter, setTxnFilter] = useState('all'); // all|unallocated|allocated
   const [editTxn, setEditTxn] = useState(null);
 
+  // ── Invoices sub-tab state — search / status filter (display-only; default
+  // list order is newest-first, matching Sales → Invoices) ──
+  const [invSearchAcc, setInvSearchAcc] = useState('');
+  const [invStatusFilterAcc, setInvStatusFilterAcc] = useState('all'); // 'all'|'draft'|'sent'|'partial'|'paid'|'overdue'
+
   // ── New Account form ──
   const [newAcc, setNewAcc] = useState({code:'',name:'',type:'Expense',group:'',taxRate:0});
 
@@ -16579,10 +16602,15 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     );
   }
 
-  // ── Convert jobs (invoiced/completed stage) into invoice-format objects ──
+  // ── Convert jobs that carry a REAL invoice number into invoice-format objects ──
+  // A job only appears here once it has a genuine, reserved invoiceNum — the
+  // same rule Sales / getAllInvoicesUnified already use — so a job merely at
+  // Installation/Completed stage (not yet invoiced) is never shown as if it
+  // already has a real invoice. Jobs that are invoice-ready but not yet
+  // invoiced are still surfaced separately via getPendingJobInvoices() / the
+  // "ready to invoice but not yet invoiced" banner further down.
   function getJobInvoices() {
-    const STAGE_INVOICE = [7,8,9]; // Installation, Completed, Invoiced
-    return (jobs||[]).filter(j=>STAGE_INVOICE.includes(j.stage)||j.invoiceNum).map(j=>{
+    return (jobs||[]).filter(j=>j && j.invoiceNum).map(j=>{
       const val = parseFloat(j.value)||0;
       // j.value is incl. VAT — convert to excl. VAT so the accounting module
       // can correctly add 15% VAT and arrive back at the original incl. VAT total.
@@ -16598,7 +16626,9 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
       const invDate = j.invoiceDate || j.date || new Date().toISOString().slice(0,10);
       const dueDate = j.invoiceDue || new Date(new Date(invDate).getTime()+30*864e5).toISOString().slice(0,10);
       if(status!=='paid' && new Date()>new Date(dueDate)) status = (rec.invoiceStatus==='partial')?'partial':'overdue';
-      const invNum = j.invoiceNum || ('INV-' + String(j.num||'').replace(/\D/g,'').padStart(5,'0'));
+      // j.invoiceNum is guaranteed truthy here (see the filter above) — no
+      // synthetic/fallback invoice number is ever fabricated for display.
+      const invNum = j.invoiceNum;
       // ── Discount pull-through ──
       // Any discount % applied on the job / invoice must be visible in Accounting.
       // Where the job still has its original (pre-discount) line items we can
@@ -16650,10 +16680,23 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   // since been voided).
   const manualRefs = getManualInvoiceJobRefs(accInvoices);
   const jobInvsFiltered = jobInvoices.filter(j=>!manualRefs.has(j.jobNum));
-  const allInvoices = [...accInvoices.map(i=>({...i,source:i.source||'manual'})), ...jobInvsFiltered];
+  // Exclude void manual invoices from the active list — matches Sales /
+  // getAllInvoicesUnified, which already exclude status==='void'. Void
+  // invoices are not deleted or hidden from the data itself, only from this
+  // active/counted list.
+  const allInvoices = [...accInvoices.filter(i=>i && i.status!=='void').map(i=>({...i,source:i.source||'manual'})), ...jobInvsFiltered];
   // Jobs that are invoice-ready but don't have an invoice number yet —
   // informational only, never mixed into allInvoices/exports/counts above.
   const pendingJobInvoicesAcc = getPendingJobInvoices(jobs, accInvoices);
+
+  // ── Invoices sub-tab: default newest-first (by invoice number), same as
+  // Sales → Invoices, plus a simple text search and the status filter driven
+  // by the (now clickable) status badges above the table. Display-only —
+  // never changes allInvoices/exports/counts, which still reflect everything.
+  const _invSearchAcc = invSearchAcc.trim().toLowerCase();
+  const displayedAccInvoices = numSort(allInvoices, 'number').reverse()
+    .filter(i => invStatusFilterAcc==='all' || i.status===invStatusFilterAcc)
+    .filter(i => !_invSearchAcc || [i.number, i.contactName, i.reference, i.jobNum].some(v=>(v||'').toString().toLowerCase().includes(_invSearchAcc)));
 
   // ── Auto-apply customer credit notes to invoices raised after them ──
   // A credit note's "Remaining" should fall the moment a later invoice for
@@ -17177,14 +17220,23 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
           <div className="flex flex-wrap gap-2 items-center">
             <button onClick={()=>{setEditInv(null);setShowInvModal(true);}} className="flex items-center gap-2 text-white font-bold text-sm px-4 py-2.5 rounded-xl" style={{background:'#06065c'}}>＋ New Invoice</button>
             <button onClick={exportInvoiceListCSV} className="flex items-center gap-2 font-bold text-sm px-4 py-2.5 rounded-xl border border-gray-200 bg-white text-gray-700 hover:bg-gray-50">⬇ Export List (CSV)</button>
+            <input value={invSearchAcc} onChange={e=>setInvSearchAcc(e.target.value)} placeholder="🔍 Search invoice #, contact, reference…"
+              className="border border-gray-200 rounded-xl px-3 py-2 text-xs min-w-[220px]"/>
             <div className="flex gap-2 ml-auto flex-wrap text-xs">
+              <button type="button" onClick={()=>setInvStatusFilterAcc('all')}
+                className={`px-2 py-1 rounded-full font-bold border ${invStatusFilterAcc==='all'?'border-gray-500':'border-transparent'}`}
+                style={{background:'#6b728022',color:'#374151'}}>
+                all: {allInvoices.length}
+              </button>
               {['draft','sent','partial','paid','overdue'].map(s=>(
-                <span key={s} className="px-2 py-1 rounded-full font-bold" style={{background:STATUS_COLORS[s]+'22',color:STATUS_COLORS[s]}}>
+                <button key={s} type="button" onClick={()=>setInvStatusFilterAcc(s)}
+                  className={`px-2 py-1 rounded-full font-bold border ${invStatusFilterAcc===s?'border-gray-500':'border-transparent'}`}
+                  style={{background:STATUS_COLORS[s]+'22',color:STATUS_COLORS[s]}}>
                   {s}: {allInvoices.filter(i=>i.status===s).length}
-                </span>
+                </button>
               ))}
               <span className="px-2 py-1 rounded-full font-bold bg-purple-100 text-purple-700">{jobInvsFiltered.length} from jobs</span>
-              <span className="px-2 py-1 rounded-full font-bold bg-blue-100 text-blue-700">{accInvoices.length} manual</span>
+              <span className="px-2 py-1 rounded-full font-bold bg-blue-100 text-blue-700">{accInvoices.filter(i=>i.status!=='void').length} manual</span>
             </div>
           </div>
           {jobInvsFiltered.length>0&&(
@@ -17226,12 +17278,18 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                   </tr>
                 </thead>
                 <tbody>
-                  {allInvoices.map(inv=>{
+                  {displayedAccInvoices.map(inv=>{
                     const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
                     const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
                     const today=new Date(); const due=new Date(inv.dueDate||inv.date);
                     const overdue=inv.status!=='paid'&&inv.status!=='void'&&today>due;
                     const isJob = inv.source==='job';
+                    // Display-only: how much is still owed on this invoice —
+                    // same total (sub+vat) and payments already used elsewhere
+                    // in this row, just subtracted. Never changes inv.status
+                    // or any stored/calculated payment value.
+                    const paidSoFar = (inv.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+                    const outstanding = Math.max(0, (sub+vat)-paidSoFar);
                     return(
                       <tr key={inv.id} className={`border-b border-gray-50 transition-colors ${isJob?'hover:bg-purple-50 bg-purple-50/30':'hover:bg-blue-50'}`}>
                         <td className="px-4 py-2.5 text-xs font-mono text-gray-600">
@@ -17250,7 +17308,9 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                         <td className="px-4 py-2.5 text-xs text-right text-blue-600">{fmtAmt(vat)}</td>
                         <td className="px-4 py-2.5 text-xs text-right font-black text-gray-800">{fmtAmt(sub+vat)}</td>
                         <td className="px-4 py-2.5 text-center">
-                          <span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status}</span>
+                          <span className="px-2 py-0.5 rounded-full text-white text-xs font-bold whitespace-nowrap" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>
+                            {inv.status==='partial' ? `Outstanding: ${fmtAmt(outstanding)}` : inv.status}
+                          </span>
                         </td>
                         <td className="px-4 py-2.5 text-center">
                           {isJob?(
@@ -17270,20 +17330,24 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                       </tr>
                     );
                   })}
-                  {allInvoices.length===0&&(
+                  {displayedAccInvoices.length===0&&(
                     <tr><td colSpan="10" className="px-4 py-10 text-center">
-                      <p className="text-gray-400 mb-1">No invoices yet.</p>
-                      <p className="text-xs text-gray-400 mb-3">Completed jobs will appear here automatically. Or create a manual invoice above.</p>
+                      {allInvoices.length===0 ? (<>
+                        <p className="text-gray-400 mb-1">No invoices yet.</p>
+                        <p className="text-xs text-gray-400 mb-3">Completed jobs will appear here automatically. Or create a manual invoice above.</p>
+                      </>) : (
+                        <p className="text-gray-400 mb-1">No invoices match your search/filter.</p>
+                      )}
                     </td></tr>
                   )}
                 </tbody>
-                {/* Totals row — aligned directly under the Excl. VAT / VAT / Total (incl. VAT) columns */}
+                {/* Totals row — reflects the currently displayed (sorted/filtered) invoices, aligned directly under the Excl. VAT / VAT / Total (incl. VAT) columns */}
                 <tfoot>
                   <tr className="border-t-2 border-gray-200" style={{background:'#f8f9ff'}}>
                     <td className="px-4 py-2.5 text-xs font-black text-gray-500 uppercase" colSpan="5">Totals</td>
-                    <td className="px-4 py-2.5 text-xs text-right font-black text-gray-800">{fmtAmt(allInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),s),0))}</td>
-                    <td className="px-4 py-2.5 text-xs text-right font-black text-blue-600">{fmtAmt(allInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,s),0))}</td>
-                    <td className="px-4 py-2.5 text-xs text-right font-black" style={{color:'#06065c'}}>{fmtAmt(allInvoices.reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</td>
+                    <td className="px-4 py-2.5 text-xs text-right font-black text-gray-800">{fmtAmt(displayedAccInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),s),0))}</td>
+                    <td className="px-4 py-2.5 text-xs text-right font-black text-blue-600">{fmtAmt(displayedAccInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,s),0))}</td>
+                    <td className="px-4 py-2.5 text-xs text-right font-black" style={{color:'#06065c'}}>{fmtAmt(displayedAccInvoices.reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</td>
                     <td colSpan="2"></td>
                   </tr>
                 </tfoot>
