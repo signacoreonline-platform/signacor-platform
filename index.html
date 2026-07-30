@@ -2099,12 +2099,27 @@ function numSort(list, field) {
   });
 }
 
+// A manual accounting invoice (accInvoices) whose `reference` field is set
+// to a job number IS that job's real, accounting-authoritative tax invoice
+// — the synthetic job-derived row must not also be shown as a second,
+// separate invoice for the same job. Void invoices never "claim" a job
+// number this way, so a voided manual invoice can never hide a job's real
+// invoice. Shared by getAllInvoicesUnified below and by every page that
+// used to compute this set locally (Sales / Accounting / Customers), so
+// they can never disagree about which record wins for a given job.
+function getManualInvoiceJobRefs(accInvoices) {
+  return new Set((accInvoices||[]).filter(i=>i.status!=='void').map(i=>i.reference).filter(Boolean));
+}
+
 // Merge job-derived invoices + manual accInvoices into one clean, de-duped,
-// numerically-sorted list. Mirrors the merge logic already used inside
-// QuotesPage / AccountingPage so every page that calls this sees the exact
-// same invoice set (same records, same statuses, same order).
+// numerically-sorted list. Single source of truth for "what invoices exist"
+// — every page that lists or looks up invoices (Sales, Accounting, Customer
+// dropdown, Quote/Job/Invoice linked-record lookups) should read this same
+// function instead of building its own list, so they can never drift apart.
+// Read-only: never creates, edits, deletes or renumbers any invoice.
 function getAllInvoicesUnified(jobs, quotes, accInvoices) {
-  const jobInv = (jobs||[]).filter(j=>j.invoiceNum).map(j=>{
+  const manualJobRefs = getManualInvoiceJobRefs(accInvoices);
+  const jobInv = (jobs||[]).filter(j=>j.invoiceNum && !manualJobRefs.has(j.num)).map(j=>{
     const rec = reconcileJobInvoice(j, quotes||[]);
     return {
       id:'job-'+j.id, number:j.invoiceNum, source:'job', jobNum:j.num, quoteNum:j.quoteNum||'',
@@ -2112,17 +2127,106 @@ function getAllInvoicesUnified(jobs, quotes, accInvoices) {
       amount:parseFloat(j.value)||0, status:rec.invoiceStatus||'pending', payments:rec.payments||[],
     };
   });
-  const jobRefs = new Set(jobInv.map(j=>j.jobNum).filter(Boolean));
-  const manualInv = (accInvoices||[]).filter(i=>i.status!=='void' && !jobRefs.has(i.reference)).map(i=>{
+  const manualInv = (accInvoices||[]).filter(i=>i.status!=='void').map(i=>{
     const sub=(i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
     const vat=(i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
     return {
-      id:i.id, number:i.number, source:'manual', jobNum:'', quoteNum:'',
+      id:i.id, number:i.number, source:'manual', jobNum:i.reference||'', quoteNum:'',
       client:i.contactName||'', date:i.date||'', dueDate:i.dueDate||'',
       amount:sub+vat, status:i.status||'draft', payments:i.payments||[],
     };
   });
   return numSort([...jobInv, ...manualInv], 'number');
+}
+
+// Jobs that have reached an invoice-ready stage (Installation, stage 7 —
+// same threshold JobDetail's own "Create Invoice" button already uses) but
+// do not yet carry an invoice number. Display-only "not yet invoiced" list:
+// these are never counted as invoices, never included in
+// getAllInvoicesUnified, and never exported — they simply let Sales /
+// Accounting / Job Detail show "this job is invoice-ready but hasn't been
+// invoiced yet" without changing any invoice count, total or export.
+function getPendingJobInvoices(jobs, accInvoices) {
+  const INSTALL_STAGE = 7;
+  const manualJobRefs = getManualInvoiceJobRefs(accInvoices);
+  return (jobs||[]).filter(j =>
+    (parseFloat(j.stage)||0) >= INSTALL_STAGE &&
+    !j.invoiceNum && !j.invoiceCreated &&
+    !manualJobRefs.has(j.num)
+  );
+}
+
+// Name-match a quote/job/invoice's client/contact name to a customer record,
+// using the exact same matching rule CustomersPage already uses
+// (nameMatches) so "View Customer" links always agree with what the
+// Customers page itself considers a match. Read-only lookup only.
+function findCustomerByName(name, customers) {
+  const _norm = s => (s||'').trim().toLowerCase();
+  const n = _norm(name);
+  if(!n) return null;
+  return (customers||[]).find(c=>{
+    const cn = _norm(c.companyName), cp = _norm(c.contactPerson);
+    return (cn && (n===cn || n.includes(cn) || cn.includes(n))) || (cp && n===cp);
+  }) || null;
+}
+
+// Read-only lookup of every record connected to a given quote/job/invoice —
+// used to power the linked-record panels on Quote/Job/Invoice views. Uses
+// the same matching rules already relied on elsewhere in the app
+// (convertedJobId / quoteNum back-links, accInvoice.reference, customer
+// name-matching) — never invents a new relationship rule, never mutates
+// anything. When more than one candidate matches, every candidate is
+// returned (not just the first) so the caller can warn instead of silently
+// picking one — mirrors QuoteViewModal's existing "multiple jobs linked"
+// handling.
+function findLinkedRecords({ quote, job, invoice }, { quotes=[], jobs=[], accInvoices=[], customers=[] }={}) {
+  const warnings = [];
+
+  let srcQuote = quote
+    || (job && job.quoteNum ? (quotes||[]).find(q=>q.num===job.quoteNum) : null)
+    || (invoice && invoice.quoteNum ? (quotes||[]).find(q=>q.num===invoice.quoteNum) : null)
+    || null;
+
+  let matchingJobs = [];
+  if(job){
+    matchingJobs = [job];
+  } else if(srcQuote){
+    matchingJobs = (jobs||[]).filter(j=> j.id===srcQuote.convertedJobId || (srcQuote.num && j.quoteNum===srcQuote.num));
+  } else if(invoice && invoice.jobNum){
+    matchingJobs = (jobs||[]).filter(j=>j.num===invoice.jobNum);
+  }
+  if(matchingJobs.length>1){
+    warnings.push(`Multiple linked jobs found (${matchingJobs.map(j=>j.num).filter(Boolean).join(', ')}) — review required.`);
+  }
+  const linkedJob = matchingJobs[0] || null;
+  // A quote resolved indirectly (via an invoice → job lookup, e.g. from
+  // Accounting) rather than directly — fall back to the job's own quote
+  // back-link so "View Quote" still resolves from an Invoice view.
+  if(!srcQuote && linkedJob && linkedJob.quoteNum){
+    srcQuote = (quotes||[]).find(q=>q.num===linkedJob.quoteNum) || null;
+  }
+
+  let linkedInvoices = [];
+  if(invoice){
+    linkedInvoices = [invoice];
+  } else if(linkedJob){
+    const manualJobRefs = getManualInvoiceJobRefs(accInvoices);
+    if(manualJobRefs.has(linkedJob.num)){
+      linkedInvoices = (accInvoices||[]).filter(i=>i.status!=='void' && i.reference===linkedJob.num);
+    } else if(linkedJob.invoiceNum){
+      linkedInvoices = [{ id:'job-'+linkedJob.id, number:linkedJob.invoiceNum, source:'job', jobNum:linkedJob.num }];
+    }
+  }
+  if(linkedInvoices.length>1){
+    warnings.push(`Multiple linked invoices found (${linkedInvoices.map(i=>i.number).filter(Boolean).join(', ')}) — review required.`);
+  }
+  const linkedInvoice = linkedInvoices[0] || null;
+
+  const nameToMatch = (invoice && invoice.client) || (invoice && invoice.contactName)
+    || (linkedJob && linkedJob.client) || (srcQuote && srcQuote.client) || '';
+  const linkedCustomer = findCustomerByName(nameToMatch, customers);
+
+  return { quote: srcQuote, job: linkedJob, jobs: matchingJobs, invoice: linkedInvoice, invoices: linkedInvoices, customer: linkedCustomer, warnings };
 }
 
 // Flag every place where the quote → job → invoice → payment chain breaks.
@@ -2234,6 +2338,44 @@ function getBusinessSummary(quotes, jobs, accInvoices) {
     outstandingValue: invoices.filter(i=>i.status!=='paid').reduce((s,i)=>s+(i.amount||0),0),
     issues: getConsistencyIssues(quotes, jobs, accInvoices),
   };
+}
+
+// Small, read-only linked-record panel — reused on Quote / Job / Invoice
+// detail views (and available for Customers). Shows a "View X" button for
+// every linked record the caller resolved (typically via
+// findLinkedRecords()), an inactive pill for a link that was looked for but
+// not found (e.g. "No linked invoice found"), and any warnings (e.g.
+// "Multiple linked jobs found — review required"). Purely navigational —
+// never creates, edits, relinks, merges or deletes anything.
+function RecordLinksPanel({ links=[], warnings=[] }) {
+  if(links.length===0 && warnings.length===0) return null;
+  return (
+    <div className="space-y-2">
+      {warnings.length>0 && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-2.5 space-y-1">
+          {warnings.map((w,i)=>(
+            <p key={i} className="text-xs text-amber-800 flex items-start gap-1.5"><span>⚠</span><span>{w}</span></p>
+          ))}
+        </div>
+      )}
+      {links.length>0 && (
+        <div className="flex flex-wrap gap-2">
+          {links.map((l,i)=>(
+            l.onClick ? (
+              <button key={i} type="button" onClick={l.onClick}
+                className="flex items-center gap-1.5 text-xs bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl px-3 py-2 font-bold transition-colors">
+                <span>{l.icon||'🔗'}</span><span>{l.label}</span>
+              </button>
+            ) : (
+              <span key={i} className="flex items-center gap-1.5 text-xs bg-gray-50 border border-dashed border-gray-200 text-gray-400 rounded-xl px-3 py-2 font-semibold italic">
+                <span>{l.icon||'🔗'}</span><span>{l.label}</span>
+              </span>
+            )
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 // Shared "parallel picture" panel — identical on Dashboard, Sales and
@@ -4068,11 +4210,21 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
   );
 }
 
-function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoices=[], companies=[], user, logoDataUrl, onOpenQuote, onOpenInvoice }) {
+function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoices=[], companies=[], user, logoDataUrl, onOpenQuote, onOpenInvoice, onOpenJob, onOpenStatement, openCustomerId, onOpenCustomerHandled }) {
   const [showAdd,    setShowAdd]    = useState(false);
   const [editing,    setEditing]    = useState(null);
   const [search,     setSearch]     = useState('');
   const [showImport, setShowImport] = useState(false);
+  // ── Jump to & filter down to a specific customer when navigated here from
+  //    a Quote / Job / Invoice's "View Customer" link. Display-only — never
+  //    changes any customer record, just pre-fills the search box.
+  useEffect(()=>{
+    if(!openCustomerId) return;
+    const c = customers.find(x=>x.id===openCustomerId);
+    if(c) setSearch(c.companyName||'');
+    if(onOpenCustomerHandled) onOpenCustomerHandled();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[openCustomerId]);
   // Customers are shared across both companies, but their quotes/invoices are
   // not — scope the per-customer dropdown to the logged-in user's company
   // (see belongsToUserCompany()) so a shared customer never shows the other
@@ -4100,8 +4252,13 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
     return (cn && (n===cn || n.includes(cn) || cn.includes(n))) || (cp && n===cp);
   }
   function quotesFor(c){ return myQuotes.filter(q=>nameMatches(q.client,c)); }
+  function jobsFor(c){ return myJobs.filter(j=>nameMatches(j.client,c)); }
   function invoicesFor(c){
-    const jobInv = myJobs.filter(j=>j.invoiceNum && nameMatches(j.client,c))
+    // Same dedup rule as Sales/Accounting (getManualInvoiceJobRefs): a job
+    // whose invoice has already been superseded by a manual invoice
+    // referencing it must not also show here as a second invoice.
+    const _manualJobRefs = getManualInvoiceJobRefs(myAccInvoices);
+    const jobInv = myJobs.filter(j=>j.invoiceNum && !_manualJobRefs.has(j.num) && nameMatches(j.client,c))
       .map(j=>({id:j.id, num:j.invoiceNum, date:j.invoiceDate, status:j.invoiceStatus||'pending', manual:false}));
     const manualInv = myAccInvoices.filter(i=>i.status!=='void' && nameMatches(i.contactName,c))
       .map(i=>({id:i.id, num:i.number, date:i.date, status:i.status||'pending', manual:true}));
@@ -4138,6 +4295,7 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
     const scheduleClose = () => { cancelClose(); closeTimer.current=setTimeout(()=>setOpen(false),200); };
     useEffect(()=>cancelClose,[]);
     const cQuotes   = quotesFor(c);
+    const cJobs     = jobsFor(c);
     const cInvoices = invoicesFor(c);
     return (
       <div className="bg-white rounded-2xl border border-gray-200 p-4 flex items-start gap-4 hover:border-brand-300 hover:shadow-sm transition-all">
@@ -4173,6 +4331,21 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
                     <span className="text-xs text-gray-500 flex-shrink-0">{qStatusLabel(q.status)}</span>
                   </button>
                 ))}
+                {/* Jobs */}
+                <div className="px-3 py-2 bg-gray-50 border-y border-gray-100 flex items-center justify-between">
+                  <span className="text-xs font-black text-gray-600 uppercase tracking-wide">💼 Jobs</span>
+                  <span className="text-xs text-gray-400">{cJobs.length}</span>
+                </div>
+                {cJobs.length===0?(
+                  <p className="px-3 py-2 text-xs text-gray-400">No jobs for this client.</p>
+                ):cJobs.map(j=>(
+                  <button key={'j'+j.id} type="button" onClick={()=>{ setOpen(false); onOpenJob&&onOpenJob(j); }}
+                    className="w-full text-left px-3 py-2 flex items-center justify-between gap-2 hover:bg-brand-50 border-b border-gray-50">
+                    <span className="text-xs font-mono font-bold text-brand-600 flex-shrink-0">{j.num}</span>
+                    <span className="text-xs text-gray-400 flex-1 truncate text-center">{STAGE_NAMES?STAGE_NAMES[j.stage]:'—'}</span>
+                    <span className="text-xs text-gray-500 flex-shrink-0">{j.invoiceNum?'🧾 Invoiced':'—'}</span>
+                  </button>
+                ))}
                 {/* Invoices */}
                 <div className="px-3 py-2 bg-gray-50 border-y border-gray-100 flex items-center justify-between">
                   <span className="text-xs font-black text-gray-600 uppercase tracking-wide">🧾 Invoices</span>
@@ -4189,6 +4362,15 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
                     <span className="text-xs text-gray-500 flex-shrink-0">{invStatusLabel(inv.status)}</span>
                   </button>
                 ))}
+                {/* Statement shortcut — opens Accounting → Statements pre-filled
+                    to this customer. Uses the existing statement builder
+                    unchanged; this only pre-fills the contact field. */}
+                {onOpenStatement&&(
+                  <button type="button" onClick={()=>{ setOpen(false); onOpenStatement(c.companyName); }}
+                    className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-brand-50 bg-gray-50 border-t border-gray-100">
+                    <span className="text-xs font-bold text-gray-700">📄 View Statement</span>
+                  </button>
+                )}
               </div>
               </div>
             )}
@@ -4201,8 +4383,8 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
           </div>
           {c.address&&<p className="text-xs text-gray-400 mt-0.5 truncate">📍 {c.address}</p>}
           {c.notes&&<p className="text-xs text-amber-600 mt-0.5 truncate">💬 {c.notes}</p>}
-          {(cQuotes.length>0||cInvoices.length>0)&&(
-            <p className="text-xs text-gray-300 mt-1">{cQuotes.length} quote{cQuotes.length!==1?'s':''} · {cInvoices.length} invoice{cInvoices.length!==1?'s':''} — hover name, then click to open</p>
+          {(cQuotes.length>0||cJobs.length>0||cInvoices.length>0)&&(
+            <p className="text-xs text-gray-300 mt-1">{cQuotes.length} quote{cQuotes.length!==1?'s':''} · {cJobs.length} job{cJobs.length!==1?'s':''} · {cInvoices.length} invoice{cInvoices.length!==1?'s':''} — hover name, then click to open</p>
           )}
         </div>
         <button onClick={()=>{setEditing(c);setShowAdd(true);}}
@@ -5292,7 +5474,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setC
   );
 }
 
-function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs, creditNotes, setCreditNotes, isAdmin, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob }) {
+function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs, creditNotes, setCreditNotes, isAdmin, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob, customers, onOpenCustomer }) {
   const [showEmailFlow, setShowEmailFlow] = useState(false);
   const [showProformaEmail, setShowProformaEmail] = useState(false);
   const [showPayments, setShowPayments] = useState(false);
@@ -5343,6 +5525,9 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
   // convertedJobId to keep the picker focused on genuinely free records,
   // but still lets the user pick any job if none look obviously free.
   const relinkCandidates = (companyJobs||[]).slice().sort((a,b)=>String(b.num||'').localeCompare(String(a.num||'')));
+  // Linked customer record, by the same name-matching rule Customers uses —
+  // display/navigation only, never mutates the quote or the customer.
+  const linkedCustomer = findCustomerByName(quote.client, customers);
   return (
     <Modal onClose={onClose} wide>
       <ModalHeader title={`${quote.num} — ${quote.client}`} onClose={onClose}/>
@@ -5596,6 +5781,17 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
               className="flex items-center gap-1.5 text-xs bg-blue-700 hover:bg-blue-800 text-white rounded-xl px-4 py-2.5 font-bold">
               🧾 View Invoice {linkedJob.invoiceNum||''}
             </button>
+          )}
+          {/* ── View Customer — read-only navigation to the matching customer record ── */}
+          {linkedCustomer&&onOpenCustomer ? (
+            <button onClick={()=>{ onClose(); onOpenCustomer(linkedCustomer); }}
+              className="flex items-center gap-1.5 text-xs bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl px-4 py-2.5 font-bold">
+              🏢 View Customer
+            </button>
+          ) : (!linkedCustomer && quote.client &&
+            <span className="flex items-center gap-1.5 text-xs bg-gray-50 border border-dashed border-gray-200 text-gray-400 rounded-xl px-4 py-2.5 font-semibold italic">
+              🏢 No matching customer record found
+            </span>
           )}
           {/* ── Job missing: recreate (with confirmation) or relink to an existing job ── */}
           {orphanedJob&&(
@@ -6030,7 +6226,12 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // the quotation (line items, discount, setup fee, total incl. VAT and contact
   // details). This is display-layer only — when a payment is later saved the
   // corrected value is what gets persisted.
-  const jobInvItems = myJobs.filter(j=>j.invoiceNum).map(j=>{
+  // Excludes any job whose invoice number has already been superseded by a
+  // manual accounting invoice referencing this job (getManualInvoiceJobRefs)
+  // — same dedup rule Accounting already used, now shared, so a job invoice
+  // that also has a manual invoice raised against it never shows twice here.
+  const _manualJobRefs = getManualInvoiceJobRefs(myAccInvoices);
+  const jobInvItems = myJobs.filter(j=>j.invoiceNum && !_manualJobRefs.has(j.num)).map(j=>{
     const link = myQuotes.find(q=>q && q.num && j.quoteNum && q.num===j.quoteNum);
     let job = j;
     if(link){
@@ -6060,6 +6261,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const _invSearch = searchInv.trim().toLowerCase();
   const displayedInvoices = (invFilter==='all' ? invoicedJobs : invoicedJobs.filter(j=>(j.invoiceStatus||'pending')===invFilter))
     .filter(j=>!_invSearch || [j.invoiceNum,j.client,j.reference,j.num].some(v=>(v||'').toString().toLowerCase().includes(_invSearch)));
+  // Jobs that are invoice-ready but don't have an invoice number yet — shown
+  // as a separate "not yet invoiced" info list, never mixed into the actual
+  // invoice table/count above.
+  const pendingJobInvoices = getPendingJobInvoices(myJobs, myAccInvoices);
 
   // ── Open a specific quote / invoice when navigated here from Customers ──
   useEffect(()=>{
@@ -6071,6 +6276,12 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       setSubTab('invoices'); setInvFilter('all'); setInvHighlight(initialOpen.id);
       setTimeout(()=>{ const el=document.getElementById('inv-row-'+initialOpen.id); if(el) el.scrollIntoView({behavior:'smooth',block:'center'}); }, 80);
       setTimeout(()=>setInvHighlight(null), 4000);
+    } else if(initialOpen.type==='jobPayments'){
+      // "View Payments" from Job Detail — opens the existing, unchanged
+      // JobPaymentHistoryModal for this job (same modal/logic the Invoices
+      // sub-tab's own Payments button already uses).
+      const j=myJobs.find(x=>x.id===initialOpen.id);
+      if(j){ setSubTab('invoices'); setJobPayModal(j); }
     }
     if(onInitialOpenHandled) onInitialOpenHandled();
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -6800,6 +7011,20 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
               className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700 text-sm">✕</button>
           )}
         </div>
+        {/* Jobs that are invoice-ready but haven't had "Create Invoice" clicked
+            yet — informational only, not counted as invoices and not exported. */}
+        {pendingJobInvoices.length>0&&(
+          <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-2.5 text-xs text-amber-800">
+            <strong>🕐 {pendingJobInvoices.length} job{pendingJobInvoices.length>1?'s are':' is'} ready to invoice but not yet invoiced:</strong>{' '}
+            {pendingJobInvoices.map((j,i)=>(
+              <span key={j.id}>
+                <button type="button" onClick={()=>{ onJobCreated&&onJobCreated(j.id); }} className="underline font-semibold hover:text-amber-900">{j.num}</button>
+                {i<pendingJobInvoices.length-1?', ':''}
+              </span>
+            ))}
+            {' '}— open the job and click "Create Invoice" when ready.
+          </div>
+        )}
         <div className="flex gap-2 flex-wrap">
           {[
             {k:'all',    label:`All (${invoicedJobs.length})`},
@@ -6972,6 +7197,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         onRelinkJob={handleRelinkJob}
         creditNotes={myCreditNotes} setCreditNotes={setCreditNotes}
         isAdmin={isAdmin}
+        customers={customers}
+        onOpenCustomer={onOpenCustomer}
       />}
       {/* ── Edit Invoice modal ── */}
       {editInvoice&&(
@@ -9986,7 +10213,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
 /* ═══════════════════════════════════════════
    JOB DETAIL  (with editable cost breakdown)
 ═══════════════════════════════════════════ */
-function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack, user, logoDataUrl, accInvoices }) {
+function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack, user, logoDataUrl, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer }) {
   const [showInvoiceEmail, setShowInvoiceEmail] = useState(false);
   const job=jobs.find(j=>j.id===jobId);
   const [editingCosts, setEditingCosts]=useState(false);
@@ -10006,6 +10233,20 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   const isAdmin = user.role === 'admin';
   const isFactory = user.role === 'factory'; // Manufacturing — Job Card view only, no Rand values, no invoicing
   const co=companies.find(c=>c.id===job.co)||companies[0];
+  // ── Linked-record lookup (read-only; never mutates the job) ──
+  const _links = findLinkedRecords({ job }, { quotes, jobs, accInvoices, customers });
+  const linkPanelLinks = [
+    _links.quote
+      ? { icon:'📋', label:`View Quote ${_links.quote.num}`, onClick: onOpenQuote ? ()=>onOpenQuote(_links.quote) : null }
+      : { icon:'📋', label:'No linked quote found' },
+    job.invoiceNum
+      ? { icon:'🧾', label:`View Invoice ${job.invoiceNum}`, onClick: onOpenInvoice ? ()=>onOpenInvoice(job) : null }
+      : { icon:'🧾', label:'No linked invoice found' },
+    { icon:'💳', label:'View Payments', onClick: onOpenJobPayments ? ()=>onOpenJobPayments(job) : null },
+    _links.customer
+      ? { icon:'🏢', label:'View Customer', onClick: onOpenCustomer ? ()=>onOpenCustomer(_links.customer) : null }
+      : { icon:'🏢', label:'No matching customer record found' },
+  ];
   const totalCost=breakdownTotal(job.breakdown);
   const profit=totalCost>0?job.value-totalCost:null;
   const margin=profit!=null&&job.value>0?(profit/job.value*100).toFixed(1):null;
@@ -10088,6 +10329,9 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
         <button onClick={onBack} className="flex items-center gap-1 text-brand-500 hover:text-brand-600 text-sm font-semibold">← Back to Jobs</button>
         {isAdmin&&<button onClick={deleteJob} className="text-xs text-red-500 hover:text-red-600 border border-red-200 hover:border-red-300 rounded-xl px-3 py-1.5 transition-colors font-semibold">🗑 Delete Job</button>}
       </div>
+
+      {/* Linked records — read-only navigation, never edits/relinks/deletes anything */}
+      <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
 
       {/* Header */}
       <div className="bg-white rounded-2xl border border-gray-200 p-5 space-y-5">
@@ -10545,7 +10789,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 const DONE_STATUSES = ['completed','invoiced'];
 const WIP_STATUSES  = STAGE_STATUSES.filter(s=>!DONE_STATUSES.includes(s));
 
-function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared, proposedProjects=[], setProposedProjects, accInvoices }) {
+function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared, proposedProjects=[], setProposedProjects, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer }) {
   const [jobTab,       setJobTab]       = useState('active'); // 'active' | 'completed'
   const [statusFilter, setStatusFilter] = useState('all');
   const [search,       setSearch]       = useState('');
@@ -10628,7 +10872,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
   const completedCount = visibleJobs.filter(j=> DONE_STATUSES.includes(j.status)).length;
   const statusOpts     = jobTab==='active' ? WIP_STATUSES : DONE_STATUSES;
 
-  if(detail!==null) return <JobDetail jobId={detail} jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} onBack={()=>setDetail(null)} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices}/>;
+  if(detail!==null) return <JobDetail jobId={detail} jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} onBack={()=>setDetail(null)} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices} customers={customers} onOpenQuote={onOpenQuote} onOpenInvoice={onOpenInvoice} onOpenJobPayments={onOpenJobPayments} onOpenCustomer={onOpenCustomer}/>;
 
   return (
     <div className="p-4 space-y-4">
@@ -15212,7 +15456,7 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 /* ═══════════════════════════════════════════
    ACCOUNTING PAGE
 ═══════════════════════════════════════════ */
-function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices:accInvoicesAll, setAccInvoices, accBills:accBillsAll, setAccBills, creditNotes:creditNotesAll, setCreditNotes, suppliers, customers, companies, logoDataUrl, user }) {
+function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices:accInvoicesAll, setAccInvoices, accBills:accBillsAll, setAccBills, creditNotes:creditNotesAll, setCreditNotes, suppliers, customers, companies, logoDataUrl, user, onOpenJob, onOpenQuote, onOpenCustomer, onOpenJobPayments, initialStatementContact, onInitialStatementHandled }) {
   // Company-context filter for DISPLAY, applied by shadowing the prop names
   // — every plain read of jobs/bankTxns/accInvoices/accBills/creditNotes
   // below this line is already company-scoped throughout this component.
@@ -15656,6 +15900,15 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   // which already treats '' as unbounded on both ends).
   const [stmtFrom,    setStmtFrom]    = useState('');
   const [stmtTo,      setStmtTo]      = useState('');
+  // Jump straight to a pre-filled statement when navigated here from a
+  // customer's "View Statement" shortcut — uses the existing statement
+  // builder unchanged, this only pre-fills the contact field and tab.
+  useEffect(()=>{
+    if(!initialStatementContact) return;
+    setAccTab('statements'); setStmtType('customer'); setStmtContact(initialStatementContact);
+    if(onInitialStatementHandled) onInitialStatementHandled();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[initialStatementContact]);
   function contactMetaFor(name, type){
     if(type==='supplier'){ const s=(suppliers||[]).find(s=>norm(s.name)===norm(name)); return s?{contactPerson:s.contactPerson, email:s.email, tel:s.phone, address:[s.address,s.city,s.postalCode].filter(Boolean).join(', '), vatNumber:s.vatNumber}:{}; }
     const c=(customers||[]).find(c=>norm(c.company)===norm(name)); return c?{contactPerson:c.contactPerson, email:c.email, tel:c.tel, address:c.address, vatNumber:c.vatNumber}:{};
@@ -15911,6 +16164,28 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
     const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
     const isJob=inv.source==='job';
+    // ── Linked-record lookup (read-only; never edits/relinks/deletes anything) ──
+    const _links = findLinkedRecords(
+      { invoice: { ...inv, jobNum: inv.jobNum || inv.reference || '' } },
+      { quotes, jobs, accInvoices, customers }
+    );
+    const linkPanelLinks = [
+      _links.quote
+        ? { icon:'📋', label:`View Quote ${_links.quote.num}`, onClick: onOpenQuote ? ()=>{ onClose(); onOpenQuote(_links.quote); } : null }
+        : { icon:'📋', label:'No linked quote found' },
+      _links.job
+        ? { icon:'💼', label:`View Job ${_links.job.num}`, onClick: onOpenJob ? ()=>{ onClose(); onOpenJob(_links.job); } : null }
+        : { icon:'💼', label:'No linked job found' },
+      {
+        icon:'💳', label:'View Payments',
+        onClick: isJob
+          ? (onOpenJobPayments && _links.job ? ()=>{ onClose(); onOpenJobPayments(_links.job); } : null)
+          : ()=>{ setPayModalInv(inv); setShowPayModal(true); }
+      },
+      _links.customer
+        ? { icon:'🏢', label:'View Customer', onClick: onOpenCustomer ? ()=>{ onClose(); onOpenCustomer(_links.customer); } : null }
+        : { icon:'🏢', label:'No matching customer record found' },
+    ];
     return (
       <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
         <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[95vh] overflow-y-auto">
@@ -15920,6 +16195,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
           </div>
           <div className="p-5 space-y-4">
             {isJob&&<div className="bg-purple-50 border border-purple-200 rounded-xl px-4 py-2 text-xs text-purple-700 font-semibold">📋 This invoice is linked to Job {inv.jobNum} — edit it in the Jobs section.</div>}
+            <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
             <div className="grid grid-cols-2 gap-3 text-sm">
               <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">CONTACT</span><span className="font-semibold">{inv.contactName||'—'}</span></div>
               <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">EMAIL</span><span>{inv.contactEmail||'—'}</span></div>
@@ -16236,10 +16512,17 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   }
 
   const jobInvoices = getJobInvoices();
-  // Merge: manual accInvoices take precedence; skip job invoices already linked by reference
-  const manualRefs = new Set(accInvoices.map(i=>i.reference).filter(Boolean));
+  // Merge: manual accInvoices take precedence; skip job invoices already linked by reference.
+  // Uses the same shared getManualInvoiceJobRefs() rule Sales now uses too
+  // (and correctly ignores void manual invoices, which previously could
+  // wrongly hide a job's real invoice here if the linked manual invoice had
+  // since been voided).
+  const manualRefs = getManualInvoiceJobRefs(accInvoices);
   const jobInvsFiltered = jobInvoices.filter(j=>!manualRefs.has(j.jobNum));
   const allInvoices = [...accInvoices.map(i=>({...i,source:i.source||'manual'})), ...jobInvsFiltered];
+  // Jobs that are invoice-ready but don't have an invoice number yet —
+  // informational only, never mixed into allInvoices/exports/counts above.
+  const pendingJobInvoicesAcc = getPendingJobInvoices(jobs, accInvoices);
 
   // ── Auto-apply customer credit notes to invoices raised after them ──
   // A credit note's "Remaining" should fall the moment a later invoice for
@@ -16764,6 +17047,22 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
           {jobInvsFiltered.length>0&&(
             <div className="bg-purple-50 border border-purple-200 rounded-xl px-4 py-2.5 text-xs text-purple-800">
               <strong>💡 {jobInvsFiltered.length} job invoice{jobInvsFiltered.length>1?'s':''} pulled from your Jobs module.</strong> These are read-only here — update them in the Jobs section. To record payment or add notes, create a matching manual invoice and link it via the Reference field (use the job number).
+            </div>
+          )}
+          {/* Jobs that are invoice-ready but haven't had "Create Invoice" clicked
+              yet — informational only, not counted in the table/counts above. */}
+          {pendingJobInvoicesAcc.length>0&&(
+            <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-2.5 text-xs text-amber-800">
+              <strong>🕐 {pendingJobInvoicesAcc.length} job{pendingJobInvoicesAcc.length>1?'s are':' is'} ready to invoice but not yet invoiced:</strong>{' '}
+              {pendingJobInvoicesAcc.map((j,i)=>(
+                <span key={j.id}>
+                  {onOpenJob ? (
+                    <button type="button" onClick={()=>onOpenJob(j)} className="underline font-semibold hover:text-amber-900">{j.num}</button>
+                  ) : <span className="font-semibold">{j.num}</span>}
+                  {i<pendingJobInvoicesAcc.length-1?', ':''}
+                </span>
+              ))}
+              {' '}— create their invoice from the Jobs section when ready.
             </div>
           )}
           <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
@@ -17917,7 +18216,9 @@ function App() {
   const [sidebarOpen,  setSidebarOpen]  = useState(false);
   const [entityFilter, setEntityFilter] = useState(null);
   const [highlightJobId, setHighlightJobId] = useState(null); // navigate to specific job after creation
-  const [salesOpen, setSalesOpen] = useState(null); // {type:'quote'|'invoice', id} to open on Sales page
+  const [salesOpen, setSalesOpen] = useState(null); // {type:'quote'|'invoice'|'jobPayments', id} to open on Sales page
+  const [openCustomerId, setOpenCustomerId] = useState(null); // customer id to jump to on Customers page
+  const [accountingOpen, setAccountingOpen] = useState(null); // {contact} to pre-fill on Accounting → Statements
   const [saveMsg,      setSaveMsg]      = useState('');
   const [lastSaved,    setLastSaved]    = useState('');
   const [showShare,    setShowShare]    = useState(false);
@@ -18620,19 +18921,33 @@ function App() {
   const brandingLogo = isHoldingsUser(user) ? HOLDINGS_LOGO_URL : logoDataUrl;
   const brandingLogoSetter = isHoldingsUser(user) ? undefined : setLogoDataUrl;
 
+  // ── Shared cross-page "View X" navigation handlers ──────────────────────
+  // Read-only navigation only — none of these create, edit, relink, merge or
+  // delete any record. Reused by the linked-record panels/buttons added to
+  // Quote / Job / Invoice / Customer views.
+  const openQuoteRecord = (q)=>{ setSalesOpen({type:'quote', id:q.id}); setPage('sales'); };
+  const openJobRecord = (j)=>{ setHighlightJobId(j.id); setPage('jobs'); };
+  // A job-sourced invoice is looked up on Sales by the job's own id (see
+  // QuotesPage's invoicedJobs, which never prefixes job-derived rows).
+  const openJobInvoiceRecord = (j)=>{ setSalesOpen({type:'invoice', id:j.id}); setPage('sales'); };
+  const openManualInvoiceRecord = (inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); };
+  const openJobPaymentsRecord = (j)=>{ setSalesOpen({type:'jobPayments', id:j.id}); setPage('sales'); };
+  const openCustomerRecord = (c)=>{ setOpenCustomerId(c.id); setPage('customers'); };
+  const openStatementForContact = (contactName)=>{ setAccountingOpen({contact:contactName}); setPage('accounting'); };
+
   const pageMap = {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={accInvoices}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} creditNotes={creditNotes} setCreditNotes={setCreditNotes}/>,
-    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={(q)=>{ setSalesOpen({type:'quote', id:q.id}); setPage('sales'); }} onOpenInvoice={(inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); }}/>,
+    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord}/>,
+    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
-    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} accInvoices={accInvoices}/>,
+    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
     reports:     <ReportsPage     jobs={jobs} companies={companies} user={user} logoDataUrl={brandingLogo}/>,
-    accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user}/>,
+    accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user} onOpenJob={openJobRecord} onOpenQuote={openQuoteRecord} onOpenCustomer={openCustomerRecord} onOpenJobPayments={openJobPaymentsRecord} initialStatementContact={accountingOpen&&accountingOpen.contact} onInitialStatementHandled={()=>setAccountingOpen(null)}/>,
     hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={brandingLogo} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
   };
 
