@@ -2108,7 +2108,7 @@ function numSort(list, field) {
 // used to compute this set locally (Sales / Accounting / Customers), so
 // they can never disagree about which record wins for a given job.
 function getManualInvoiceJobRefs(accInvoices) {
-  return new Set((accInvoices||[]).filter(i=>i.status!=='void').map(i=>i.reference).filter(Boolean));
+  return new Set((accInvoices||[]).filter(i=>i && i.status!=='void').map(i=>i.reference).filter(Boolean));
 }
 
 // Merge job-derived invoices + manual accInvoices into one clean, de-duped,
@@ -2119,7 +2119,7 @@ function getManualInvoiceJobRefs(accInvoices) {
 // Read-only: never creates, edits, deletes or renumbers any invoice.
 function getAllInvoicesUnified(jobs, quotes, accInvoices) {
   const manualJobRefs = getManualInvoiceJobRefs(accInvoices);
-  const jobInv = (jobs||[]).filter(j=>j.invoiceNum && !manualJobRefs.has(j.num)).map(j=>{
+  const jobInv = (jobs||[]).filter(j=>j && j.invoiceNum && !manualJobRefs.has(j.num)).map(j=>{
     const rec = reconcileJobInvoice(j, quotes||[]);
     return {
       id:'job-'+j.id, number:j.invoiceNum, source:'job', jobNum:j.num, quoteNum:j.quoteNum||'',
@@ -2127,7 +2127,7 @@ function getAllInvoicesUnified(jobs, quotes, accInvoices) {
       amount:parseFloat(j.value)||0, status:rec.invoiceStatus||'pending', payments:rec.payments||[],
     };
   });
-  const manualInv = (accInvoices||[]).filter(i=>i.status!=='void').map(i=>{
+  const manualInv = (accInvoices||[]).filter(i=>i && i.status!=='void').map(i=>{
     const sub=(i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
     const vat=(i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
     return {
@@ -2149,7 +2149,7 @@ function getAllInvoicesUnified(jobs, quotes, accInvoices) {
 function getPendingJobInvoices(jobs, accInvoices) {
   const INSTALL_STAGE = 7;
   const manualJobRefs = getManualInvoiceJobRefs(accInvoices);
-  return (jobs||[]).filter(j =>
+  return (jobs||[]).filter(j => j &&
     (parseFloat(j.stage)||0) >= INSTALL_STAGE &&
     !j.invoiceNum && !j.invoiceCreated &&
     !manualJobRefs.has(j.num)
@@ -2165,6 +2165,7 @@ function findCustomerByName(name, customers) {
   const n = _norm(name);
   if(!n) return null;
   return (customers||[]).find(c=>{
+    if(!c) return false; // defensive: skip any malformed/empty entry rather than throw
     const cn = _norm(c.companyName), cp = _norm(c.contactPerson);
     return (cn && (n===cn || n.includes(cn) || cn.includes(n))) || (cp && n===cp);
   }) || null;
@@ -2182,28 +2183,30 @@ function findCustomerByName(name, customers) {
 function findLinkedRecords({ quote, job, invoice }, { quotes=[], jobs=[], accInvoices=[], customers=[] }={}) {
   const warnings = [];
 
+  // Defensive: every lookup below skips null/undefined array entries rather
+  // than throwing, in case any array ever contains a malformed record.
   let srcQuote = quote
-    || (job && job.quoteNum ? (quotes||[]).find(q=>q.num===job.quoteNum) : null)
-    || (invoice && invoice.quoteNum ? (quotes||[]).find(q=>q.num===invoice.quoteNum) : null)
+    || (job && job.quoteNum ? (quotes||[]).find(q=>q && q.num===job.quoteNum) : null)
+    || (invoice && invoice.quoteNum ? (quotes||[]).find(q=>q && q.num===invoice.quoteNum) : null)
     || null;
 
   let matchingJobs = [];
   if(job){
     matchingJobs = [job];
   } else if(srcQuote){
-    matchingJobs = (jobs||[]).filter(j=> j.id===srcQuote.convertedJobId || (srcQuote.num && j.quoteNum===srcQuote.num));
+    matchingJobs = (jobs||[]).filter(j=> j && (j.id===srcQuote.convertedJobId || (srcQuote.num && j.quoteNum===srcQuote.num)));
   } else if(invoice && invoice.jobNum){
-    matchingJobs = (jobs||[]).filter(j=>j.num===invoice.jobNum);
+    matchingJobs = (jobs||[]).filter(j=>j && j.num===invoice.jobNum);
   }
   if(matchingJobs.length>1){
-    warnings.push(`Multiple linked jobs found (${matchingJobs.map(j=>j.num).filter(Boolean).join(', ')}) — review required.`);
+    warnings.push(`Multiple linked jobs found (${matchingJobs.map(j=>j&&j.num).filter(Boolean).join(', ')}) — review required.`);
   }
   const linkedJob = matchingJobs[0] || null;
   // A quote resolved indirectly (via an invoice → job lookup, e.g. from
   // Accounting) rather than directly — fall back to the job's own quote
   // back-link so "View Quote" still resolves from an Invoice view.
   if(!srcQuote && linkedJob && linkedJob.quoteNum){
-    srcQuote = (quotes||[]).find(q=>q.num===linkedJob.quoteNum) || null;
+    srcQuote = (quotes||[]).find(q=>q && q.num===linkedJob.quoteNum) || null;
   }
 
   let linkedInvoices = [];
@@ -2212,7 +2215,7 @@ function findLinkedRecords({ quote, job, invoice }, { quotes=[], jobs=[], accInv
   } else if(linkedJob){
     const manualJobRefs = getManualInvoiceJobRefs(accInvoices);
     if(manualJobRefs.has(linkedJob.num)){
-      linkedInvoices = (accInvoices||[]).filter(i=>i.status!=='void' && i.reference===linkedJob.num);
+      linkedInvoices = (accInvoices||[]).filter(i=>i && i.status!=='void' && i.reference===linkedJob.num);
     } else if(linkedJob.invoiceNum){
       linkedInvoices = [{ id:'job-'+linkedJob.id, number:linkedJob.invoiceNum, source:'job', jobNum:linkedJob.num }];
     }
@@ -6188,7 +6191,7 @@ function reconcileJobInvoice(job, quotes){
 /* ═══════════════════════════════════════════
    QUOTES PAGE
 ═══════════════════════════════════════════ */
-function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated, initialOpen, onInitialOpenHandled, creditNotes, setCreditNotes }) {
+function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated, initialOpen, onInitialOpenHandled, creditNotes, setCreditNotes, onOpenCustomer }) {
   const [subTab,    setSubTab]    = useState('quotes'); // 'quotes' | 'invoices'
   const [showCreate,setShowCreate]=useState(false);
   const [viewQuote,setViewQuote]=useState(null);
