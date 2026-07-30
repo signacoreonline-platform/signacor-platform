@@ -5353,8 +5353,21 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
    Records deposits & partial payments against a quote/proforma.
    Stored on quote.payments and persisted via onUpdate (platform_state).
 ═══════════════════════════════════════════ */
-function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setCreditNotes }) {
+function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setCreditNotes, linkedJob, linkedJobHasInvoice, linkedCustomer, onOpenJob, onOpenInvoice, onOpenCustomer }) {
   const [payments, setPayments] = useState(quote.payments||[]);
+  // ── Linked-record quick access (read-only) — uses the linked job/customer
+  // QuoteViewModal already resolved, so this never invents a new relationship. ──
+  const linkPanelLinks = [
+    linkedJob
+      ? { icon:'💼', label:`View Job ${linkedJob.num}`, onClick: onOpenJob ? ()=>{ onClose(); onOpenJob(linkedJob.id); } : null }
+      : { icon:'💼', label:'No linked job found' },
+    (linkedJob&&linkedJobHasInvoice)
+      ? { icon:'🧾', label:`View Invoice${linkedJob.invoiceNum?' '+linkedJob.invoiceNum:''}`, onClick: onOpenInvoice ? ()=>{ onClose(); onOpenInvoice(linkedJob); } : null }
+      : { icon:'🧾', label:'No linked invoice found' },
+    linkedCustomer
+      ? { icon:'🏢', label:'View Customer', onClick: onOpenCustomer ? ()=>{ onClose(); onOpenCustomer(linkedCustomer); } : null }
+      : { icon:'🏢', label:'No matching customer record found' },
+  ];
   const [date,   setDate]   = useState(new Date().toISOString().slice(0,10));
   const [method, setMethod] = useState('EFT');
   const [amount, setAmount] = useState('');
@@ -5401,6 +5414,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setC
           <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
         </div>
         <div className="p-5 space-y-4">
+          <RecordLinksPanel links={linkPanelLinks}/>
           {/* Summary cards */}
           <div className="grid grid-cols-3 gap-3">
             <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 text-center">
@@ -5859,6 +5873,8 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
           quote={quote} total={total} onUpdate={onUpdate}
           onClose={()=>setShowPayments(false)}
           creditNotes={creditNotes} setCreditNotes={setCreditNotes}
+          linkedJob={linkedJob} linkedJobHasInvoice={linkedJobHasInvoice} linkedCustomer={linkedCustomer}
+          onOpenJob={onOpenJob} onOpenInvoice={onOpenInvoice} onOpenCustomer={onOpenCustomer}
         />
       )}
     </Modal>
@@ -6208,6 +6224,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [invHighlight,setInvHighlight]=useState(null); // invoice id to highlight when opened from elsewhere
   const [jobPayModal,setJobPayModal]=useState(null); // job being viewed in payment history modal
   const [convertedInfo,setConvertedInfo]=useState(null); // {jobId,jobNum} after a quote→job conversion, awaiting the user's "Open Job" choice
+  const [invoiceCreatedInfo,setInvoiceCreatedInfo]=useState(null); // {job,invoiceNum} after an invoice is created — awaiting View Invoice / Open Job / Stay Here
   const convertingRef = useRef(false); // re-entrancy lock — blocks double-click duplicate job creation in handleConvertToJob
   const nonUtech = companies.filter(c=>c.id!==UNIONTECH_ID);
   // Company-context filter: Holdings users see only Holdings (co:1)
@@ -6529,8 +6546,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
         return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
       });
-      alert(`Invoice ${job.invoiceNum} created for Job ${job.num}.\n\nIt now appears in Sales → Invoices and in Accounting. This job has moved from Active to the Completed tab in Jobs (status: Invoiced).`);
-      revealJobInvoice(job);
+      setInvoiceCreatedInfo({ job, invoiceNum: job.invoiceNum });
       return;
     }
 
@@ -6549,8 +6565,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
       return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
     });
-    alert(`Invoice ${reserved} created for Job ${job.num}.\n\nIt now appears in Sales → Invoices and in Accounting. This job has moved from Active to the Completed tab in Jobs (status: Invoiced).`);
-    revealJobInvoice(job);
+    setInvoiceCreatedInfo({ job, invoiceNum: reserved });
   }
 
   // ── Job Invoice Payment History Modal ──
@@ -6624,6 +6639,17 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       setPayments(updated); saveJob(saved);
     }
     const iCls="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
+    // ── Linked-record quick access (read-only; reuses Phase 1's findLinkedRecords) ──
+    const _links = findLinkedRecords({ job }, { quotes, jobs, accInvoices, customers });
+    const linkPanelLinks = [
+      { icon:'💼', label:`View Job ${job.num}`, onClick: onJobCreated ? ()=>{ onClose(); onJobCreated(job.id); } : null },
+      job.invoiceNum
+        ? { icon:'🧾', label:`View Invoice ${job.invoiceNum}`, onClick: ()=>{ onClose(); revealJobInvoice(job); } }
+        : { icon:'🧾', label:'No linked invoice found' },
+      _links.customer
+        ? { icon:'🏢', label:'View Customer', onClick: onOpenCustomer ? ()=>{ onClose(); onOpenCustomer(_links.customer); } : null }
+        : { icon:'🏢', label:'No matching customer record found' },
+    ];
     return (
       <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
         <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[92vh] overflow-y-auto">
@@ -6635,6 +6661,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
             <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
           </div>
           <div className="p-5 space-y-4">
+            <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
             {/* Summary cards */}
             <div className="grid grid-cols-3 gap-3">
               <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 text-center">
@@ -7133,10 +7160,30 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 text-center">
             <div className="text-4xl mb-3">✅</div>
             <h3 className="text-lg font-black text-gray-900 mb-1">Job {convertedInfo.jobNum} created successfully.</h3>
-            <p className="text-xs text-gray-500 mb-5">The quote has been converted. You can open the new job now or stay here.</p>
+            <p className="text-xs text-gray-500 mb-5">The quote has been converted. It now appears under Jobs → Active. You can open the new job now or stay here.</p>
             <div className="flex gap-3">
               <button onClick={()=>setConvertedInfo(null)} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Stay Here</button>
               <button onClick={()=>{ const id=convertedInfo.jobId; setConvertedInfo(null); if(onJobCreated) onJobCreated(id); }} className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl py-2.5 text-sm font-bold">Open Job →</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Invoice creation confirmation — replaces the old blocking alert() ── */}
+      {invoiceCreatedInfo&&(
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&setInvoiceCreatedInfo(null)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 text-center">
+            <div className="text-4xl mb-3">🧾</div>
+            <h3 className="text-lg font-black text-gray-900 mb-1">Invoice {invoiceCreatedInfo.invoiceNum} created.</h3>
+            <p className="text-xs text-gray-500 mb-1">For Job {invoiceCreatedInfo.job.num} — {invoiceCreatedInfo.job.client}.</p>
+            <p className="text-xs text-gray-500 mb-5">It now appears in Sales → Invoices and Accounting → Invoices. This job has moved from Active to the Completed tab in Jobs (status: Invoiced).</p>
+            <div className="flex flex-col gap-2">
+              <button onClick={()=>{ const j=invoiceCreatedInfo.job; setInvoiceCreatedInfo(null); revealJobInvoice(j); }}
+                className="w-full bg-brand-600 hover:bg-brand-700 text-white rounded-xl py-2.5 text-sm font-bold">View Invoice →</button>
+              <button onClick={()=>{ const id=invoiceCreatedInfo.job.id; setInvoiceCreatedInfo(null); if(onJobCreated) onJobCreated(id); }}
+                className="w-full bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl py-2.5 text-sm font-bold">Open Job →</button>
+              <button onClick={()=>setInvoiceCreatedInfo(null)}
+                className="w-full border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Stay Here</button>
             </div>
           </div>
         </div>
@@ -10227,6 +10274,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
 ═══════════════════════════════════════════ */
 function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack, user, logoDataUrl, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer }) {
   const [showInvoiceEmail, setShowInvoiceEmail] = useState(false);
+  const [invoiceCreatedInfo, setInvoiceCreatedInfo] = useState(null); // {invoiceNum} after creating an invoice here — replaces the old blocking alert()
   const job=jobs.find(j=>j.id===jobId);
   const [editingCosts, setEditingCosts]=useState(false);
   const [bd, setBd]=useState(null); // local copy of breakdown being edited
@@ -10719,7 +10767,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                         if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
                         return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
                       });
-                      alert(`Invoice ${job.invoiceNum} created for Job ${job.num}.\n\nIt now appears in Sales → Invoices and in Accounting. This job has moved from Active to the Completed tab in Jobs (status: Invoiced) — you're still looking at it here on the Job Detail page.`);
+                      setInvoiceCreatedInfo({ invoiceNum: job.invoiceNum });
                       return;
                     }
                     // Reserve a brand-new number from the backend-atomic
@@ -10737,7 +10785,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                       if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
                       return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
                     });
-                    alert(`Invoice ${reserved} created for Job ${job.num}.\n\nIt now appears in Sales → Invoices and in Accounting. This job has moved from Active to the Completed tab in Jobs (status: Invoiced) — you're still looking at it here on the Job Detail page.`);
+                    setInvoiceCreatedInfo({ invoiceNum: reserved });
                   }}
                   className="flex items-center gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl px-4 py-2.5 font-bold">
                   🧾 Create Invoice
@@ -10790,6 +10838,25 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
           type="invoice" data={job} companies={companies} logoDataUrl={logoDataUrl}
           onClose={()=>setShowInvoiceEmail(false)}
         />
+      )}
+
+      {/* ── Invoice creation confirmation — replaces the old blocking alert() ── */}
+      {invoiceCreatedInfo&&(
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&setInvoiceCreatedInfo(null)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 text-center">
+            <div className="text-4xl mb-3">🧾</div>
+            <h3 className="text-lg font-black text-gray-900 mb-1">Invoice {invoiceCreatedInfo.invoiceNum} created.</h3>
+            <p className="text-xs text-gray-500 mb-5">It now appears in Sales → Invoices and Accounting → Invoices. This job has moved from Active to the Completed tab in Jobs (status: Invoiced) — you're still looking at it here on the Job Detail page.</p>
+            <div className="flex flex-col gap-2">
+              {onOpenInvoice&&(
+                <button onClick={()=>{ setInvoiceCreatedInfo(null); onOpenInvoice(job); }}
+                  className="w-full bg-brand-600 hover:bg-brand-700 text-white rounded-xl py-2.5 text-sm font-bold">View Invoice →</button>
+              )}
+              <button onClick={()=>setInvoiceCreatedInfo(null)}
+                className="w-full border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Stay Here</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -16253,6 +16320,14 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
               </div>
             </div>
             <div className="flex gap-3 pt-1">
+              {/* Job-sourced invoices reuse the existing printInvoice(job,...) —
+                  same output as Jobs/Sales — via the linked job already resolved
+                  above. Manual invoices don't have an equivalent print template
+                  yet, so no button is shown for them in this phase. */}
+              {isJob&&_links.job&&(
+                <button onClick={()=>printInvoice(_links.job,companies,logoDataUrl)}
+                  className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
+              )}
               {onEdit&&<button onClick={onEdit} className="px-5 py-2.5 text-white font-bold rounded-xl text-sm" style={{background:'#06065c'}}>✏️ Edit Invoice</button>}
               <button onClick={onClose} className="px-5 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600">Close</button>
             </div>
@@ -16682,6 +16757,17 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     }
 
     const iCls="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
+    // ── Linked-record quick access (read-only; reuses Phase 1's findLinkedRecords) ──
+    const _links = findLinkedRecords({ invoice: { ...inv, jobNum: inv.jobNum || inv.reference || '' } }, { quotes, jobs, accInvoices, customers });
+    const linkPanelLinks = [
+      _links.job
+        ? { icon:'💼', label:`View Job ${_links.job.num}`, onClick: onOpenJob ? ()=>{ onClose(); onOpenJob(_links.job); } : null }
+        : { icon:'💼', label:'No linked job found' },
+      { icon:'🧾', label:'View Invoice', onClick: ()=>{ onClose(); setViewInv(inv); } },
+      _links.customer
+        ? { icon:'🏢', label:'View Customer', onClick: onOpenCustomer ? ()=>{ onClose(); onOpenCustomer(_links.customer); } : null }
+        : { icon:'🏢', label:'No matching customer record found' },
+    ];
     return (
       <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
         <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[92vh] overflow-y-auto">
@@ -16693,6 +16779,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
             <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
           </div>
           <div className="p-5 space-y-4">
+            <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
             {/* Summary cards */}
             <div className="grid grid-cols-3 gap-3">
               <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 text-center">
