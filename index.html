@@ -6214,7 +6214,7 @@ function reconcileJobInvoice(job, quotes){
 /* ═══════════════════════════════════════════
    QUOTES PAGE
 ═══════════════════════════════════════════ */
-function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated, initialOpen, onInitialOpenHandled, creditNotes, setCreditNotes, onOpenCustomer }) {
+function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated, initialOpen, onInitialOpenHandled, onJobPaymentsClosed, creditNotes, setCreditNotes, onOpenCustomer }) {
   const [subTab,    setSubTab]    = useState('quotes'); // 'quotes' | 'invoices'
   const [showCreate,setShowCreate]=useState(false);
   const [viewQuote,setViewQuote]=useState(null);
@@ -6230,6 +6230,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [invFilter,setInvFilter]=useState('all'); // 'all' | 'paid' | 'partial' | 'pending'
   const [invHighlight,setInvHighlight]=useState(null); // invoice id to highlight when opened from elsewhere
   const [jobPayModal,setJobPayModal]=useState(null); // job being viewed in payment history modal
+  // True only when the currently-open jobPayModal above was opened via a
+  // cross-page "Go to Payments" / "View Payments" navigation from Jobs, Job
+  // Detail, or Accounting (never when opened locally via the button in this
+  // page's own Invoices sub-tab). Used solely to decide whether closing the
+  // modal should call back to App to return to the previous page — never
+  // affects payment saving/calculation or the modal itself.
+  const [jobPayModalExternal,setJobPayModalExternal]=useState(false);
   const [convertedInfo,setConvertedInfo]=useState(null); // {jobId,jobNum} after a quote→job conversion, awaiting the user's "Open Job" choice
   const [invoiceCreatedInfo,setInvoiceCreatedInfo]=useState(null); // {job,invoiceNum} after an invoice is created — awaiting View Invoice / Open Job / Stay Here
   const convertingRef = useRef(false); // re-entrancy lock — blocks double-click duplicate job creation in handleConvertToJob
@@ -6304,11 +6311,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       setTimeout(()=>{ const el=document.getElementById('inv-row-'+initialOpen.id); if(el) el.scrollIntoView({behavior:'smooth',block:'center'}); }, 80);
       setTimeout(()=>setInvHighlight(null), 4000);
     } else if(initialOpen.type==='jobPayments'){
-      // "View Payments" from Job Detail — opens the existing, unchanged
-      // JobPaymentHistoryModal for this job (same modal/logic the Invoices
-      // sub-tab's own Payments button already uses).
+      // "View Payments" from Job Detail / Jobs / Accounting — opens the
+      // existing, unchanged JobPaymentHistoryModal for this job (same
+      // modal/logic the Invoices sub-tab's own Payments button already
+      // uses). Flagged as an externally-opened instance so closing it can
+      // call back to App to return to wherever the user came from.
       const j=myJobs.find(x=>x.id===initialOpen.id);
-      if(j){ setSubTab('invoices'); setJobPayModal(j); }
+      if(j){ setSubTab('invoices'); setJobPayModal(j); setJobPayModalExternal(true); }
     }
     if(onInitialOpenHandled) onInitialOpenHandled();
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -7142,7 +7151,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       </span>
                     ):(
                       <>
-                        <button onClick={()=>setJobPayModal(j)}
+                        <button onClick={()=>{setJobPayModal(j);setJobPayModalExternal(false);}}
                           className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#ecfdf5',color:'#059669'}}>
                           💳 Payments
                         </button>
@@ -7169,7 +7178,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       </>)}
 
       {/* ── Job Payment History Modal ── */}
-      {jobPayModal&&<JobPaymentHistoryModal job={jobPayModal} onClose={()=>setJobPayModal(null)}/>}
+      {jobPayModal&&<JobPaymentHistoryModal job={jobPayModal} onClose={()=>{
+        setJobPayModal(null);
+        // Only call back to App when this instance was opened via the
+        // cross-page nav from Jobs/Job Detail/Accounting — the normal,
+        // already-working Sales-local Payments button never sets this flag,
+        // so closing it here keeps behaving exactly as before (stay on Sales).
+        if(jobPayModalExternal){ setJobPayModalExternal(false); if(onJobPaymentsClosed) onJobPaymentsClosed(); }
+      }}/>}
 
       {/* ── Quote → Job conversion confirmation ── */}
       {convertedInfo&&(
@@ -17290,6 +17306,13 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                     // or any stored/calculated payment value.
                     const paidSoFar = (inv.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
                     const outstanding = Math.max(0, (sub+vat)-paidSoFar);
+                    // Display-only rounding tolerance: a "partial" invoice with
+                    // only a sub-cent amount left (<= R0.01, e.g. from VAT/
+                    // discount rounding) reads as effectively paid here. Never
+                    // touches inv.status, invoiceStatus, or any stored payment —
+                    // purely how this one badge is labelled/coloured, and never
+                    // triggers above the R0.01 tolerance.
+                    const isEffectivelyPaid = inv.status==='partial' && outstanding<=0.01;
                     return(
                       <tr key={inv.id} className={`border-b border-gray-50 transition-colors ${isJob?'hover:bg-purple-50 bg-purple-50/30':'hover:bg-blue-50'}`}>
                         <td className="px-4 py-2.5 text-xs font-mono text-gray-600">
@@ -17308,8 +17331,8 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                         <td className="px-4 py-2.5 text-xs text-right text-blue-600">{fmtAmt(vat)}</td>
                         <td className="px-4 py-2.5 text-xs text-right font-black text-gray-800">{fmtAmt(sub+vat)}</td>
                         <td className="px-4 py-2.5 text-center">
-                          <span className="px-2 py-0.5 rounded-full text-white text-xs font-bold whitespace-nowrap" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>
-                            {inv.status==='partial' ? `Outstanding: ${fmtAmt(outstanding)}` : inv.status}
+                          <span className="px-2 py-0.5 rounded-full text-white text-xs font-bold whitespace-nowrap" style={{background:STATUS_COLORS[isEffectivelyPaid?'paid':inv.status]||'#6b7280'}}>
+                            {isEffectivelyPaid ? 'Paid' : (inv.status==='partial' ? `Outstanding: ${fmtAmt(outstanding)}` : inv.status)}
                           </span>
                         </td>
                         <td className="px-4 py-2.5 text-center">
@@ -18424,6 +18447,12 @@ function App() {
   const [entityFilter, setEntityFilter] = useState(null);
   const [highlightJobId, setHighlightJobId] = useState(null); // navigate to specific job after creation
   const [salesOpen, setSalesOpen] = useState(null); // {type:'quote'|'invoice'|'jobPayments', id} to open on Sales page
+  // Where to return once the cross-page "Job Payments" modal (opened via
+  // openJobPaymentsRecord from Jobs/Job Detail/Accounting) is closed. Left
+  // null when the payments modal is opened locally from within Sales itself
+  // — closing it there already just stays on Sales, unchanged, and never
+  // touches this.
+  const [jobPaymentsReturn, setJobPaymentsReturn] = useState(null); // {page, jobId?}
   const [openCustomerId, setOpenCustomerId] = useState(null); // customer id to jump to on Customers page
   const [accountingOpen, setAccountingOpen] = useState(null); // {contact} to pre-fill on Accounting → Statements
   const [saveMsg,      setSaveMsg]      = useState('');
@@ -19156,13 +19185,34 @@ function App() {
   // QuotesPage's invoicedJobs, which never prefixes job-derived rows).
   const openJobInvoiceRecord = (j)=>{ setSalesOpen({type:'invoice', id:j.id}); setPage('sales'); };
   const openManualInvoiceRecord = (inv)=>{ setSalesOpen({type:'invoice', id:inv.id}); setPage('sales'); };
-  const openJobPaymentsRecord = (j)=>{ setSalesOpen({type:'jobPayments', id:j.id}); setPage('sales'); };
+  const openJobPaymentsRecord = (j)=>{
+    // Remember where the user is right now so closing the payments modal can
+    // bring them back. Opening payments from within Sales itself sets this to
+    // null — closing it there already just stays on Sales, unchanged.
+    setJobPaymentsReturn(page!=='sales' ? {page, jobId:j.id} : null);
+    setSalesOpen({type:'jobPayments', id:j.id});
+    setPage('sales');
+  };
+  // Called only when the cross-page Job Payments modal specifically is
+  // closed (see QuotesPage's onJobPaymentsClosed) — never fires for the
+  // normal, already-working Sales-local payments modal. Restores the page
+  // the user was on before, and for Jobs specifically, reopens the same
+  // job's detail view via the existing highlightJobId mechanism (the same
+  // one already used to reveal a newly created job) — no new navigation
+  // logic introduced.
+  const returnFromJobPayments = ()=>{
+    if(!jobPaymentsReturn) return;
+    const { page: retPage, jobId } = jobPaymentsReturn;
+    setJobPaymentsReturn(null);
+    if(retPage==='jobs' && jobId!=null) setHighlightJobId(jobId);
+    setPage(retPage);
+  };
   const openCustomerRecord = (c)=>{ setOpenCustomerId(c.id); setPage('customers'); };
   const openStatementForContact = (contactName)=>{ setAccountingOpen({contact:contactName}); setPage('accounting'); };
 
   const pageMap = {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={accInvoices}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord}/>,
+    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord}/>,
