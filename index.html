@@ -11310,6 +11310,8 @@ function VinylCalc() {
   const [labRate,    setLabRate]    = useState('220');
   const [manualHrs,  setManualHrs]  = useState('');
   const [hrsLocked,  setHrsLocked]  = useState(false);
+  const [manualArea, setManualArea] = useState('');
+  const [areaLocked, setAreaLocked] = useState(false);
   const [sellPrice,  setSellPrice]  = useState('');
   const [result,     setResult]     = useState(null);
   const selectAllRef = useRef(null);
@@ -11336,6 +11338,12 @@ function VinylCalc() {
   const totalRollLen   = selData.reduce((s,x)=>s+x.rollLen,   0);
   const autoHrs        = selData.reduce((s,x)=>s+x.autoH,     0);
 
+  // Manual total m² override — skip entering per-section sizes entirely
+  const manualAreaVal = parseFloat(manualArea)||0;
+  const effGross       = areaLocked ? manualAreaVal : totalGross;
+  const effRollLen     = areaLocked ? (rw>0 ? effGross/rw : 0) : totalRollLen;
+  const canCalc         = selected.length>0 || (areaLocked && manualAreaVal>0);
+
   // Keep auto hours updated when selection changes (unless locked)
   useEffect(()=>{
     if(!hrsLocked) setManualHrs(autoHrs.toFixed(1));
@@ -11352,17 +11360,17 @@ function VinylCalc() {
   const removeSection = id => { setSections(prev=>prev.filter(s=>s.id!==id)); setResult(null); };
 
   function calculate() {
-    if(selected.length===0) return;
+    if(!canCalc) return;
     const mat  = parseFloat(matRate)||0;
     const lab  = parseFloat(labRate)||0;
     const hrs  = parseFloat(manualHrs)||autoHrs;
     const sell = parseFloat(sellPrice)||0;
-    const matCost  = totalRollLen * mat;
+    const matCost  = effRollLen * mat;
     const labCost  = hrs * lab;
     const total    = matCost + labCost;
     const profit   = sell - total;
     const margin   = sell>0 ? profit/sell*100 : null;
-    setResult({ totalNet, totalGross, totalRollLen, matCost, labCost, hrs, total, profit, margin, sections:selData });
+    setResult({ totalNet, totalGross:effGross, totalRollLen:effRollLen, matCost, labCost, hrs, total, profit, margin, sections:selData });
   }
 
   const surfOpts = [['flat','Flat +10%'],['curved','Curved +20%'],['contour','Contour +35%']];
@@ -11443,6 +11451,21 @@ function VinylCalc() {
           </div>
         </div>
 
+        {/* Manual total m² override — skip per-section sizes entirely */}
+        <div className="bg-gray-50 rounded-xl border border-gray-200 p-3 flex flex-wrap items-end gap-3">
+          <div className="flex-1 min-w-[220px]">
+            <label className="text-xs text-gray-500 mb-1 block">
+              Total m² Override {areaLocked?<span className="text-brand-500 font-semibold">(manual — section table ignored)</span>:<span className="text-gray-400">(optional — skip entering section sizes)</span>}
+            </label>
+            <div className="flex gap-1.5">
+              <input type="number" value={manualArea} step="0.01" min="0" placeholder="e.g. 25.5"
+                onChange={e=>{setManualArea(e.target.value);setAreaLocked(true);setResult(null);}}
+                className="flex-1 border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400"/>
+              {areaLocked&&<button onClick={()=>{setAreaLocked(false);setManualArea('');setResult(null);}} title="Use section table instead" className="px-2 border border-gray-200 rounded-xl text-xs text-gray-500 hover:bg-gray-50">↺</button>}
+            </div>
+          </div>
+        </div>
+
         {/* Pricing & settings */}
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
           <div>
@@ -11478,9 +11501,25 @@ function VinylCalc() {
           </div>
         </div>
 
-        <button onClick={calculate} disabled={selected.length===0}
+        {/* Live costing preview — updates instantly, no sell price or Calculate click needed */}
+        <div className="bg-gray-50 rounded-xl border border-gray-200 p-4 grid grid-cols-3 gap-3 text-center">
+          <div>
+            <p className="text-xs text-gray-400 mb-0.5">Material Cost</p>
+            <p className="text-sm font-bold text-gray-700">{zar(effRollLen*(parseFloat(matRate)||0))}</p>
+          </div>
+          <div>
+            <p className="text-xs text-gray-400 mb-0.5">Labour Cost</p>
+            <p className="text-sm font-bold text-gray-700">{zar((parseFloat(manualHrs)||autoHrs)*(parseFloat(labRate)||0))}</p>
+          </div>
+          <div>
+            <p className="text-xs text-gray-400 mb-0.5">Total Costing (before markup)</p>
+            <p className="text-sm font-black text-brand-600">{zar(effRollLen*(parseFloat(matRate)||0) + (parseFloat(manualHrs)||autoHrs)*(parseFloat(labRate)||0))}</p>
+          </div>
+        </div>
+
+        <button onClick={calculate} disabled={!canCalc}
           className="w-full bg-brand-500 hover:bg-brand-600 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold rounded-xl py-3 text-sm transition-colors">
-          {selected.length>0?`Calculate (${selected.length} section${selected.length!==1?'s':''})`:'Select at least one section'}
+          {canCalc?`Calculate (${areaLocked?`manual ${manualAreaVal.toFixed(2)} m²`:`${selected.length} section${selected.length!==1?'s':''}`})`:'Select at least one section or enter a total m²'}
         </button>
       </div>
 
@@ -11554,6 +11593,8 @@ function VehicleCalc() {
   const [labRate,   setLabRate]   = useState('220');
   const [manualHrs, setManualHrs] = useState('');
   const [hrsLocked, setHrsLocked] = useState(false);
+  const [manualArea, setManualArea] = useState('');
+  const [areaLocked, setAreaLocked] = useState(false);
   const [sellPrice, setSellPrice] = useState('');
   const [result,    setResult]    = useState(null);
   const selectAllRef = useRef(null);
@@ -11563,6 +11604,12 @@ function VehicleCalc() {
   const allSelected  = selectedCount===panels.length;
   const selectedTotal= selected.reduce((s,p)=>s+p.w*p.h, 0);
   const autoHrs      = selectedCount>0 ? Math.round(selectedCount*BASE_HOURS_PER_PANEL*10)/10 : 0;
+
+  // Manual total m² override — skip entering per-panel sizes entirely
+  const manualAreaVal = parseFloat(manualArea)||0;
+  const effTotalArea    = areaLocked ? manualAreaVal : selectedTotal;
+  const effGrossArea    = effTotalArea * 1.15;
+  const canCalc          = selectedCount>0 || (areaLocked && manualAreaVal>0);
 
   useEffect(()=>{
     if(!hrsLocked) setManualHrs(autoHrs.toFixed(1));
@@ -11581,9 +11628,9 @@ function VehicleCalc() {
   const applyPreset= n   => { setPanels(prev=>prev.map((p,i)=>({...p,selected:i<n}))); setResult(null); };
 
   function calculate() {
-    if(selectedCount===0) return;
-    const totalArea = selectedTotal;
-    const grossArea = totalArea * 1.15;
+    if(!canCalc) return;
+    const totalArea = effTotalArea;
+    const grossArea = effGrossArea;
     const hrs       = parseFloat(manualHrs)||autoHrs;
     const mat       = parseFloat(matRate)||0;
     const lab       = parseFloat(labRate)||0;
@@ -11658,6 +11705,21 @@ function VehicleCalc() {
           </table>
         </div>
 
+        {/* Manual total m² override — skip per-panel sizes entirely */}
+        <div className="bg-gray-50 rounded-xl border border-gray-200 p-3 flex flex-wrap items-end gap-3">
+          <div className="flex-1 min-w-[220px]">
+            <label className="text-xs text-gray-500 mb-1 block">
+              Total m² Override {areaLocked?<span className="text-brand-500 font-semibold">(manual — panel table ignored)</span>:<span className="text-gray-400">(optional — skip entering panel sizes)</span>}
+            </label>
+            <div className="flex gap-1.5">
+              <input type="number" value={manualArea} step="0.01" min="0" placeholder="e.g. 12.5"
+                onChange={e=>{setManualArea(e.target.value);setAreaLocked(true);setResult(null);}}
+                className="flex-1 border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400"/>
+              {areaLocked&&<button onClick={()=>{setAreaLocked(false);setManualArea('');setResult(null);}} title="Use panel table instead" className="px-2 border border-gray-200 rounded-xl text-xs text-gray-500 hover:bg-gray-50">↺</button>}
+            </div>
+          </div>
+        </div>
+
         {/* Pricing */}
         <div className="grid grid-cols-2 gap-3">
           <div>
@@ -11692,9 +11754,25 @@ function VehicleCalc() {
           <input type="number" value={sellPrice} onChange={e=>setSellPrice(e.target.value)} className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400" placeholder="0.00"/>
         </div>
 
-        <button onClick={calculate} disabled={selectedCount===0}
+        {/* Live costing preview — updates instantly, no sell price or Calculate click needed */}
+        <div className="bg-gray-50 rounded-xl border border-gray-200 p-4 grid grid-cols-3 gap-3 text-center">
+          <div>
+            <p className="text-xs text-gray-400 mb-0.5">Material Cost</p>
+            <p className="text-sm font-bold text-gray-700">{zar(effGrossArea*(parseFloat(matRate)||0))}</p>
+          </div>
+          <div>
+            <p className="text-xs text-gray-400 mb-0.5">Labour Cost</p>
+            <p className="text-sm font-bold text-gray-700">{zar((parseFloat(manualHrs)||autoHrs)*(parseFloat(labRate)||0))}</p>
+          </div>
+          <div>
+            <p className="text-xs text-gray-400 mb-0.5">Total Costing (before markup)</p>
+            <p className="text-sm font-black text-brand-600">{zar(effGrossArea*(parseFloat(matRate)||0) + (parseFloat(manualHrs)||autoHrs)*(parseFloat(labRate)||0))}</p>
+          </div>
+        </div>
+
+        <button onClick={calculate} disabled={!canCalc}
           className="w-full bg-brand-500 hover:bg-brand-600 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold rounded-xl py-3 text-sm transition-colors">
-          {selectedCount>0?`Calculate (${selectedCount} panel${selectedCount!==1?'s':''}, ${parseFloat(manualHrs)||autoHrs}h)`:'Select at least one panel'}
+          {canCalc?`Calculate (${areaLocked?`manual ${manualAreaVal.toFixed(2)} m²`:`${selectedCount} panel${selectedCount!==1?'s':''}`}, ${parseFloat(manualHrs)||autoHrs}h)`:'Select at least one panel or enter a total m²'}
         </button>
       </div>
 
