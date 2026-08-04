@@ -6214,7 +6214,7 @@ function reconcileJobInvoice(job, quotes){
 /* ═══════════════════════════════════════════
    QUOTES PAGE
 ═══════════════════════════════════════════ */
-function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated, initialOpen, onInitialOpenHandled, onJobPaymentsClosed, creditNotes, setCreditNotes, onOpenCustomer }) {
+function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated, initialOpen, onInitialOpenHandled, onJobPaymentsClosed, creditNotes, setCreditNotes, onOpenCustomer, forceSaveSections }) {
   const [subTab,    setSubTab]    = useState('quotes'); // 'quotes' | 'invoices'
   const [showCreate,setShowCreate]=useState(false);
   const [viewQuote,setViewQuote]=useState(null);
@@ -6333,7 +6333,21 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   function handleSave(q){
     // If editing an existing quote, update it; otherwise prepend as new
     const isEdit = !!(quotes||[]).find(x=>x.id===q.id);
-    setQuotes(prev=>prev.find(x=>x.id===q.id) ? prev.map(x=>x.id===q.id?q:x) : [q,...prev]);
+    setQuotes(prev=>{
+      const live = prev.find(x=>x.id===q.id);
+      if(!live) return [q,...prev];
+      // Stale-save guard (2026-08-04): the quote form's `q` can be built
+      // from a copy of the quote captured before "Convert to Job" ran
+      // elsewhere (e.g. the form was left open in another tab/window). If
+      // the LIVE record has since been converted (status:'converted' +
+      // convertedJobId) but this save's payload doesn't reflect that, never
+      // let it silently revert the conversion — only the fields this form
+      // actually edits (client/contact/lines/etc.) should ever change here.
+      if(live.status==='converted' && live.convertedJobId && (q.status!=='converted' || !q.convertedJobId)){
+        return prev.map(x=>x.id===q.id?{...q, status:live.status, convertedJobId:live.convertedJobId}:x);
+      }
+      return prev.map(x=>x.id===q.id?q:x);
+    });
     // ── Pull quote changes through to any linked (converted) job's invoice ──
     // The proforma is generated live from the quote so it already reflects edits;
     // the job's invoice copies the quote at conversion, so sync it here too.
@@ -6407,7 +6421,25 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // restore=true rebuilds a job for a quote that was already converted but whose
   // job went missing. On restore we skip inventory deduction / PO generation
   // because those side-effects already ran during the original conversion.
-  function handleConvertToJob(q, restore){
+  //
+  // 2026-08-04 FIX: this used to apply the new job/quote to local state
+  // immediately (setJobs/setQuotes) and show "Job created successfully"
+  // right away, with the actual database write happening afterwards on the
+  // normal 800ms-debounced autosave. If that save was slow (Render cold
+  // start), failed, or the page reloaded before it completed, the
+  // confirmation had already told the user the job existed even though
+  // nothing durable had been written yet — and the next load's server fetch
+  // would silently overwrite local state, making the "created" job and the
+  // quote's converted status vanish with no error ever shown (confirmed
+  // against Quote SQ-00108 / Job SNS-00110 disappearing 2026-08-04). Fixed
+  // by computing the new job/quote/inventory/PO state WITHOUT touching React
+  // state, saving that exact snapshot to the backend immediately
+  // (forceSaveSections — bypasses the debounce, reuses the same
+  // merge/backup/wipe-guard protected save path as normal autosave) and
+  // AWAITING confirmation before ever calling setJobs/setQuotes or showing
+  // success. If the save fails, nothing local changes at all and a clear
+  // error is shown instead of a silent/misleading "created".
+  async function handleConvertToJob(q, restore){
     // Re-entrancy lock — a ref (not state) so it takes effect immediately,
     // even for two calls fired back-to-back before React re-renders. Blocks
     // a rapid double-click from slipping past the existing-job check below
@@ -6479,56 +6511,86 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       payments: (q.payments||[]).map(p=>({...p})),
       invoiceStatus: (()=>{ const paid=(q.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0); const tot=_qAfterDisc*1.15; return paid>=tot&&tot>0?'paid':paid>0?'partial':'pending'; })(),
     };
-    setJobs(prev=>[newJob,...prev]);
+    const nextJobs = [newJob,...jobs];
 
+    // ── Compute (but do not yet apply) inventory deduction / auto-PO side
+    // effects — deferred until the save below is confirmed, so a failed or
+    // blocked save never leaves stock silently deducted or POs generated
+    // for a job that doesn't durably exist. Same logic/values as before,
+    // just held in local variables instead of calling setState. ──
+    let nextInventory = inventory;
+    let lowItems = [];
+    let newPOs = [];
     if(!restore){
-    // ── Deduct inventory for linked line items ──
-    const linkedLines = q.lines.filter(l=>l.itemId);
-    let updatedInventory = inventory.map(inv=>{
-      const consumed = linkedLines.filter(l=>parseInt(l.itemId)===inv.id).reduce((s,l)=>s+(parseFloat(l.qty)||0),0);
-      return consumed>0 ? {...inv, stock:Math.max(0,inv.stock-consumed)} : inv;
-    });
+      const linkedLines = q.lines.filter(l=>l.itemId);
+      nextInventory = inventory.map(inv=>{
+        const consumed = linkedLines.filter(l=>parseInt(l.itemId)===inv.id).reduce((s,l)=>s+(parseFloat(l.qty)||0),0);
+        return consumed>0 ? {...inv, stock:Math.max(0,inv.stock-consumed)} : inv;
+      });
+      lowItems = nextInventory.filter(inv=>inv.stock<=inv.reorder);
+      if(lowItems.length>0){
+        const bySupplier = {};
+        lowItems.forEach(inv=>{
+          const sid = inv.supplierId||'none';
+          if(!bySupplier[sid]) bySupplier[sid]=[];
+          const qtyNeeded = Math.max(1, (inv.reorder*2) - inv.stock);
+          bySupplier[sid].push({ inventoryId:inv.id, sku:inv.sku, name:inv.name, unit:inv.unit, qtyNeeded, qtyOrdered:qtyNeeded, unitCost:inv.cost||0 });
+        });
+        newPOs = Object.entries(bySupplier).map(([sid,items])=>({
+          id: Date.now()+Math.random(),
+          num: '', // will be set below
+          supplierId: sid==='none'?null:parseInt(sid),
+          jobNum: jobNum,
+          quoteNum: q.num,
+          co: q.co, // tag with the source quote's company so it stays on that company's PO list
+          date: today,
+          status: 'draft',
+          items,
+          notes:'Auto-generated from Job '+jobNum+' (Quote '+q.num+')',
+        }));
+      }
+    }
+    let nextPurchaseOrders = purchaseOrders;
+    if(newPOs.length){
+      let counter = purchaseOrders.length;
+      const numbered = newPOs.map(po=>({...po, num:getNextPONum([...purchaseOrders,...newPOs.slice(0,counter++)])}));
+      nextPurchaseOrders = [...numbered,...purchaseOrders];
+    }
 
-    // ── Find items below reorder level ──
-    const lowItems = updatedInventory.filter(inv=>inv.stock<=inv.reorder);
-    setInventory(updatedInventory);
+    const updated={...q,status:'converted',convertedJobId:newJob.id};
+    const nextQuotes = quotes.map(qx=>qx.id===q.id?updated:qx);
 
-    // ── Auto-generate POs grouped by supplier ──
+    // ── Save FIRST — only touch local state / show "created" once the
+    // backend has actually confirmed this write. forceSaveSections pushes
+    // an immediate (non-debounced) save through the same merge/backup/
+    // wipe-guard protected path normal autosave uses, and throws if the
+    // server didn't accept it (network error, cold-start timeout, or a
+    // blocked/wipe-guarded save). ──
+    if(!forceSaveSections){
+      alert('Job could NOT be created — the save system is not ready yet. Please wait a moment and try again.');
+      return;
+    }
+    try{
+      await forceSaveSections({ jobs:nextJobs, quotes:nextQuotes, inventory:nextInventory, purchaseOrders:nextPurchaseOrders });
+    } catch(saveErr){
+      alert('Job could NOT be created.\n\nThe save was not confirmed by the server, so nothing was changed — no job was created and the quote was not marked as converted.\n\nReason: '+(saveErr&&saveErr.message?saveErr.message:'unknown error')+'\n\nPlease check your connection and try again.');
+      return; // nothing local changed — safe to stop here
+    }
+
+    // Save confirmed durable — now safe to reflect it in the UI.
+    setJobs(nextJobs);
+    if(nextInventory!==inventory) setInventory(nextInventory);
+    if(nextPurchaseOrders!==purchaseOrders) setPurchaseOrders(nextPurchaseOrders);
+    setQuotes(nextQuotes);
+    setViewQuote(null); // close the quote view
+
     if(lowItems.length>0){
-      const bySupplier = {};
-      lowItems.forEach(inv=>{
-        const sid = inv.supplierId||'none';
-        if(!bySupplier[sid]) bySupplier[sid]=[];
-        const qtyNeeded = Math.max(1, (inv.reorder*2) - inv.stock);
-        bySupplier[sid].push({ inventoryId:inv.id, sku:inv.sku, name:inv.name, unit:inv.unit, qtyNeeded, qtyOrdered:qtyNeeded, unitCost:inv.cost||0 });
-      });
-      const newPOs = Object.entries(bySupplier).map(([sid,items])=>({
-        id: Date.now()+Math.random(),
-        num: '', // will be set below
-        supplierId: sid==='none'?null:parseInt(sid),
-        jobNum: jobNum,
-        quoteNum: q.num,
-        co: q.co, // tag with the source quote's company so it stays on that company's PO list
-        date: today,
-        status: 'draft',
-        items,
-        notes:'Auto-generated from Job '+jobNum+' (Quote '+q.num+')',
-      }));
-      setPurchaseOrders(prev=>{
-        let counter = prev.length;
-        const numbered = newPOs.map(po=>({...po, num:getNextPONum([...prev,...newPOs.slice(0,counter++)])}));
-        return [...numbered,...prev];
-      });
       const count = newPOs.length;
       setTimeout(()=>alert('⚠ '+lowItems.length+' inventory item'+(lowItems.length>1?'s are':' is')+' at or below reorder level.\n'+count+' Purchase Order'+(count>1?'s have':' has')+' been generated automatically.\n\nGo to Purchase Orders to review, approve, and email to suppliers.'),300);
     }
-    } // end if(!restore)
-
-    const updated={...q,status:'converted',convertedJobId:newJob.id};
-    setQuotes(prev=>prev.map(qx=>qx.id===q.id?updated:qx));
-    setViewQuote(null); // close the quote view
     // Show a confirmation with the new job number instead of silently
-    // auto-navigating away — the user chooses whether to open it now.
+    // auto-navigating away — the user chooses whether to open it now. Only
+    // ever shown after the save above has been confirmed by the server.
     setConvertedInfo({jobId:newJob.id, jobNum:jobNum});
     } finally {
       convertingRef.current = false;
@@ -18837,6 +18899,28 @@ function App() {
     return run;
   }
 
+  // Immediate (non-debounced), awaited save for actions that must be
+  // confirmed durable before the UI claims success — currently used only by
+  // Convert to Job (see handleConvertToJob in QuotesPage), added 2026-08-04
+  // after Quote SQ-00108 / Job SNS-00110 silently disappeared: the normal
+  // 800ms-debounced autosave let the UI show "created" before the write was
+  // actually confirmed. `overrides` is a small object of just the sections
+  // this action changed (e.g. {jobs, quotes, inventory, purchaseOrders}) —
+  // it's overlaid onto the latest known local snapshot and pushed through
+  // the SAME queued mergeAndSave used by normal autosave, so it gets the
+  // identical merge/backup/wipe-guard protection, it simply isn't debounced
+  // and the caller can await its result. Resolves true on confirmed success;
+  // throws with a human-readable message on failure — callers must treat a
+  // thrown error as "nothing was saved", never as a partial success.
+  function forceSaveSections(overrides){
+    if(!apiReadyRef.current){
+      return Promise.reject(new Error('Not yet connected to the server — please wait a moment and try again.'));
+    }
+    const snapshot = {...(currentSnapshotRef.current||{}), ...overrides};
+    currentSnapshotRef.current = snapshot; // keep ref current immediately (see poll effect)
+    return enqueueMergeAndSave(snapshot);
+  }
+
   // 1) Initial load from backend
   useEffect(() => {
     let cancelled = false;
@@ -18970,8 +19054,27 @@ function App() {
   useEffect(()=>{
     const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, logo:logoDataUrl, utLogo:utLogoDataUrl, holdingsLogo:holdingsLogoDataUrl, sigOTSmit, savedAt:lastSaved};
     currentSnapshotRef.current = snapshot; // keep ref current for poll effect
-    // Backup to localStorage (safety net — DB is source of truth)
-    try { localStorage.setItem('sgr_platform_data', JSON.stringify(snapshot)); } catch(e) {}
+    // Backup to localStorage (safety net — DB is source of truth).
+    //
+    // 2026-08-04 FIX: this backup previously carried no _autoSavedAt, so on
+    // the next page load the initial-load effect's "is local newer than the
+    // server?" check (localAt vs serverAt, below) almost always favoured the
+    // server and did a full applyServerData() overwrite — silently
+    // discarding any local change (e.g. a just-converted quote/job) that
+    // hadn't yet been confirmed-saved when the page reloaded. Stamp this
+    // backup with an accurate timestamp — but ONLY bump it when this
+    // snapshot genuinely differs from the last save this session has
+    // confirmed with the server (serverBaselineRef), so a plain reload with
+    // nothing pending never falsely looks "newer than the server" and
+    // blocks legitimate updates from other sessions from applying.
+    const _stampBaseline = serverBaselineRef.current || _saved;
+    const _stampChanged = _stampBaseline
+      ? Object.values(locallyChangedSections(snapshot, _stampBaseline) || {}).some(Boolean)
+      : true;
+    const _localStamp = _stampChanged
+      ? new Date().toISOString()
+      : ((_stampBaseline && (_stampBaseline._autoSavedAt || _stampBaseline.savedAt)) || '');
+    try { localStorage.setItem('sgr_platform_data', JSON.stringify({...snapshot, _autoSavedAt:_localStamp})); } catch(e) {}
     // Debounced merge-and-push to backend — only after the initial API GET completed
     if (!apiReadyRef.current) return;
     if (apiSaveTimerRef.current) clearTimeout(apiSaveTimerRef.current);
@@ -19212,7 +19315,7 @@ function App() {
 
   const pageMap = {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={accInvoices}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord}/>,
+    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} forceSaveSections={forceSaveSections}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord}/>,
