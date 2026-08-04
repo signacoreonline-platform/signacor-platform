@@ -29,8 +29,16 @@ app.use(cors({
   credentials: true,
 }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
-app.use(express.json({ limit: '5mb' }));
-app.use(express.urlencoded({ extended: true }));
+// 2026-08-04: the full platform_state save body (driven mostly by
+// purchaseOrders and quotes) has grown to ~5.3MB, already past the previous
+// 5mb limit — confirmed live as "request entity too large" on PUT
+// /api/platform-state. Most saves now use the new partial-save path (only
+// the sections that changed, see platformState.ts), but a full-state save
+// is still the default for every other caller and will keep growing with
+// normal business use, so the limit is raised with real headroom rather
+// than tuned to today's exact size.
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 // ── Health check ──────────────────────────────────────────────
 app.get('/health', (_req: Request, res: Response) => {

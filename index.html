@@ -6565,13 +6565,20 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // an immediate (non-debounced) save through the same merge/backup/
     // wipe-guard protected path normal autosave uses, and throws if the
     // server didn't accept it (network error, cold-start timeout, or a
-    // blocked/wipe-guarded save). ──
+    // blocked/wipe-guarded save). Only the sections this conversion actually
+    // changed are sent — inventory/purchaseOrders are included only when a
+    // low-stock line item genuinely triggered a deduction/auto-PO, which
+    // keeps the request small for the common case instead of always sending
+    // the full (multi-MB) purchaseOrders history. ──
     if(!forceSaveSections){
       alert('Job could NOT be created — the save system is not ready yet. Please wait a moment and try again.');
       return;
     }
+    const saveOverrides = { jobs:nextJobs, quotes:nextQuotes };
+    if(nextInventory!==inventory) saveOverrides.inventory = nextInventory;
+    if(nextPurchaseOrders!==purchaseOrders) saveOverrides.purchaseOrders = nextPurchaseOrders;
     try{
-      await forceSaveSections({ jobs:nextJobs, quotes:nextQuotes, inventory:nextInventory, purchaseOrders:nextPurchaseOrders });
+      await forceSaveSections(saveOverrides);
     } catch(saveErr){
       alert('Job could NOT be created.\n\nThe save was not confirmed by the server, so nothing was changed — no job was created and the quote was not marked as converted.\n\nReason: '+(saveErr&&saveErr.message?saveErr.message:'unknown error')+'\n\nPlease check your connection and try again.');
       return; // nothing local changed — safe to stop here
@@ -18899,26 +18906,83 @@ function App() {
     return run;
   }
 
-  // Immediate (non-debounced), awaited save for actions that must be
-  // confirmed durable before the UI claims success — currently used only by
-  // Convert to Job (see handleConvertToJob in QuotesPage), added 2026-08-04
-  // after Quote SQ-00108 / Job SNS-00110 silently disappeared: the normal
-  // 800ms-debounced autosave let the UI show "created" before the write was
-  // actually confirmed. `overrides` is a small object of just the sections
-  // this action changed (e.g. {jobs, quotes, inventory, purchaseOrders}) —
-  // it's overlaid onto the latest known local snapshot and pushed through
-  // the SAME queued mergeAndSave used by normal autosave, so it gets the
-  // identical merge/backup/wipe-guard protection, it simply isn't debounced
-  // and the caller can await its result. Resolves true on confirmed success;
-  // throws with a human-readable message on failure — callers must treat a
-  // thrown error as "nothing was saved", never as a partial success.
+  // Immediate (non-debounced), awaited, PARTIAL save for actions that must
+  // be confirmed durable before the UI claims success — currently used only
+  // by Convert to Job (see handleConvertToJob in QuotesPage).
+  //
+  // 2026-08-04: added after Quote SQ-00108 / Job SNS-00110 silently
+  // disappeared (the normal 800ms-debounced autosave let the UI show
+  // "created" before the write was confirmed).
+  //
+  // 2026-08-04 HOTFIX: the first version of this function merged `overrides`
+  // onto the FULL local snapshot (every section — customers, accInvoices,
+  // chartOfAccounts, logos, etc.) and sent that whole ~5.3MB object through
+  // the normal mergeAndSave path, which re-fetches the full server state and
+  // always sends the FULL merged state back regardless of how small the
+  // input was. Once the live platform_state (driven mostly by `purchaseOrders`
+  // and `quotes`, together ~5MB) grew past the backend's 5MB body limit,
+  // every one of these saves was rejected with "request entity too large" —
+  // confirmed live. `forceSaveSections` now sends ONLY the given `overrides`
+  // sections (e.g. {jobs, quotes} — plus inventory/purchaseOrders only when
+  // the caller actually changed them), tagged `_partial:true` so the backend
+  // merges them onto the current row instead of replacing it (see
+  // backend/src/routes/platformState.ts). This keeps the request small for
+  // the common case (no low-stock trigger ⇒ just jobs+quotes, roughly
+  // 1.2MB instead of 5.3MB) while still getting the same per-section
+  // id-based merge protection as every other save. Resolves true on
+  // confirmed success; throws with a human-readable message on failure —
+  // callers must treat a thrown error as "nothing was saved".
   function forceSaveSections(overrides){
     if(!apiReadyRef.current){
       return Promise.reject(new Error('Not yet connected to the server — please wait a moment and try again.'));
     }
-    const snapshot = {...(currentSnapshotRef.current||{}), ...overrides};
-    currentSnapshotRef.current = snapshot; // keep ref current immediately (see poll effect)
-    return enqueueMergeAndSave(snapshot);
+    return enqueueSavePartialSections(overrides);
+  }
+
+  // Serializes partial saves through the SAME FIFO queue as normal autosave
+  // (saveQueueRef) so a partial save and a full-state autosave from this
+  // session can never race against each other — see enqueueMergeAndSave
+  // above for why that matters.
+  function enqueueSavePartialSections(overrides){
+    const run = saveQueueRef.current.then(
+      () => savePartialSectionsNow(overrides),
+      () => savePartialSectionsNow(overrides) // previous queued save failed — still attempt this one
+    );
+    saveQueueRef.current = run.catch(() => {});
+    return run;
+  }
+
+  // Sends ONLY `overrides` (e.g. {jobs, quotes}) to the backend, tagged as a
+  // partial save. Never touches or reads the other ~20 sections of local
+  // state, so the request body stays proportional to what actually changed
+  // instead of the entire platform state. `_knownSectionIds` is built the
+  // same way as the full-state save (from this session's last confirmed
+  // server baseline) so the backend's existing per-section id-based merge
+  // still protects against losing another session's concurrent additions to
+  // these SAME sections. Throws (never silently no-ops) if the PUT is
+  // rejected, so a caller's try/catch is always trustworthy.
+  async function savePartialSectionsNow(overrides){
+    if(!apiReadyRef.current) throw new Error('Not yet connected to the server — please wait a moment and try again.');
+    const keys = Object.keys(overrides||{});
+    const data = {...overrides};
+    const knownSectionIds = {};
+    keys.forEach(k=>{
+      const base = serverBaselineRef.current && Array.isArray(serverBaselineRef.current[k]) ? serverBaselineRef.current[k] : [];
+      knownSectionIds[k] = base.map(x=>x && x.id).filter(id=>id!==undefined && id!==null);
+    });
+    data._knownSectionIds = knownSectionIds;
+    data._partial = true;
+    data.v = DATA_VERSION;
+    const savedAt = new Date().toISOString();
+    data._autoSavedAt = savedAt;
+    await saveToServer(data);
+    // Fold the saved sections into this session's known server baseline —
+    // unrelated sections already in the baseline are left exactly as they
+    // were, since this save never touched or knew about them.
+    if(serverBaselineRef.current){
+      serverBaselineRef.current = {...serverBaselineRef.current, ...overrides, _autoSavedAt:savedAt};
+    }
+    return true;
   }
 
   // 1) Initial load from backend

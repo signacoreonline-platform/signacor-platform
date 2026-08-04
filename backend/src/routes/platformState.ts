@@ -81,7 +81,21 @@ function buildRecordCounts(data: Record<string, any>): Record<string, number> {
 // reason if it looks like it would wipe/partially-wipe existing data.
 // Deliberately conservative: small/normal edits and deletions must never
 // trip this guard — only clearly-accidental full/partial wipes should.
-function detectWipe(existingData: Record<string, any> | null, incomingData: any): string | null {
+//
+// `isPartial` (added 2026-08-04 for the Convert-to-Job payload-size hotfix):
+// true only for saves explicitly marked `data._partial` — i.e. the caller
+// intentionally sent just a few sections (e.g. {jobs, quotes}) instead of
+// the whole platform state, because the omitted sections (customers,
+// accInvoices, etc.) genuinely weren't touched and will be preserved
+// unchanged from the live row (see the partial-merge block below). For
+// those saves, a critical key being entirely ABSENT from the payload is
+// expected and must never trip the "missing from payload" wipe check — that
+// check exists to catch a FULL-state save that accidentally dropped a
+// section, which is a different situation. Every other check (a key that
+// IS present dropping to zero, or dropping >80%, or losing a whole
+// company's slice) still applies exactly as before, for any key the
+// payload actually includes — a partial save is not exempt from those.
+function detectWipe(existingData: Record<string, any> | null, incomingData: any, isPartial: boolean = false): string | null {
   if (!existingData || typeof existingData !== 'object' || Object.keys(existingData).length === 0) {
     return null; // nothing live yet to protect — first-ever save, allow it
   }
@@ -91,11 +105,14 @@ function detectWipe(existingData: Record<string, any> | null, incomingData: any)
 
   // Whole-state shape check: if the live data clearly has real records in it,
   // an incoming payload with NONE of the expected sections present as arrays
-  // looks like an empty/default/broken state, not a real edit.
-  const existingHasData = STATE_ARRAY_KEYS.some((k) => arr(existingData[k]).length > 0);
-  const incomingHasAnySection = STATE_ARRAY_KEYS.some((k) => Array.isArray(incomingData[k]));
-  if (existingHasData && !incomingHasAnySection) {
-    return 'incoming payload has none of the expected data sections (looks like an empty/default state)';
+  // looks like an empty/default/broken state, not a real edit. Skipped for
+  // partial saves, which are allowed to include only one or two sections.
+  if (!isPartial) {
+    const existingHasData = STATE_ARRAY_KEYS.some((k) => arr(existingData[k]).length > 0);
+    const incomingHasAnySection = STATE_ARRAY_KEYS.some((k) => Array.isArray(incomingData[k]));
+    if (existingHasData && !incomingHasAnySection) {
+      return 'incoming payload has none of the expected data sections (looks like an empty/default state)';
+    }
   }
 
   for (const k of CRITICAL_KEYS) {
@@ -105,10 +122,17 @@ function detectWipe(existingData: Record<string, any> | null, incomingData: any)
     const incomingLen = incomingIsArray ? incomingData[k].length : 0;
 
     // A previously-populated critical section missing entirely from the
-    // payload (not even sent as an empty array) is always suspicious.
-    if (existingLen >= 3 && !incomingIsArray) {
+    // payload (not even sent as an empty array) is always suspicious for a
+    // full-state save — but expected/intentional for a partial save, whose
+    // omitted sections are preserved from the live row, not wiped.
+    if (!isPartial && existingLen >= 3 && !incomingIsArray) {
       return `"${k}" is missing from the incoming payload (currently has ${existingLen} record(s))`;
     }
+    // The remaining checks only make sense for a key the payload actually
+    // included — for a partial save, a key that's simply absent (not sent
+    // as an array at all) was never a candidate to compare lengths against;
+    // it's preserved untouched below, not "dropped to 0".
+    if (!incomingIsArray && isPartial) continue;
     // Dropping to zero from a meaningful size.
     if (existingLen >= 5 && incomingLen === 0) {
       return `"${k}" would drop from ${existingLen} record(s) to 0`;
@@ -211,6 +235,21 @@ router.put('/', async (req: Request, res: Response): Promise<void> => {
       ? data._knownSectionIds
       : {};
     delete data._knownSectionIds;
+    // ── Partial save support (2026-08-04, Convert-to-Job payload-size hotfix) ──
+    // `data._partial === true` means the caller deliberately sent only some
+    // sections (e.g. {jobs, quotes}) instead of the full platform state — a
+    // full-state save's request body was hitting the ~5MB request-size limit
+    // once purchaseOrders/quotes grew large. Every section NOT present in a
+    // partial payload is preserved untouched from the live row (see the
+    // merge at the end of this handler) — it is never wiped, never
+    // implicitly emptied. Every existing protection (wipe guard, per-section
+    // id-based merge, backup-before-save) still applies in full to whichever
+    // sections the payload DOES include. Regular full-state saves (every
+    // existing caller — normal autosave, manual edits) are entirely
+    // unaffected: `isPartial` is false for them, and behaviour is identical
+    // to before this change.
+    const isPartial = data._partial === true;
+    delete data._partial;
 
     await client.query('BEGIN');
 
@@ -224,7 +263,7 @@ router.put('/', async (req: Request, res: Response): Promise<void> => {
     const existingData: Record<string, any> | null = existingRes.rowCount ? (existingRes.rows[0].data || {}) : null;
 
     // ── Save protection: block obvious wipe/partial/empty saves ──────────
-    const wipeReason = detectWipe(existingData, data);
+    const wipeReason = detectWipe(existingData, data, isPartial);
     if (wipeReason) {
       await client.query('ROLLBACK');
       console.warn('PUT /api/platform-state BLOCKED — possible data loss:', wipeReason);
@@ -348,17 +387,29 @@ router.put('/', async (req: Request, res: Response): Promise<void> => {
       }
     }
 
+    // ── Partial-save merge (2026-08-04) ───────────────────────────────────
+    // A full-state save (isPartial false — every existing caller) keeps its
+    // exact previous behaviour: `data` is the complete new row, written as-is.
+    // A partial save (isPartial true) only ever contains the sections its
+    // caller actually changed — every other top-level key from the CURRENT
+    // live row (locked above) is carried forward untouched here, so nothing
+    // the payload didn't mention is ever lost. This is the only place a
+    // partial save's omitted sections are resolved — everywhere else in this
+    // handler (detectWipe, the merge loop above) already only looks at keys
+    // that are present in `data`.
+    const finalData = isPartial ? { ...(existingData || {}), ...data } : data;
+
     await client.query(
       `INSERT INTO platform_state (id, data, updated_at)
        VALUES (1, $1::jsonb, NOW())
        ON CONFLICT (id) DO UPDATE
          SET data = EXCLUDED.data,
              updated_at = NOW()`,
-      [JSON.stringify(data)]
+      [JSON.stringify(finalData)]
     );
 
     await client.query('COMMIT');
-    res.json({ success: true, data });
+    res.json({ success: true, data: finalData });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     console.error('PUT /api/platform-state failed:', err);
