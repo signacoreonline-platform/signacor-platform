@@ -2118,6 +2118,37 @@ function getManualInvoiceJobRefs(accInvoices) {
   return new Set((accInvoices||[]).filter(i=>i && i.status!=='void').map(i=>i.reference).filter(Boolean));
 }
 
+/* ═══════════════════════════════════════════
+   INVOICE-FROM-QUOTE LINKING HELPERS (2026-08-05)
+   A quote can be invoiced directly, before any job exists (see
+   QuotesPage.createInvoiceFromQuote). That invoice lives in accInvoices —
+   the same single source of truth Sales/Accounting already read — tagged
+   with quoteId/quoteNum. Once the quote is later converted to a job, the
+   SAME record is relinked (reference/jobId/jobNum set) rather than a second
+   invoice ever being created. These two read-only lookups are shared by
+   every place that needs to ask "does this quote/job already have an
+   invoice somewhere other than the normal job.invoiceNum flow" so they can
+   never disagree and never trigger a duplicate.
+═══════════════════════════════════════════ */
+// The accInvoices record already created directly from this quote, if any.
+// Matched primarily by the stable quoteId; quoteNum is a fallback for the
+// rare case a record only carries the number. Void invoices never count.
+function getQuoteInvoice(quote, accInvoices) {
+  if(!quote) return null;
+  return (accInvoices||[]).find(i => i && i.status!=='void' &&
+    ((quote.id!=null && i.quoteId===quote.id) || (quote.num && i.quoteNum===quote.num))
+  ) || null;
+}
+// The accInvoices record this job has inherited from its source quote (its
+// `reference` field equals this job's number) — same rule
+// getManualInvoiceJobRefs()/getAllInvoicesUnified() already use to suppress
+// a second, synthetic job-derived invoice row for the same job.
+function getJobManualInvoice(job, accInvoices) {
+  if(!job || !job.num) return null;
+  if(!getManualInvoiceJobRefs(accInvoices).has(job.num)) return null;
+  return (accInvoices||[]).find(i => i && i.status!=='void' && i.reference===job.num) || null;
+}
+
 // Merge job-derived invoices + manual accInvoices into one clean, de-duped,
 // numerically-sorted list. Single source of truth for "what invoices exist"
 // — every page that lists or looks up invoices (Sales, Accounting, Customer
@@ -5498,7 +5529,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setC
   );
 }
 
-function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs, creditNotes, setCreditNotes, isAdmin, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob, customers, onOpenCustomer }) {
+function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs, creditNotes, setCreditNotes, isAdmin, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob, customers, onOpenCustomer, accInvoices, onCreateInvoiceFromQuote, onOpenQuoteInvoice }) {
   const [showEmailFlow, setShowEmailFlow] = useState(false);
   const [showProformaEmail, setShowProformaEmail] = useState(false);
   const [showPayments, setShowPayments] = useState(false);
@@ -5542,7 +5573,16 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
   // Prefer the job convertedJobId actually points at; fall back to the
   // quoteNum back-link match. Display/action purposes only — never mutates.
   const linkedJob = matchingJobs.find(j=>j.id===quote.convertedJobId) || matchingJobs[0] || null;
-  const linkedJobHasInvoice = !!linkedJob && (!!linkedJob.invoiceCreated || (!!linkedJob.invoiceNum && linkedJob.stage>=9));
+  // An invoice this job inherited from this same quote (via createInvoiceFromQuote
+  // + handleConvertToJob's relinking step) counts as "already invoiced" too —
+  // never offer to create a second, job-numbered invoice on top of it.
+  const jobManualInvoice = linkedJob ? getJobManualInvoice(linkedJob, accInvoices) : null;
+  const linkedJobHasInvoice = !!linkedJob && (!!linkedJob.invoiceCreated || (!!linkedJob.invoiceNum && linkedJob.stage>=9) || !!jobManualInvoice);
+  // A tax invoice already created directly from THIS quote, before any job
+  // exists (see createInvoiceFromQuote in QuotesPage). A quote may only ever
+  // have one — if found, the quote view offers View Invoice instead of
+  // Create Invoice from Quote.
+  const quoteInvoice = getQuoteInvoice(quote, accInvoices);
   // Candidate jobs for manual relinking — company-scoped list passed down
   // from QuotesPage (myJobs), so relinking can never cross into the other
   // company's jobs. Excludes jobs already linked to this or another quote's
@@ -5783,6 +5823,25 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
               💼 Convert to Job
             </button>
           )}
+          {/* ── Invoice-from-quote — lets a client pay from an invoice/statement
+                before a job exists. Only offered when no job has been created
+                yet (once a job exists, the job-based Create/View Invoice
+                buttons below take over) and this quote doesn't already have
+                one — a quote may only ever have one invoice. ── */}
+          {quote.status==='approved'&&!linkedJob&&!quoteInvoice&&onCreateInvoiceFromQuote&&(
+            <button onClick={()=>onCreateInvoiceFromQuote(quote)}
+              title="Create a standalone tax invoice for this quote before a job exists, so the client can pay immediately"
+              className="flex items-center gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl px-4 py-2.5 font-bold">
+              🧾 Create Invoice from Quote
+            </button>
+          )}
+          {!linkedJob&&quoteInvoice&&onOpenQuoteInvoice&&(
+            <button onClick={()=>{ onClose(); onOpenQuoteInvoice(quoteInvoice); }}
+              title="An invoice already exists for this quote — opening it instead of creating another"
+              className="flex items-center gap-1.5 text-xs bg-blue-700 hover:bg-blue-800 text-white rounded-xl px-4 py-2.5 font-bold">
+              🧾 View Invoice {quoteInvoice.number}
+            </button>
+          )}
           {/* ── Linked job found (and not ambiguous) — open it directly ── */}
           {linkedJob&&!multipleJobsLinked&&onOpenJob&&(
             <button onClick={()=>onOpenJob(linkedJob.id)}
@@ -5800,10 +5859,10 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
             </button>
           )}
           {linkedJob&&!multipleJobsLinked&&linkedJobHasInvoice&&onOpenInvoice&&(
-            <button onClick={()=>{ onClose(); onOpenInvoice(linkedJob); }}
+            <button onClick={()=>{ onClose(); onOpenInvoice(jobManualInvoice ? {id:jobManualInvoice.id} : linkedJob); }}
               title="An invoice already exists for this job — opening it instead of creating a duplicate"
               className="flex items-center gap-1.5 text-xs bg-blue-700 hover:bg-blue-800 text-white rounded-xl px-4 py-2.5 font-bold">
-              🧾 View Invoice {linkedJob.invoiceNum||''}
+              🧾 View Invoice {jobManualInvoice ? jobManualInvoice.number : (linkedJob.invoiceNum||'')}
             </button>
           )}
           {/* ── View Customer — read-only navigation to the matching customer record ── */}
@@ -6214,7 +6273,7 @@ function reconcileJobInvoice(job, quotes){
 /* ═══════════════════════════════════════════
    QUOTES PAGE
 ═══════════════════════════════════════════ */
-function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, onJobCreated, initialOpen, onInitialOpenHandled, onJobPaymentsClosed, creditNotes, setCreditNotes, onOpenCustomer, forceSaveSections }) {
+function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, setAccInvoices, onJobCreated, initialOpen, onInitialOpenHandled, onJobPaymentsClosed, creditNotes, setCreditNotes, onOpenCustomer, forceSaveSections }) {
   const [subTab,    setSubTab]    = useState('quotes'); // 'quotes' | 'invoices'
   const [showCreate,setShowCreate]=useState(false);
   const [viewQuote,setViewQuote]=useState(null);
@@ -6239,6 +6298,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [jobPayModalExternal,setJobPayModalExternal]=useState(false);
   const [convertedInfo,setConvertedInfo]=useState(null); // {jobId,jobNum} after a quote→job conversion, awaiting the user's "Open Job" choice
   const [invoiceCreatedInfo,setInvoiceCreatedInfo]=useState(null); // {job,invoiceNum} after an invoice is created — awaiting View Invoice / Open Job / Stay Here
+  const [quoteInvoiceCreatedInfo,setQuoteInvoiceCreatedInfo]=useState(null); // {quote,invoiceNum} after an invoice is created directly from a quote (no job yet) — awaiting View Invoice / Stay Here
   const convertingRef = useRef(false); // re-entrancy lock — blocks double-click duplicate job creation in handleConvertToJob
   const nonUtech = companies.filter(c=>c.id!==UNIONTECH_ID);
   // Company-context filter: Holdings users see only Holdings (co:1)
@@ -6560,6 +6620,16 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const updated={...q,status:'converted',convertedJobId:newJob.id};
     const nextQuotes = quotes.map(qx=>qx.id===q.id?updated:qx);
 
+    // ── If this quote already has an invoice created directly from it
+    // (see createInvoiceFromQuote below), relink that SAME accInvoices
+    // record to the new job — reference/jobId/jobNum — instead of ever
+    // reserving or creating a second invoice for this quote. Applies on
+    // restore too (a restored job may need the number relinked). ──
+    const quoteInvoice = getQuoteInvoice(q, accInvoices);
+    const nextAccInvoices = quoteInvoice
+      ? accInvoices.map(i=>i.id===quoteInvoice.id ? {...i, reference:jobNum, jobId:newJob.id, jobNum:jobNum} : i)
+      : accInvoices;
+
     // ── Save FIRST — only touch local state / show "created" once the
     // backend has actually confirmed this write. forceSaveSections pushes
     // an immediate (non-debounced) save through the same merge/backup/
@@ -6577,6 +6647,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const saveOverrides = { jobs:nextJobs, quotes:nextQuotes };
     if(nextInventory!==inventory) saveOverrides.inventory = nextInventory;
     if(nextPurchaseOrders!==purchaseOrders) saveOverrides.purchaseOrders = nextPurchaseOrders;
+    if(quoteInvoice) saveOverrides.accInvoices = nextAccInvoices;
     try{
       await forceSaveSections(saveOverrides);
     } catch(saveErr){
@@ -6589,6 +6660,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     if(nextInventory!==inventory) setInventory(nextInventory);
     if(nextPurchaseOrders!==purchaseOrders) setPurchaseOrders(nextPurchaseOrders);
     setQuotes(nextQuotes);
+    if(quoteInvoice) setAccInvoices(nextAccInvoices);
     setViewQuote(null); // close the quote view
 
     if(lowItems.length>0){
@@ -6597,8 +6669,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     }
     // Show a confirmation with the new job number instead of silently
     // auto-navigating away — the user chooses whether to open it now. Only
-    // ever shown after the save above has been confirmed by the server.
-    setConvertedInfo({jobId:newJob.id, jobNum:jobNum});
+    // ever shown after the save above has been confirmed by the server. When
+    // this quote already had its own invoice, surface that it was relinked
+    // rather than duplicated.
+    setConvertedInfo({jobId:newJob.id, jobNum:jobNum, linkedInvoiceNum: quoteInvoice ? quoteInvoice.number : null});
     } finally {
       convertingRef.current = false;
     }
@@ -6619,6 +6693,16 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   }
   async function createInvoiceNow(job){
     if(!job) return;
+    // This job may already have inherited an invoice created directly from
+    // its source quote (see createInvoiceFromQuote/handleConvertToJob) —
+    // that record IS this job's real invoice. Never reserve/create a second
+    // one; open the existing one instead.
+    const inheritedInvoice = getJobManualInvoice(job, accInvoices);
+    if(inheritedInvoice){
+      alert(`Job ${job.num||''} already has an invoice (${inheritedInvoice.number}) created from its source quote. Opening the existing invoice instead of creating another one.`);
+      revealJobInvoice({id:inheritedInvoice.id});
+      return;
+    }
     if(job.invoiceCreated || (job.invoiceNum && job.stage>=9)){
       // Already invoiced — warn instead of silently doing nothing, and take
       // the user straight to the existing invoice rather than a dead click.
@@ -6661,6 +6745,81 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:today, invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
     });
     setInvoiceCreatedInfo({ job, invoiceNum: reserved });
+  }
+
+  // ── Create a standalone tax invoice directly from a quote, BEFORE any job
+  // exists — lets a client pay from an invoice/statement immediately after
+  // accepting a quote, instead of waiting for a job to be created and reach
+  // the Installation stage. Stored in accInvoices (the same single source
+  // of truth Sales/Accounting already read), tagged with quoteId/quoteNum.
+  // If this quote is later converted to a job, handleConvertToJob relinks
+  // this SAME record (reference/jobId/jobNum) — it never creates a second
+  // invoice or reserves a second number for the same quote.
+  async function createInvoiceFromQuote(quote){
+    if(!quote) return;
+    // Duplicate guard — re-checked against the live accInvoices array at
+    // the moment of the click, not a stale closure.
+    const existing = getQuoteInvoice(quote, accInvoices);
+    if(existing){
+      alert(`An invoice already exists for quote ${quote.num||''} (${existing.number}). Opening it instead of creating another.`);
+      setViewQuote(null);
+      revealJobInvoice({id:existing.id});
+      return;
+    }
+    const today = new Date().toISOString().slice(0,10);
+    const due   = new Date(Date.now()+30*864e5).toISOString().slice(0,10);
+    const sub      = (quote.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
+    const discPct  = parseFloat(quote.discount)||0;
+    const discAmt  = sub*(discPct/100);
+    const setupFee = parseFloat(quote.setupFee)||0;
+
+    // Copy quote lines/details/totals exactly — each line taxed at 15% (same
+    // as the quote's own flat VAT calc), with discount/setup fee reproduced
+    // as their own adjustment lines so the invoice subtotal, VAT and total
+    // match the quote precisely (subtotal - discAmt + setupFee, then *1.15).
+    const lineItems = (quote.lines||[]).map(l=>({
+      description: l.desc||'', qty: parseFloat(l.qty)||1, unitAmount: parseFloat(l.unitPrice)||0,
+      accountCode:'4000', taxType:'15%'
+    }));
+    if(discAmt>0.005) lineItems.push({ description:`Discount (${discPct}%)`, qty:1, unitAmount:-discAmt, accountCode:'4000', taxType:'15%' });
+    if(setupFee>0.005) lineItems.push({ description:'Design & Setup Fee', qty:1, unitAmount:setupFee, accountCode:'4000', taxType:'15%' });
+
+    // Deposits/partials already recorded on the quote travel with it onto
+    // this new invoice, so payment tracking picks up where the quote left
+    // off. This is the ONLY place they are ever counted against a real
+    // invoice/statement — quotes themselves are never a statement or ledger
+    // source (buildStatement only reads accInvoices/accBills/credit notes) —
+    // so this never double-counts a quote deposit.
+    const carriedPayments = (quote.payments||[]).map(p=>({...p}));
+    const totalIncl = (sub-discAmt+setupFee)*1.15;
+    const paidSoFar  = carriedPayments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+    const status = (paidSoFar>=totalIncl && totalIncl>0) ? 'paid' : (paidSoFar>0 ? 'partial' : 'sent');
+
+    // Reserve a brand-new number from the same backend-atomic counter every
+    // other invoice (job-derived or manual) uses. Never falls back to a
+    // local max()+1 generator if this fails.
+    const reserved = await reserveInvoiceNumber(quote.co);
+    if(!reserved || invoiceNumberExists(reserved, quote.co, jobs, accInvoices)){
+      alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
+      return;
+    }
+    // Re-check for a race — another tab/session may have created this
+    // quote's invoice while the reservation call above was in flight.
+    if(getQuoteInvoice(quote, accInvoices)){
+      alert(`Invoice already exists for quote ${quote.num||''} — the number just reserved (${reserved}) was left unused, to avoid creating a duplicate.`);
+      return;
+    }
+    const newInvoice = {
+      id: Date.now(), number: reserved, co: quote.co,
+      date: today, dueDate: due,
+      contactName: quote.client||'', contactEmail: quote.email||'', contactAddress: quote.address||'',
+      reference: '', jobId: null, jobNum: '', // set once this quote converts to a job (see handleConvertToJob)
+      quoteId: quote.id, quoteNum: quote.num,
+      status, lineItems, payments: carriedPayments,
+    };
+    setAccInvoices(prev => [newInvoice, ...prev]);
+    setViewQuote(null);
+    setQuoteInvoiceCreatedInfo({ quote, invoiceNum: reserved, invoiceId: newInvoice.id });
   }
 
   // ── Job Invoice Payment History Modal ──
@@ -7027,6 +7186,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                 const total=(sub-discAmt+setup)*1.15;
                 const co=companies.find(c=>c.id===q.co)||{short:'?'};
                 const linkedJob=jobs.find(j=>j.id===q.convertedJobId||j.quoteNum===q.num);
+                // A job inherited invoice (from this quote's own invoice-from-quote
+                // record, relinked on conversion) counts as "already invoiced" here too —
+                // never offer to create a second one.
+                const linkedJobManualInvoice = linkedJob ? getJobManualInvoice(linkedJob, accInvoices) : null;
                 return (
                   <div key={q.id} className="bg-white rounded-2xl border border-emerald-100 overflow-hidden">
                     <div className="px-5 py-4 border-b border-emerald-50 bg-emerald-50/40 flex flex-wrap items-start justify-between gap-3">
@@ -7087,7 +7250,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       <button onClick={()=>setCopyQuote(q)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 transition-colors">
                         📋 Copy to New Quote
                       </button>
-                      {linkedJob&&!linkedJob.invoiceCreated&&!(linkedJob.invoiceNum&&linkedJob.stage>=9)&&(
+                      {linkedJob&&linkedJobManualInvoice&&(
+                        <button onClick={()=>revealJobInvoice({id:linkedJobManualInvoice.id})}
+                          title="An invoice already exists for this job's quote — opening it instead of creating a duplicate"
+                          className="text-xs font-bold px-3 py-1.5 rounded-lg border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 transition-colors">
+                          🧾 View Existing Invoice
+                        </button>
+                      )}
+                      {linkedJob&&!linkedJobManualInvoice&&!linkedJob.invoiceCreated&&!(linkedJob.invoiceNum&&linkedJob.stage>=9)&&(
                         <button onClick={()=>createInvoiceNow(linkedJob)}
                           title="Create the tax invoice now, without waiting for the job to reach the Installation stage"
                           className="text-xs font-bold px-3 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 transition-colors">
@@ -7262,6 +7432,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 text-center">
             <div className="text-4xl mb-3">✅</div>
             <h3 className="text-lg font-black text-gray-900 mb-1">Job {convertedInfo.jobNum} created successfully.</h3>
+            {convertedInfo.linkedInvoiceNum ? (
+              <p className="text-xs text-emerald-600 font-semibold mb-1">🧾 Linked to existing invoice {convertedInfo.linkedInvoiceNum} — no new invoice was created.</p>
+            ) : null}
             <p className="text-xs text-gray-500 mb-5">The quote has been converted. It now appears under Jobs → Active. You can open the new job now or stay here.</p>
             <div className="flex gap-3">
               <button onClick={()=>setConvertedInfo(null)} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Stay Here</button>
@@ -7285,6 +7458,25 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
               <button onClick={()=>{ const id=invoiceCreatedInfo.job.id; setInvoiceCreatedInfo(null); if(onJobCreated) onJobCreated(id); }}
                 className="w-full bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl py-2.5 text-sm font-bold">Open Job →</button>
               <button onClick={()=>setInvoiceCreatedInfo(null)}
+                className="w-full border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Stay Here</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Invoice-from-quote creation confirmation — no job exists yet, so
+          this only offers View Invoice / Stay Here (no "Open Job"). ── */}
+      {quoteInvoiceCreatedInfo&&(
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&setQuoteInvoiceCreatedInfo(null)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 text-center">
+            <div className="text-4xl mb-3">🧾</div>
+            <h3 className="text-lg font-black text-gray-900 mb-1">Invoice {quoteInvoiceCreatedInfo.invoiceNum} created.</h3>
+            <p className="text-xs text-gray-500 mb-1">For Quote {quoteInvoiceCreatedInfo.quote.num} — {quoteInvoiceCreatedInfo.quote.client}.</p>
+            <p className="text-xs text-gray-500 mb-5">It now appears in Sales → Invoices and Accounting → Invoices, and on this client's statement. No job has been created yet — converting this quote to a job later will link it to this same invoice.</p>
+            <div className="flex flex-col gap-2">
+              <button onClick={()=>{ const id=quoteInvoiceCreatedInfo.invoiceId; setQuoteInvoiceCreatedInfo(null); revealJobInvoice({id}); }}
+                className="w-full bg-brand-600 hover:bg-brand-700 text-white rounded-xl py-2.5 text-sm font-bold">View Invoice →</button>
+              <button onClick={()=>setQuoteInvoiceCreatedInfo(null)}
                 className="w-full border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Stay Here</button>
             </div>
           </div>
@@ -7351,6 +7543,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         isAdmin={isAdmin}
         customers={customers}
         onOpenCustomer={onOpenCustomer}
+        accInvoices={accInvoices}
+        onCreateInvoiceFromQuote={createInvoiceFromQuote}
+        onOpenQuoteInvoice={(inv)=>revealJobInvoice({id:inv.id})}
       />}
       {/* ── Edit Invoice modal ── */}
       {editInvoice&&(
@@ -10434,13 +10629,21 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   const co=companies.find(c=>c.id===job.co)||companies[0];
   // ── Linked-record lookup (read-only; never mutates the job) ──
   const _links = findLinkedRecords({ job }, { quotes, jobs, accInvoices, customers });
+  // An invoice this job inherited from its source quote (created via
+  // createInvoiceFromQuote, relinked on conversion) IS this job's real
+  // invoice — same rule getJobManualInvoice()/getManualInvoiceJobRefs()
+  // already use elsewhere. Takes priority over job.invoiceNum, which should
+  // never be set at the same time as an inherited invoice.
+  const jobManualInvoice = getJobManualInvoice(job, accInvoices);
   const linkPanelLinks = [
     _links.quote
       ? { icon:'📋', label:`View Quote ${_links.quote.num}`, onClick: onOpenQuote ? ()=>onOpenQuote(_links.quote) : null }
       : { icon:'📋', label:'No linked quote found' },
-    job.invoiceNum
-      ? { icon:'🧾', label:`View Invoice ${job.invoiceNum}`, onClick: onOpenInvoice ? ()=>onOpenInvoice(job) : null }
-      : { icon:'🧾', label:'No linked invoice found' },
+    jobManualInvoice
+      ? { icon:'🧾', label:`View Invoice ${jobManualInvoice.number}`, onClick: onOpenInvoice ? ()=>onOpenInvoice({id:jobManualInvoice.id}) : null }
+      : job.invoiceNum
+        ? { icon:'🧾', label:`View Invoice ${job.invoiceNum}`, onClick: onOpenInvoice ? ()=>onOpenInvoice(job) : null }
+        : { icon:'🧾', label:'No linked invoice found' },
     { icon:'💳', label:'View Payments', onClick: onOpenJobPayments ? ()=>onOpenJobPayments(job) : null },
     _links.customer
       ? { icon:'🏢', label:'View Customer', onClick: onOpenCustomer ? ()=>onOpenCustomer(_links.customer) : null }
@@ -10893,6 +11096,24 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
           {/* ── INVOICE ── An invoice can only be created once the job reaches the Installation stage (7). ── */}
           {(() => {
             const INSTALL_STAGE = 7;
+            // This job already has an invoice inherited from its source quote
+            // (created via createInvoiceFromQuote, relinked here on
+            // conversion) — that record IS this job's real invoice. Never
+            // offer to create a second, job-numbered one; show View Existing
+            // Invoice instead, at any stage.
+            if(jobManualInvoice){
+              return (
+                <div className="flex items-center gap-2 text-xs bg-purple-50 border border-purple-200 rounded-xl px-4 py-2.5">
+                  <span className="text-purple-700 font-semibold">🧾 Invoice {jobManualInvoice.number} already exists for this job (created from its source quote).</span>
+                  {onOpenInvoice&&(
+                    <button onClick={()=>onOpenInvoice({id:jobManualInvoice.id})}
+                      className="text-xs bg-purple-600 hover:bg-purple-700 text-white font-bold px-3 py-1.5 rounded-xl">
+                      View Existing Invoice
+                    </button>
+                  )}
+                </div>
+              );
+            }
             const invoiceCreated  = !!job.invoiceCreated || (!!job.invoiceNum && job.stage>=9);
             const canCreateInvoice= job.stage>=INSTALL_STAGE;
             if(!invoiceCreated){
@@ -19457,7 +19678,7 @@ function App() {
 
   const pageMap = {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={accInvoices}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} forceSaveSections={forceSaveSections}/>,
+    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} forceSaveSections={forceSaveSections}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord}/>,
