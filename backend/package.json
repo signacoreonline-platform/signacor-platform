@@ -11,7 +11,8 @@
     "db:migrate": "psql $DATABASE_URL -f ../database/schema.sql",
     "seed:platform-state": "node dist/db/seedPlatformStateFromIndex.js",
     "fix:diaz-statement": "node dist/db/fixDiazStatementJuly2026.js",
-    "seed:app-users": "node dist/db/seedAppUsersFromPlatformState.js"
+    "seed:app-users": "node dist/db/seedAppUsersFromPlatformState.js",
+    "remove-plaintext-passwords": "node dist/db/removePlaintextPasswordsFromPlatformState.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

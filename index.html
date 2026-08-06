@@ -10470,25 +10470,39 @@ function LoginPage({ onLogin, userAccounts }) {
    ─────────────────────────────────────────
    Lets the main Admin (never Holdings Admin, Accounts, Assistant, Holdings
    Assistant or Factory — enforced in App()/Sidebar, not here) view and edit
-   the platform's login accounts. Only display name, email and password are
-   editable — role/company are shown read-only so access restrictions can
-   never be reassigned from this screen. Saves through the same userAccounts
-   app state as everything else (see App() → STATE_SECTIONS).
+   the platform's login accounts. Display name and email are editable and
+   still save through the same userAccounts app state as everything else
+   (see App() → STATE_SECTIONS) — that remains the visible record of who has
+   an account.
+   Password is handled differently (2026-08-06, removing plaintext passwords
+   from platform_state — see backend/src/db/
+   removePlaintextPasswordsFromPlatformState.ts): this page no longer shows
+   or stores anyone's actual password. The password field is "enter a NEW
+   password to change it" only — whatever is typed goes straight to the
+   backend (PUT /api/auth/sync-user, bcrypt-hashed into app_users) and is
+   never written into userAccounts/platform_state at all. Real login has
+   checked app_users, not this record, since the backend-auth change; this
+   page's password field existing at all is purely a convenience for an
+   admin resetting someone's password.
 ═══════════════════════════════════════════ */
 function UserRolesPage({ userAccounts, setUserAccounts }) {
-  const [visiblePw, setVisiblePw] = useState({});
   const [syncMsg, setSyncMsg] = useState({}); // { [id]: 'Saved ✓' | 'Sync failed — ...' }
+  // Local-only draft of a NEW password being typed for an account — never
+  // read from or written into userAccounts/platform_state. Cleared once the
+  // backend confirms it took effect, so nothing lingers in memory longer
+  // than it has to.
+  const [newPw, setNewPwState] = useState({});
+  const [showNewPw, setShowNewPw] = useState({});
   // Debounce per-account so fast typing doesn't fire a request per keystroke —
   // same 800ms debounce feel as the rest of the platform's autosave.
   const syncTimers = useRef({});
-  // Authentication (2026-08-06, audit finding B1): editing a name/email/
-  // password here still updates `userAccounts` exactly as before — that
-  // remains the visible record of who has an account — but real login now
-  // checks the backend's own app_users table (see backend/src/routes/
-  // auth.ts), which this screen has no other way to reach. Without this
-  // call, changing a password here would silently stop having any effect on
-  // whether that password actually works.
-  function syncAccountToBackend(nextUser, field) {
+  const pwTimers = useRef({});
+  // Authentication (2026-08-06, audit finding B1): editing a name/email here
+  // still updates `userAccounts` exactly as before, and ALSO syncs to the
+  // backend's own app_users table (see backend/src/routes/auth.ts) — without
+  // this call, a name/email change made here would silently stop matching
+  // what the account actually logs in with.
+  function syncAccountToBackend(nextUser) {
     const id = nextUser.id;
     if (syncTimers.current[id]) clearTimeout(syncTimers.current[id]);
     syncTimers.current[id] = setTimeout(async () => {
@@ -10497,7 +10511,6 @@ function UserRolesPage({ userAccounts, setUserAccounts }) {
           accountId: nextUser.id, email: nextUser.email, name: nextUser.name,
           role: nextUser.role, co: nextUser.co,
         };
-        if (field === 'pw' && nextUser.pw) body.password = nextUser.pw;
         const res = await fetch(API_AUTH_SYNC_URL, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -10519,7 +10532,33 @@ function UserRolesPage({ userAccounts, setUserAccounts }) {
       nextUser = { ...u, [field]: value };
       return nextUser;
     }));
-    if (nextUser) syncAccountToBackend(nextUser, field);
+    if (nextUser) syncAccountToBackend(nextUser);
+  }
+  // New-password entry: local component state only (never touches
+  // userAccounts/platform_state). Debounced sync to the backend; on success
+  // the typed value is cleared so it doesn't sit on screen or in memory
+  // after it's taken effect.
+  function setNewPassword(u, value) {
+    const id = u.id;
+    setNewPwState(m => ({ ...m, [id]: value }));
+    if (pwTimers.current[id]) clearTimeout(pwTimers.current[id]);
+    if (!value) return; // nothing typed (or just cleared) — nothing to sync yet
+    pwTimers.current[id] = setTimeout(async () => {
+      try {
+        const res = await fetch(API_AUTH_SYNC_URL, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          body: JSON.stringify({ accountId: u.id, email: u.email, name: u.name, role: u.role, co: u.co, password: value }),
+        });
+        if (res.status === 401) { forceLogoutExpiredSession(); return; }
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        setNewPwState(m => ({ ...m, [id]: '' }));
+        setSyncMsg(m => ({ ...m, [id]: 'Password updated ✓' }));
+      } catch (e) {
+        setSyncMsg(m => ({ ...m, [id]: 'Password change failed — this account’s password was NOT updated. Try again.' }));
+      }
+      setTimeout(() => setSyncMsg(m => { const n = { ...m }; delete n[id]; return n; }), 3000);
+    }, 800);
   }
   function roleLabel(u) {
     if (u.role==='admin')     return isHoldingsUser(u) ? 'Holdings Admin' : 'Admin';
@@ -10532,7 +10571,7 @@ function UserRolesPage({ userAccounts, setUserAccounts }) {
     <div className="p-6 max-w-4xl mx-auto">
       <div className="mb-6">
         <h2 className="text-lg font-bold" style={{color:'#06065c'}}>User Roles</h2>
-        <p className="text-sm text-gray-500 mt-1">Admin-only. Edit the login name, email and password for each account below — changes save automatically, the same way the rest of the platform saves.</p>
+        <p className="text-sm text-gray-500 mt-1">Admin-only. Edit the login name and email for each account below — changes save automatically. Existing passwords are never shown here; type a new one only if you want to change it.</p>
       </div>
       <div className="space-y-4">
         {(userAccounts||[]).map(u=>(
@@ -10555,8 +10594,8 @@ function UserRolesPage({ userAccounts, setUserAccounts }) {
                 {u.role==='factory'
                   ? <input className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm bg-gray-50 text-gray-400" value="No password — one-tap sign in" disabled/>
                   : <div className="flex gap-2">
-                      <input type={visiblePw[u.id]?'text':'password'} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono" value={u.pw||''} onChange={e=>updateField(u.id,'pw',e.target.value)}/>
-                      <button type="button" onClick={()=>setVisiblePw(v=>({...v,[u.id]:!v[u.id]}))} className="shrink-0 text-xs text-gray-500 border border-gray-200 rounded-lg px-3 hover:bg-gray-50">{visiblePw[u.id]?'Hide':'Show'}</button>
+                      <input type={showNewPw[u.id]?'text':'password'} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono" value={newPw[u.id]||''} onChange={e=>setNewPassword(u,e.target.value)} placeholder="Enter a new password to change it" autoComplete="new-password"/>
+                      <button type="button" onClick={()=>setShowNewPw(v=>({...v,[u.id]:!v[u.id]}))} className="shrink-0 text-xs text-gray-500 border border-gray-200 rounded-lg px-3 hover:bg-gray-50">{showNewPw[u.id]?'Hide':'Show'}</button>
                     </div>}
               </div>
               <div>
