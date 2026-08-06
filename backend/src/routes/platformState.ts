@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { query } from '../db/pool';
 import pool from '../db/pool';
+import { authenticate } from '../middleware/auth';
 
 /**
  * /api/platform-state
@@ -12,8 +13,21 @@ import pool from '../db/pool';
  * The static dashboard (root index.html) calls these endpoints to
  * load and save its full state. The database is the source of truth;
  * localStorage in the browser is only an emergency fallback.
+ *
+ * ── Authentication (added 2026-08-06, audit finding B1) ──────────────────
+ * Both GET and PUT below now require a valid, backend-issued JWT
+ * (`Authorization: Bearer <token>`, verified by `authenticate` — see
+ * backend/src/middleware/auth.ts). Previously this endpoint had no
+ * authentication at all: since it holds every job/quote/invoice/payment/
+ * customer/supplier record for both companies, plus (until this same change)
+ * login credentials, it was readable and writable by anyone with the URL —
+ * which is not a secret, it's hard-coded in index.html. Tokens are obtained
+ * from POST /api/auth/login, which now checks a real backend `app_users`
+ * table instead of data stored inside this endpoint's own payload. Nothing
+ * about the save/merge/backup/wipe-guard logic below this line was changed.
  */
 const router = Router();
+router.use(authenticate);
 
 /**
  * ── Backup-before-save + wipe protection ─────────────────────────────

@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/pool';
+import { authenticate } from '../middleware/auth';
 
 /**
  * /api/document-numbers
@@ -29,9 +30,16 @@ import pool from '../db/pool';
  * number, and uses it when creating the invoice/quote. Nothing else about
  * invoice/quote creation, editing, or the job workflow is changed by this
  * route.
+ *
+ * ── Authentication (added 2026-08-06, audit finding B1) ──────────────────
+ * Requires a valid, backend-issued JWT (Authorization: Bearer <token>) the
+ * same way /api/platform-state now does — previously this endpoint was also
+ * unauthenticated, letting anyone burn/skip numbers from either company's
+ * counter with a direct API call. See platformState.ts for the fuller note.
  */
 
 const router = Router();
+router.use(authenticate);
 
 const VALID_COMPANIES = ['1', '2'];
 const VALID_DOC_TYPES = ['invoice', 'quote'] as const;

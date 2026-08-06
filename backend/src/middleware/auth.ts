@@ -1,8 +1,13 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 
+// `co` mirrors the live app's simple Holdings(1)/Original(other) company
+// model (see index.html isHoldingsUser/belongsToUserCompany) — deliberately
+// not `company_id` (a UUID FK into the separate, unused schema.sql
+// `companies` table). Optional because most accounts (Original company,
+// pre-Holdings) carry no `co` at all.
 export interface AuthRequest extends Request {
-  user?: { id: string; email: string; role: string; company_id: string };
+  user?: { id: string; email: string; role: string; co?: number | null };
 }
 
 export const authenticate = (req: AuthRequest, res: Response, next: NextFunction): void => {

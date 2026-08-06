@@ -126,6 +126,28 @@ const { useState, useEffect, useRef, useMemo } = React;
 const DATA_VERSION = 4; // bump this to wipe stale localStorage caches
 const API_STATE_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/platform-state';
 const API_DOC_NUMBER_RESERVE_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/document-numbers/reserve';
+// ── Authentication (added 2026-08-06, audit finding B1) ────────────────────
+// API_STATE_URL and API_DOC_NUMBER_RESERVE_URL above now both require a
+// valid backend-issued JWT. Login used to be a purely local comparison
+// against userAccounts loaded from platform_state itself — that's no longer
+// possible once platform_state requires auth, so login now goes through the
+// backend instead (see LoginPage), which returns a token stored here.
+const API_AUTH_LOGIN_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/auth/login';
+const API_AUTH_SYNC_URL  = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/auth/sync-user';
+const SGR_TOKEN_KEY = 'sgr_token';
+function getAuthToken() { try { return localStorage.getItem(SGR_TOKEN_KEY) || null; } catch (e) { return null; } }
+function setAuthToken(t) { try { if (t) localStorage.setItem(SGR_TOKEN_KEY, t); else localStorage.removeItem(SGR_TOKEN_KEY); } catch (e) {} }
+function authHeaders() { const t = getAuthToken(); return t ? { 'Authorization': 'Bearer ' + t } : {}; }
+// Called whenever a platform-state/document-number call comes back 401 —
+// the token is missing/invalid/expired. Clears the stored session and sends
+// the person back to the login screen with a clear reason, instead of the
+// app silently failing to load/save forever. Defined at top level so it can
+// be called from fetch helpers before the App() component (and its own
+// handleLogout) has even mounted.
+function forceLogoutExpiredSession() {
+  try { localStorage.removeItem('sgr_user'); localStorage.removeItem(SGR_TOKEN_KEY); } catch (e) {}
+  if (window.__sgrOnAuthExpired) { window.__sgrOnAuthExpired(); }
+}
 const STORAGE_KEY = 'sgr_platform_data';
 
 function validState(d) {
@@ -2024,9 +2046,10 @@ async function reserveInvoiceNumber(co) {
   try {
     const res = await fetch(API_DOC_NUMBER_RESERVE_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ company: co, docType: 'invoice' }),
     });
+    if (res.status === 401) { forceLogoutExpiredSession(); return null; }
     if (!res.ok) return null;
     const result = await res.json();
     return (result && result.number) ? result.number : null;
@@ -2066,9 +2089,10 @@ async function reserveQuoteNumber(co) {
   try {
     const res = await fetch(API_DOC_NUMBER_RESERVE_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ company: co, docType: 'quote' }),
     });
+    if (res.status === 401) { forceLogoutExpiredSession(); return null; }
     if (!res.ok) return null;
     const result = await res.json();
     return (result && result.number) ? result.number : null;
@@ -10340,15 +10364,56 @@ function HRPage({ employees, setEmployees, leaveRequests, setLeaveRequests, disc
 /* ═══════════════════════════════════════════
    LOGIN
 ═══════════════════════════════════════════ */
+// Authentication (2026-08-06, audit finding B1): login now goes through the
+// backend (POST /api/auth/login) instead of comparing the typed
+// email/password against `userAccounts` loaded from platform_state — that
+// local comparison is no longer possible once platform_state itself
+// requires a login to read. `userAccounts` is still passed in here, but only
+// to list the passwordless "Manufacturing" one-tap accounts by name; it is
+// never used to decide whether a login succeeds. `onLogin(user, token)` is
+// only called once the backend has actually confirmed the credentials.
 function LoginPage({ onLogin, userAccounts }) {
   const [em,setEm]=useState('');
   const [pw,setPw]=useState('');
   const [err,setErr]=useState('');
+  const [busy,setBusy]=useState(false);
   const inputCls="w-full border border-gray-200 rounded-xl px-4 py-3 text-sm";
-  function submit(e){
+  async function backendLogin(email, password){
+    const res = await fetch(API_AUTH_LOGIN_URL, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ email, password }),
+    });
+    if(res.status===401){ throw new Error('Incorrect email or password.'); }
+    if(!res.ok){ throw new Error('Could not reach the server. Please check your connection and try again.'); }
+    const result = await res.json();
+    if(!result || !result.token || !result.user){ throw new Error('Unexpected response from the server.'); }
+    return result;
+  }
+  async function submit(e){
     e.preventDefault();
-    const u=userAccounts.find(u=>u.email===em.trim().toLowerCase()&&u.pw===pw);
-    if(u){onLogin(u);}else{setErr('Incorrect email or password.');}
+    if(busy) return;
+    setErr(''); setBusy(true);
+    try{
+      const { token, user } = await backendLogin(em.trim().toLowerCase(), pw);
+      onLogin(user, token);
+    }catch(ex){
+      setErr((ex&&ex.message)||'Sign in failed. Please try again.');
+    }finally{
+      setBusy(false);
+    }
+  }
+  async function oneTapLogin(u){
+    if(busy) return;
+    setErr(''); setBusy(true);
+    try{
+      const { token, user } = await backendLogin(u.email, '');
+      onLogin(user, token);
+    }catch(ex){
+      setErr((ex&&ex.message)||'Sign in failed. Please try again.');
+    }finally{
+      setBusy(false);
+    }
   }
   return (
     <div className="min-h-screen flex items-center justify-center p-4" style={{background:'linear-gradient(135deg,#06065c 0%,#0000ba 55%,#0000ff 100%)'}}>
@@ -10372,8 +10437,8 @@ function LoginPage({ onLogin, userAccounts }) {
               <input type="password" value={pw} onChange={e=>setPw(e.target.value)} required className={inputCls} style={{borderColor:'#c7d2fe'}}/>
             </div>
             {err&&<p className="text-xs bg-red-50 rounded-lg px-3 py-2" style={{color:'#ED0101'}}>{err}</p>}
-            <button type="submit" className="w-full text-white font-bold rounded-xl py-3 text-sm transition-all" style={{background:'#06065c',fontFamily:'Barlow Condensed,sans-serif',fontSize:'1rem',letterSpacing:'0.1em'}}>
-              SIGN IN →
+            <button type="submit" disabled={busy} className="w-full text-white font-bold rounded-xl py-3 text-sm transition-all disabled:opacity-60" style={{background:'#06065c',fontFamily:'Barlow Condensed,sans-serif',fontSize:'1rem',letterSpacing:'0.1em'}}>
+              {busy ? 'SIGNING IN…' : 'SIGN IN →'}
             </button>
           </form>
           <p className="text-center text-xs text-gray-400 mt-4">Applied Graphics and Visual Displays</p>
@@ -10386,8 +10451,8 @@ function LoginPage({ onLogin, userAccounts }) {
           </div>
           <div className="p-3 flex gap-2">
             {userAccounts.filter(u=>u.role==='factory').map(u=>(
-              <button key={u.email} type="button" onClick={()=>onLogin(u)}
-                className="flex-1 text-white font-bold rounded-xl py-2.5 text-xs transition-all hover:opacity-90"
+              <button key={u.email} type="button" disabled={busy} onClick={()=>oneTapLogin(u)}
+                className="flex-1 text-white font-bold rounded-xl py-2.5 text-xs transition-all hover:opacity-90 disabled:opacity-60"
                 style={{background:'rgba(255,255,255,0.12)',border:'1px solid rgba(255,255,255,0.25)'}}>
                 {u.name} →
               </button>
@@ -10412,8 +10477,49 @@ function LoginPage({ onLogin, userAccounts }) {
 ═══════════════════════════════════════════ */
 function UserRolesPage({ userAccounts, setUserAccounts }) {
   const [visiblePw, setVisiblePw] = useState({});
+  const [syncMsg, setSyncMsg] = useState({}); // { [id]: 'Saved ✓' | 'Sync failed — ...' }
+  // Debounce per-account so fast typing doesn't fire a request per keystroke —
+  // same 800ms debounce feel as the rest of the platform's autosave.
+  const syncTimers = useRef({});
+  // Authentication (2026-08-06, audit finding B1): editing a name/email/
+  // password here still updates `userAccounts` exactly as before — that
+  // remains the visible record of who has an account — but real login now
+  // checks the backend's own app_users table (see backend/src/routes/
+  // auth.ts), which this screen has no other way to reach. Without this
+  // call, changing a password here would silently stop having any effect on
+  // whether that password actually works.
+  function syncAccountToBackend(nextUser, field) {
+    const id = nextUser.id;
+    if (syncTimers.current[id]) clearTimeout(syncTimers.current[id]);
+    syncTimers.current[id] = setTimeout(async () => {
+      try {
+        const body = {
+          accountId: nextUser.id, email: nextUser.email, name: nextUser.name,
+          role: nextUser.role, co: nextUser.co,
+        };
+        if (field === 'pw' && nextUser.pw) body.password = nextUser.pw;
+        const res = await fetch(API_AUTH_SYNC_URL, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          body: JSON.stringify(body),
+        });
+        if (res.status === 401) { forceLogoutExpiredSession(); return; }
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        setSyncMsg(m => ({ ...m, [id]: 'Saved ✓' }));
+      } catch (e) {
+        setSyncMsg(m => ({ ...m, [id]: 'Sync failed — this change may not take effect for login. Try again.' }));
+      }
+      setTimeout(() => setSyncMsg(m => { const n = { ...m }; delete n[id]; return n; }), 3000);
+    }, 800);
+  }
   function updateField(id, field, value) {
-    setUserAccounts(prev => prev.map(u => u.id===id ? {...u, [field]: value} : u));
+    let nextUser = null;
+    setUserAccounts(prev => prev.map(u => {
+      if (u.id !== id) return u;
+      nextUser = { ...u, [field]: value };
+      return nextUser;
+    }));
+    if (nextUser) syncAccountToBackend(nextUser, field);
   }
   function roleLabel(u) {
     if (u.role==='admin')     return isHoldingsUser(u) ? 'Holdings Admin' : 'Admin';
@@ -10458,6 +10564,7 @@ function UserRolesPage({ userAccounts, setUserAccounts }) {
                 <input className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm bg-gray-50 text-gray-500" value={`${roleLabel(u)} — ${isHoldingsUser(u)?'Signacore Holdings':'Signacore'}`} disabled/>
               </div>
             </div>
+            {syncMsg[u.id]&&<p className={`text-xs mt-2 ${syncMsg[u.id].startsWith('Sync failed')?'text-red-500':'text-emerald-600'}`}>{syncMsg[u.id]}</p>}
           </div>
         ))}
       </div>
@@ -19148,6 +19255,10 @@ function App() {
     try{const s=localStorage.getItem('sgr_user');if(s){const u=JSON.parse(s);if(u&&u.role&&u.email)return u;}}catch(e){}
     return null;
   });
+  // Backend-issued JWT (audit finding B1) — read synchronously at mount so a
+  // returning user (page refresh, same browser) already has it available for
+  // the very first platform-state fetch below, exactly like `user` above.
+  const [token,        setToken]        = useState(()=>getAuthToken());
   const [page,         setPage]         = useState('dashboard');
   const [sidebarOpen,  setSidebarOpen]  = useState(false);
   const [entityFilter, setEntityFilter] = useState(null);
@@ -19259,7 +19370,8 @@ function App() {
 
   // Fetch latest state from the backend
   async function fetchFromServer() {
-    const res = await fetch(API_STATE_URL);
+    const res = await fetch(API_STATE_URL, { headers: { ...authHeaders() } });
+    if (res.status === 401) { forceLogoutExpiredSession(); throw new Error('Not logged in — please sign in again.'); }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const result = await res.json();
     return (result && Object.prototype.hasOwnProperty.call(result, 'data')) ? result.data : result;
@@ -19269,9 +19381,10 @@ function App() {
   async function saveToServer(payload) {
     const res = await fetch(API_STATE_URL, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ data: payload })
     });
+    if (res.status === 401) { forceLogoutExpiredSession(); throw new Error('Not logged in — please sign in again.'); }
     if (!res.ok) {
       // The backend now rejects saves that look like an accidental wipe
       // (empty/default/partial state, or a whole section/company vanishing)
@@ -19623,7 +19736,16 @@ function App() {
   }
 
   // 1) Initial load from backend
+  // Gated on `token` (audit finding B1): platform-state now requires a
+  // logged-in session, so there is nothing to load until handleLogin has run
+  // and set a token — attempting it earlier would just fail with 401.
+  // Re-runs whenever `token` changes: on first mount for a returning user
+  // whose token was already in localStorage (the common case — behaves
+  // exactly as before), and again right after a fresh login in a brand-new
+  // session, which previously only had `[]` deps and so never re-fetched
+  // after the user logged in without a page reload.
   useEffect(() => {
+    if (!token) { setApiMsg(''); return; }
     let cancelled = false;
     (async () => {
       try {
@@ -19704,7 +19826,7 @@ function App() {
     })();
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [token]);
 
   // 2) Poll every 30 s — apply server changes for sections this user hasn't locally modified
   //    This keeps admin and assistant in sync without requiring a page reload.
@@ -19798,8 +19920,21 @@ function App() {
     }, 800);
   }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, logoDataUrl, utLogoDataUrl, sigOTSmit]);
 
-  function handleLogin(u){ try{localStorage.setItem('sgr_user',JSON.stringify(u));}catch(e){} setUser(u); setPage('dashboard'); setEntityFilter(null); }
-  function handleLogout(){ try{localStorage.removeItem('sgr_user');}catch(e){} setUser(null); setPage('dashboard'); setEntityFilter(null); }
+  // `token` is the backend-issued JWT from POST /api/auth/login (audit
+  // finding B1) — stored the same way `user` already was, so a page refresh
+  // keeps both. Setting it (rather than just localStorage) triggers the
+  // token-gated initial-load effect below to (re)run.
+  function handleLogin(u,tok){ try{localStorage.setItem('sgr_user',JSON.stringify(u));}catch(e){} setAuthToken(tok); setToken(tok); setUser(u); setPage('dashboard'); setEntityFilter(null); }
+  function handleLogout(){ try{localStorage.removeItem('sgr_user');}catch(e){} setAuthToken(null); setToken(null); setUser(null); setPage('dashboard'); setEntityFilter(null); }
+  // Lets forceLogoutExpiredSession() (called from fetchFromServer/
+  // saveToServer/reserve* on a 401) end the session the same way a manual
+  // logout does, even though those helpers are plain functions defined
+  // outside this component and have no direct access to setUser/setToken.
+  useEffect(()=>{
+    window.__sgrOnAuthExpired = handleLogout;
+    return ()=>{ if(window.__sgrOnAuthExpired===handleLogout) window.__sgrOnAuthExpired=null; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
   function handleEntitySelect(coId){ setEntityFilter(coId); setPage('jobs'); }
 
   // ── Save file ──────────────────────────────────────────────
@@ -19952,7 +20087,13 @@ function App() {
     }
   }
 
-  if (!user) return <LoginPage onLogin={handleLogin} userAccounts={userAccounts}/>;
+  // Requires BOTH `user` and `token` (audit finding B1). A `user` with no
+  // `token` covers the one-time transition case: a browser session that was
+  // already logged in (via localStorage `sgr_user`) from before this change
+  // deployed never has a `sgr_token`, since that key didn't exist yet — sent
+  // back to LoginPage once, where a normal sign-in with the same credentials
+  // gets them a real token and they're straight back in.
+  if (!user || !token) return <LoginPage onLogin={handleLogin} userAccounts={userAccounts}/>;
 
   const assistantBlocked = []; // imports removed from nav; assets & hr open to all roles
   // Generalized fallback: if the current `page` isn't one this user's role
