@@ -3132,6 +3132,7 @@ const C_GREY   = [107, 114, 128];
 const C_LGREY  = [248, 249, 250];
 const C_MGREY  = [229, 231, 235];
 const C_WHITE  = [255, 255, 255];
+const C_ORANGE = [194,  65,  12];
 const C_GREEN  = [6,   95,  70];
 const C_LGREEN = [240, 253, 250];
 const C_BGREEN = [187, 247, 208];
@@ -3426,26 +3427,40 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   y += 28;
 
   // Quoted To / From boxes
-  const boxH = 28;
+  const boxH = 36;
   sf(C_LBLUE); sd([191,219,254]); doc.setLineWidth(0.2);
   doc.roundedRect(LM,y,82,boxH,2,2,'FD');
   doc.setFont('helvetica','bold'); doc.setFontSize(7); sc(C_BLUE);
   doc.text(isQuote?'QUOTED TO':'BILLED TO', LM+4, y+6);
   doc.setFont('helvetica','bold'); doc.setFontSize(10); sc(C_DARK);
-  doc.text(data.client||'', LM+4, y+13);
-  doc.setFont('helvetica','normal'); doc.setFontSize(8); sc(C_GREY);
-  if (data.contact) doc.text('Attn: '+data.contact, LM+4, y+19);
-  if (data.email)   doc.text(data.email, LM+4, y+24);
+  doc.text(data.client||'', LM+4, y+12.5);
+  doc.setFont('helvetica','normal'); doc.setFontSize(7.5); sc(C_GREY);
+  let qy = y+17.5;
+  if (data.address) {
+    const addrLines = doc.splitTextToSize(data.address, 74).slice(0,2);
+    addrLines.forEach(l=>{ doc.text(l, LM+4, qy); qy += 4; });
+  }
+  const attnBits = [];
+  if (data.contact) attnBits.push('Attn: '+data.contact);
+  if (data.email)   attnBits.push(data.email);
+  if (attnBits.length) {
+    doc.setFont('helvetica','normal'); doc.setFontSize(7.5); sc(C_GREY);
+    doc.text(attnBits.join('  ·  '), LM+4, qy); qy += 4;
+  }
+  if (data.reference) {
+    doc.setFont('helvetica','bold'); doc.setFontSize(8); sc(C_ORANGE);
+    doc.text('Ref: '+data.reference, LM+4, qy);
+  }
 
   sf([242,242,242]); sd(C_MGREY);
   doc.roundedRect(LM+88,y,82,boxH,2,2,'FD');
   doc.setFont('helvetica','bold'); doc.setFontSize(7); sc(C_GREY);
   doc.text('FROM', LM+92, y+6);
   doc.setFont('helvetica','bold'); doc.setFontSize(10); sc(C_DARK);
-  doc.text(co.short||co.name, LM+92, y+13);
+  doc.text(co.short||co.name, LM+92, y+12.5);
   doc.setFont('helvetica','normal'); doc.setFontSize(8); sc(C_GREY);
-  doc.text('21 Voortrekker St, Mossdustria, Mossel Bay', LM+92, y+19);
-  doc.text('orders@snsg.co.za  ·  040-940-5555', LM+92, y+24);
+  doc.text('21 Voortrekker St, Mossdustria, Mossel Bay', LM+92, y+18.5);
+  doc.text('orders@snsg.co.za  ·  040-940-5555', LM+92, y+23.5);
   y += boxH+8;
 
   // Line items header — 4 columns: Item No | Description (+sizes) | Qty | Total
