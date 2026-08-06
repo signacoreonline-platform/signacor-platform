@@ -4804,6 +4804,10 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   // for the same click, and disables the Save button while the atomic
   // reservation call to the backend is in flight.
   const [saving, setSaving] = useState(false);
+  // Confirmed-save-before-success (2026-08-06): shown when the awaited
+  // onSave(payload) below throws (backend save rejected/failed) — the form
+  // stays open with everything the user typed intact, exactly as required.
+  const [saveErr, setSaveErr] = useState('');
   const today = new Date().toISOString().slice(0,10);
   const validDef = new Date(Date.now()+14*24*3600*1000).toISOString().slice(0,10);
 
@@ -5067,7 +5071,27 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       };
     }
 
-    onSave(payload);
+    // Confirmed-save-before-success (2026-08-06): onSave (QuotesPage's
+    // handleSave) now awaits a confirmed backend save before returning —
+    // the form only closes / clears its draft once that's actually
+    // succeeded. If it throws (save rejected/failed — e.g. offline, or the
+    // backend's wipe-guard), the modal stays open exactly as it was, with
+    // the reserved quote number NOT reused on retry (a fresh submit reserves
+    // a new one, same as before this change — the number just goes unused,
+    // consistent with how a race-condition duplicate is already handled
+    // elsewhere in this file).
+    setSaving(true);
+    setSaveErr('');
+    try {
+      await onSave(payload);
+    } catch(saveError) {
+      setSaving(false);
+      setSaveErr(
+        (saveError && saveError.message) ? saveError.message : 'Save failed. Please check your connection and try again.'
+      );
+      return; // nothing local changed — form stays open, draft preserved
+    }
+    setSaving(false);
     try { localStorage.removeItem(_draftKey); } catch(e){}
     onClose();
   }
@@ -5541,9 +5565,10 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
           )}
         </div>
 
+        {saveErr&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2">{saveErr}</p>}
         <div className="flex gap-3 pt-1 pb-1">
           <button type="button" onClick={onClose} disabled={saving} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed">Cancel</button>
-          <button type="submit" disabled={saving} className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed">{saving?'Reserving number…':(eq?'💾 Save Changes':'💾 Save Quote')}</button>
+          <button type="submit" disabled={saving} className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed">{saving?'Saving…':(eq?'💾 Save Changes':'💾 Save Quote')}</button>
         </div>
       </form>
       {showCPPicker&&<ProductPickerModal
@@ -5575,7 +5600,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
    Invoice view. Before an invoice exists, quote.payments is still
    authoritative and persisted via onUpdate (platform_state), same as before.
 ═══════════════════════════════════════════ */
-function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setCreditNotes, linkedJob, linkedJobHasInvoice, linkedCustomer, onOpenJob, onOpenInvoice, onOpenCustomer, accInvoices, setAccInvoices, jobs, setJobs }) {
+function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose, creditNotes, setCreditNotes, linkedJob, linkedJobHasInvoice, linkedCustomer, onOpenJob, onOpenInvoice, onOpenCustomer, accInvoices, setAccInvoices, jobs, setJobs, forceSaveSections }) {
   // Resolved once per mount via the quote-specific chain-walking resolver
   // (quote's own invoice → linked job's invoice → linked job's own
   // job-created invoice → quote.payments) — matches exactly what
@@ -5617,81 +5642,127 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setC
   const depRate   = total<=5000 ? 1.0 : 0.80;
   const deposit   = total*depRate;
   const availableCredit = creditNoteAvailable(creditNotes, quote.client);
+  // Confirmed-save-before-success (2026-08-06): disables Add/Edit/Delete
+  // while a save is in flight (prevents double-submit/duplicate payments on
+  // a repeated click) and surfaces a failed save clearly instead of ever
+  // showing a payment as recorded when it wasn't.
+  const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState('');
 
   // Writes `updated` to whichever record resolveQuotePaymentSource() picked
   // — the linked invoice (accInvoices), the linked job (job.payments — a
-  // job-created invoice with no accInvoices record), or quote.payments.
-  // `patch` carries the status/paidAt-style fields appropriate to that
-  // record; only one setter ever runs per save, so a payment is never
-  // written to two places at once.
-  function persist(updated, patch){
-    setPayments(updated);
-    if(paySource.kind==='invoice'){
-      setAccInvoices(prev=>prev.map(i=>i.id===paySource.record.id?{...i,payments:updated,...(patch||{})}:i));
-    } else if(paySource.kind==='job'){
-      setJobs(prev=>prev.map(j=>j.id===paySource.record.id?{...j,payments:updated,...(patch||{})}:j));
-    } else {
-      onUpdate({...quote, payments:updated});
+  // job-created invoice with no accInvoices record), or quote.payments (via
+  // onUpdateConfirmed/saveQuotePayments in QuotesPage, which also mirrors
+  // handleUpdate's linked-job payment-sync cascade). `patch` carries the
+  // status/paidAt-style fields appropriate to that record; only one
+  // destination is ever written per save, so a payment is never written to
+  // two places at once. `creditDelta` (Credit-method payments only) is
+  // resolved to the next creditNotes array and saved in the SAME backend
+  // write as the payment change — never as a separate save — so credit-note
+  // usage and the payment it belongs to can never end up out of step if the
+  // save fails partway. Local state (payments/creditNotes) is only ever
+  // updated AFTER the backend confirms; throws (never silently no-ops) on
+  // failure so callers can show a clear error and leave the modal open.
+  async function persist(updated, patch, creditDelta){
+    setSaving(true); setSaveErr('');
+    try {
+      const nextCreditNotes = creditDelta
+        ? (creditDelta.type==='apply'
+            ? applyCreditNoteUsage(creditNotes, quote.client, creditDelta.amount)
+            : releaseCreditNoteUsage(creditNotes, quote.client, creditDelta.amount))
+        : null;
+      if(paySource.kind==='invoice'){
+        const nextAccInvoices = accInvoices.map(i=>i.id===paySource.record.id?{...i,payments:updated,...(patch||{})}:i);
+        const overrides = {accInvoices: nextAccInvoices};
+        if(nextCreditNotes) overrides.creditNotes = nextCreditNotes;
+        await forceSaveSections(overrides);
+        setAccInvoices(nextAccInvoices);
+        if(nextCreditNotes) setCreditNotes(nextCreditNotes);
+      } else if(paySource.kind==='job'){
+        const nextJobs = jobs.map(j=>j.id===paySource.record.id?{...j,payments:updated,...(patch||{})}:j);
+        const overrides = {jobs: nextJobs};
+        if(nextCreditNotes) overrides.creditNotes = nextCreditNotes;
+        await forceSaveSections(overrides);
+        setJobs(nextJobs);
+        if(nextCreditNotes) setCreditNotes(nextCreditNotes);
+      } else {
+        // 'quote' kind — onUpdateConfirmed (saveQuotePayments in QuotesPage)
+        // saves quotes (+ linked job cascade, if any) and creditNotes
+        // together in one call, and commits all of it itself on success.
+        await onUpdateConfirmed({...quote, payments:updated}, nextCreditNotes);
+      }
+      setPayments(updated);
+    } catch(e){
+      setSaveErr((e&&e.message) ? e.message : 'Save failed. Please check your connection and try again.');
+      throw e;
+    } finally {
+      setSaving(false);
     }
   }
-  function addPayment(){
+  async function addPayment(){
+    if(saving) return;
     if(!amount||parseFloat(amount)<=0){ alert('Enter a valid amount'); return; }
     const amt = parseFloat(amount);
+    let creditDelta = null;
     if(method==='Credit'){
       if(amt > availableCredit + 0.005){
         alert(`${quote.client} only has ${zr(availableCredit)} of available credit. Reduce the amount, issue another credit note first, or choose a different payment method.`);
         return;
       }
-      setCreditNotes(prev=>applyCreditNoteUsage(prev, quote.client, amt));
+      creditDelta = {type:'apply', amount:amt};
     }
     const updated = [...payments,{id:Date.now(),date,method,amount:amt,notes:notes.trim()}];
     const newTotal = updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+    let patch;
     if(paySource.kind==='invoice'){
       const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':paySource.record.status;
       const paidDate  = newTotal>=statusTotal?(paySource.record.paidDate||date||new Date().toISOString().slice(0,10)):(paySource.record.paidDate||null);
-      persist(updated, {status:newStatus, paidDate});
+      patch = {status:newStatus, paidDate};
     } else if(paySource.kind==='job'){
       const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':'pending';
       const paidAt    = newTotal>=statusTotal?(date||new Date().toISOString().slice(0,10)):paySource.record.paidAt||null;
-      persist(updated, {invoiceStatus:newStatus, paidAt});
-    } else {
-      persist(updated);
+      patch = {invoiceStatus:newStatus, paidAt};
     }
-    setAmount(''); setNotes('');
+    try {
+      await persist(updated, patch, creditDelta);
+      setAmount(''); setNotes('');
+    } catch(e){ /* saveErr already shown; amount/notes deliberately left as typed */ }
   }
-  function editPayment(pid){
+  async function editPayment(pid){
+    if(saving) return;
     const p = payments.find(x=>x.id===pid);
-    const patch = promptEditPayment(p);
-    if(!patch) return;
-    const updated = updatePaymentInSource(payments, pid, patch);
+    const patch0 = promptEditPayment(p);
+    if(!patch0) return;
+    const updated = updatePaymentInSource(payments, pid, patch0);
     const newTotal = updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+    let patch;
     if(paySource.kind==='invoice'){
       const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':paySource.record.status;
-      persist(updated, {status:newStatus, paidDate:newTotal>=statusTotal?paySource.record.paidDate:null});
+      patch = {status:newStatus, paidDate:newTotal>=statusTotal?paySource.record.paidDate:null};
     } else if(paySource.kind==='job'){
       const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':'pending';
-      persist(updated, {invoiceStatus:newStatus, paidAt:newTotal>=statusTotal?paySource.record.paidAt:null});
-    } else {
-      persist(updated);
+      patch = {invoiceStatus:newStatus, paidAt:newTotal>=statusTotal?paySource.record.paidAt:null};
     }
+    try { await persist(updated, patch, null); } catch(e){ /* saveErr already shown */ }
   }
-  function deletePayment(pid){
+  async function deletePayment(pid){
+    if(saving) return;
     if(!window.confirm('Delete this payment record?')) return;
     const removed = payments.find(p=>p.id===pid);
-    if(removed && removed.method==='Credit'){
-      setCreditNotes(prev=>releaseCreditNoteUsage(prev, quote.client, parseFloat(removed.amount)||0));
-    }
+    const creditDelta = (removed && removed.method==='Credit')
+      ? {type:'release', amount:parseFloat(removed.amount)||0}
+      : null;
     const updated = deletePaymentFromSource(payments, pid);
     const newTotal = updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+    let patch;
     if(paySource.kind==='invoice'){
       const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':'sent';
-      persist(updated, {status:newStatus, paidDate:newTotal>=statusTotal?paySource.record.paidDate:null});
+      patch = {status:newStatus, paidDate:newTotal>=statusTotal?paySource.record.paidDate:null};
     } else if(paySource.kind==='job'){
       const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':'pending';
-      persist(updated, {invoiceStatus:newStatus, paidAt:newTotal>=statusTotal?paySource.record.paidAt:null});
-    } else {
-      persist(updated);
+      patch = {invoiceStatus:newStatus, paidAt:newTotal>=statusTotal?paySource.record.paidAt:null};
     }
+    try { await persist(updated, patch, creditDelta); } catch(e){ /* saveErr already shown */ }
   }
 
   return (
@@ -5766,8 +5837,8 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setC
                         <td className="px-3 py-2 text-gray-400">{p.notes||'—'}</td>
                         <td className="px-1 text-center">
                           <span className="flex gap-1 justify-center">
-                            <button onClick={()=>editPayment(p.id)} className="text-blue-300 hover:text-blue-600 text-xs px-1">✏️</button>
-                            <button onClick={()=>deletePayment(p.id)} className="text-gray-300 hover:text-red-400 text-sm">✕</button>
+                            <button onClick={()=>editPayment(p.id)} disabled={saving} className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
+                            <button onClick={()=>deletePayment(p.id)} disabled={saving} className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
                           </span>
                         </td>
                       </tr>
@@ -5777,6 +5848,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setC
               </div>
             )}
           </div>
+          {saveErr&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2">{saveErr}</p>}
           {/* Record form */}
           <div className="border border-dashed border-green-300 rounded-xl p-4 bg-green-50/40">
             <p className="text-xs font-black text-green-700 uppercase tracking-widest mb-3">Record New Payment</p>
@@ -5789,7 +5861,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setC
               <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes (optional)</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="Deposit, partial payment, etc."/></div>
             </div>
             {method==='Credit'&&<p className="text-xs text-emerald-600 mt-2">This will draw down {quote.client}'s available credit instead of taking a cash payment.</p>}
-            <button onClick={addPayment} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#059669'}}>＋ Record Payment</button>
+            <button onClick={addPayment} disabled={saving} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm disabled:opacity-50 disabled:cursor-not-allowed" style={{background:'#059669'}}>{saving?'Saving…':'＋ Record Payment'}</button>
           </div>
           <div className="flex justify-end pt-1">
             <button onClick={onClose} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-4 py-2 font-semibold hover:bg-gray-50">Close</button>
@@ -5800,7 +5872,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onClose, creditNotes, setC
   );
 }
 
-function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, logoDataUrl, onEdit, jobs, setJobs, creditNotes, setCreditNotes, isAdmin, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob, customers, onOpenCustomer, accInvoices, setAccInvoices, onCreateInvoiceFromQuote, onOpenQuoteInvoice }) {
+function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvertToJob, companies, logoDataUrl, onEdit, jobs, setJobs, creditNotes, setCreditNotes, isAdmin, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob, customers, onOpenCustomer, accInvoices, setAccInvoices, onCreateInvoiceFromQuote, onOpenQuoteInvoice, forceSaveSections }) {
   const [showEmailFlow, setShowEmailFlow] = useState(false);
   const [showProformaEmail, setShowProformaEmail] = useState(false);
   const [showPayments, setShowPayments] = useState(false);
@@ -6225,13 +6297,14 @@ function QuoteViewModal({ quote, onClose, onUpdate, onConvertToJob, companies, l
       )}
       {showPayments&&(
         <QuotePaymentsModal
-          quote={quote} total={total} onUpdate={onUpdate}
+          quote={quote} total={total} onUpdate={onUpdate} onUpdateConfirmed={onUpdateConfirmed}
           onClose={()=>setShowPayments(false)}
           creditNotes={creditNotes} setCreditNotes={setCreditNotes}
           linkedJob={linkedJob} linkedJobHasInvoice={linkedJobHasInvoice} linkedCustomer={linkedCustomer}
           onOpenJob={onOpenJob} onOpenInvoice={onOpenInvoice} onOpenCustomer={onOpenCustomer}
           accInvoices={accInvoices} setAccInvoices={setAccInvoices}
           jobs={jobs} setJobs={setJobs}
+          forceSaveSections={forceSaveSections}
         />
       )}
     </Modal>
@@ -6681,12 +6754,27 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     reader.readAsDataURL(file);
   }
 
-  function handleSave(q){
+  // Confirmed-save-before-success (2026-08-06): async now — awaits a
+  // confirmed backend save of ONLY the affected section(s) (via
+  // forceSaveSections) BEFORE touching any local React state, so a quote
+  // create/edit can never appear to succeed and then vanish on refresh/tab
+  // close/network failure. Throws if the save is rejected; callers
+  // (CreateQuoteModal.submit) must treat a thrown error as "nothing was
+  // saved" and keep their form open — mirrors the pattern already used by
+  // handleConvertToJob. The actual computation below (stale-save guard,
+  // quote→job cascade) is byte-for-byte the same as before, just evaluated
+  // directly against the current `quotes`/`jobs` props instead of inside a
+  // setQuotes(prev=>...)/setJobs(prev=>...) updater — safe because a single
+  // click handler runs synchronously start-to-finish, so `quotes`/`jobs`
+  // here are exactly what `prev` would have been.
+  async function handleSave(q){
     // If editing an existing quote, update it; otherwise prepend as new
     const isEdit = !!(quotes||[]).find(x=>x.id===q.id);
-    setQuotes(prev=>{
-      const live = prev.find(x=>x.id===q.id);
-      if(!live) return [q,...prev];
+    const live = (quotes||[]).find(x=>x.id===q.id);
+    let nextQuotes;
+    if(!live){
+      nextQuotes = [q,...quotes];
+    } else if(live.status==='converted' && live.convertedJobId && (q.status!=='converted' || !q.convertedJobId)){
       // Stale-save guard (2026-08-04): the quote form's `q` can be built
       // from a copy of the quote captured before "Convert to Job" ran
       // elsewhere (e.g. the form was left open in another tab/window). If
@@ -6694,17 +6782,19 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // convertedJobId) but this save's payload doesn't reflect that, never
       // let it silently revert the conversion — only the fields this form
       // actually edits (client/contact/lines/etc.) should ever change here.
-      if(live.status==='converted' && live.convertedJobId && (q.status!=='converted' || !q.convertedJobId)){
-        return prev.map(x=>x.id===q.id?{...q, status:live.status, convertedJobId:live.convertedJobId}:x);
-      }
-      return prev.map(x=>x.id===q.id?q:x);
-    });
+      nextQuotes = quotes.map(x=>x.id===q.id?{...q, status:live.status, convertedJobId:live.convertedJobId}:x);
+    } else {
+      nextQuotes = quotes.map(x=>x.id===q.id?q:x);
+    }
+
     // ── Pull quote changes through to any linked (converted) job's invoice ──
     // The proforma is generated live from the quote so it already reflects edits;
     // the job's invoice copies the quote at conversion, so sync it here too.
+    let nextJobs = jobs, jobsChanged = false;
     if(isEdit){
-      setJobs(prev=>prev.map(j=>{
+      const mapped = jobs.map(j=>{
         if(j.quoteNum!==q.num) return j;
+        jobsChanged = true;
         const _sub      = (q.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
         const _discPct  = parseFloat(q.discount)||0;
         const _setupFee = parseFloat(q.setupFee)||0;
@@ -6717,8 +6807,16 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           tel: q.tel||'', address: q.address||'', vatNum: q.vatNum||'',
           notes: q.notes||j.notes||'',
         };
-      }));
+      });
+      if(jobsChanged) nextJobs = mapped;
     }
+
+    const overrides = {quotes: nextQuotes};
+    if(jobsChanged) overrides.jobs = nextJobs;
+    await forceSaveSections(overrides); // throws on failure — nothing below runs
+
+    setQuotes(nextQuotes);
+    if(jobsChanged) setJobs(nextJobs);
     setEditQuote(null);
   }
   function handleUpdate(updated){
@@ -6743,6 +6841,42 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           ...(bumpDeposit ? {stage:5, status:'deposit_received'} : {})};
       }));
     }
+    setViewQuote(updated);
+  }
+  // Confirmed-save-before-success (2026-08-06), used ONLY by
+  // QuotePaymentsModal for its 'quote' payment-source case (no invoice/job
+  // exists yet for this quote — see resolveQuotePaymentSource). Mirrors
+  // handleUpdate's linked-job payment-sync cascade above exactly (same
+  // reconcileJobInvoice call, same bumpDeposit rule) — kept as its own
+  // function rather than reusing handleUpdate so that handleUpdate's OTHER
+  // callers (mark sent, approve, decline, etc.) are completely unaffected by
+  // this change; only payment recording is being hardened in this pass.
+  // `creditNotesOverride`, when provided, is committed in the SAME
+  // forceSaveSections call as the quote/job change — so a Credit-method
+  // payment's credit-note usage can never be saved out of step with the
+  // payment itself (see QuotePaymentsModal.persist).
+  async function saveQuotePayments(updated, creditNotesOverride){
+    const nextQuotes = quotes.map(q=>q.id===updated.id?updated:q);
+    let nextJobs = jobs, jobsChanged = false;
+    if(updated && updated.num){
+      const mapped = jobs.map(j=>{
+        if(j.quoteNum!==updated.num) return j;
+        jobsChanged = true;
+        const rec = reconcileJobInvoice(j, [updated]);
+        const bumpDeposit = rec.totalPaid>0 && (parseFloat(j.stage)||0)<5;
+        return {...j, payments:rec.payments, invoiceStatus:rec.invoiceStatus,
+          ...(bumpDeposit ? {stage:5, status:'deposit_received'} : {})};
+      });
+      if(jobsChanged) nextJobs = mapped;
+    }
+    const overrides = {quotes: nextQuotes};
+    if(jobsChanged) overrides.jobs = nextJobs;
+    if(creditNotesOverride) overrides.creditNotes = creditNotesOverride;
+    await forceSaveSections(overrides); // throws on failure — nothing below runs
+
+    setQuotes(nextQuotes);
+    if(jobsChanged) setJobs(nextJobs);
+    if(creditNotesOverride) setCreditNotes(creditNotesOverride);
     setViewQuote(updated);
   }
   function handleEditQuote(q){ setViewQuote(null); setEditQuote(q); }
@@ -7021,11 +7155,19 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // Job already carries an invoice number (e.g. a historical job invoiced
     // before this fix) — just flip the invoice flags, no new number needed.
     if(job.invoiceNum){
-      setJobs(prev=>{
-        const cur = prev.find(j=>j.id===job.id);
-        if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
-        return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
-      });
+      const cur = jobs.find(j=>j.id===job.id);
+      if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return;
+      const nextJobs = jobs.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
+      // Confirmed-save-before-success (2026-08-06): wait for the backend to
+      // actually accept this before flipping local state / showing the
+      // "Invoice created" success screen — see forceSaveSections above.
+      try {
+        await forceSaveSections({ jobs: nextJobs });
+      } catch(saveErr){
+        alert('Invoice could NOT be created.\n\nThe save was not confirmed by the server, so nothing was changed.\n\nReason: '+(saveErr&&saveErr.message?saveErr.message:'unknown error')+'\n\nPlease check your connection and try again.');
+        return;
+      }
+      setJobs(nextJobs);
       setInvoiceCreatedInfo({ job, invoiceNum: job.invoiceNum });
       return;
     }
@@ -7037,18 +7179,28 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
       return;
     }
-    setJobs(prev=>{
-      const cur = prev.find(j=>j.id===job.id);
-      // Recheck: the job may have become invoiced by another action while
-      // we were waiting on the network. If so, leave it untouched — the
-      // reserved number simply goes unused (acceptable, per project rules).
-      if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
-      // invoiceDate is set to the actual moment of invoice creation here —
-      // never preserved from an earlier value pre-seeded at quote→job
-      // conversion time (that used to make the invoice date silently equal
-      // the job-creation date instead of the real invoice-creation date).
-      return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:today, invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
-    });
+    // Recheck: the job may have become invoiced by another action while we
+    // were waiting on the network. If so, leave it untouched — the reserved
+    // number simply goes unused (acceptable, per project rules).
+    const cur = jobs.find(j=>j.id===job.id);
+    if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return;
+    // invoiceDate is set to the actual moment of invoice creation here —
+    // never preserved from an earlier value pre-seeded at quote→job
+    // conversion time (that used to make the invoice date silently equal
+    // the job-creation date instead of the real invoice-creation date).
+    const nextJobs = jobs.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:today, invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
+    // Confirmed-save-before-success (2026-08-06): save FIRST — only touch
+    // local state / show "created" once the backend has actually confirmed
+    // this write, same as handleConvertToJob. If this fails, the reserved
+    // invoice number goes unused (never reused/retried automatically) and
+    // the job is NOT marked invoiced — a retry reserves a fresh number.
+    try {
+      await forceSaveSections({ jobs: nextJobs });
+    } catch(saveErr){
+      alert('Invoice could NOT be created.\n\nThe invoice number '+reserved+' was reserved but the save was not confirmed by the server, so nothing was changed — the job was not marked as invoiced.\n\nReason: '+(saveErr&&saveErr.message?saveErr.message:'unknown error')+'\n\nPlease check your connection and try again.');
+      return;
+    }
+    setJobs(nextJobs);
     setInvoiceCreatedInfo({ job, invoiceNum: reserved });
   }
 
@@ -7122,7 +7274,20 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       quoteId: quote.id, quoteNum: quote.num,
       status, lineItems, payments: carriedPayments,
     };
-    setAccInvoices(prev => [newInvoice, ...prev]);
+    const nextAccInvoices = [newInvoice, ...accInvoices];
+    // Confirmed-save-before-success (2026-08-06): save FIRST — only touch
+    // local state / show "created" once the backend has actually confirmed
+    // this write, same pattern as handleConvertToJob. If this fails, the
+    // reserved invoice number goes unused (never reused/retried
+    // automatically, matching the race-condition handling above) and no
+    // invoice record is created — a retry reserves a fresh number.
+    try {
+      await forceSaveSections({ accInvoices: nextAccInvoices });
+    } catch(saveErr){
+      alert('Invoice could NOT be created.\n\nThe invoice number '+reserved+' was reserved but the save was not confirmed by the server, so nothing was changed — no invoice exists for this quote.\n\nReason: '+(saveErr&&saveErr.message?saveErr.message:'unknown error')+'\n\nPlease check your connection and try again.');
+      return;
+    }
+    setAccInvoices(nextAccInvoices);
     setViewQuote(null);
     setQuoteInvoiceCreatedInfo({ quote, invoiceNum: reserved, invoiceId: newInvoice.id });
   }
@@ -7149,83 +7314,120 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const [method, setMethod] = useState('EFT');
     const [amount, setAmount] = useState('');
     const [notes,  setNotes]  = useState('');
+    const [saving, setSaving] = useState(false);
+    const [saveErr, setSaveErr] = useState('');
     const availableCredit = creditNoteAvailable(creditNotes, job.client);
     const zr = n => 'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
 
-    // Writes `updated` to whichever record resolvePaymentSource() picked.
+    // Writes `updated` to whichever record resolvePaymentSource() picked —
+    // now gated on a CONFIRMED backend save before any local state changes.
     // `jobPatch` (invoiceStatus/paidAt/stage-bump) only ever applies to the
     // job record; `invoicePatch` (status/paidDate) only ever applies to the
-    // linked accInvoices record — only one of the two setters below ever
-    // runs per save.
-    function persist(updated, jobPatch, invoicePatch){
-      setPayments(updated);
-      if(paySource.kind==='invoice'){
-        setAccInvoices(prev=>prev.map(i=>i.id===paySource.record.id?{...i,payments:updated,...(invoicePatch||{})}:i));
-      } else {
-        const saved={...job, payments:updated, ...(jobPatch||{})};
-        setJobs(prev=>prev.map(j=>j.id===saved.id?saved:j));
-        setJobPayModal(saved);
+    // linked accInvoices record — only one of the two ever applies per save.
+    // `creditNotesOverride`, when provided, is the already-computed next
+    // creditNotes array for a Credit-method payment change — it is saved in
+    // the SAME forceSaveSections call as the payment so the two can never
+    // drift apart (audit requirement E).
+    async function persist(updated, jobPatch, invoicePatch, creditNotesOverride){
+      setSaveErr('');
+      setSaving(true);
+      try {
+        if(paySource.kind==='invoice'){
+          const nextAccInvoices = accInvoices.map(i=>i.id===paySource.record.id?{...i,payments:updated,...(invoicePatch||{})}:i);
+          const overrides = { accInvoices: nextAccInvoices };
+          if(creditNotesOverride) overrides.creditNotes = creditNotesOverride;
+          await forceSaveSections(overrides);
+          setPayments(updated);
+          setAccInvoices(nextAccInvoices);
+          if(creditNotesOverride) setCreditNotes(creditNotesOverride);
+        } else {
+          const saved={...job, payments:updated, ...(jobPatch||{})};
+          const nextJobs = jobs.map(j=>j.id===saved.id?saved:j);
+          const overrides = { jobs: nextJobs };
+          if(creditNotesOverride) overrides.creditNotes = creditNotesOverride;
+          await forceSaveSections(overrides);
+          setPayments(updated);
+          setJobs(nextJobs);
+          if(creditNotesOverride) setCreditNotes(creditNotesOverride);
+          setJobPayModal(saved);
+        }
+      } catch(err) {
+        setSaveErr((err && err.message) ? err.message : 'Save failed. Please check your connection and try again.');
+        throw err;
+      } finally {
+        setSaving(false);
       }
     }
-    function addPayment() {
+    async function addPayment() {
+      if(saving) return;
       if(!amount||parseFloat(amount)<=0){alert('Enter a valid amount');return;}
       const amt = parseFloat(amount);
+      let creditNotesOverride = null;
       if(method==='Credit'){
         if(amt > availableCredit + 0.005){
           alert(`${job.client} only has ${zr(availableCredit)} of available credit. Reduce the amount, issue another credit note first, or choose a different payment method.`);
           return;
         }
-        setCreditNotes(prev=>applyCreditNoteUsage(prev, job.client, amt));
+        creditNotesOverride = applyCreditNoteUsage(creditNotes, job.client, amt);
       }
       const newP={id:Date.now(),date,method,amount:amt,notes:notes.trim()};
       const updated=[...payments,newP];
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-      if(paySource.kind==='invoice'){
-        const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':paySource.record.status;
-        const paidDate=newTotal>=invTotal?(paySource.record.paidDate||date||new Date().toISOString().slice(0,10)):(paySource.record.paidDate||null);
-        persist(updated, null, {status:newStatus, paidDate});
-      } else {
-        const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
-        const paidAt=newTotal>=invTotal?(date||new Date().toISOString().slice(0,10)):job.paidAt||null;
-        // A recorded deposit / payment auto-advances the lifecycle to Deposit
-        // Received (stage 5) the first time money comes in, never regressing a job
-        // that is already further along.
-        const bumpDeposit = newTotal>0 && (parseFloat(job.stage)||0)<5;
-        persist(updated, {invoiceStatus:newStatus, paidAt, ...(bumpDeposit ? {stage:5, status:'deposit_received'} : {})});
-      }
+      try {
+        if(paySource.kind==='invoice'){
+          const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':paySource.record.status;
+          const paidDate=newTotal>=invTotal?(paySource.record.paidDate||date||new Date().toISOString().slice(0,10)):(paySource.record.paidDate||null);
+          await persist(updated, null, {status:newStatus, paidDate}, creditNotesOverride);
+        } else {
+          const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
+          const paidAt=newTotal>=invTotal?(date||new Date().toISOString().slice(0,10)):job.paidAt||null;
+          // A recorded deposit / payment auto-advances the lifecycle to Deposit
+          // Received (stage 5) the first time money comes in, never regressing a job
+          // that is already further along.
+          const bumpDeposit = newTotal>0 && (parseFloat(job.stage)||0)<5;
+          await persist(updated, {invoiceStatus:newStatus, paidAt, ...(bumpDeposit ? {stage:5, status:'deposit_received'} : {})}, null, creditNotesOverride);
+        }
+      } catch(e) { return; }
       setAmount(''); setNotes('');
     }
-    function deletePayment(pid) {
+    async function deletePayment(pid) {
+      if(saving) return;
       if(!isAdmin){alert('Only admins can delete payments.');return;}
       if(!window.confirm('Delete this payment record? This may change the invoice status.'))return;
       const removed = payments.find(p=>p.id===pid);
+      let creditNotesOverride = null;
       if(removed && removed.method==='Credit'){
-        setCreditNotes(prev=>releaseCreditNoteUsage(prev, job.client, parseFloat(removed.amount)||0));
+        creditNotesOverride = releaseCreditNoteUsage(creditNotes, job.client, parseFloat(removed.amount)||0);
       }
       const updated=deletePaymentFromSource(payments, pid);
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-      if(paySource.kind==='invoice'){
-        const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'sent';
-        persist(updated, null, {status:newStatus, paidDate:newTotal>=invTotal?paySource.record.paidDate:null});
-      } else {
-        const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
-        persist(updated, {invoiceStatus:newStatus, paidAt:newTotal>=invTotal?job.paidAt:null});
-      }
+      try {
+        if(paySource.kind==='invoice'){
+          const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'sent';
+          await persist(updated, null, {status:newStatus, paidDate:newTotal>=invTotal?paySource.record.paidDate:null}, creditNotesOverride);
+        } else {
+          const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
+          await persist(updated, {invoiceStatus:newStatus, paidAt:newTotal>=invTotal?job.paidAt:null}, null, creditNotesOverride);
+        }
+      } catch(e) {}
     }
-    function editPayment(pid) {
+    async function editPayment(pid) {
+      if(saving) return;
       if(!isAdmin){alert('Only admins can edit payments.');return;}
       const p=payments.find(x=>x.id===pid);
       const patch = promptEditPayment(p);
       if(!patch) return;
       const updated = updatePaymentInSource(payments, pid, patch);
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-      if(paySource.kind==='invoice'){
-        const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':paySource.record.status;
-        persist(updated, null, {status:newStatus, paidDate:newTotal>=invTotal?paySource.record.paidDate:null});
-      } else {
-        const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
-        persist(updated, {invoiceStatus:newStatus, paidAt:newTotal>=invTotal?job.paidAt:null});
-      }
+      try {
+        if(paySource.kind==='invoice'){
+          const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':paySource.record.status;
+          await persist(updated, null, {status:newStatus, paidDate:newTotal>=invTotal?paySource.record.paidDate:null});
+        } else {
+          const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
+          await persist(updated, {invoiceStatus:newStatus, paidAt:newTotal>=invTotal?job.paidAt:null});
+        }
+      } catch(e) {}
     }
     const iCls="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
     // ── Linked-record quick access (read-only; reuses Phase 1's findLinkedRecords) ──
@@ -7319,8 +7521,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                           <td className="px-1 text-center">
                             {isAdmin?(
                               <span className="flex gap-1 justify-center">
-                                <button onClick={()=>editPayment(p.id)} className="text-blue-300 hover:text-blue-600 text-xs px-1">✏️</button>
-                                <button onClick={()=>deletePayment(p.id)} className="text-gray-300 hover:text-red-400 text-sm">✕</button>
+                                <button onClick={()=>editPayment(p.id)} disabled={saving} className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
+                                <button onClick={()=>deletePayment(p.id)} disabled={saving} className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
                               </span>
                             ):<span className="text-gray-200 text-xs">🔒</span>}
                           </td>
@@ -7341,6 +7543,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
             {/* Record payment form */}
             <div className="border border-dashed border-green-300 rounded-xl p-4 bg-green-50/40">
               <p className="text-xs font-black text-green-700 uppercase tracking-widest mb-3">Record New Payment</p>
+              {saveErr&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2 mb-3">{saveErr}</p>}
               <div className="grid grid-cols-2 gap-3">
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
@@ -7352,7 +7555,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes (optional)</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="Reference, partial payment, etc."/></div>
               </div>
               {method==='Credit'&&<p className="text-xs text-emerald-600 mt-2">This will draw down {job.client}'s available credit instead of taking a cash payment.</p>}
-              <button onClick={addPayment} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#059669'}}>＋ Record Payment</button>
+              <button onClick={addPayment} disabled={saving} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm disabled:opacity-50 disabled:cursor-not-allowed" style={{background:'#059669'}}>{saving?'Saving…':'＋ Record Payment'}</button>
             </div>
             {!isAdmin&&<p className="text-xs text-gray-400 text-center">🔒 Only admins can edit or delete payment records.</p>}
             <div className="flex justify-end pt-1">
@@ -7861,7 +8064,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       />}
       {/* ── Copy Quote modal (new quote pre-filled from source) ── */}
       {copyQuote&&<CreateQuoteModal
-        onClose={()=>setCopyQuote(null)} onSave={q=>{ handleSave(q); setCopyQuote(null); }}
+        onClose={()=>setCopyQuote(null)} onSave={async q=>{ await handleSave(q); setCopyQuote(null); }}
         inventory={inventory} setInventory={setInventory} companies={creatableCompanies(companies,user)}
         nextNum={getNextQuoteNum(quotes)} preparedBy={user.name}
         customers={customers||[]} setCustomers={setCustomers}
@@ -7875,6 +8078,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       {viewQuote&&<QuoteViewModal
         quote={viewQuote} onClose={()=>setViewQuote(null)}
         onUpdate={q=>{ handleUpdate(q); setViewQuote(q); }}
+        onUpdateConfirmed={saveQuotePayments}
+        forceSaveSections={forceSaveSections}
         onConvertToJob={handleConvertToJob}
         companies={companies} logoDataUrl={logoDataUrl}
         onEdit={handleEditQuote}
@@ -16448,7 +16653,7 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 /* ═══════════════════════════════════════════
    ACCOUNTING PAGE
 ═══════════════════════════════════════════ */
-function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices:accInvoicesAll, setAccInvoices, accBills:accBillsAll, setAccBills, creditNotes:creditNotesAll, setCreditNotes, suppliers, customers, companies, logoDataUrl, user, onOpenJob, onOpenQuote, onOpenCustomer, onOpenJobPayments, initialStatementContact, onInitialStatementHandled }) {
+function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices:accInvoicesAll, setAccInvoices, accBills:accBillsAll, setAccBills, creditNotes:creditNotesAll, setCreditNotes, suppliers, customers, companies, logoDataUrl, user, onOpenJob, onOpenQuote, onOpenCustomer, onOpenJobPayments, initialStatementContact, onInitialStatementHandled, forceSaveSections }) {
   // Company-context filter for DISPLAY, applied by shadowing the prop names
   // — every plain read of jobs/bankTxns/accInvoices/accBills/creditNotes
   // below this line is already company-scoped throughout this component.
@@ -17654,50 +17859,79 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     const [method, setMethod] = useState('EFT');
     const [amount, setAmount] = useState('');
     const [notes,  setNotes]  = useState('');
+    const [saving, setSaving] = useState(false);
+    const [saveErr, setSaveErr] = useState('');
     const availableCredit = creditNoteAvailable(creditNotes, inv.contactName);
 
     // This IS the single source of truth for a manual/quote-created invoice
     // — no resolution needed here, always accInvoices. Kept as its own
-    // `persist` so add/delete/edit share one place that writes it.
-    function persist(updated, patch){
-      const saved={...inv, payments:updated, ...(patch||{})};
-      setAccInvoices(prev=>prev.find(i=>i.id===saved.id)?prev.map(i=>i.id===saved.id?saved:i):[saved,...prev]);
-      setPayments(updated);
-      setPayModalInv(saved);
+    // `persist` so add/delete/edit share one place that writes it — now
+    // gated on a CONFIRMED backend save before any local state changes.
+    // `creditNotesOverride`, when provided, is the already-computed next
+    // creditNotes array for a Credit-method payment change, saved in the
+    // SAME forceSaveSections call as the payment (audit requirement E).
+    async function persist(updated, patch, creditNotesOverride){
+      setSaveErr('');
+      setSaving(true);
+      try {
+        const saved={...inv, payments:updated, ...(patch||{})};
+        const nextAccInvoices = accInvoices.find(i=>i.id===saved.id) ? accInvoices.map(i=>i.id===saved.id?saved:i) : [saved,...accInvoices];
+        const overrides = { accInvoices: nextAccInvoices };
+        if(creditNotesOverride) overrides.creditNotes = creditNotesOverride;
+        await forceSaveSections(overrides);
+        setAccInvoices(nextAccInvoices);
+        setPayments(updated);
+        if(creditNotesOverride) setCreditNotes(creditNotesOverride);
+        setPayModalInv(saved);
+      } catch(err) {
+        setSaveErr((err && err.message) ? err.message : 'Save failed. Please check your connection and try again.');
+        throw err;
+      } finally {
+        setSaving(false);
+      }
     }
-    function addPayment() {
+    async function addPayment() {
+      if(saving) return;
       if(!amount||parseFloat(amount)<=0){alert('Enter a valid amount');return;}
       const amt = parseFloat(amount);
+      let creditNotesOverride = null;
       if(method==='Credit'){
         if(amt > availableCredit + 0.005){
           alert(`${inv.contactName} only has ${fmtAmt(availableCredit)} of available credit. Reduce the amount, issue another credit note first, or choose a different payment method.`);
           return;
         }
-        setCreditNotes(prev=>applyCreditNoteUsage(prev, inv.contactName, amt));
+        creditNotesOverride = applyCreditNoteUsage(creditNotes, inv.contactName, amt);
       }
       const newP={id:Date.now(),date,method,amount:amt,notes:notes.trim()};
       const updated=[...payments,newP];
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':inv.status;
       const paidDate=newTotal>=invTotal?(date||new Date().toISOString().slice(0,10)):inv.paidDate||null;
-      persist(updated, {status:newStatus, paidDate});
+      try {
+        await persist(updated, {status:newStatus, paidDate}, creditNotesOverride);
+      } catch(e) { return; }
       setAmount(''); setNotes('');
     }
 
-    function deletePayment(pid) {
+    async function deletePayment(pid) {
+      if(saving) return;
       if(!isAdmin){alert('Only admins can delete payments.');return;}
       if(!window.confirm('Delete this payment? This may change the invoice status.'))return;
       const removed = payments.find(p=>p.id===pid);
+      let creditNotesOverride = null;
       if(removed && removed.method==='Credit'){
-        setCreditNotes(prev=>releaseCreditNoteUsage(prev, inv.contactName, parseFloat(removed.amount)||0));
+        creditNotesOverride = releaseCreditNoteUsage(creditNotes, inv.contactName, parseFloat(removed.amount)||0);
       }
       const updated=deletePaymentFromSource(payments, pid);
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'sent';
-      persist(updated, {status:newStatus, paidDate:newTotal>=invTotal?inv.paidDate:null});
+      try {
+        await persist(updated, {status:newStatus, paidDate:newTotal>=invTotal?inv.paidDate:null}, creditNotesOverride);
+      } catch(e) {}
     }
 
-    function editPayment(pid) {
+    async function editPayment(pid) {
+      if(saving) return;
       if(!isAdmin){alert('Only admins can edit payments.');return;}
       const p = payments.find(x=>x.id===pid);
       const patch = promptEditPayment(p);
@@ -17705,7 +17939,9 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
       const updated = updatePaymentInSource(payments, pid, patch);
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':inv.status;
-      persist(updated, {status:newStatus, paidDate:newTotal>=invTotal?inv.paidDate:null});
+      try {
+        await persist(updated, {status:newStatus, paidDate:newTotal>=invTotal?inv.paidDate:null});
+      } catch(e) {}
     }
 
     const iCls="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
@@ -17793,8 +18029,8 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                           <td className="px-1 text-center">
                             {isAdmin
                               ? <span className="flex gap-1 justify-center">
-                                  <button onClick={()=>editPayment(p.id)} className="text-blue-300 hover:text-blue-600 text-xs px-1">✏️</button>
-                                  <button onClick={()=>deletePayment(p.id)} className="text-gray-300 hover:text-red-400 text-sm">✕</button>
+                                  <button onClick={()=>editPayment(p.id)} disabled={saving} className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
+                                  <button onClick={()=>deletePayment(p.id)} disabled={saving} className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
                                 </span>
                               : <span className="text-gray-200 text-xs">🔒</span>}
                           </td>
@@ -17816,6 +18052,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
             {/* Record payment form */}
             <div className="border border-dashed border-green-300 rounded-xl p-4 bg-green-50/40">
               <p className="text-xs font-black text-green-700 uppercase tracking-widest mb-3">Record New Payment</p>
+              {saveErr&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2 mb-3">{saveErr}</p>}
               <div className="grid grid-cols-2 gap-3">
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
@@ -17827,7 +18064,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                 <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes (optional)</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="Reference, partial, etc."/></div>
               </div>
               {method==='Credit'&&<p className="text-xs text-emerald-600 mt-2">This will draw down {inv.contactName}'s available credit instead of taking a cash payment.</p>}
-              <button onClick={addPayment} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#059669'}}>＋ Record Payment</button>
+              <button onClick={addPayment} disabled={saving} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm disabled:opacity-50 disabled:cursor-not-allowed" style={{background:'#059669'}}>{saving?'Saving…':'＋ Record Payment'}</button>
             </div>
 
             <div className="flex justify-end pt-1">
@@ -20206,7 +20443,7 @@ function App() {
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
     reports:     <ReportsPage     jobs={jobs} companies={companies} user={user} logoDataUrl={brandingLogo}/>,
-    accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user} onOpenJob={openJobRecord} onOpenQuote={openQuoteRecord} onOpenCustomer={openCustomerRecord} onOpenJobPayments={openJobPaymentsRecord} initialStatementContact={accountingOpen&&accountingOpen.contact} onInitialStatementHandled={()=>setAccountingOpen(null)}/>,
+    accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user} onOpenJob={openJobRecord} onOpenQuote={openQuoteRecord} onOpenCustomer={openCustomerRecord} onOpenJobPayments={openJobPaymentsRecord} initialStatementContact={accountingOpen&&accountingOpen.contact} onInitialStatementHandled={()=>setAccountingOpen(null)} forceSaveSections={forceSaveSections}/>,
     hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={brandingLogo} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
     // Admin-only (main Admin, never Holdings Admin) — guarded again here in
     // addition to the Sidebar link and safePage above, so this can never
