@@ -2815,7 +2815,19 @@ stageNames.map(function(s,i){
 /* ═══════════════════════════════════════════
    PRINT INVOICE
 ═══════════════════════════════════════════ */
-function buildInvoiceHtml(job, companies, logoDataUrl) {
+// Fallback lookup (2026-08-07): historical jobs/quotes created before a
+// client's VAT number was captured never got it copied onto job.vatNum, so
+// the printed invoice showed nothing even though the VAT number was saved
+// under Customers. This matches the invoice's client name against the
+// Customers list (same trim+lowercase rule used everywhere else in the
+// file) so the invoice always falls back to the saved customer record.
+function sgrCustomerVatLookup(clientName, customers){
+  if(!clientName || !Array.isArray(customers)) return '';
+  const norm = s=>(s||'').trim().toLowerCase();
+  const c = customers.find(c=>norm(c.companyName)===norm(clientName));
+  return c ? (c.vatNumber||'') : '';
+}
+function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
   const co = companies.find(c=>c.id===job.co)||{name:'Signacore',short:'SGR'};
   const legal = sgrCompanyLegal(co);
   const lines = job.lines||[];
@@ -2828,6 +2840,9 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
   const payments = Array.isArray(job.payments) ? job.payments : [];
   const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
   const balanceDue = Math.max(0, total-totalPaid);
+  // Prefer whatever VAT number is already stored on the job/invoice; fall
+  // back to the saved Customer record so historical jobs pick it up too.
+  const billVatNum = job.vatNum || sgrCustomerVatLookup(job.client, customers);
   const fmt = n=>'R\u00a0'+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const rows = lines.map((l,i)=>{
     const sz = lineSizeText(l);
@@ -2935,7 +2950,7 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
 '<div class="lbl">Billed To</div>'+
 '<div class="nm">'+job.client+'</div>'+
 (job.contact?'<p>Attn: '+job.contact+'</p>':'')+
-(job.vatNum?'<p>VAT Reg: '+job.vatNum+'</p>':'')+
+(billVatNum?'<p>VAT Reg: '+billVatNum+'</p>':'')+
 (job.email?'<p>'+job.email+'</p>':'')+
 (job.tel?'<p>Tel: '+job.tel+'</p>':'')+
 '</div>'+
@@ -2999,8 +3014,8 @@ function buildInvoiceHtml(job, companies, logoDataUrl) {
   return html;
 }
 
-function printInvoice(job, companies, logoDataUrl) {
-  const html = buildInvoiceHtml(job, companies, logoDataUrl);
+function printInvoice(job, companies, logoDataUrl, customers) {
+  const html = buildInvoiceHtml(job, companies, logoDataUrl, customers);
   sgrOpenPrintPreview(html, 'Invoice '+(job.invoiceNum||job.num||''));
 }
 
@@ -4497,7 +4512,7 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
       client:link.client, contact:link.contact||j.contact||'', email:link.email||j.email||'',
       tel:link.tel||j.tel||'', address:link.address||j.address||'', vatNum:link.vatNum||j.vatNum||'',
       notes:j.notes||link.notes||''} : j;
-    printInvoice(pj, companies, logoDataUrl);
+    printInvoice(pj, companies, logoDataUrl, customers);
   }
 
   // ── Per-customer row with hover dropdown of related quotes & invoices ──
@@ -7970,7 +7985,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                           className="text-xs bg-amber-500 hover:bg-amber-600 text-white font-bold px-3 py-1.5 rounded-xl">
                           ✏️ Edit
                         </button>
-                        <button onClick={()=>printInvoice(j,companies,logoDataUrl)}
+                        <button onClick={()=>printInvoice(j,companies,logoDataUrl,customers)}
                           className="text-xs bg-gray-800 hover:bg-gray-900 text-white font-bold px-3 py-1.5 rounded-xl">
                           🧾 Print
                         </button>
@@ -11862,7 +11877,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
             }
             return (
             <>
-              <button onClick={()=>printInvoice(job,companies,logoDataUrl)}
+              <button onClick={()=>printInvoice(job,companies,logoDataUrl,customers)}
                 className="flex items-center gap-1.5 text-xs bg-brand-600 hover:bg-brand-700 text-white rounded-xl px-4 py-2.5 font-bold">
                 🧾 Print Invoice
               </button>
@@ -17474,7 +17489,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                   above. Manual invoices don't have an equivalent print template
                   yet, so no button is shown for them in this phase. */}
               {isJob&&_links.job&&(
-                <button onClick={()=>printInvoice(_links.job,companies,logoDataUrl)}
+                <button onClick={()=>printInvoice(_links.job,companies,logoDataUrl,customers)}
                   className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
               )}
               {onEdit&&<button onClick={onEdit} className="px-5 py-2.5 text-white font-bold rounded-xl text-sm" style={{background:'#06065c'}}>✏️ Edit Invoice</button>}
@@ -19222,7 +19237,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
 /* ═══════════════════════════════════════════
    REPORTS
 ═══════════════════════════════════════════ */
-function ReportsPage({ jobs, companies, user, logoDataUrl }) {
+function ReportsPage({ jobs, companies, user, logoDataUrl, customers }) {
   const isAdmin = user.role !== 'assistant';
   // Invoice hover-preview (Payments tab) — {job, x, y} while hovering a blue invoice no.
   const [hoverInv, setHoverInv] = useState(null);
@@ -19264,7 +19279,7 @@ function ReportsPage({ jobs, companies, user, logoDataUrl }) {
       onMouseEnter={e=>setHoverInv({job:j,x:e.clientX,y:e.clientY})}
       onMouseMove={e=>setHoverInv({job:j,x:e.clientX,y:e.clientY})}
       onMouseLeave={()=>setHoverInv(h=>(h&&h.job&&h.job.id===j.id)?null:h)}
-      onClick={()=>printInvoice(j,companies,logoDataUrl)}
+      onClick={()=>printInvoice(j,companies,logoDataUrl,customers)}
       className="font-black text-brand-600 hover:text-brand-800 hover:underline cursor-pointer"
       title="Hover to preview · click to open the full invoice">
       {j.invoiceNum}
@@ -20468,7 +20483,7 @@ function App() {
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
-    reports:     <ReportsPage     jobs={jobs} companies={companies} user={user} logoDataUrl={brandingLogo}/>,
+    reports:     <ReportsPage     jobs={jobs} companies={companies} user={user} logoDataUrl={brandingLogo} customers={customers}/>,
     accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user} onOpenJob={openJobRecord} onOpenQuote={openQuoteRecord} onOpenCustomer={openCustomerRecord} onOpenJobPayments={openJobPaymentsRecord} initialStatementContact={accountingOpen&&accountingOpen.contact} onInitialStatementHandled={()=>setAccountingOpen(null)} forceSaveSections={forceSaveSections}/>,
     hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={brandingLogo} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
     // Admin-only (main Admin, never Holdings Admin) — guarded again here in
