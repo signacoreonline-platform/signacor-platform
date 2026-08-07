@@ -4879,7 +4879,20 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   function saveAsNewCustomer() {
     if (!client.trim()) { setSaveAsCustomerMsg('⚠ Enter a company name first.'); setTimeout(()=>setSaveAsCustomerMsg(''),3000); return; }
     const exists = customers.find(c=>c.companyName.trim().toLowerCase()===client.trim().toLowerCase());
-    if (exists) { setSaveAsCustomerMsg('ℹ Already saved as a customer.'); setTimeout(()=>setSaveAsCustomerMsg(''),3000); return; }
+    if (exists) {
+      // Already a saved customer — still let a VAT number typed on this quote
+      // stick to that existing customer record (2026-08-07), instead of just
+      // reporting "already saved" and discarding it.
+      const vt = vatNum.trim();
+      if (vt && (exists.vatNumber||'').trim() !== vt) {
+        setCustomers(prev=>prev.map(c=>c.id===exists.id?{...c,vatNumber:vt}:c));
+        setSaveAsCustomerMsg('✓ VAT number updated on existing customer!');
+      } else {
+        setSaveAsCustomerMsg('ℹ Already saved as a customer.');
+      }
+      setTimeout(()=>setSaveAsCustomerMsg(''),3000);
+      return;
+    }
     const nc = { id: Date.now()+Math.random(), companyName: client.trim(), contactPerson: contact.trim(), email: email.trim(), tel: tel.trim(), address: address.trim(), vatNumber: vatNum.trim() };
     setCustomers(prev=>[...prev, nc]);
     setSaveAsCustomerMsg('✓ Saved as new customer!');
@@ -5092,6 +5105,19 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       return; // nothing local changed — form stays open, draft preserved
     }
     setSaving(false);
+    // ── Sync VAT number back to the matching saved customer (2026-08-07) ──
+    // If this quote's client already exists under Customers and the VAT
+    // number entered here is new or different from what's on file, update
+    // that customer record so the VAT sticks for future quotes/invoices.
+    // Only ever touches vatNumber — never creates a new customer here.
+    const _vatToSync = vatNum.trim();
+    if (_vatToSync && client.trim()) {
+      setCustomers(prev => {
+        const match = prev.find(c => (c.companyName||'').trim().toLowerCase() === client.trim().toLowerCase());
+        if (!match || (match.vatNumber||'').trim() === _vatToSync) return prev;
+        return prev.map(c => c.id === match.id ? {...c, vatNumber: _vatToSync} : c);
+      });
+    }
     try { localStorage.removeItem(_draftKey); } catch(e){}
     onClose();
   }
