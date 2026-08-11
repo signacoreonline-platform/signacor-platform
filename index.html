@@ -3162,6 +3162,198 @@ function emailInvoiceViaOutlook(job, companies) {
 }
 
 /* ═══════════════════════════════════════════
+   PRINT / EMAIL A MANUAL (ACCOUNTING) INVOICE (2026-08-11)
+   accInvoices records use a different shape to a job (lineItems with
+   qty/unitAmount/taxType, contactName/contactEmail/contactAddress instead of
+   client/email/address, no discount/setupFee fields) — buildInvoiceHtml()
+   above can't read them directly. These are read-only presentation helpers
+   only: they never create, edit or duplicate the accInvoices record itself,
+   and are shared by both Accounting -> Invoices and Sales -> Invoices so a
+   manual invoice prints/emails identically regardless of which page it was
+   opened from.
+═══════════════════════════════════════════ */
+function buildManualInvoiceHtml(inv, companies, logoDataUrl) {
+  const co = companies.find(c=>c.id===inv.co)||{name:'Signacore',short:'SGR'};
+  const legal = sgrCompanyLegal(co);
+  const lines = inv.lineItems||[];
+  const sub = lines.reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+  const vat = lines.reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+  const total = sub+vat;
+  const payments = Array.isArray(inv.payments) ? inv.payments : [];
+  const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+  const balanceDue = Math.max(0, total-totalPaid);
+  const fmt = n=>'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const rows = lines.map((l,i)=>{
+    const lNeg = (parseFloat(l.unitAmount)||0) < 0;
+    const lineTotal = parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);
+    return '<tr style="'+(lNeg?'color:#dc2626;':'')+'"><td style="width:42px;color:#4b5563;font-size:10px;vertical-align:top;">'+(i+1)+'</td>'+
+    '<td style="font-size:11px;word-break:break-word;vertical-align:top;">'+(l.description||'-')+'</td>'+
+    '<td style="width:50px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+(l.qty||1)+'</td>'+
+    '<td style="width:110px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(parseFloat(l.unitAmount||0))+'</td>'+
+    '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(lineTotal)+'</td></tr>';
+  }).join('');
+  const invNum = inv.number||'';
+  const invDate = inv.date||(new Date().toISOString().slice(0,10));
+  const due = inv.dueDate||(new Date(Date.now()+30*864e5).toISOString().slice(0,10));
+  const logoHtml = (logoDataUrl
+    ? '<img src="'+logoDataUrl+'" style="max-height:112px;max-width:322px;object-fit:contain;display:block;">'
+    : '<div style="font-family:\'Barlow Condensed\',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#0000ff;letter-spacing:0.08em;">SIGNACORE</div>')
+    + (legal.logoSuffix ? '<div style="font-family:\'Barlow Condensed\',Arial,sans-serif;font-size:1.1rem;font-weight:900;font-style:italic;color:#06065c;letter-spacing:0.1em;text-transform:uppercase;margin-top:2px;">'+legal.logoSuffix+'</div>' : '');
+  const css =
+'*{box-sizing:border-box;margin:0;padding:0}'+
+'body{font-family:\'Noto Sans SC\',Arial,sans-serif;font-size:11.5px;color:#1a1a1a;padding:10mm 16mm 26mm 16mm;background:#fff}'+
+'.hdr{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:0}'+
+'.inv-title{font-family:\'Barlow Condensed\',Arial,sans-serif;font-size:2rem;font-weight:900;font-style:italic;color:#06065c;letter-spacing:0.05em;text-transform:uppercase;line-height:1}'+
+'.inv-badge{display:inline-block;background:#ED0101;color:#fff;font-family:\'Barlow Condensed\',Arial,sans-serif;font-size:0.72rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;padding:3px 12px;border-radius:20px;margin-bottom:5px}'+
+'.qi-meta{margin-top:5px;font-size:9.5px;color:#555;text-align:right;border-collapse:collapse}'+
+'.qi-meta td{padding:1.5px 5px}.qi-meta td:first-child{color:#4b5563;text-align:right}'+
+'.qi-meta td strong{color:#06065c;font-weight:700}'+
+'.rule{height:3px;background:linear-gradient(90deg,#06065c 0%,#0000ff 60%,#ED0101 100%);margin:8px 0 10px 0}'+
+'.tagline{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}'+
+'.tagline .co{font-family:\'Barlow Condensed\',Arial,sans-serif;font-size:0.8rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:#06065c}'+
+'.tagline .reg{font-size:8px;color:#4b5563;letter-spacing:0.05em}'+
+'.parties{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}'+
+'.box{border-radius:6px;padding:10px 13px}'+
+'.box-to{background:#f0f4ff;border:1px solid #c7d2fe;border-left:3px solid #0000ff}'+
+'.box-from{background:#f8f9ff;border:1px solid #e0e7ff}'+
+'.box .lbl{font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:4px;color:#4b5563}'+
+'.box .nm{font-size:12.5px;font-weight:800;color:#06065c;margin-bottom:3px;font-family:\'Barlow Condensed\',Arial,sans-serif;letter-spacing:0.04em}'+
+'.box p{font-size:9.5px;color:#555;line-height:1.55}'+
+'table.ln{width:100%;border-collapse:collapse;margin-bottom:12px;page-break-inside:auto}'+
+'table.ln thead{display:table-header-group}'+
+'table.ln thead tr{background:#06065c}'+
+'table.ln th{color:#fff;padding:7px 9px;font-size:8px;text-transform:uppercase;letter-spacing:0.8px;text-align:left;font-weight:700}'+
+'table.ln td{padding:7px 9px;border-bottom:1px solid #f0f0f0;vertical-align:top;page-break-inside:avoid}'+
+'table.ln tbody tr:nth-child(even) td{background:#f7f8ff}'+
+'.tots-wrap{display:flex;justify-content:flex-end;margin-bottom:14px;clear:both}'+
+'.tots{width:270px}'+
+'.tots table{width:100%;border-collapse:collapse}'+
+'.tots td{padding:4px 6px;font-size:11px;border-bottom:1px solid #f0f0f0}'+
+'.tots td:last-child{text-align:right;font-weight:600}'+
+'.tots .vat-row td{color:#555}'+
+'.tots .total-row td{background:#06065c;color:#fff;font-size:13px;font-weight:900;border:none;padding:7px 6px;font-family:\'Barlow Condensed\',Arial,sans-serif;letter-spacing:0.04em}'+
+'.tots .paid-row td{color:#059669;font-weight:700}'+
+'.tots .bal-row td{background:#ED0101;color:#fff;font-size:13px;font-weight:900;border:none;padding:7px 6px;font-family:\'Barlow Condensed\',Arial,sans-serif;letter-spacing:0.04em}'+
+'.pay-hist{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 13px;margin-bottom:16px;clear:both;page-break-inside:avoid}'+
+'.pay-hist .lbl{font-size:8px;font-weight:700;color:#065f46;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}'+
+'.pay-hist table{width:100%;border-collapse:collapse}'+
+'.pay-hist td{padding:3px 4px;font-size:9.5px;color:#374151;border-bottom:1px solid #dcfce7}'+
+'.pay-hist td:last-child{text-align:right;font-weight:700;color:#059669}'+
+'.bank{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 13px;margin-bottom:16px;clear:both;page-break-inside:avoid}'+
+'.bank .lbl{font-size:8px;font-weight:700;color:#065f46;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}'+
+'.bank table td{padding:2px 0;font-size:9.5px;color:#374151}.bank table td:first-child{color:#6b7280;width:130px}'+
+'.tc{margin-bottom:16px;clear:both;page-break-inside:avoid}'+
+'.tc .lbl{font-size:8px;font-weight:700;color:#4b5563;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;border-bottom:1px solid #e5e7eb;padding-bottom:3px}'+
+'.tc ol{padding-left:14px}.tc li{font-size:8.5px;color:#6b7280;margin-bottom:2px;line-height:1.55}'+
+'.foot{position:fixed;bottom:0;left:16mm;right:16mm;padding-top:5px;background:#fff}'+
+'.foot-line{height:2px;background:linear-gradient(90deg,#06065c 0%,#0000ff 60%,#ED0101 100%);margin-bottom:4px}'+
+'.foot p{font-size:8px;color:#4b5563;text-align:center;letter-spacing:0.02em}'+
+'@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}.no-break{page-break-inside:avoid}}';
+  const html =
+'<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Invoice_'+invNum+'</title>'+
+'<link rel="preconnect" href="https://fonts.googleapis.com">'+
+'<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,600;0,700;0,800;1,700;1,800&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">'+
+'<style>'+css+'</style></head><body>'+
+'<div class="hdr">'+
+'<div>'+logoHtml+'</div>'+
+'<div style="text-align:right">'+
+'<div class="inv-badge">TAX INVOICE</div>'+
+'<div class="inv-title">'+invNum+'</div>'+
+'<table class="qi-meta"><tbody>'+
+'<tr><td>Invoice Date:</td><td><strong>'+invDate+'</strong></td></tr>'+
+'<tr><td>Due Date:</td><td><strong>'+due+'</strong></td></tr>'+
+(inv.reference?'<tr><td>Reference:</td><td><strong>'+inv.reference+'</strong></td></tr>':'')+
+'</tbody></table>'+
+'</div>'+
+'</div>'+
+'<div class="rule"></div>'+
+'<div class="tagline">'+
+'<div>'+
+'<div class="co">Applied Graphics &amp; Visual Displays</div>'+
+'<div class="reg">'+legal.legalName+' &nbsp;&bull;&nbsp; Reg. No. '+legal.regNo+' &nbsp;&bull;&nbsp; VAT No: '+legal.vatNo+'</div>'+
+'</div>'+
+'<div style="font-size:9px;color:#ED0101;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;font-family:\'Barlow Condensed\',sans-serif">Mossel Bay</div>'+
+'</div>'+
+'<div class="parties">'+
+'<div class="box box-to">'+
+'<div class="lbl">Billed To</div>'+
+'<div class="nm">'+(inv.contactName||'')+'</div>'+
+(inv.contactEmail?'<p>'+inv.contactEmail+'</p>':'')+
+(inv.contactAddress?'<p>'+String(inv.contactAddress).replace(/\n/g,'<br>')+'</p>':'')+
+'</div>'+
+'<div class="box box-from">'+
+'<div class="lbl">Remit To</div>'+
+'<div class="nm">Signacore</div>'+
+'<p>21 Voortrekker St, Mossdustria, Mossel Bay</p>'+
+'<p>Tel: 040-940-5555 &nbsp;&bull;&nbsp; orders@snsg.co.za</p>'+
+'<p style="margin-top:4px;color:#06065c;font-weight:600">www.signacore.co.za</p>'+
+'</div>'+
+'</div>'+
+(rows.length>0
+?'<table class="ln"><thead><tr>'+
+'<th style="width:42px">Item No</th><th>Description</th>'+
+'<th style="width:50px;text-align:center">Qty</th>'+
+'<th style="width:110px;text-align:right">Unit Price</th>'+
+'<th style="width:120px;text-align:right">Total</th>'+
+'</tr></thead><tbody>'+rows+'</tbody></table>'
+:'<div style="border:1px solid #e5e7eb;border-radius:6px;padding:14px;text-align:center;color:#4b5563;font-size:11px;margin-bottom:12px;">No line items on record.</div>')+
+'<div class="tots-wrap no-break"><div class="tots"><table>'+
+'<tr><td>Subtotal (excl. VAT)</td><td>'+fmt(sub)+'</td></tr>'+
+'<tr class="vat-row"><td>VAT (15%)</td><td>'+fmt(vat)+'</td></tr>'+
+'<tr class="total-row"><td>'+(totalPaid>0?'INVOICE TOTAL':'TOTAL DUE')+'</td><td>'+fmt(total)+'</td></tr>'+
+(totalPaid>0?'<tr class="paid-row"><td>Less: Payments Received</td><td>- '+fmt(totalPaid)+'</td></tr>':'')+
+(totalPaid>0?'<tr class="bal-row" style="background:'+(balanceDue<=0.005?'#059669':'#ED0101')+'"><td>'+(balanceDue<=0.005?'PAID IN FULL':'BALANCE DUE')+'</td><td>'+fmt(balanceDue)+'</td></tr>':'')+
+'</table></div></div>'+
+(totalPaid>0
+?'<div class="pay-hist no-break">'+
+  '<div class="lbl">Payments Received To Date</div>'+
+  '<table><tbody>'+
+  payments.map(p=>'<tr><td style="width:90px">'+(p.date||'-')+'</td><td>'+(p.method||'Payment')+(p.notes?' - '+p.notes:'')+'</td><td>'+fmt(parseFloat(p.amount)||0)+'</td></tr>').join('')+
+  '</tbody></table>'+
+'</div>'
+:'')+
+'<div class="tc no-break">'+
+'<div class="lbl">Terms &amp; Conditions</div>'+
+'<ol>'+invoiceTermsList(invNum).map(t=>'<li>'+t+'</li>').join('')+'</ol>'+
+'</div>'+
+'<div class="bank no-break">'+
+'<div class="lbl">Banking Details</div>'+
+'<table><tbody>'+
+'<tr><td>Bank:</td><td>'+legal.bankName+'</td></tr>'+
+'<tr><td>Account Name:</td><td>'+legal.bankAccName+'</td></tr>'+
+'<tr><td>Account No:</td><td>'+legal.bankAccNo+'</td></tr>'+
+'<tr><td>Branch Code:</td><td>'+legal.bankBranch+'</td></tr>'+
+'<tr><td>Reference:</td><td>'+invNum+' / '+(inv.contactName||'')+'</td></tr>'+
+'</tbody></table>'+
+'</div>'+
+'</body></html>';
+  return html;
+}
+
+function printManualInvoice(inv, companies, logoDataUrl) {
+  const html = buildManualInvoiceHtml(inv, companies, logoDataUrl);
+  sgrOpenPrintPreview(html, 'Invoice '+(inv.number||''));
+}
+
+// Simple mailto: composer for a manual invoice, mirroring emailInvoiceViaOutlook
+// above (same mailto-only pattern already used for job invoices — no PDF
+// attached automatically either way). Never creates/edits/duplicates the
+// accInvoices record itself.
+function emailManualInvoiceViaOutlook(inv, companies) {
+  const invNum = inv.number||'';
+  const body =
+'Dear '+(inv.contactName||'Sir/Madam')+',\r\n\r\n'+
+'Thank you for your valued business. Please find attached our tax invoice '+invNum+' for your records.\r\n\r\n'+
+'Should you have any queries regarding this invoice, please do not hesitate to contact us.\r\n\r\n'+
+'Kind regards,\r\n'+
+'Signacore | Applied Graphics and Visual Displays\r\n'+
+'Tel: 040-940-5555 | orders@snsg.co.za';
+  const subject = 'Tax Invoice '+invNum+' - '+(inv.contactName||'');
+  const mailto = 'mailto:'+(inv.contactEmail?encodeURIComponent(inv.contactEmail):'')+'?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body);
+  window.location.href = mailto;
+}
+
+/* ═══════════════════════════════════════════
    PDF COLOUR CONSTANTS
 ═══════════════════════════════════════════ */
 const C_RED    = [220, 38,  38];
@@ -6678,7 +6870,7 @@ function reconcileJobInvoice(job, quotes){
 /* ═══════════════════════════════════════════
    QUOTES PAGE
 ═══════════════════════════════════════════ */
-function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, setAccInvoices, onJobCreated, initialOpen, onInitialOpenHandled, onJobPaymentsClosed, creditNotes, setCreditNotes, onOpenCustomer, forceSaveSections }) {
+function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, setAccInvoices, onJobCreated, initialOpen, onInitialOpenHandled, onJobPaymentsClosed, creditNotes, setCreditNotes, onOpenCustomer, onOpenJob, forceSaveSections }) {
   const [subTab,    setSubTab]    = useState('quotes'); // 'quotes' | 'invoices'
   const [showCreate,setShowCreate]=useState(false);
   const [viewQuote,setViewQuote]=useState(null);
@@ -6686,6 +6878,21 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [copyQuote, setCopyQuote] = useState(null);   // quote being copied to new quote
   const [editInvoice, setEditInvoice] = useState(null); // job open in invoice edit modal
   const [emailInvoiceJob, setEmailInvoiceJob] = useState(null); // job for email flow modal
+  // ── Manual/accounting invoice actions (2026-08-11) ──
+  // Sales → Invoices used to show a "Manage in Accounting" placeholder for
+  // manual invoices instead of real actions. These give this page the same
+  // Payments/Edit access Accounting already has, against the exact same
+  // accInvoices record (see PaymentHistoryModal/InvoiceModal/
+  // saveManualInvoice, all shared top-level functions — never a second
+  // invoice record, never a duplicated payment).
+  const [manualInvPayModal, setManualInvPayModal] = useState(null); // accInvoices record open in Payments modal
+  const [editManualInv, setEditManualInv] = useState(null); // accInvoices record open in the Edit modal
+  const [showManualInvModal, setShowManualInvModal] = useState(false);
+  // Same formatting used by Accounting's own invoice tables — kept local
+  // (not global) exactly like every other page's fmtAmt/fmtDate, just so
+  // this page's manual-invoice modals display identically to Accounting's.
+  const fmtAmt = n => 'R ' + Number(Math.abs(n)).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const fmtDate = d => d ? new Date(d).toLocaleDateString('en-ZA') : '';
   const [filter,setFilter]=useState('all');
   const [sortOrder,setSortOrder]=useState('desc');  // 'asc' = oldest→newest, 'desc' = newest→oldest (Quotes sub-tab) — newest-first default
   const [search,setSearch]=useState('');           // client-name search (Quotes sub-tab)
@@ -6716,8 +6923,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // must not be shown as available against the other company's quotes.
   const myCreditNotes = (creditNotes||[]).filter(c=>belongsToUserCompany(c,user));
   const _searchTerm = search.trim().toLowerCase();
+  // Matches client name (as before) OR quote number, full or partial (e.g.
+  // "SQ-00143" or just "143") — same partial-match rule already used by
+  // Accepted Quotes / Sales Invoices / Accounting Invoices search below.
   const _sortedQuotes = numSort((filter==='all' ? myQuotes : myQuotes.filter(q=>q.status===filter))
-    .filter(q=>!_searchTerm || (q.client||'').toLowerCase().includes(_searchTerm)), 'num');
+    .filter(q=>!_searchTerm || [q.client, q.num].some(v=>(v||'').toString().toLowerCase().includes(_searchTerm))), 'num');
   const displayed = sortOrder==='desc' ? _sortedQuotes.slice().reverse() : _sortedQuotes;
   const isAdmin = user.role === 'admin';
   // Invoices sub-tab: all jobs with an invoiceNum + manual accounting invoices.
@@ -7170,6 +7380,18 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     setSubTab('invoices'); setInvFilter('all'); setInvHighlight(job.id);
     setTimeout(()=>{ const el=document.getElementById('inv-row-'+job.id); if(el) el.scrollIntoView({behavior:'smooth',block:'center'}); }, 80);
     setTimeout(()=>setInvHighlight(null), 4000);
+  }
+  // Edit-action for a manual invoice opened from Sales → Invoices — thin
+  // wrapper around the shared saveManualInvoice(), the exact same reserve/
+  // duplicate-check/save path Accounting's own Edit action uses (see
+  // AccountingPage.saveInvoice). `accInvoices`/`jobs` here are QuotesPage's
+  // own raw (unfiltered) props — the same full arrays Accounting passes as
+  // jobsAll/accInvoicesAll — so invoice numbers stay globally unique across
+  // both companies exactly as before. Only ever updates the existing
+  // accInvoices record; never creates a second invoice.
+  async function saveManualInvoiceFromSales(inv) {
+    const ok = await saveManualInvoice(inv, { user, jobsAll: jobs, accInvoicesAll: accInvoices, setAccInvoices });
+    if(ok){ setShowManualInvModal(false); setEditManualInv(null); }
   }
   async function createInvoiceNow(job){
     if(!job) return;
@@ -7646,11 +7868,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
 
       {/* ── QUOTES SUB-TAB ── */}
       {subTab==='quotes'&&(<>
-        {/* Search by client name */}
+        {/* Search by client name or quote number */}
         <div className="relative">
           <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm pointer-events-none">🔍</span>
           <input value={search} onChange={e=>setSearch(e.target.value)}
-            placeholder="Search quotes by client name…"
+            placeholder="Search quotes by client name or quote number…"
             className="w-full border border-gray-200 rounded-xl pl-9 pr-9 py-2.5 text-sm bg-white focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/>
           {search&&(
             <button type="button" onClick={()=>setSearch('')}
@@ -7945,6 +8167,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                   ? 'bg-blue-100 text-blue-700 border-blue-200'
                   : 'bg-amber-100 text-amber-700 border-amber-200';
               const statusLabel = isPaid ? '✓ Fully Paid' : isPartial ? '⏳ Partly Paid' : '🕐 Pending';
+              // The real accInvoices record behind this manual-invoice summary
+              // row — Payments/Edit/Print/Email below all act on THIS record
+              // (never a copy), the same single source of truth Accounting
+              // reads/writes. Falls back to the old "Manage in Accounting"
+              // notice only in the defensive case it can't be found (e.g. a
+              // race with a delete elsewhere) rather than acting on nothing.
+              const manualRec = j._isManual ? myAccInvoices.find(i=>i.id===j.id) : null;
               return (
                 <div key={j.id} id={'inv-row-'+j.id} className={`bg-white rounded-2xl border p-4 flex items-center gap-4 transition-all ${invHighlight===j.id?'border-brand-500 ring-2 ring-brand-300 shadow-md':isPartial?'border-blue-200':'border-gray-200'}`}>
                   <div className="w-10 h-10 bg-brand-600 rounded-xl flex items-center justify-center text-white font-black text-xs flex-shrink-0">INV</div>
@@ -7972,9 +8201,30 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                   </div>
                   <div className="flex flex-col gap-1">
                     {j._isManual?(
-                      <span className="text-xs font-semibold px-3 py-1.5 rounded-xl text-center" style={{background:'#eff6ff',color:'#1d4ed8'}}>
-                        Manage in<br/>Accounting
-                      </span>
+                      manualRec?(
+                        <>
+                          <button onClick={()=>setManualInvPayModal(manualRec)}
+                            className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#ecfdf5',color:'#059669'}}>
+                            💳 Payments
+                          </button>
+                          <button onClick={()=>{setEditManualInv(manualRec);setShowManualInvModal(true);}}
+                            className="text-xs bg-amber-500 hover:bg-amber-600 text-white font-bold px-3 py-1.5 rounded-xl">
+                            ✏️ Edit
+                          </button>
+                          <button onClick={()=>printManualInvoice(manualRec,companies,logoDataUrl)}
+                            className="text-xs bg-gray-800 hover:bg-gray-900 text-white font-bold px-3 py-1.5 rounded-xl">
+                            🧾 Print
+                          </button>
+                          <button onClick={()=>emailManualInvoiceViaOutlook(manualRec,companies)}
+                            className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#dbeafe',color:'#1e40af'}}>
+                            📧 Email
+                          </button>
+                        </>
+                      ):(
+                        <span className="text-xs font-semibold px-3 py-1.5 rounded-xl text-center" style={{background:'#eff6ff',color:'#1d4ed8'}}>
+                          Manage in<br/>Accounting
+                        </span>
+                      )
                     ):(
                       <>
                         <button onClick={()=>{setJobPayModal(j);setJobPayModalExternal(false);}}
@@ -8076,6 +8326,23 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           type="invoice" data={emailInvoiceJob} companies={companies} logoDataUrl={logoDataUrl}
           onClose={()=>setEmailInvoiceJob(null)}
         />
+      )}
+
+      {/* ── Manual invoice Payments / Edit modals (2026-08-11) ──
+          Same shared PaymentHistoryModal/InvoiceModal Accounting uses, acting
+          on the exact same accInvoices record via this page's own (already
+          company-filtered) myAccInvoices / (raw) accInvoices+setAccInvoices —
+          never a copy, never a second source of truth. */}
+      {manualInvPayModal&&(
+        <PaymentHistoryModal inv={manualInvPayModal} onClose={()=>setManualInvPayModal(null)}
+          accInvoices={myAccInvoices} setAccInvoices={setAccInvoices} forceSaveSections={forceSaveSections}
+          creditNotes={myCreditNotes} setCreditNotes={setCreditNotes} isAdmin={isAdmin} quotes={quotes} jobs={jobs} customers={customers}
+          onOpenJob={onOpenJob} onOpenCustomer={onOpenCustomer} onViewInvoice={null} onSaved={setManualInvPayModal}
+          fmtAmt={fmtAmt} fmtDate={fmtDate}/>
+      )}
+      {showManualInvModal&&(
+        <InvoiceModal inv={editManualInv} onSave={saveManualInvoiceFromSales}
+          onClose={()=>{setShowManualInvModal(false);setEditManualInv(null);}} customers={customers} fmtAmt={fmtAmt}/>
       )}
 
       {/* ── New Quote modal ── */}
@@ -16694,6 +16961,385 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 /* ═══════════════════════════════════════════
    ACCOUNTING PAGE
 ═══════════════════════════════════════════ */
+/* ═══════════════════════════════════════════
+   SHARED MANUAL/ACCOUNTING INVOICE MODALS (2026-08-11)
+   accInvoices is the single source of truth for a manual invoice regardless
+   of whether it's opened from Accounting or from Sales → Invoices (see
+   getAllInvoicesUnified/getManualInvoiceJobRefs above). These two modals
+   used to be defined only inside AccountingPage; they are hoisted here,
+   UNCHANGED in behaviour, and now take their data via explicit props
+   instead of closure variables, so both AccountingPage and QuotesPage can
+   render the exact same Edit/Payments UI against the exact same accInvoices
+   record — never a second invoice record, never a copied/duplicated
+   payment, never a second numbering or save path.
+═══════════════════════════════════════════ */
+  // ── Invoice Modal (manual/accounting invoice — create or edit) ──
+  function InvoiceModal({ inv, onSave, onClose, customers, fmtAmt }) {
+    const isNew = !inv;
+    // A new invoice gets its number reserved atomically from the backend at
+    // save time (see saveManualInvoice) — never pre-computed here client-side,
+    // and never editable by the user (no input field for it exists below).
+    const [form, setForm] = useState(inv || {
+      id: Date.now(), number: '', date: new Date().toISOString().slice(0,10),
+      dueDate: new Date(Date.now()+30*864e5).toISOString().slice(0,10),
+      contactName:'', contactEmail:'', contactAddress:'', reference:'',
+      status:'draft', lineItems:[{description:'',qty:1,unitAmount:0,accountCode:'4000',taxType:'15%'}]
+    });
+    const [saving, setSaving] = useState(false);
+    const upd = k => v => setForm(p=>({...p,[k]:v}));
+    const updLine = (i,k,v) => setForm(p=>({...p,lineItems:p.lineItems.map((l,idx)=>idx===i?{...l,[k]:v}:l)}));
+    const addLine = () => setForm(p=>({...p,lineItems:[...p.lineItems,{description:'',qty:1,unitAmount:0,accountCode:'4000',taxType:'15%'}]}));
+    const delLine = i => setForm(p=>({...p,lineItems:p.lineItems.filter((_,idx)=>idx!==i)}));
+    const subtotal = (form.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0)),0);
+    const vat = (form.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0)*0.15):s,0);
+    const iCls="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
+    async function save(){
+      if(!form.contactName){ alert('Contact name is required.'); return; }
+      if(saving) return; // guard against double-click firing two reservations
+      setSaving(true);
+      try { await onSave(form); } finally { setSaving(false); }
+    }
+    return (
+      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[95vh] overflow-y-auto">
+          <div className="px-5 py-4 flex items-center justify-between" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
+            <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>{isNew?'NEW INVOICE':'EDIT INVOICE'} — {form.number||'(number auto-reserved on save)'}</p>
+            <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
+          </div>
+          <div className="p-5 space-y-4">
+            {/* Header fields */}
+            <div className="grid grid-cols-2 gap-3">
+              <div><label className="text-xs font-bold text-gray-500 block mb-1">Contact / Customer *</label><input value={form.contactName} onChange={e=>upd('contactName')(e.target.value)} className={iCls} placeholder="Company or person name" list="cust-list"/><datalist id="cust-list">{(customers||[]).map(c=><option key={c.id} value={c.name}/>)}</datalist></div>
+              <div><label className="text-xs font-bold text-gray-500 block mb-1">Email</label><input type="email" value={form.contactEmail} onChange={e=>upd('contactEmail')(e.target.value)} className={iCls}/></div>
+              <div><label className="text-xs font-bold text-gray-500 block mb-1">Invoice Date</label><input type="date" value={form.date} onChange={e=>upd('date')(e.target.value)} className={iCls}/></div>
+              <div><label className="text-xs font-bold text-gray-500 block mb-1">Due Date</label><input type="date" value={form.dueDate} onChange={e=>upd('dueDate')(e.target.value)} className={iCls}/></div>
+              <div><label className="text-xs font-bold text-gray-500 block mb-1">Reference</label><input value={form.reference} onChange={e=>upd('reference')(e.target.value)} className={iCls} placeholder="PO# or job ref"/></div>
+              <div><label className="text-xs font-bold text-gray-500 block mb-1">Status</label>
+                <select value={form.status} onChange={e=>upd('status')(e.target.value)} className={iCls}>
+                  {['draft','sent','paid','overdue','void'].map(s=><option key={s} value={s}>{s.charAt(0).toUpperCase()+s.slice(1)}</option>)}
+                </select>
+              </div>
+              <div className="col-span-2"><label className="text-xs font-bold text-gray-500 block mb-1">Address</label><textarea value={form.contactAddress} onChange={e=>upd('contactAddress')(e.target.value)} rows={2} className={iCls}/></div>
+            </div>
+            {/* Line items */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-xs font-black text-gray-600 uppercase tracking-wide">Line Items</p>
+                <button onClick={addLine} className="text-xs font-bold px-3 py-1 rounded-lg text-white" style={{background:'#06065c'}}>＋ Add Line</button>
+              </div>
+              <div className="border border-gray-200 rounded-xl overflow-hidden">
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="px-3 py-2 text-left text-gray-500 font-bold">Description</th>
+                      <th className="px-3 py-2 text-center text-gray-500 font-bold w-16">Qty</th>
+                      <th className="px-3 py-2 text-right text-gray-500 font-bold w-28">Unit Price</th>
+                      <th className="px-3 py-2 text-center text-gray-500 font-bold w-20">Acc Code</th>
+                      <th className="px-3 py-2 text-center text-gray-500 font-bold w-16">VAT</th>
+                      <th className="px-3 py-2 text-right text-gray-500 font-bold w-24">Amount</th>
+                      <th className="w-8"/>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(form.lineItems||[]).map((l,i)=>(
+                      <tr key={i} className="border-t border-gray-100">
+                        <td className="px-2 py-1"><input value={l.description} onChange={e=>updLine(i,'description',e.target.value)} className="w-full border-0 text-xs focus:ring-1 focus:ring-blue-300 rounded px-1 py-0.5" placeholder="Description"/></td>
+                        <td className="px-2 py-1"><input type="number" value={l.qty} onChange={e=>updLine(i,'qty',e.target.value)} className="w-full border-0 text-xs text-center focus:ring-1 focus:ring-blue-300 rounded px-1 py-0.5" min="0"/></td>
+                        <td className="px-2 py-1"><input type="number" value={l.unitAmount} onChange={e=>updLine(i,'unitAmount',e.target.value)} className="w-full border-0 text-xs text-right focus:ring-1 focus:ring-blue-300 rounded px-1 py-0.5" min="0"/></td>
+                        <td className="px-2 py-1"><input value={l.accountCode} onChange={e=>updLine(i,'accountCode',e.target.value)} className="w-full border-0 text-xs text-center focus:ring-1 focus:ring-blue-300 rounded px-1 py-0.5" placeholder="4000"/></td>
+                        <td className="px-2 py-1">
+                          <select value={l.taxType} onChange={e=>updLine(i,'taxType',e.target.value)} className="w-full border-0 text-xs focus:ring-1 focus:ring-blue-300 rounded px-1 py-0.5 bg-transparent">
+                            <option value="15%">15%</option>
+                            <option value="0%">0%</option>
+                            <option value="Exempt">Exempt</option>
+                          </select>
+                        </td>
+                        <td className="px-2 py-1 text-right font-semibold text-gray-700">{fmtAmt(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0))}</td>
+                        <td className="px-1"><button onClick={()=>delLine(i)} className="text-gray-300 hover:text-red-400 text-sm">✕</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div className="bg-gray-50 border-t border-gray-200 px-4 py-2 flex justify-end gap-6 text-xs">
+                  <span className="text-gray-500">Excl. VAT: <strong className="text-gray-800">{fmtAmt(subtotal)}</strong></span>
+                  <span className="text-gray-500">VAT (15%): <strong className="text-blue-700">{fmtAmt(vat)}</strong></span>
+                  <span className="text-gray-600 font-black text-sm">Total (incl. VAT): <span style={{color:'#06065c'}}>{fmtAmt(subtotal+vat)}</span></span>
+                </div>
+              </div>
+            </div>
+            <div className="flex gap-3 pt-2">
+              <button disabled={saving} onClick={save} className="flex-1 text-white font-bold py-2.5 rounded-xl text-sm disabled:opacity-50" style={{background:'#06065c'}}>{saving?'Reserving number…':'💾 Save Invoice'}</button>
+              <button disabled={saving} onClick={()=>{ save(); }} className="px-4 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50">Save &amp; Close</button>
+              <button onClick={onClose} className="px-4 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600">Cancel</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Payment History Modal (manual/accounting invoice payments) ──
+  function PaymentHistoryModal({ inv, onClose, accInvoices, setAccInvoices, forceSaveSections, creditNotes, setCreditNotes, isAdmin, quotes, jobs, customers, onOpenJob, onOpenCustomer, onViewInvoice, onSaved, fmtAmt, fmtDate }) {
+    const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
+    const [payments, setPayments] = useState(()=>ensurePaymentIds(inv.payments||[]));
+    const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+    const balance = invTotal-totalPaid;
+    const overpayment = totalPaid>invTotal ? totalPaid-invTotal : 0;
+    const [date,   setDate]   = useState(new Date().toISOString().slice(0,10));
+    const [method, setMethod] = useState('EFT');
+    const [amount, setAmount] = useState('');
+    const [notes,  setNotes]  = useState('');
+    const [saving, setSaving] = useState(false);
+    const [saveErr, setSaveErr] = useState('');
+    const availableCredit = creditNoteAvailable(creditNotes, inv.contactName);
+
+    // This IS the single source of truth for a manual/quote-created invoice
+    // — no resolution needed here, always accInvoices. Kept as its own
+    // `persist` so add/delete/edit share one place that writes it — now
+    // gated on a CONFIRMED backend save before any local state changes.
+    // `creditNotesOverride`, when provided, is the already-computed next
+    // creditNotes array for a Credit-method payment change, saved in the
+    // SAME forceSaveSections call as the payment (audit requirement E).
+    async function persist(updated, patch, creditNotesOverride){
+      setSaveErr('');
+      setSaving(true);
+      try {
+        const saved={...inv, payments:updated, ...(patch||{})};
+        const nextAccInvoices = accInvoices.find(i=>i.id===saved.id) ? accInvoices.map(i=>i.id===saved.id?saved:i) : [saved,...accInvoices];
+        const overrides = { accInvoices: nextAccInvoices };
+        if(creditNotesOverride) overrides.creditNotes = creditNotesOverride;
+        await forceSaveSections(overrides);
+        setAccInvoices(nextAccInvoices);
+        setPayments(updated);
+        if(creditNotesOverride) setCreditNotes(creditNotesOverride);
+        onSaved && onSaved(saved);
+      } catch(err) {
+        setSaveErr((err && err.message) ? err.message : 'Save failed. Please check your connection and try again.');
+        throw err;
+      } finally {
+        setSaving(false);
+      }
+    }
+    async function addPayment() {
+      if(saving) return;
+      if(!amount||parseFloat(amount)<=0){alert('Enter a valid amount');return;}
+      const amt = parseFloat(amount);
+      let creditNotesOverride = null;
+      if(method==='Credit'){
+        if(amt > availableCredit + 0.005){
+          alert(`${inv.contactName} only has ${fmtAmt(availableCredit)} of available credit. Reduce the amount, issue another credit note first, or choose a different payment method.`);
+          return;
+        }
+        creditNotesOverride = applyCreditNoteUsage(creditNotes, inv.contactName, amt);
+      }
+      const newP={id:Date.now(),date,method,amount:amt,notes:notes.trim()};
+      const updated=[...payments,newP];
+      const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':inv.status;
+      const paidDate=newTotal>=invTotal?(date||new Date().toISOString().slice(0,10)):inv.paidDate||null;
+      try {
+        await persist(updated, {status:newStatus, paidDate}, creditNotesOverride);
+      } catch(e) { return; }
+      setAmount(''); setNotes('');
+    }
+
+    async function deletePayment(pid) {
+      if(saving) return;
+      if(!isAdmin){alert('Only admins can delete payments.');return;}
+      if(!window.confirm('Delete this payment? This may change the invoice status.'))return;
+      const removed = payments.find(p=>p.id===pid);
+      let creditNotesOverride = null;
+      if(removed && removed.method==='Credit'){
+        creditNotesOverride = releaseCreditNoteUsage(creditNotes, inv.contactName, parseFloat(removed.amount)||0);
+      }
+      const updated=deletePaymentFromSource(payments, pid);
+      const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'sent';
+      try {
+        await persist(updated, {status:newStatus, paidDate:newTotal>=invTotal?inv.paidDate:null}, creditNotesOverride);
+      } catch(e) {}
+    }
+
+    async function editPayment(pid) {
+      if(saving) return;
+      if(!isAdmin){alert('Only admins can edit payments.');return;}
+      const p = payments.find(x=>x.id===pid);
+      const patch = promptEditPayment(p);
+      if(!patch) return;
+      const updated = updatePaymentInSource(payments, pid, patch);
+      const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':inv.status;
+      try {
+        await persist(updated, {status:newStatus, paidDate:newTotal>=invTotal?inv.paidDate:null});
+      } catch(e) {}
+    }
+
+    const iCls="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
+    // ── Linked-record quick access (read-only; reuses Phase 1's findLinkedRecords) ──
+    const _links = findLinkedRecords({ invoice: { ...inv, jobNum: inv.jobNum || inv.reference || '' } }, { quotes, jobs, accInvoices, customers });
+    const linkPanelLinks = [
+      _links.job
+        ? { icon:'💼', label:`View Job ${_links.job.num}`, onClick: onOpenJob ? ()=>{ onClose(); onOpenJob(_links.job); } : null }
+        : { icon:'💼', label:'No linked job found' },
+      { icon:'🧾', label:'View Invoice', onClick: onViewInvoice ? ()=>{ onClose(); onViewInvoice(inv); } : null },
+      _links.customer
+        ? { icon:'🏢', label:'View Customer', onClick: onOpenCustomer ? ()=>{ onClose(); onOpenCustomer(_links.customer); } : null }
+        : { icon:'🏢', label:'No matching customer record found' },
+    ];
+    return (
+      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[92vh] overflow-y-auto">
+          <div className="px-5 py-4 flex items-center justify-between" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
+            <div>
+              <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>PAYMENT HISTORY — {inv.number}</p>
+              <p className="text-blue-200 text-xs mt-0.5">{inv.contactName} · Due: {fmtDate(inv.dueDate)}</p>
+            </div>
+            <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
+          </div>
+          <div className="p-5 space-y-4">
+            <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
+            {/* Summary cards */}
+            <div className="grid grid-cols-3 gap-3">
+              <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 text-center">
+                <p className="text-xs text-gray-400 mb-1">Invoice Total (incl. VAT)</p>
+                <p className="text-lg font-black" style={{color:'#06065c'}}>{fmtAmt(invTotal)}</p>
+                <p className="text-xs text-gray-400 mt-0.5">Due: {fmtDate(inv.dueDate)}</p>
+                {availableCredit>0.005&&<p className="text-xs text-emerald-600 font-bold mt-0.5">{fmtAmt(availableCredit)} credit available</p>}
+              </div>
+              <div className="bg-green-50 border border-green-200 rounded-xl p-3 text-center">
+                <p className="text-xs text-green-600 mb-1">Total Paid</p>
+                <p className="text-lg font-black text-green-700">{fmtAmt(totalPaid)}</p>
+                <p className="text-xs text-green-500 mt-0.5">{payments.length} payment{payments.length!==1?'s':''}</p>
+              </div>
+              {overpayment>0?(
+                <div className="bg-orange-50 border border-orange-200 rounded-xl p-3 text-center">
+                  <p className="text-xs text-orange-600 mb-1">Overpayment</p>
+                  <p className="text-lg font-black text-orange-700">{fmtAmt(overpayment)}</p>
+                  <p className="text-xs text-orange-400 mt-0.5">Refund to client</p>
+                </div>
+              ):balance>0?(
+                <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-center">
+                  <p className="text-xs text-amber-600 mb-1">Balance Due</p>
+                  <p className="text-lg font-black text-amber-700">{fmtAmt(balance)}</p>
+                  <p className="text-xs text-amber-500 mt-0.5">Remaining</p>
+                </div>
+              ):(
+                <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center">
+                  <p className="text-xs text-emerald-600 mb-1">Fully Paid ✓</p>
+                  <p className="text-lg font-black text-emerald-700">{fmtAmt(0)}</p>
+                  <p className="text-xs text-emerald-500 mt-0.5">Balance clear</p>
+                </div>
+              )}
+            </div>
+
+            {/* Payment history */}
+            <div>
+              <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Payment History</p>
+              {payments.length===0?(
+                <p className="text-xs text-gray-400 italic text-center py-5 bg-gray-50 rounded-xl">No payments recorded yet.</p>
+              ):(
+                <div className="border border-gray-200 rounded-xl overflow-hidden">
+                  <table className="w-full text-xs">
+                    <thead className="bg-gray-50 border-b border-gray-100">
+                      <tr>
+                        <th className="px-3 py-2 text-left text-gray-500 font-bold">Date</th>
+                        <th className="px-3 py-2 text-left text-gray-500 font-bold">Method</th>
+                        <th className="px-3 py-2 text-right text-gray-500 font-bold">Amount</th>
+                        <th className="px-3 py-2 text-left text-gray-500 font-bold">Notes</th>
+                        <th className="w-16"/>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...payments].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0)||(b.id||0)-(a.id||0)).map((p,idx)=>(
+                        <tr key={p.id} className="border-t border-gray-100">
+                          <td className="px-3 py-2 text-gray-700">{fmtDate(p.date)}</td>
+                          <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold text-xs">{p.method}</span></td>
+                          <td className="px-3 py-2 text-right font-bold text-green-700">{fmtAmt(p.amount)}</td>
+                          <td className="px-3 py-2 text-gray-400">{p.notes||'—'}</td>
+                          <td className="px-1 text-center">
+                            {isAdmin
+                              ? <span className="flex gap-1 justify-center">
+                                  <button onClick={()=>editPayment(p.id)} disabled={saving} className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
+                                  <button onClick={()=>deletePayment(p.id)} disabled={saving} className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
+                                </span>
+                              : <span className="text-gray-200 text-xs">🔒</span>}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot className="bg-gray-50 border-t border-gray-200">
+                      <tr>
+                        <td colSpan="2" className="px-3 py-2 font-black text-gray-600 text-right text-xs">Total Paid:</td>
+                        <td className="px-3 py-2 text-right font-black text-green-700">{fmtAmt(totalPaid)}</td>
+                        <td colSpan="2"/>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* Record payment form */}
+            <div className="border border-dashed border-green-300 rounded-xl p-4 bg-green-50/40">
+              <p className="text-xs font-black text-green-700 uppercase tracking-widest mb-3">Record New Payment</p>
+              {saveErr&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2 mb-3">{saveErr}</p>}
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
+                <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
+                  <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>
+                    {['EFT','Cash','Card','Cheque','Credit','Other'].map(m=><option key={m} value={m} disabled={m==='Credit'&&availableCredit<=0.005}>{m==='Credit'?`Credit${availableCredit>0.005?' ('+fmtAmt(availableCredit)+' available)':' (none available)'}`:m}</option>)}
+                  </select>
+                </div>
+                <div><label className="text-xs font-bold text-gray-500 block mb-1">Amount (R)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} placeholder={balance>0?balance.toFixed(2):'0.00'} min="0.01" step="0.01"/></div>
+                <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes (optional)</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="Reference, partial, etc."/></div>
+              </div>
+              {method==='Credit'&&<p className="text-xs text-emerald-600 mt-2">This will draw down {inv.contactName}'s available credit instead of taking a cash payment.</p>}
+              <button onClick={addPayment} disabled={saving} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm disabled:opacity-50 disabled:cursor-not-allowed" style={{background:'#059669'}}>{saving?'Saving…':'＋ Record Payment'}</button>
+            </div>
+
+            <div className="flex justify-end pt-1">
+              <button onClick={onClose} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-4 py-2 font-semibold hover:bg-gray-50">Close</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+// ═══════════════════════════════════════════
+// Reserve/duplicate-check/save a manual (accounting) invoice — the ONE save
+// path for accInvoices, used identically by AccountingPage's own InvoiceModal
+// flow and by Sales → Invoices' Edit action, so a number is never reserved,
+// tagged or duplicate-checked two different ways depending on which page the
+// user happened to be on. `jobsAll`/`accInvoicesAll` must be the FULL,
+// unfiltered arrays (not a company-filtered view) so invoice numbers stay
+// globally unique across both companies, exactly as AccountingPage already
+// required before this was shared. Returns true on success (caller closes
+// its own modal state), false if validation/reservation failed (modal stays
+// open so the user can retry) — never throws.
+// ═══════════════════════════════════════════
+async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, setAccInvoices }) {
+  if(!inv.contactName){ alert('Contact name is required.'); return false; }
+  let working = inv;
+  if(!working.number){
+    const co = isHoldingsUser(user) ? HOLDINGS_CO_ID : 2;
+    const reserved = await reserveInvoiceNumber(co);
+    if(!reserved || invoiceNumberExists(reserved, co, jobsAll, accInvoicesAll)){
+      alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
+      return false;
+    }
+    working = { ...working, number: reserved, co };
+  }
+  const duplicate = (accInvoicesAll||[]).find(i=>i.id!==working.id && i.number && i.number.trim().toLowerCase()===(working.number||'').trim().toLowerCase());
+  if(duplicate){
+    alert('⚠ Invoice number "'+working.number+'" is already used by another invoice. Please choose a unique number.');
+    return false;
+  }
+  const tagged = { ...working, co: working.co !== undefined ? working.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : null) };
+  setAccInvoices(prev => prev.find(i=>i.id===tagged.id) ? prev.map(i=>i.id===tagged.id?tagged:i) : [tagged,...prev]);
+  return true;
+}
+
 function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices:accInvoicesAll, setAccInvoices, accBills:accBillsAll, setAccBills, creditNotes:creditNotesAll, setCreditNotes, suppliers, customers, companies, logoDataUrl, user, onOpenJob, onOpenQuote, onOpenCustomer, onOpenJobPayments, initialStatementContact, onInitialStatementHandled, forceSaveSections }) {
   // Company-context filter for DISPLAY, applied by shadowing the prop names
   // — every plain read of jobs/bankTxns/accInvoices/accBills/creditNotes
@@ -16999,41 +17645,13 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     return 'SNS-BILL-' + String((Math.max(0,...nums)+1)).padStart(4,'0');
   }
 
+  // Thin wrapper around the shared saveManualInvoice() — same reservation,
+  // duplicate-check and tagging logic Sales → Invoices' Edit action now also
+  // calls, so the two pages can never diverge. Only what's specific to this
+  // page (which local modal state to close on success) lives here.
   async function saveInvoice(inv) {
-    if(!inv.contactName){ alert('Contact name is required.'); return; }
-
-    // New invoice (no number yet — InvoiceModal leaves it blank for a new
-    // record) → reserve one atomically from the backend before creating
-    // anything. Never falls back to a local max()+1 generator. Editing an
-    // existing invoice always already has a number, so this never runs on
-    // edit — the existing number is preserved untouched.
-    let working = inv;
-    if(!working.number){
-      // Explicit company id for the reservation/scoping — co:1 Holdings,
-      // co:2 Original Signacore. (Some older manual invoices were tagged
-      // co:null for original-company users; new invoices are tagged with
-      // the explicit id below so company-scoped numbering stays reliable.)
-      const co = isHoldingsUser(user) ? HOLDINGS_CO_ID : 2;
-      const reserved = await reserveInvoiceNumber(co);
-      if(!reserved || invoiceNumberExists(reserved, co, jobsAll, accInvoicesAll)){
-        alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
-        return;
-      }
-      working = { ...working, number: reserved, co };
-    }
-
-    // Duplicate invoice number check — number must not exist on any OTHER invoice
-    // (checked against the FULL array — a number must be globally unique).
-    const duplicate = (accInvoicesAll||[]).find(i=>i.id!==working.id && i.number && i.number.trim().toLowerCase()===(working.number||'').trim().toLowerCase());
-    if(duplicate){
-      alert('⚠ Invoice number "'+working.number+'" is already used by another invoice. Please choose a unique number.');
-      return;
-    }
-    // Tag with the logged-in user's company on create; preserve the existing
-    // company tag on edit (never re-tag an existing record).
-    const tagged = { ...working, co: working.co !== undefined ? working.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : null) };
-    setAccInvoices(prev => prev.find(i=>i.id===tagged.id) ? prev.map(i=>i.id===tagged.id?tagged:i) : [tagged,...prev]);
-    setShowInvModal(false); setEditInv(null);
+    const ok = await saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, setAccInvoices });
+    if(ok){ setShowInvModal(false); setEditInv(null); }
   }
   function saveBill(bill) {
     const tagged = { ...bill, co: bill.co !== undefined ? bill.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : null) };
@@ -17486,119 +18104,25 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
             <div className="flex gap-3 pt-1">
               {/* Job-sourced invoices reuse the existing printInvoice(job,...) —
                   same output as Jobs/Sales — via the linked job already resolved
-                  above. Manual invoices don't have an equivalent print template
-                  yet, so no button is shown for them in this phase. */}
+                  above. Manual invoices use buildManualInvoiceHtml/
+                  printManualInvoice — the shared print template also used by
+                  Accounting's Invoices table and Sales → Invoices, so a
+                  manual invoice prints/emails identically everywhere it's
+                  opened from. */}
               {isJob&&_links.job&&(
                 <button onClick={()=>printInvoice(_links.job,companies,logoDataUrl,customers)}
                   className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
               )}
+              {!isJob&&(
+                <button onClick={()=>printManualInvoice(inv,companies,logoDataUrl)}
+                  className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
+              )}
+              {!isJob&&(
+                <button onClick={()=>emailManualInvoiceViaOutlook(inv,companies)}
+                  className="px-5 py-2.5 text-white font-bold rounded-xl text-sm" style={{background:'#1e40af'}}>📧 Email Invoice</button>
+              )}
               {onEdit&&<button onClick={onEdit} className="px-5 py-2.5 text-white font-bold rounded-xl text-sm" style={{background:'#06065c'}}>✏️ Edit Invoice</button>}
               <button onClick={onClose} className="px-5 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600">Close</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // ── Invoice Modal ──
-  function InvoiceModal({ inv, onSave, onClose }) {
-    const isNew = !inv;
-    // A new invoice gets its number reserved atomically from the backend at
-    // save time (see saveInvoice) — never pre-computed here client-side, and
-    // never editable by the user (no input field for it exists below).
-    const [form, setForm] = useState(inv || {
-      id: Date.now(), number: '', date: new Date().toISOString().slice(0,10),
-      dueDate: new Date(Date.now()+30*864e5).toISOString().slice(0,10),
-      contactName:'', contactEmail:'', contactAddress:'', reference:'',
-      status:'draft', lineItems:[{description:'',qty:1,unitAmount:0,accountCode:'4000',taxType:'15%'}]
-    });
-    const [saving, setSaving] = useState(false);
-    const upd = k => v => setForm(p=>({...p,[k]:v}));
-    const updLine = (i,k,v) => setForm(p=>({...p,lineItems:p.lineItems.map((l,idx)=>idx===i?{...l,[k]:v}:l)}));
-    const addLine = () => setForm(p=>({...p,lineItems:[...p.lineItems,{description:'',qty:1,unitAmount:0,accountCode:'4000',taxType:'15%'}]}));
-    const delLine = i => setForm(p=>({...p,lineItems:p.lineItems.filter((_,idx)=>idx!==i)}));
-    const subtotal = (form.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0)),0);
-    const vat = (form.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0)*0.15):s,0);
-    const iCls="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
-    async function save(){
-      if(!form.contactName){ alert('Contact name is required.'); return; }
-      if(saving) return; // guard against double-click firing two reservations
-      setSaving(true);
-      try { await onSave(form); } finally { setSaving(false); }
-    }
-    return (
-      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[95vh] overflow-y-auto">
-          <div className="px-5 py-4 flex items-center justify-between" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
-            <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>{isNew?'NEW INVOICE':'EDIT INVOICE'} — {form.number||'(number auto-reserved on save)'}</p>
-            <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
-          </div>
-          <div className="p-5 space-y-4">
-            {/* Header fields */}
-            <div className="grid grid-cols-2 gap-3">
-              <div><label className="text-xs font-bold text-gray-500 block mb-1">Contact / Customer *</label><input value={form.contactName} onChange={e=>upd('contactName')(e.target.value)} className={iCls} placeholder="Company or person name" list="cust-list"/><datalist id="cust-list">{(customers||[]).map(c=><option key={c.id} value={c.name}/>)}</datalist></div>
-              <div><label className="text-xs font-bold text-gray-500 block mb-1">Email</label><input type="email" value={form.contactEmail} onChange={e=>upd('contactEmail')(e.target.value)} className={iCls}/></div>
-              <div><label className="text-xs font-bold text-gray-500 block mb-1">Invoice Date</label><input type="date" value={form.date} onChange={e=>upd('date')(e.target.value)} className={iCls}/></div>
-              <div><label className="text-xs font-bold text-gray-500 block mb-1">Due Date</label><input type="date" value={form.dueDate} onChange={e=>upd('dueDate')(e.target.value)} className={iCls}/></div>
-              <div><label className="text-xs font-bold text-gray-500 block mb-1">Reference</label><input value={form.reference} onChange={e=>upd('reference')(e.target.value)} className={iCls} placeholder="PO# or job ref"/></div>
-              <div><label className="text-xs font-bold text-gray-500 block mb-1">Status</label>
-                <select value={form.status} onChange={e=>upd('status')(e.target.value)} className={iCls}>
-                  {['draft','sent','paid','overdue','void'].map(s=><option key={s} value={s}>{s.charAt(0).toUpperCase()+s.slice(1)}</option>)}
-                </select>
-              </div>
-              <div className="col-span-2"><label className="text-xs font-bold text-gray-500 block mb-1">Address</label><textarea value={form.contactAddress} onChange={e=>upd('contactAddress')(e.target.value)} rows={2} className={iCls}/></div>
-            </div>
-            {/* Line items */}
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <p className="text-xs font-black text-gray-600 uppercase tracking-wide">Line Items</p>
-                <button onClick={addLine} className="text-xs font-bold px-3 py-1 rounded-lg text-white" style={{background:'#06065c'}}>＋ Add Line</button>
-              </div>
-              <div className="border border-gray-200 rounded-xl overflow-hidden">
-                <table className="w-full text-xs">
-                  <thead className="bg-gray-50">
-                    <tr>
-                      <th className="px-3 py-2 text-left text-gray-500 font-bold">Description</th>
-                      <th className="px-3 py-2 text-center text-gray-500 font-bold w-16">Qty</th>
-                      <th className="px-3 py-2 text-right text-gray-500 font-bold w-28">Unit Price</th>
-                      <th className="px-3 py-2 text-center text-gray-500 font-bold w-20">Acc Code</th>
-                      <th className="px-3 py-2 text-center text-gray-500 font-bold w-16">VAT</th>
-                      <th className="px-3 py-2 text-right text-gray-500 font-bold w-24">Amount</th>
-                      <th className="w-8"/>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(form.lineItems||[]).map((l,i)=>(
-                      <tr key={i} className="border-t border-gray-100">
-                        <td className="px-2 py-1"><input value={l.description} onChange={e=>updLine(i,'description',e.target.value)} className="w-full border-0 text-xs focus:ring-1 focus:ring-blue-300 rounded px-1 py-0.5" placeholder="Description"/></td>
-                        <td className="px-2 py-1"><input type="number" value={l.qty} onChange={e=>updLine(i,'qty',e.target.value)} className="w-full border-0 text-xs text-center focus:ring-1 focus:ring-blue-300 rounded px-1 py-0.5" min="0"/></td>
-                        <td className="px-2 py-1"><input type="number" value={l.unitAmount} onChange={e=>updLine(i,'unitAmount',e.target.value)} className="w-full border-0 text-xs text-right focus:ring-1 focus:ring-blue-300 rounded px-1 py-0.5" min="0"/></td>
-                        <td className="px-2 py-1"><input value={l.accountCode} onChange={e=>updLine(i,'accountCode',e.target.value)} className="w-full border-0 text-xs text-center focus:ring-1 focus:ring-blue-300 rounded px-1 py-0.5" placeholder="4000"/></td>
-                        <td className="px-2 py-1">
-                          <select value={l.taxType} onChange={e=>updLine(i,'taxType',e.target.value)} className="w-full border-0 text-xs focus:ring-1 focus:ring-blue-300 rounded px-1 py-0.5 bg-transparent">
-                            <option value="15%">15%</option>
-                            <option value="0%">0%</option>
-                            <option value="Exempt">Exempt</option>
-                          </select>
-                        </td>
-                        <td className="px-2 py-1 text-right font-semibold text-gray-700">{fmtAmt(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0))}</td>
-                        <td className="px-1"><button onClick={()=>delLine(i)} className="text-gray-300 hover:text-red-400 text-sm">✕</button></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                <div className="bg-gray-50 border-t border-gray-200 px-4 py-2 flex justify-end gap-6 text-xs">
-                  <span className="text-gray-500">Excl. VAT: <strong className="text-gray-800">{fmtAmt(subtotal)}</strong></span>
-                  <span className="text-gray-500">VAT (15%): <strong className="text-blue-700">{fmtAmt(vat)}</strong></span>
-                  <span className="text-gray-600 font-black text-sm">Total (incl. VAT): <span style={{color:'#06065c'}}>{fmtAmt(subtotal+vat)}</span></span>
-                </div>
-              </div>
-            </div>
-            <div className="flex gap-3 pt-2">
-              <button disabled={saving} onClick={save} className="flex-1 text-white font-bold py-2.5 rounded-xl text-sm disabled:opacity-50" style={{background:'#06065c'}}>{saving?'Reserving number…':'💾 Save Invoice'}</button>
-              <button disabled={saving} onClick={()=>{ save(); }} className="px-4 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50">Save &amp; Close</button>
-              <button onClick={onClose} className="px-4 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600">Cancel</button>
             </div>
           </div>
         </div>
@@ -17889,234 +18413,6 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
 
   const STATUS_COLORS = { draft:'#6b7280', sent:'#2563eb', paid:'#059669', partial:'#f59e0b', overdue:'#dc2626', void:'#9ca3af', approved:'#d97706' };
 
-  // ── Payment History Modal ──
-  function PaymentHistoryModal({ inv, onClose }) {
-    const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
-    const [payments, setPayments] = useState(()=>ensurePaymentIds(inv.payments||[]));
-    const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-    const balance = invTotal-totalPaid;
-    const overpayment = totalPaid>invTotal ? totalPaid-invTotal : 0;
-    const [date,   setDate]   = useState(new Date().toISOString().slice(0,10));
-    const [method, setMethod] = useState('EFT');
-    const [amount, setAmount] = useState('');
-    const [notes,  setNotes]  = useState('');
-    const [saving, setSaving] = useState(false);
-    const [saveErr, setSaveErr] = useState('');
-    const availableCredit = creditNoteAvailable(creditNotes, inv.contactName);
-
-    // This IS the single source of truth for a manual/quote-created invoice
-    // — no resolution needed here, always accInvoices. Kept as its own
-    // `persist` so add/delete/edit share one place that writes it — now
-    // gated on a CONFIRMED backend save before any local state changes.
-    // `creditNotesOverride`, when provided, is the already-computed next
-    // creditNotes array for a Credit-method payment change, saved in the
-    // SAME forceSaveSections call as the payment (audit requirement E).
-    async function persist(updated, patch, creditNotesOverride){
-      setSaveErr('');
-      setSaving(true);
-      try {
-        const saved={...inv, payments:updated, ...(patch||{})};
-        const nextAccInvoices = accInvoices.find(i=>i.id===saved.id) ? accInvoices.map(i=>i.id===saved.id?saved:i) : [saved,...accInvoices];
-        const overrides = { accInvoices: nextAccInvoices };
-        if(creditNotesOverride) overrides.creditNotes = creditNotesOverride;
-        await forceSaveSections(overrides);
-        setAccInvoices(nextAccInvoices);
-        setPayments(updated);
-        if(creditNotesOverride) setCreditNotes(creditNotesOverride);
-        setPayModalInv(saved);
-      } catch(err) {
-        setSaveErr((err && err.message) ? err.message : 'Save failed. Please check your connection and try again.');
-        throw err;
-      } finally {
-        setSaving(false);
-      }
-    }
-    async function addPayment() {
-      if(saving) return;
-      if(!amount||parseFloat(amount)<=0){alert('Enter a valid amount');return;}
-      const amt = parseFloat(amount);
-      let creditNotesOverride = null;
-      if(method==='Credit'){
-        if(amt > availableCredit + 0.005){
-          alert(`${inv.contactName} only has ${fmtAmt(availableCredit)} of available credit. Reduce the amount, issue another credit note first, or choose a different payment method.`);
-          return;
-        }
-        creditNotesOverride = applyCreditNoteUsage(creditNotes, inv.contactName, amt);
-      }
-      const newP={id:Date.now(),date,method,amount:amt,notes:notes.trim()};
-      const updated=[...payments,newP];
-      const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':inv.status;
-      const paidDate=newTotal>=invTotal?(date||new Date().toISOString().slice(0,10)):inv.paidDate||null;
-      try {
-        await persist(updated, {status:newStatus, paidDate}, creditNotesOverride);
-      } catch(e) { return; }
-      setAmount(''); setNotes('');
-    }
-
-    async function deletePayment(pid) {
-      if(saving) return;
-      if(!isAdmin){alert('Only admins can delete payments.');return;}
-      if(!window.confirm('Delete this payment? This may change the invoice status.'))return;
-      const removed = payments.find(p=>p.id===pid);
-      let creditNotesOverride = null;
-      if(removed && removed.method==='Credit'){
-        creditNotesOverride = releaseCreditNoteUsage(creditNotes, inv.contactName, parseFloat(removed.amount)||0);
-      }
-      const updated=deletePaymentFromSource(payments, pid);
-      const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'sent';
-      try {
-        await persist(updated, {status:newStatus, paidDate:newTotal>=invTotal?inv.paidDate:null}, creditNotesOverride);
-      } catch(e) {}
-    }
-
-    async function editPayment(pid) {
-      if(saving) return;
-      if(!isAdmin){alert('Only admins can edit payments.');return;}
-      const p = payments.find(x=>x.id===pid);
-      const patch = promptEditPayment(p);
-      if(!patch) return;
-      const updated = updatePaymentInSource(payments, pid, patch);
-      const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':inv.status;
-      try {
-        await persist(updated, {status:newStatus, paidDate:newTotal>=invTotal?inv.paidDate:null});
-      } catch(e) {}
-    }
-
-    const iCls="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
-    // ── Linked-record quick access (read-only; reuses Phase 1's findLinkedRecords) ──
-    const _links = findLinkedRecords({ invoice: { ...inv, jobNum: inv.jobNum || inv.reference || '' } }, { quotes, jobs, accInvoices, customers });
-    const linkPanelLinks = [
-      _links.job
-        ? { icon:'💼', label:`View Job ${_links.job.num}`, onClick: onOpenJob ? ()=>{ onClose(); onOpenJob(_links.job); } : null }
-        : { icon:'💼', label:'No linked job found' },
-      { icon:'🧾', label:'View Invoice', onClick: ()=>{ onClose(); setViewInv(inv); } },
-      _links.customer
-        ? { icon:'🏢', label:'View Customer', onClick: onOpenCustomer ? ()=>{ onClose(); onOpenCustomer(_links.customer); } : null }
-        : { icon:'🏢', label:'No matching customer record found' },
-    ];
-    return (
-      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[92vh] overflow-y-auto">
-          <div className="px-5 py-4 flex items-center justify-between" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
-            <div>
-              <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>PAYMENT HISTORY — {inv.number}</p>
-              <p className="text-blue-200 text-xs mt-0.5">{inv.contactName} · Due: {fmtDate(inv.dueDate)}</p>
-            </div>
-            <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
-          </div>
-          <div className="p-5 space-y-4">
-            <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
-            {/* Summary cards */}
-            <div className="grid grid-cols-3 gap-3">
-              <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 text-center">
-                <p className="text-xs text-gray-400 mb-1">Invoice Total (incl. VAT)</p>
-                <p className="text-lg font-black" style={{color:'#06065c'}}>{fmtAmt(invTotal)}</p>
-                <p className="text-xs text-gray-400 mt-0.5">Due: {fmtDate(inv.dueDate)}</p>
-                {availableCredit>0.005&&<p className="text-xs text-emerald-600 font-bold mt-0.5">{fmtAmt(availableCredit)} credit available</p>}
-              </div>
-              <div className="bg-green-50 border border-green-200 rounded-xl p-3 text-center">
-                <p className="text-xs text-green-600 mb-1">Total Paid</p>
-                <p className="text-lg font-black text-green-700">{fmtAmt(totalPaid)}</p>
-                <p className="text-xs text-green-500 mt-0.5">{payments.length} payment{payments.length!==1?'s':''}</p>
-              </div>
-              {overpayment>0?(
-                <div className="bg-orange-50 border border-orange-200 rounded-xl p-3 text-center">
-                  <p className="text-xs text-orange-600 mb-1">Overpayment</p>
-                  <p className="text-lg font-black text-orange-700">{fmtAmt(overpayment)}</p>
-                  <p className="text-xs text-orange-400 mt-0.5">Refund to client</p>
-                </div>
-              ):balance>0?(
-                <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-center">
-                  <p className="text-xs text-amber-600 mb-1">Balance Due</p>
-                  <p className="text-lg font-black text-amber-700">{fmtAmt(balance)}</p>
-                  <p className="text-xs text-amber-500 mt-0.5">Remaining</p>
-                </div>
-              ):(
-                <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center">
-                  <p className="text-xs text-emerald-600 mb-1">Fully Paid ✓</p>
-                  <p className="text-lg font-black text-emerald-700">{fmtAmt(0)}</p>
-                  <p className="text-xs text-emerald-500 mt-0.5">Balance clear</p>
-                </div>
-              )}
-            </div>
-
-            {/* Payment history */}
-            <div>
-              <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Payment History</p>
-              {payments.length===0?(
-                <p className="text-xs text-gray-400 italic text-center py-5 bg-gray-50 rounded-xl">No payments recorded yet.</p>
-              ):(
-                <div className="border border-gray-200 rounded-xl overflow-hidden">
-                  <table className="w-full text-xs">
-                    <thead className="bg-gray-50 border-b border-gray-100">
-                      <tr>
-                        <th className="px-3 py-2 text-left text-gray-500 font-bold">Date</th>
-                        <th className="px-3 py-2 text-left text-gray-500 font-bold">Method</th>
-                        <th className="px-3 py-2 text-right text-gray-500 font-bold">Amount</th>
-                        <th className="px-3 py-2 text-left text-gray-500 font-bold">Notes</th>
-                        <th className="w-16"/>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {[...payments].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0)||(b.id||0)-(a.id||0)).map((p,idx)=>(
-                        <tr key={p.id} className="border-t border-gray-100">
-                          <td className="px-3 py-2 text-gray-700">{fmtDate(p.date)}</td>
-                          <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold text-xs">{p.method}</span></td>
-                          <td className="px-3 py-2 text-right font-bold text-green-700">{fmtAmt(p.amount)}</td>
-                          <td className="px-3 py-2 text-gray-400">{p.notes||'—'}</td>
-                          <td className="px-1 text-center">
-                            {isAdmin
-                              ? <span className="flex gap-1 justify-center">
-                                  <button onClick={()=>editPayment(p.id)} disabled={saving} className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
-                                  <button onClick={()=>deletePayment(p.id)} disabled={saving} className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
-                                </span>
-                              : <span className="text-gray-200 text-xs">🔒</span>}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                    <tfoot className="bg-gray-50 border-t border-gray-200">
-                      <tr>
-                        <td colSpan="2" className="px-3 py-2 font-black text-gray-600 text-right text-xs">Total Paid:</td>
-                        <td className="px-3 py-2 text-right font-black text-green-700">{fmtAmt(totalPaid)}</td>
-                        <td colSpan="2"/>
-                      </tr>
-                    </tfoot>
-                  </table>
-                </div>
-              )}
-            </div>
-
-            {/* Record payment form */}
-            <div className="border border-dashed border-green-300 rounded-xl p-4 bg-green-50/40">
-              <p className="text-xs font-black text-green-700 uppercase tracking-widest mb-3">Record New Payment</p>
-              {saveErr&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2 mb-3">{saveErr}</p>}
-              <div className="grid grid-cols-2 gap-3">
-                <div><label className="text-xs font-bold text-gray-500 block mb-1">Payment Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
-                <div><label className="text-xs font-bold text-gray-500 block mb-1">Method</label>
-                  <select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>
-                    {['EFT','Cash','Card','Cheque','Credit','Other'].map(m=><option key={m} value={m} disabled={m==='Credit'&&availableCredit<=0.005}>{m==='Credit'?`Credit${availableCredit>0.005?' ('+fmtAmt(availableCredit)+' available)':' (none available)'}`:m}</option>)}
-                  </select>
-                </div>
-                <div><label className="text-xs font-bold text-gray-500 block mb-1">Amount (R)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} placeholder={balance>0?balance.toFixed(2):'0.00'} min="0.01" step="0.01"/></div>
-                <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes (optional)</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="Reference, partial, etc."/></div>
-              </div>
-              {method==='Credit'&&<p className="text-xs text-emerald-600 mt-2">This will draw down {inv.contactName}'s available credit instead of taking a cash payment.</p>}
-              <button onClick={addPayment} disabled={saving} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm disabled:opacity-50 disabled:cursor-not-allowed" style={{background:'#059669'}}>{saving?'Saving…':'＋ Record Payment'}</button>
-            </div>
-
-            <div className="flex justify-end pt-1">
-              <button onClick={onClose} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-4 py-2 font-semibold hover:bg-gray-50">Close</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   const TABS = [
     {id:'dashboard', label:'🏠 Dashboard'},
     {id:'invoices',  label:'🧾 Invoices'},
@@ -18133,10 +18429,14 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     <div className="p-4 space-y-4 max-w-7xl mx-auto">
       {editTxn&&<AllocationModal txn={editTxn} onSave={saveAllocation} onClose={()=>setEditTxn(null)}/>}
       {showAddAccount&&<AddAccountModal onClose={()=>setShowAddAccount(false)}/>}
-      {showInvModal&&<InvoiceModal inv={editInv} onSave={saveInvoice} onClose={()=>{setShowInvModal(false);setEditInv(null);}}/>}
+      {showInvModal&&<InvoiceModal inv={editInv} onSave={saveInvoice} onClose={()=>{setShowInvModal(false);setEditInv(null);}} customers={customers} fmtAmt={fmtAmt}/>}
       {viewInv&&<ViewInvoiceModal inv={viewInv} onClose={()=>setViewInv(null)} onEdit={viewInv.source!=='job'?()=>{setEditInv(viewInv);setShowInvModal(true);setViewInv(null);}:null}/>}
       {showBillModal&&<BillModal bill={editBill} onSave={saveBill} onClose={()=>{setShowBillModal(false);setEditBill(null);}}/>}
-      {showPayModal&&payModalInv&&<PaymentHistoryModal inv={payModalInv} onClose={()=>{setShowPayModal(false);setPayModalInv(null);}}/>}
+      {showPayModal&&payModalInv&&<PaymentHistoryModal inv={payModalInv} onClose={()=>{setShowPayModal(false);setPayModalInv(null);}}
+        accInvoices={accInvoices} setAccInvoices={setAccInvoices} forceSaveSections={forceSaveSections}
+        creditNotes={creditNotes} setCreditNotes={setCreditNotes} isAdmin={isAdmin} quotes={quotes} jobs={jobs} customers={customers}
+        onOpenJob={onOpenJob} onOpenCustomer={onOpenCustomer} onViewInvoice={inv=>setViewInv(inv)} onSaved={setPayModalInv}
+        fmtAmt={fmtAmt} fmtDate={fmtDate}/>}
 
       {/* Tab bar */}
       <div className="flex flex-wrap gap-2">
@@ -18475,6 +18775,8 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                               <button onClick={()=>setViewInv(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f0f4ff',color:'#4338ca'}}>👁 View</button>
                               <button onClick={()=>{setPayModalInv(inv);setShowPayModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#ecfdf5',color:'#059669'}}>💳 Payments</button>
                               <button onClick={()=>{setEditInv(inv);setShowInvModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#e6e6ff',color:'#06065c'}}>Edit</button>
+                              <button onClick={()=>printManualInvoice(inv,companies,logoDataUrl)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f3f4f6',color:'#1f2937'}}>🧾 Print</button>
+                              <button onClick={()=>emailManualInvoiceViaOutlook(inv,companies)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dbeafe',color:'#1e40af'}}>📧 Email</button>
                               {inv.status!=='paid'&&<button onClick={()=>markInvPaid(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dcfce7',color:'#059669'}}>✓ Paid</button>}
                               {isAdmin&&<button onClick={()=>deleteInvoice(inv.id)} className="text-xs text-gray-300 hover:text-red-400">✕</button>}
                             </div>
@@ -20474,7 +20776,7 @@ function App() {
 
   const pageMap = {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={accInvoices}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} forceSaveSections={forceSaveSections}/>,
+    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} onOpenJob={openJobRecord} forceSaveSections={forceSaveSections}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord}/>,
