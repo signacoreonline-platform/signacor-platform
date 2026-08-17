@@ -2060,17 +2060,86 @@ async function reserveInvoiceNumber(co) {
 }
 
 // Final frontend safeguard in addition to the backend's own atomic
-// reservation + duplicate check: confirm a just-reserved number doesn't
-// already exist among this company's job-derived invoices or accInvoices
-// in the CURRENT master state before it is actually used. Should not
-// normally trigger — the backend already checked — but invoice creation
-// must stop rather than proceed if it ever does.
+// reservation + duplicate check: confirm a just-reserved (or reused-from-
+// proforma) number doesn't already exist among ANY company's job-derived
+// invoices or accInvoices in the CURRENT master state before it is actually
+// used. Should not normally trigger — the backend already checked — but
+// invoice creation must stop rather than proceed if it ever does.
+//
+// Checked GLOBALLY, across every company, NOT scoped to `co` (2026-08-17
+// fix — root cause of the INV-00068 collision). The formatted number itself
+// ("INV-00068") carries no company marker anywhere it's displayed, printed
+// or searched, so it must be unique across the whole platform, not just
+// within one company. Before this fix, this check (and the backend's
+// matching guard in documentNumbers.ts) only compared same-company records,
+// so two independent per-company counters were able to converge on the same
+// formatted number with nothing catching it — see job SNS-00055 (co:1, a
+// legacy mistagged company on an old record) colliding with the real,
+// pre-existing co:2 invoice INV-00068 (Whalecoast Dried Fruit and Nuts).
+// `co` is still accepted (kept for call-site compatibility) but no longer
+// used to filter — every existing call site already re-checks the specific
+// reserved number immediately after reservation, so widening this to global
+// scope can only ever make it MORE cautious, never block a legitimate save.
 function invoiceNumberExists(number, co, jobs, accInvoices) {
   const target = (number||'').trim().toUpperCase();
   if (!target) return false;
-  const inJobs = (jobs||[]).some(j=>j && String(j.co)===String(co) && (j.invoiceNum||'').trim().toUpperCase()===target);
+  const inJobs = (jobs||[]).some(j=>j && (j.invoiceNum||'').trim().toUpperCase()===target);
   if (inJobs) return true;
-  return (accInvoices||[]).some(i=>i && String(i.co)===String(co) && (i.number||'').trim().toUpperCase()===target);
+  return (accInvoices||[]).some(i=>i && (i.number||'').trim().toUpperCase()===target);
+}
+
+/* ═══════════════════════════════════════════
+   PROFORMA-TO-INVOICE NUMBER REUSE (2026-08-17)
+   New business rule: if the quote that produced an invoice already carries a
+   legacy `proformaNum` (an already-persisted INV-xxxxx-style value — see the
+   comment in QuoteViewModal above `const proformaNum = quote.proformaNum ||
+   quote.num;`), the FINAL invoice must reuse that EXACT number instead of
+   reserving a fresh one from the atomic counter, so a customer's proforma
+   and their tax invoice are never two different numbers. This does NOT
+   change how proformas are printed/displayed (QuoteViewModal's own
+   `proformaNum` computation is untouched, and nothing new starts minting or
+   persisting a proformaNum on quotes going forward — new quotes simply don't
+   have this field, so this whole block is a no-op for them and they fall
+   straight through to the existing reserveInvoiceNumber() flow unchanged).
+   It only closes the gap for quotes that already carry a legacy proformaNum,
+   used by createInvoiceFromQuote / createInvoiceNow / JobDetail's own
+   "Create Invoice" action.
+═══════════════════════════════════════════ */
+// Finds the quote a job was converted from, by the same job.quoteNum ===
+// quote.num rule reconcileJobInvoice()/resolvePaymentSource() already use —
+// so proforma-number reuse and payment reconciliation can never disagree
+// about which quote a job came from.
+function findSourceQuoteForJob(job, quotes) {
+  if (!job) return null;
+  return (quotes||[]).find(q=>q && q.num && job.quoteNum && q.num===job.quoteNum) || null;
+}
+// Pure decision helper — never mutates anything, never reserves/writes a
+// number itself. Returns exactly one of:
+//   { number: 'INV-x' }               — safe to reuse this exact number
+//   { blocked: true, reason: '...' }  — do NOT create the invoice; caller
+//                                        must show `reason` and stop
+//   { number: null }                  — no proformaNum on this quote (the
+//                                        normal case); caller should fall
+//                                        back to reserveInvoiceNumber()
+function resolveProformaInvoiceNumber(quote, { jobs, accInvoices, quotes }) {
+  if (!quote || !quote.proformaNum) return { number: null };
+  const proforma = String(quote.proformaNum).trim();
+  if (!proforma) return { number: null };
+  // Already used by a REAL invoice (job-derived or accInvoices, any company)
+  // — never silently substitute a different number; block and require a
+  // targeted correction (same pattern as the INV-00068 collision fix).
+  if (invoiceNumberExists(proforma, quote.co, jobs, accInvoices)) {
+    return { blocked: true, reason: `Proforma number ${proforma} on quote ${quote.num||''} is already used by another real invoice. It cannot be safely reused — a targeted correction script is needed to resolve this before ${quote.num||'this quote'} can be invoiced.` };
+  }
+  // Also duplicated on another quote's proformaNum (a historical proforma
+  // collision, e.g. the same number issued to two different quotes before
+  // this rule existed) — do not auto-pick a winner; block both until a
+  // person decides which one actually gets to keep the number.
+  const siblings = (quotes||[]).filter(q=>q && q.id!==quote.id && String(q.proformaNum||'').trim().toUpperCase()===proforma.toUpperCase());
+  if (siblings.length>0) {
+    return { blocked: true, reason: `Proforma number ${proforma} is also recorded on ${siblings.length} other quote(s) (${siblings.map(s=>s.num).join(', ')}) — it was duplicated historically and is not safe to auto-assign to either. A targeted correction is needed to decide which record keeps ${proforma} before any of them can be invoiced.` };
+  }
+  return { number: proforma };
 }
 
 /* ═══════════════════════════════════════════
@@ -2244,10 +2313,23 @@ function getPendingJobInvoices(jobs, accInvoices) {
 // exact same getQuoteInvoice/getJobManualInvoice rules already used by the
 // "View Invoice" links, so the payment view and the invoice view can never
 // disagree about which invoice this belongs to.
-function resolvePaymentSource({ quote, job, accInvoices }) {
+// `quotes`, when passed, lets the `job` branch fall back to this job's
+// ORIGINATING quote (2026-08-17 fix) — see below.
+function resolvePaymentSource({ quote, job, accInvoices, quotes }) {
   if (job) {
     const linkedInvoice = getJobManualInvoice(job, accInvoices);
     if (linkedInvoice) return { kind: 'invoice', record: linkedInvoice, payments: linkedInvoice.payments || [] };
+    // No linked invoice yet. job.payments alone can be empty/stale for a job
+    // converted from a quote before the deposit-carry-forward step existed
+    // (or any case where a deposit was recorded on the quote after
+    // conversion) — merge in the source quote's payments the exact same
+    // deduped-by-id way reconcileJobInvoice()/getAllInvoicesUnified() already
+    // do for the Sales/Accounting invoice list, so this modal (opened from
+    // Job Detail, Jobs, Accounting or Sales — see JobPaymentHistoryModal)
+    // can never show an empty/incomplete payment history for a deposit that
+    // genuinely exists on the linked quote. Falls back to raw job.payments
+    // when `quotes` isn't supplied, unchanged from before.
+    if (quotes) return { kind: 'job', record: job, payments: reconcileJobInvoice(job, quotes).payments };
     return { kind: 'job', record: job, payments: job.payments || [] };
   }
   if (quote) {
@@ -7435,9 +7517,25 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       return;
     }
 
-    // Reserve a brand-new number from the backend-atomic counter. Never
-    // falls back to a local max()+1 generator if this fails.
-    const reserved = await reserveInvoiceNumber(job.co);
+    // If this job's source quote already carries a legacy proformaNum, that
+    // EXACT number must become the invoice number instead of a fresh
+    // reservation (2026-08-17 rule) — see resolveProformaInvoiceNumber()
+    // above. findSourceQuoteForJob() mirrors reconcileJobInvoice()'s own
+    // job.quoteNum===quote.num matching rule, so this can never disagree
+    // with what the payments reconciliation already considers "this job's
+    // quote". Blocked (not silently skipped) if that number is unsafe to
+    // reuse — see the helper for the two block conditions.
+    const sourceQuoteNow = findSourceQuoteForJob(job, quotes);
+    const proformaDecisionNow = resolveProformaInvoiceNumber(sourceQuoteNow, { jobs, accInvoices, quotes });
+    if (proformaDecisionNow.blocked) {
+      alert('Invoice not created.\n\n' + proformaDecisionNow.reason);
+      return;
+    }
+    // Reserve a brand-new number from the backend-atomic counter, unless the
+    // proforma check above already supplied the exact number to reuse. Never
+    // falls back to a local max()+1 generator if reservation fails.
+    let reserved = proformaDecisionNow.number;
+    if (!reserved) reserved = await reserveInvoiceNumber(job.co);
     if(!reserved || invoiceNumberExists(reserved, job.co, jobs, accInvoices)){
       alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
       return;
@@ -7515,10 +7613,21 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const paidSoFar  = carriedPayments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
     const status = (paidSoFar>=totalIncl && totalIncl>0) ? 'paid' : (paidSoFar>0 ? 'partial' : 'sent');
 
+    // If this quote already carries a legacy proformaNum, that EXACT number
+    // must become the invoice number instead of a fresh reservation
+    // (2026-08-17 rule) — see resolveProformaInvoiceNumber() above. Blocked
+    // (not silently skipped) if that number is unsafe to reuse.
+    const proformaDecisionFromQuote = resolveProformaInvoiceNumber(quote, { jobs, accInvoices, quotes });
+    if (proformaDecisionFromQuote.blocked) {
+      alert('Invoice not created.\n\n' + proformaDecisionFromQuote.reason);
+      return;
+    }
     // Reserve a brand-new number from the same backend-atomic counter every
-    // other invoice (job-derived or manual) uses. Never falls back to a
-    // local max()+1 generator if this fails.
-    const reserved = await reserveInvoiceNumber(quote.co);
+    // other invoice (job-derived or manual) uses, unless the proforma check
+    // above already supplied the exact number to reuse. Never falls back to
+    // a local max()+1 generator if reservation fails.
+    let reserved = proformaDecisionFromQuote.number;
+    if (!reserved) reserved = await reserveInvoiceNumber(quote.co);
     if(!reserved || invoiceNumberExists(reserved, quote.co, jobs, accInvoices)){
       alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
       return;
@@ -7565,7 +7674,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // can never show/edit a stale copy disconnected from Accounting/Sales/
     // the invoice view. Jobs with no linked invoice keep using job.payments
     // exactly as before.
-    const paySource = resolvePaymentSource({ job, accInvoices });
+    const paySource = resolvePaymentSource({ job, accInvoices, quotes });
     const invTotal = paySource.kind==='invoice'
       ? (paySource.record.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0)
       : (parseFloat(job.value)||0); // already incl. VAT
@@ -12115,9 +12224,26 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                       setInvoiceCreatedInfo({ invoiceNum: job.invoiceNum });
                       return;
                     }
+                    // If this job's source quote already carries a legacy
+                    // proformaNum, that EXACT number must become the invoice
+                    // number instead of a fresh reservation (2026-08-17 rule)
+                    // — see resolveProformaInvoiceNumber() above. Blocked
+                    // (not silently skipped) if unsafe to reuse. Mirrors the
+                    // exact same check createInvoiceNow (QuotesPage) uses, so
+                    // this job's real invoice can never come out differently
+                    // depending on which "Create Invoice" button was clicked.
+                    const sourceQuoteJD = findSourceQuoteForJob(job, quotes);
+                    const proformaDecisionJD = resolveProformaInvoiceNumber(sourceQuoteJD, { jobs, accInvoices, quotes });
+                    if (proformaDecisionJD.blocked) {
+                      alert('Invoice not created.\n\n' + proformaDecisionJD.reason);
+                      return;
+                    }
                     // Reserve a brand-new number from the backend-atomic
-                    // counter. Never falls back to a local max()+1 generator.
-                    const reserved = await reserveInvoiceNumber(job.co);
+                    // counter, unless the proforma check above already
+                    // supplied the exact number to reuse. Never falls back
+                    // to a local max()+1 generator if reservation fails.
+                    let reserved = proformaDecisionJD.number;
+                    if (!reserved) reserved = await reserveInvoiceNumber(job.co);
                     if(!reserved || invoiceNumberExists(reserved, job.co, jobs, accInvoices)){
                       alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
                       return;

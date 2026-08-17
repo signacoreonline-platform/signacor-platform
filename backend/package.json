@@ -12,7 +12,9 @@
     "seed:platform-state": "node dist/db/seedPlatformStateFromIndex.js",
     "fix:diaz-statement": "node dist/db/fixDiazStatementJuly2026.js",
     "seed:app-users": "node dist/db/seedAppUsersFromPlatformState.js",
-    "remove-plaintext-passwords": "node dist/db/removePlaintextPasswordsFromPlatformState.js"
+    "remove-plaintext-passwords": "node dist/db/removePlaintextPasswordsFromPlatformState.js",
+    "find:inv00033": "node dist/db/findMissingInvoiceINV00033August2026.js",
+    "fix:inv00068-collision": "node dist/db/fixInvoiceCollisionINV00068August2026.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
