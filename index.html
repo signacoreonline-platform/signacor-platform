@@ -6643,7 +6643,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
 /* ═══════════════════════════════════════════
    EDIT INVOICE FORM (inline inside modal)
 ═══════════════════════════════════════════ */
-function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[] }) {
+function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[], quotes=[] }) {
   const iCls = "w-full border border-gray-200 rounded-xl px-3 py-2 text-sm";
   // ── Restore unsaved draft if one exists ──
   const _invDraftKey0 = 'sgr_inv_draft_' + (job.invoiceNum||job.id);
@@ -6730,15 +6730,45 @@ function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[] }) {
     // Only checked when the number was actually changed — mirrors the
     // safeguard the manual-invoice path already has (reserveInvoiceNumber /
     // invoiceNumberExists), but here it's a synchronous check against the
-    // in-memory jobs/accInvoices already loaded, excluding this job itself.
+    // in-memory jobs/accInvoices/quotes already loaded, excluding this job
+    // itself. Checked GLOBALLY across both companies (2026-08-17, same fix
+    // already applied to invoiceNumberExists() and for the same reason: the
+    // formatted number carries no company marker anywhere it's displayed,
+    // printed or searched, so two companies' records must not be allowed to
+    // collide just because this local check used to stop at company lines.
+    // jobs[].invoiceNo / accInvoices[].num are checked defensively alongside
+    // the real jobs[].invoiceNum / accInvoices[].number fields this app
+    // actually uses — harmless no-ops if those alternate fields are never
+    // populated, but future-proof if they ever are.
+    //
+    // quotes[].proformaNum (2026-08-17, INV-00033/INV-00068 follow-up): a
+    // persisted legacy proforma number is a RESERVED future invoice number
+    // for whichever quote it's recorded on (see resolveProformaInvoiceNumber()
+    // above, which already enforces this on invoice CREATION) — it must not
+    // be silently reassigned to a different invoice by a manual number edit
+    // either. Excluded ONLY when this job's own source quote
+    // (findSourceQuoteForJob — the same job.quoteNum===quote.num match
+    // reconcileJobInvoice()/resolvePaymentSource() already use) is the one
+    // that actually owns that proformaNum, so a job legitimately reusing its
+    // own quote's proforma number is never blocked by its own reservation.
+    // Deliberately a local check here, NOT a call to invoiceNumberExists() —
+    // this fix only touches the manual-edit path; invoice CREATION
+    // (reserveInvoiceNumber/invoiceNumberExists and every caller of it) is
+    // completely untouched.
     const newNum = (invoiceNum||'').trim();
     const oldNum = (job.invoiceNum||'').trim();
     if (newNum && newNum.toUpperCase()!==oldNum.toUpperCase()) {
       const target = newNum.toUpperCase();
-      const dupJob = (jobs||[]).some(j=>j && j.id!==job.id && String(j.co)===String(job.co) && (j.invoiceNum||'').trim().toUpperCase()===target);
-      const dupAcc = (accInvoices||[]).some(i=>i && String(i.co)===String(job.co) && (i.number||'').trim().toUpperCase()===target);
+      const dupJob = (jobs||[]).some(j=>j && j.id!==job.id && ((j.invoiceNum||j.invoiceNo||'')+'').trim().toUpperCase()===target);
+      const dupAcc = (accInvoices||[]).some(i=>i && ((i.number||i.num||'')+'').trim().toUpperCase()===target);
       if (dupJob || dupAcc) {
-        alert(`Invoice number ${newNum} already exists for this company. Choose a different number — duplicate invoice numbers are not allowed.`);
+        alert(`Invoice number ${newNum} already exists. Choose a different number — duplicate invoice numbers are not allowed.`);
+        return;
+      }
+      const sourceQuoteForThisJob = findSourceQuoteForJob(job, quotes);
+      const dupProforma = (quotes||[]).find(q=>q && q.id!==(sourceQuoteForThisJob?sourceQuoteForThisJob.id:null) && (q.proformaNum||'').trim().toUpperCase()===target);
+      if (dupProforma) {
+        alert(`Invoice number ${newNum} is already reserved as quote ${dupProforma.num||'another quote'}'s proforma number. Choose a different number — a reserved proforma number cannot be manually reassigned to a different invoice.`);
         return;
       }
     }
@@ -8536,7 +8566,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
               <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>✏️ EDIT INVOICE — {editInvoice.invoiceNum}</p>
               <button onClick={()=>setEditInvoice(null)} className="text-white/60 hover:text-white text-xl">✕</button>
             </div>
-            <EditInvoiceForm job={editInvoice} jobs={jobs} accInvoices={accInvoices} onSave={updated=>{ setJobs(prev=>prev.map(j=>j.id===updated.id?updated:j)); setEditInvoice(null); }} onClose={()=>setEditInvoice(null)}/>
+            <EditInvoiceForm job={editInvoice} jobs={jobs} accInvoices={accInvoices} quotes={quotes} onSave={updated=>{ setJobs(prev=>prev.map(j=>j.id===updated.id?updated:j)); setEditInvoice(null); }} onClose={()=>setEditInvoice(null)}/>
           </div>
         </div>
       )}
