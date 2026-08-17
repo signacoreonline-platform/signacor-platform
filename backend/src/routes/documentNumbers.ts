@@ -56,11 +56,14 @@ function escapeForRegex(s: string): string {
 }
 
 // Scans the live platform_state for every existing number already used by
-// this company for this doc type. For invoices this covers BOTH sources
-// (job-derived invoices and manual accInvoices); for quotes it covers the
-// `quotes` array. Only records whose `co` field strictly equals the
-// requested company are counted — a record with a missing/null company
-// marker is never silently claimed by either company here.
+// this company for this doc type. For invoices this covers THREE sources
+// (job-derived invoices, manual accInvoices, and — 2026-08-17 follow-up to
+// the INV-00068/INV-00033 fix — any quote's persisted legacy proformaNum,
+// which is a RESERVED future invoice number and must not be handed out to a
+// different customer); for quotes it covers the `quotes` array's own `num`.
+// Only records whose `co` field strictly equals the requested company are
+// counted — a record with a missing/null company marker is never silently
+// claimed by either company here.
 function scanExistingNumbers(data: Record<string, any> | null | undefined, company: string, docType: DocType): Set<string> {
   const found = new Set<string>();
   if (!data) return found;
@@ -77,6 +80,19 @@ function scanExistingNumbers(data: Record<string, any> | null | undefined, compa
     for (const i of accInvoices) {
       if (i && String(i.co) === company && typeof i.number === 'string' && i.number.trim()) {
         found.add(i.number.trim().toUpperCase());
+      }
+    }
+
+    // A quote's proformaNum reserves that exact number for its own eventual
+    // real invoice (see index.html's resolveProformaInvoiceNumber()) — the
+    // atomic counter must never hand it to another quote/job in the
+    // meantime. This never blocks the quote that OWNS the proformaNum from
+    // reusing it: that path goes through resolveProformaInvoiceNumber()
+    // directly and never calls /reserve for that number in the first place.
+    const quotesForInvoice = Array.isArray(data.quotes) ? data.quotes : [];
+    for (const q of quotesForInvoice) {
+      if (q && String(q.co) === company && typeof q.proformaNum === 'string' && q.proformaNum.trim()) {
+        found.add(q.proformaNum.trim().toUpperCase());
       }
     }
   } else if (docType === 'quote') {
@@ -168,7 +184,8 @@ router.post('/reserve', async (req: Request, res: Response): Promise<void> => {
 
     // Extra safety net beyond the atomic counter itself: confirm the
     // candidate isn't already present anywhere in this company's live
-    // invoice records (job-derived or accInvoices) before handing it out.
+    // invoice records (job-derived or accInvoices) — or, for docType
+    // 'invoice', reserved as a quote's proformaNum — before handing it out.
     // Guards against any historical or otherwise-created number sitting
     // above the counter. Never touches or repairs existing duplicates.
     const stateRes2 = await client.query('SELECT data FROM platform_state WHERE id = 1');

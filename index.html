@@ -2080,12 +2080,26 @@ async function reserveInvoiceNumber(co) {
 // used to filter — every existing call site already re-checks the specific
 // reserved number immediately after reservation, so widening this to global
 // scope can only ever make it MORE cautious, never block a legitimate save.
-function invoiceNumberExists(number, co, jobs, accInvoices) {
+//
+// `quotes`/`excludeQuoteId` (2026-08-17, INV-00033/INV-00068 follow-up): a
+// persisted legacy quote.proformaNum is a RESERVED future invoice number —
+// the same collision class as INV-00068 (two independent things converging
+// on one formatted number), just against a proforma instead of another real
+// invoice. Without this, a freshly-reserved atomic-counter number could
+// silently land on a number another quote's proforma is still waiting to
+// become. `excludeQuoteId` lets the quote that legitimately OWNS that exact
+// proformaNum reuse it (per resolveProformaInvoiceNumber() below) without
+// tripping over its own reservation. Both params are optional so every
+// existing caller that hasn't been updated to pass them keeps working
+// exactly as before — only calls that now pass `quotes` get the new check.
+function invoiceNumberExists(number, co, jobs, accInvoices, quotes, excludeQuoteId) {
   const target = (number||'').trim().toUpperCase();
   if (!target) return false;
   const inJobs = (jobs||[]).some(j=>j && (j.invoiceNum||'').trim().toUpperCase()===target);
   if (inJobs) return true;
-  return (accInvoices||[]).some(i=>i && (i.number||'').trim().toUpperCase()===target);
+  const inAcc = (accInvoices||[]).some(i=>i && (i.number||'').trim().toUpperCase()===target);
+  if (inAcc) return true;
+  return (quotes||[]).some(q=>q && q.id!==excludeQuoteId && (q.proformaNum||'').trim().toUpperCase()===target);
 }
 
 /* ═══════════════════════════════════════════
@@ -7472,7 +7486,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // both companies exactly as before. Only ever updates the existing
   // accInvoices record; never creates a second invoice.
   async function saveManualInvoiceFromSales(inv) {
-    const ok = await saveManualInvoice(inv, { user, jobsAll: jobs, accInvoicesAll: accInvoices, setAccInvoices });
+    const ok = await saveManualInvoice(inv, { user, jobsAll: jobs, accInvoicesAll: accInvoices, quotesAll: quotes, setAccInvoices });
     if(ok){ setShowManualInvModal(false); setEditManualInv(null); }
   }
   async function createInvoiceNow(job){
@@ -7536,7 +7550,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // falls back to a local max()+1 generator if reservation fails.
     let reserved = proformaDecisionNow.number;
     if (!reserved) reserved = await reserveInvoiceNumber(job.co);
-    if(!reserved || invoiceNumberExists(reserved, job.co, jobs, accInvoices)){
+    if(!reserved || invoiceNumberExists(reserved, job.co, jobs, accInvoices, quotes, sourceQuoteNow ? sourceQuoteNow.id : null)){
       alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
       return;
     }
@@ -7628,7 +7642,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // a local max()+1 generator if reservation fails.
     let reserved = proformaDecisionFromQuote.number;
     if (!reserved) reserved = await reserveInvoiceNumber(quote.co);
-    if(!reserved || invoiceNumberExists(reserved, quote.co, jobs, accInvoices)){
+    if(!reserved || invoiceNumberExists(reserved, quote.co, jobs, accInvoices, quotes, quote.id)){
       alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
       return;
     }
@@ -12244,7 +12258,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                     // to a local max()+1 generator if reservation fails.
                     let reserved = proformaDecisionJD.number;
                     if (!reserved) reserved = await reserveInvoiceNumber(job.co);
-                    if(!reserved || invoiceNumberExists(reserved, job.co, jobs, accInvoices)){
+                    if(!reserved || invoiceNumberExists(reserved, job.co, jobs, accInvoices, quotes, sourceQuoteJD ? sourceQuoteJD.id : null)){
                       alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
                       return;
                     }
@@ -17440,17 +17454,21 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 // user happened to be on. `jobsAll`/`accInvoicesAll` must be the FULL,
 // unfiltered arrays (not a company-filtered view) so invoice numbers stay
 // globally unique across both companies, exactly as AccountingPage already
-// required before this was shared. Returns true on success (caller closes
-// its own modal state), false if validation/reservation failed (modal stays
-// open so the user can retry) — never throws.
+// required before this was shared. `quotesAll` (optional, 2026-08-17
+// follow-up) lets the same reserved-proformaNum check every other invoice-
+// creation path now has apply here too — excludes `inv.quoteId` itself so a
+// manual invoice being saved back onto its own linked quote never trips over
+// its own proforma reservation. Returns true on success (caller closes its
+// own modal state), false if validation/reservation failed (modal stays open
+// so the user can retry) — never throws.
 // ═══════════════════════════════════════════
-async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, setAccInvoices }) {
+async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll, setAccInvoices }) {
   if(!inv.contactName){ alert('Contact name is required.'); return false; }
   let working = inv;
   if(!working.number){
     const co = isHoldingsUser(user) ? HOLDINGS_CO_ID : 2;
     const reserved = await reserveInvoiceNumber(co);
-    if(!reserved || invoiceNumberExists(reserved, co, jobsAll, accInvoicesAll)){
+    if(!reserved || invoiceNumberExists(reserved, co, jobsAll, accInvoicesAll, quotesAll, inv.quoteId ?? null)){
       alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
       return false;
     }
@@ -17776,7 +17794,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   // calls, so the two pages can never diverge. Only what's specific to this
   // page (which local modal state to close on success) lives here.
   async function saveInvoice(inv) {
-    const ok = await saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, setAccInvoices });
+    const ok = await saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll: quotes, setAccInvoices });
     if(ok){ setShowInvModal(false); setEditInv(null); }
   }
   function saveBill(bill) {
