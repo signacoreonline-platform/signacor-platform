@@ -20642,6 +20642,41 @@ function App() {
   const dbConfirmedEmptyRef = useRef(false);
   const [apiMsg, setApiMsg] = useState('');
 
+  // ── Hydration gate (2026-08-18 hydration-reliability fix) ───────────────
+  // Root cause this closes: `jobs`/`quotes`/`accInvoices`/etc. above are
+  // seeded synchronously (see loadPersistedData()/_saved) from whatever
+  // localStorage, the embedded sgr-data snapshot, or the hard-coded
+  // INITIAL_* constants happen to hold — none of which is confirmed live
+  // server data. Previously the full app (dashboard included) rendered
+  // immediately from that seed, so a stale/empty local cache showed
+  // business numbers indistinguishable from the real thing until the async
+  // GET below happened to succeed. `hydrationStatus` makes "have we actually
+  // confirmed the live server state yet" an explicit, render-blocking fact
+  // instead of an implicit assumption:
+  //   'loading' — seed data may be showing behind the scenes, but the app
+  //               shell itself is not rendered; nothing here is presented as
+  //               current; autosave/saves are disabled (apiReadyRef stays
+  //               false until this becomes 'ready').
+  //   'ready'   — this session's own GET /api/platform-state has been
+  //               confirmed (or the database was directly confirmed empty),
+  //               server data has been applied, and it is now safe to save.
+  //   'error'   — every automatic retry failed; a manual Retry is offered
+  //               and nothing pre-hydration is ever shown as live data.
+  const [hydrationStatus, setHydrationStatus] = useState('loading');
+  const [hydrationError,  setHydrationError]  = useState('');
+  // Bumped by the Retry button (see the hydration-gate screen below) to
+  // force the initial-load effect to make a fresh attempt after every
+  // automatic retry has been exhausted.
+  const [hydrationRetryTick, setHydrationRetryTick] = useState(0);
+  // Every hydration attempt (initial, automatic retry, or manual Retry) is
+  // tagged with a new id here before it starts. A response is only ever
+  // applied if it is still tied to the CURRENT id when it resolves — this is
+  // what stops a slow, superseded request (an earlier retry, or a previous
+  // session's in-flight GET from before a logout/login) from hydrating state
+  // after a newer attempt has already started or already succeeded.
+  const hydrationAttemptRef = useRef(0);
+  function retryHydration(){ setHydrationRetryTick(t => t + 1); }
+
   // ── Auto-action system-controlled lifecycle stages ──────────────
   //  Deposit Received (stage 5): activates automatically once any deposit /
   //  partial payment is recorded on the job or its linked quote / proforma /
@@ -20790,13 +20825,32 @@ function App() {
   // every section, the same way it was already closed for credit notes.
   // Falls back to returning `local` unchanged if any record lacks a stable
   // `id` — never worse than the previous behaviour.
-  function mergeSectionArray(local, remote, knownBefore) {
+  function mergeSectionArray(local, remote, knownBefore, sectionKey) {
     local = Array.isArray(local) ? local : [];
     remote = Array.isArray(remote) ? remote : [];
     knownBefore = Array.isArray(knownBefore) ? knownBefore : [];
     const idsOk = local.every(x => x && x.id !== undefined && x.id !== null)
                && remote.every(x => x && x.id !== undefined && x.id !== null);
-    if (!idsOk) return local;
+    // FAIL CLOSED (2026-08-18 hydration-reliability fix). Previously this
+    // silently returned `local` UNCHANGED whenever any record on either side
+    // lacked a stable id — which meant a session whose local copy of a
+    // section had drifted stale (e.g. a long-lived tab, or one recovering
+    // from a hydration failure) could have that exact stale array resubmitted
+    // as the "merged" result, even though a fresh, correct server copy was
+    // sitting right there in `remote`. That is the confirmed mechanism behind
+    // a stale 14-job snapshot being submitted as a real save and only
+    // stopped by the backend's own mass-loss guard (detectWipe in
+    // platformState.ts) — this fix removes the unsafe path on the frontend
+    // side too, rather than relying solely on that backend guard to catch it.
+    // A section that cannot be safely merged must block the save outright —
+    // never guess which array (local or remote) is "right" — and must never
+    // silently prefer the smaller/older/local one. The thrown error is
+    // surfaced verbatim by every caller's existing "Save failed — …" message
+    // path (see the catch blocks around enqueueMergeAndSave /
+    // enqueueSavePartialSections), so this is visible, not silent.
+    if (!idsOk) {
+      throw new Error(`Cannot safely save "${sectionKey || 'a section'}" — one or more records are missing a stable id, so local and server changes cannot be merged safely. Nothing was saved; please reload and try again.`);
+    }
     const localIds = new Set(local.map(x => x.id));
     const knownIds = new Set(knownBefore.map(x => x && x.id));
     const addedElsewhere = remote.filter(x => x && !localIds.has(x.id) && !knownIds.has(x.id));
@@ -20840,6 +20894,15 @@ function App() {
   // Falls back to the live ref only if no captured value was passed in, to
   // stay safe if this is ever called another way.
   async function mergeAndSave(snapshot, capturedBaseline) {
+    // Defense in depth (2026-08-18 hydration-reliability fix): every current
+    // caller of mergeAndSave already only calls it once apiReadyRef.current
+    // is true, but that discipline lived entirely in the callers. Checking it
+    // again here means it is provably true FROM THIS FUNCTION ITSELF that no
+    // write can ever reach the server before this session's own hydration is
+    // confirmed — including for any future caller that forgets the guard.
+    if (!apiReadyRef.current) {
+      throw new Error('Not yet connected to the server — please wait a moment and try again.');
+    }
     const ownBaseline = capturedBaseline !== undefined ? capturedBaseline : serverBaselineRef.current;
     // Sections THIS user edited, measured against the state they last synced from.
     const changed = ownBaseline ? locallyChangedSections(snapshot, ownBaseline) : null;
@@ -20875,7 +20938,7 @@ function App() {
         // dedicated merge below, so it's skipped here.
         for (const k of STATE_SECTIONS) {
           if (!changed[k] || k === 'creditNotes') continue;
-          payload[k] = mergeSectionArray(snapshot[k], mergeBase[k], ownBaseline ? ownBaseline[k] : null);
+          payload[k] = mergeSectionArray(snapshot[k], mergeBase[k], ownBaseline ? ownBaseline[k] : null, k);
         }
         if (changed.logo)         payload.logo         = snapshot.logo;
         if (changed.utLogo)       payload.utLogo       = snapshot.utLogo;
@@ -20888,7 +20951,7 @@ function App() {
         // never loaded.
         for (const k of STATE_SECTIONS) {
           if (snapshot[k] === undefined || k === 'creditNotes') continue;
-          payload[k] = mergeSectionArray(snapshot[k], mergeBase[k], null);
+          payload[k] = mergeSectionArray(snapshot[k], mergeBase[k], null, k);
         }
         payload.logo = snapshot.logo; payload.utLogo = snapshot.utLogo; payload.holdingsLogo = snapshot.holdingsLogo; payload.sigOTSmit = snapshot.sigOTSmit;
       }
@@ -21077,59 +21140,102 @@ function App() {
   // Gated on `token` (audit finding B1): platform-state now requires a
   // logged-in session, so there is nothing to load until handleLogin has run
   // and set a token — attempting it earlier would just fail with 401.
-  // Re-runs whenever `token` changes: on first mount for a returning user
-  // whose token was already in localStorage (the common case — behaves
-  // exactly as before), and again right after a fresh login in a brand-new
-  // session, which previously only had `[]` deps and so never re-fetched
-  // after the user logged in without a page reload.
+  // Re-runs whenever `token` or `hydrationRetryTick` changes: on first mount
+  // for a returning user whose token was already in localStorage, again right
+  // after a fresh login (covers logout→login without a page reload — see
+  // requirement 8 below), and again whenever the user presses Retry on the
+  // hydration-error screen.
+  //
+  // ── Retry-with-backoff (2026-08-18 hydration-reliability fix) ───────────
+  // Previously this was a single unretried attempt: any failure (network
+  // blip, a Render free-tier cold start, a transient 5xx) left
+  // apiReadyRef.current false for the rest of that page load with no path
+  // back to true — permanently disabling both saving AND the 30 s poll
+  // (which itself refuses to run while apiReadyRef is false), while the app
+  // kept rendering whatever pre-hydration fallback state (localStorage / the
+  // embedded sgr-data snapshot / INITIAL_* constants) it happened to start
+  // with, indistinguishable from real data. This is the confirmed mechanism
+  // behind the 14 jobs / 0 quotes / 0 invoices production symptom. Now:
+  // transient failures retry automatically with exponential backoff (capped);
+  // after MAX_AUTO_HYDRATION_RETRIES failures, hydrationStatus becomes
+  // 'error' and a manual Retry is offered (see the render-gate below)
+  // instead of silently giving up.
   useEffect(() => {
-    if (!token) { setApiMsg(''); return; }
+    // A fresh attempt cycle starts on every token change (new login, logout,
+    // token refresh) and every manual retry. Bumping this id first means any
+    // response still in flight from a PRIOR cycle — including one belonging
+    // to a previous user's session before a logout/login — can never apply
+    // itself once a newer cycle has started (checked before every apply
+    // below). This directly satisfies "old retry timers/in-flight responses
+    // must not hydrate the new session."
+    const myAttemptGen = ++hydrationAttemptRef.current;
     let cancelled = false;
-    (async () => {
+
+    if (!token) {
+      // Logged out (or never logged in): nothing to hydrate. Reset to
+      // 'loading' so a subsequent login always starts from a clean gate
+      // rather than possibly re-showing a stale 'error'/'ready' from a
+      // previous session.
+      apiReadyRef.current = false;
+      setHydrationStatus('loading');
+      setHydrationError('');
+      setApiMsg('');
+      return () => { cancelled = true; };
+    }
+
+    setHydrationStatus('loading');
+    setHydrationError('');
+    apiReadyRef.current = false;
+
+    const MAX_AUTO_HYDRATION_RETRIES = 5;
+    const RETRY_BASE_MS = 1500;
+    const RETRY_MAX_MS  = 15000;
+
+    async function attemptHydration(attempt) {
       try {
         const dbData = await fetchFromServer();
-        if (cancelled) return;
+        // Superseded by a newer attempt (token changed / manual retry) while
+        // this request was in flight — never apply a stale response.
+        if (cancelled || hydrationAttemptRef.current !== myAttemptGen) return;
         const hasData = dbData && typeof dbData === 'object' && Object.keys(dbData).length > 0;
         if (hasData) {
-          // Only overwrite local state when server data is not older than what we loaded
-          // from localStorage.  If the user refreshed within the 800 ms autosave debounce
-          // the server won't have their latest change yet — skipping applyServerData keeps
-          // the task alive in local state so the next autosave can push it to the server.
-          const localAt  = _saved ? (_saved._autoSavedAt || _saved.savedAt || '') : '';
-          const serverAt = dbData._autoSavedAt || dbData.savedAt || '';
-          if (!localAt || serverAt >= localAt) {
-            // Guard against the race where a user adds a customer/employee entry WHILE
-            // the initial GET is in flight.  currentSnapshotRef tracks live state; _saved
-            // is the startup snapshot.  If they differ the user made changes during the
-            // load window — do a selective merge (same logic as the 30 s poll) instead of
-            // a full overwrite, so freshly-added entries are never silently discarded.
-            const current       = currentSnapshotRef.current;
-            const startSnapshot = _saved;
-            if (current && startSnapshot) {
-              const changedLocally   = locallyChangedSections(current, startSnapshot);
-              const hasLocalChanges  = changedLocally && Object.values(changedLocally).some(Boolean);
-              if (hasLocalChanges) {
-                const selective = {};
-                for (const k of STATE_SECTIONS) {
-                  if (!changedLocally[k] && Array.isArray(dbData[k])) selective[k] = dbData[k];
-                }
-                if (!changedLocally.logo      && typeof dbData.logo === 'string')  selective.logo      = dbData.logo;
-                if (!changedLocally.utLogo    && typeof dbData.utLogo === 'string') selective.utLogo    = dbData.utLogo;
-                if (!changedLocally.holdingsLogo && typeof dbData.holdingsLogo === 'string') selective.holdingsLogo = dbData.holdingsLogo;
-                if (!changedLocally.sigOTSmit && dbData.sigOTSmit)                  selective.sigOTSmit = dbData.sigOTSmit;
-                // Never let this selective apply drop a credit note the running
-                // session already knows about — union instead of a raw overwrite
-                // (see mergeCreditNotes() above).
-                if (Array.isArray(dbData.creditNotes)) {
-                  selective.creditNotes = mergeCreditNotes(current.creditNotes, dbData.creditNotes, startSnapshot.creditNotes);
-                }
-                applyServerData(selective);
-              } else {
-                applyServerData(dbData);
+          // Guard against the race where a user adds a customer/employee entry
+          // WHILE the initial GET is in flight. currentSnapshotRef tracks live
+          // state; _saved is the startup snapshot. If they differ, this
+          // session made changes during the load window — do a selective
+          // merge (same logic as the 30 s poll) instead of a full overwrite,
+          // so freshly-added entries are never silently discarded. This is
+          // the ONLY case where confirmed server data does not immediately
+          // and fully replace the pre-hydration snapshot — every other path
+          // below applies the server response outright, because server data
+          // is the authoritative source of truth once confirmed (fallback
+          // seed data is never treated as a competing "newer" source).
+          const current       = currentSnapshotRef.current;
+          const startSnapshot = _saved;
+          if (current && startSnapshot) {
+            const changedLocally   = locallyChangedSections(current, startSnapshot);
+            const hasLocalChanges  = changedLocally && Object.values(changedLocally).some(Boolean);
+            if (hasLocalChanges) {
+              const selective = {};
+              for (const k of STATE_SECTIONS) {
+                if (!changedLocally[k] && Array.isArray(dbData[k])) selective[k] = dbData[k];
               }
+              if (!changedLocally.logo      && typeof dbData.logo === 'string')  selective.logo      = dbData.logo;
+              if (!changedLocally.utLogo    && typeof dbData.utLogo === 'string') selective.utLogo    = dbData.utLogo;
+              if (!changedLocally.holdingsLogo && typeof dbData.holdingsLogo === 'string') selective.holdingsLogo = dbData.holdingsLogo;
+              if (!changedLocally.sigOTSmit && dbData.sigOTSmit)                  selective.sigOTSmit = dbData.sigOTSmit;
+              // Never let this selective apply drop a credit note the running
+              // session already knows about — union instead of a raw overwrite
+              // (see mergeCreditNotes() above).
+              if (Array.isArray(dbData.creditNotes)) {
+                selective.creditNotes = mergeCreditNotes(current.creditNotes, dbData.creditNotes, startSnapshot.creditNotes);
+              }
+              applyServerData(selective);
             } else {
               applyServerData(dbData);
             }
+          } else {
+            applyServerData(dbData);
           }
           serverBaselineRef.current = dbData;
           setApiMsg('Loaded from database');
@@ -21141,11 +21247,14 @@ function App() {
           setApiMsg('Database empty — using defaults');
         }
         apiReadyRef.current = true;
+        setHydrationStatus('ready');
+        setHydrationError('');
         // Flush any save that was queued before apiReady became true.
         // Covers entries added during the server-load window whose auto-save
         // was blocked by the apiReadyRef guard and never retried.
         if (apiSaveTimerRef.current) clearTimeout(apiSaveTimerRef.current);
         apiSaveTimerRef.current = setTimeout(async () => {
+          if (hydrationAttemptRef.current !== myAttemptGen) return; // superseded
           const snapshot = currentSnapshotRef.current;
           if (!snapshot) return;
           // Read together, at the same instant, so this save's baseline
@@ -21160,15 +21269,34 @@ function App() {
           }
           setTimeout(() => setApiMsg(''), 2500);
         }, 300);
+        setTimeout(() => setApiMsg(''), 3000);
       } catch (e) {
-        apiReadyRef.current = false;
-        setApiMsg('Offline — using local backup');
+        if (cancelled || hydrationAttemptRef.current !== myAttemptGen) return;
+        if (attempt < MAX_AUTO_HYDRATION_RETRIES) {
+          const delay = Math.min(RETRY_BASE_MS * Math.pow(2, attempt), RETRY_MAX_MS);
+          setHydrationStatus('loading');
+          setHydrationError('');
+          setTimeout(() => {
+            if (cancelled || hydrationAttemptRef.current !== myAttemptGen) return;
+            attemptHydration(attempt + 1);
+          }, delay);
+        } else {
+          // Automatic retries exhausted. Never fall back to showing seed/
+          // fallback data as if it were live — surface a clear error state
+          // with a manual Retry instead (see the render-gate below). Saves
+          // remain disabled: apiReadyRef.current stays false.
+          apiReadyRef.current = false;
+          setHydrationStatus('error');
+          setHydrationError(e && e.message ? e.message : 'Could not reach the server.');
+          setApiMsg('Offline — using local backup');
+        }
       }
-      setTimeout(() => setApiMsg(''), 3000);
-    })();
+    }
+
+    attemptHydration(0);
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
+  }, [token, hydrationRetryTick]);
 
   // 2) Poll every 30 s — apply server changes for sections this user hasn't locally modified
   //    This keeps admin and assistant in sync without requiring a page reload.
@@ -21218,7 +21346,25 @@ function App() {
   //    so two users editing different sections never overwrite each other.
   useEffect(()=>{
     const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, logo:logoDataUrl, utLogo:utLogoDataUrl, holdingsLogo:holdingsLogoDataUrl, sigOTSmit, savedAt:lastSaved};
+    // Always kept current (even pre-hydration) so it's immediately available
+    // the instant hydration completes — purely in-memory, never written
+    // anywhere, so this alone can't leak fallback data anywhere.
     currentSnapshotRef.current = snapshot; // keep ref current for poll effect
+
+    // ── Hydration gate (2026-08-18 hydration-reliability fix) ─────────────
+    // Everything below this line — the localStorage backup AND the debounced
+    // server save — is skipped entirely until this session's own server
+    // hydration is confirmed (hydrationStatus === 'ready'). Before that,
+    // `snapshot` above is built from pre-hydration fallback state
+    // (localStorage / the embedded sgr-data snapshot / INITIAL_* constants),
+    // which must never be (a) written back to localStorage — doing so was
+    // the confirmed mechanism that could "poison" localStorage with a
+    // freshly-timestamped copy of stale fallback data, making it look newer
+    // than genuinely older-but-real server data on a future load — or (b)
+    // queued for a server save, which the pre-existing apiReadyRef check a
+    // few lines down already blocked for the PUT specifically, but not for
+    // this localStorage write.
+    if (hydrationStatus !== 'ready') return;
     // 2026-08-18 (production stabilisation): captured HERE, at the same
     // instant as `snapshot` itself, and carried through the closure below to
     // whatever this render's debounce timer eventually sends — NOT re-read
@@ -21273,7 +21419,7 @@ function App() {
       }
       setTimeout(() => setApiMsg(''), 2500);
     }, 800);
-  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, logoDataUrl, utLogoDataUrl, sigOTSmit]);
+  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, logoDataUrl, utLogoDataUrl, sigOTSmit, hydrationStatus]);
 
   // `token` is the backend-issued JWT from POST /api/auth/login (audit
   // finding B1) — stored the same way `user` already was, so a page refresh
@@ -21449,6 +21595,38 @@ function App() {
   // back to LoginPage once, where a normal sign-in with the same credentials
   // gets them a real token and they're straight back in.
   if (!user || !token) return <LoginPage onLogin={handleLogin} userAccounts={userAccounts}/>;
+
+  // ── Hydration gate render (2026-08-18 hydration-reliability fix) ────────
+  // Never render the normal app shell — dashboard included — until THIS
+  // session's own GET /api/platform-state has been confirmed. Rendering it
+  // earlier is exactly how pre-hydration fallback state (localStorage / the
+  // embedded sgr-data snapshot / INITIAL_* constants) previously showed up
+  // on screen indistinguishable from real, live business data (the confirmed
+  // 14 jobs / 0 quotes / 0 invoices production symptom). Saving is
+  // separately blocked pre-ready via apiReadyRef (see mergeAndSave,
+  // forceSaveSections, savePartialSectionsNow) — this only controls what is
+  // ever shown on screen.
+  if (hydrationStatus !== 'ready') {
+    return (
+      <div style={{position:'fixed',inset:0,background:'#06065c',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:'sans-serif',color:'white',textAlign:'center',padding:'40px',zIndex:99999}}>
+        <div style={{maxWidth:440}}>
+          <div style={{fontSize:'2rem',fontWeight:900,marginBottom:12}}>SIGNACORE</div>
+          {hydrationStatus === 'error' ? (
+            <>
+              <p style={{opacity:0.9,lineHeight:1.6,margin:'0 0 18px'}}>
+                Could not load the current platform data from the server{hydrationError ? (' — ' + hydrationError) : ''}.
+                <br/><br/>
+                Nothing has been changed or saved — this is a connection problem only. Your data on the server is safe.
+              </p>
+              <button onClick={retryHydration} style={{background:'white',color:'#06065c',border:'none',borderRadius:10,padding:'10px 28px',fontWeight:700,fontSize:'0.9rem',cursor:'pointer'}}>Retry</button>
+            </>
+          ) : (
+            <p style={{opacity:0.75}}>Loading current platform data…</p>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   const assistantBlocked = []; // imports removed from nav; assets & hr open to all roles
   // Generalized fallback: if the current `page` isn't one this user's role
