@@ -172,6 +172,112 @@ function detectWipe(existingData: Record<string, any> | null, incomingData: any,
   return null;
 }
 
+// ── New-record validation: co presence + no NEW duplicate numbers ────────
+// (2026-08-18, production stabilisation, Section 14)
+//
+// This is an ADDITIVE, forward-only guard: it only ever inspects records
+// that are NEW in this save (their `id` was not present in the currently
+// live section array) and only ever blocks the save outright (409) when a
+// NEW record would either omit `co` or collide on its document number with
+// another record. It never inspects, flags, or rejects anything about
+// records that already existed before this save — historical duplicates
+// and historical missing-co records (several confirmed by the production
+// integrity audit) are left completely alone and remain exactly as they
+// are today; this can never reject a save for something that was already
+// true before the save arrived.
+//
+// This exists as defense-in-depth alongside (not instead of) the
+// frontend's own checks (quoteNumberExists/invoiceNumberExists, the
+// co-from-auth-context fixes) and the atomic /document-numbers and
+// /quote-conversions reservation endpoints — per the stabilisation brief,
+// no invariant like this should rely solely on the frontend, since nothing
+// stops a stale/buggy/future client from calling this endpoint directly.
+//
+// Scope is intentionally narrow: `num`/`number` on the four sections whose
+// numbering scheme is already fully understood and backend-reserved
+// (quotes, jobs, purchaseOrders, accInvoices). It deliberately does NOT
+// also cross-check the invoice-number ALIASES living on other sections
+// (job.invoiceNum, quote.proformaNum) — the frontend's existing
+// invoiceNumberExists() already covers that at creation time, and
+// replicating its exact cross-section logic here risks producing false
+// rejections of legitimate saves without a much deeper re-verification
+// pass than this stabilisation change warrants. This is a deliberate
+// scoping decision (documented in the final report), not an oversight.
+//
+// Number-collision scoping matches how each section's numbers are actually
+// reserved (see documentNumbers.ts): quotes and accInvoices are reserved
+// PER COMPANY, so two different companies legitimately sharing the same
+// number string is not a duplicate — only a collision within the SAME `co`
+// is checked. jobs and purchaseOrders are reserved from one GLOBAL
+// sequence, so any collision regardless of `co` is checked.
+const NUMBER_CHECK_SECTIONS: Array<{ key: string; field: string; scopeByCo: boolean }> = [
+  { key: 'quotes',         field: 'num',    scopeByCo: true  },
+  { key: 'accInvoices',    field: 'number', scopeByCo: true  },
+  { key: 'jobs',           field: 'num',    scopeByCo: false },
+  { key: 'purchaseOrders', field: 'num',    scopeByCo: false },
+];
+// Sections where every NEW record is expected to carry a company tag from
+// here on, matching the frontend fixes made in this same pass (co always
+// taken from the logged-in user's own company context, never a
+// hardcoded/blank fallback).
+const CO_REQUIRED_SECTIONS = ['quotes', 'jobs', 'purchaseOrders', 'accInvoices'];
+
+function newRecordValidationError(existingData: Record<string, any> | null, finalData: Record<string, any>): string | null {
+  for (const key of CO_REQUIRED_SECTIONS) {
+    const finalList = arr(finalData[key]);
+    if (finalList.length === 0) continue;
+    const existingIds = new Set(arr(existingData && existingData[key]).map((x: any) => x && x.id));
+    for (const rec of finalList) {
+      if (!rec || rec.id === undefined || rec.id === null) continue;
+      if (existingIds.has(rec.id)) continue; // pre-existing record — never inspected
+      if (rec.co === undefined || rec.co === null || rec.co === '') {
+        return `a new "${key}" record (id ${rec.id}) is missing its company (co) — save blocked to prevent an orphaned/company-1-default record`;
+      }
+    }
+  }
+
+  for (const { key, field, scopeByCo } of NUMBER_CHECK_SECTIONS) {
+    const finalList = arr(finalData[key]);
+    if (finalList.length === 0) continue;
+    const existingList = arr(existingData && existingData[key]);
+    const existingIds = new Set(existingList.map((x: any) => x && x.id));
+
+    const groupKeyOf = (rec: any): string | null => {
+      const raw = rec && rec[field];
+      if (typeof raw !== 'string' || !raw.trim()) return null;
+      const norm = raw.trim().toUpperCase();
+      return scopeByCo ? `${String(rec.co)}::${norm}` : norm;
+    };
+
+    // Group the post-save records by normalized number (+ co, if scoped).
+    const groups = new Map<string, any[]>();
+    for (const rec of finalList) {
+      if (!rec) continue;
+      const gk = groupKeyOf(rec);
+      if (gk === null) continue; // no number yet — not this guard's concern
+      if (!groups.has(gk)) groups.set(gk, []);
+      groups.get(gk)!.push(rec);
+    }
+
+    for (const [groupKey, recs] of groups) {
+      if (recs.length < 2) continue; // no collision at all
+      const anyNew = recs.some((r: any) => r.id !== undefined && r.id !== null && !existingIds.has(r.id));
+      if (!anyNew) continue; // collision is entirely between pre-existing records — historical, leave alone
+
+      // Was a collision this size (or larger) already present live before
+      // this save? If so, this save isn't introducing anything new here —
+      // never block it (e.g. two historical dupes plus an unrelated edit
+      // to one of them must still be allowed to save).
+      const existingGroupCount = existingList.filter((r: any) => r && groupKeyOf(r) === groupKey).length;
+      if (existingGroupCount >= recs.length) continue; // not a NEW duplicate
+
+      return `a new "${key}" record would duplicate document number "${recs[0][field]}"${scopeByCo ? ` for company "${recs[0].co}"` : ''} — save blocked to prevent a new duplicate`;
+    }
+  }
+
+  return null;
+}
+
 // GET /api/platform-state — returns { data: <jsonb>, updated_at: <iso> }
 router.get('/', async (_req: Request, res: Response): Promise<void> => {
   try {
@@ -412,6 +518,20 @@ router.put('/', async (req: Request, res: Response): Promise<void> => {
     // handler (detectWipe, the merge loop above) already only looks at keys
     // that are present in `data`.
     const finalData = isPartial ? { ...(existingData || {}), ...data } : data;
+
+    // ── Block NEW invariant violations only (Section 14, see the function's
+    //    own comment above for full scope/rationale) — never touches or
+    //    rejects anything that was already true before this save.
+    const newRecordError = newRecordValidationError(existingData, finalData);
+    if (newRecordError) {
+      await client.query('ROLLBACK');
+      console.warn('PUT /api/platform-state BLOCKED — new-record validation failed:', newRecordError);
+      res.status(409).json({
+        error: 'Save blocked to prevent a new data-integrity problem',
+        reason: newRecordError,
+      });
+      return;
+    }
 
     await client.query(
       `INSERT INTO platform_state (id, data, updated_at)

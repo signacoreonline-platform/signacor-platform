@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { PoolClient } from 'pg';
 import pool from '../db/pool';
 import { authenticate } from '../middleware/auth';
 
@@ -26,10 +27,24 @@ import { authenticate } from '../middleware/auth';
  * generic on (company, doc_type). That historical SQ-00130 duplicate is
  * left untouched by this change; it is not renumbered or repaired here.
  *
+ * Phase 3 (2026-08-18, production stabilisation): job numbers ("job") and
+ * purchase-order numbers ("po") added, for the same reason again — the
+ * frontend's getNextJobNum/getNextPONum client-side max()+1 scans were the
+ * confirmed mechanism behind the SQ-00014 double-conversion (two sessions'
+ * local `jobs` arrays disagreed, each independently minted the same "next"
+ * job number). Unlike invoices/quotes, job and PO numbers are NOT
+ * company-scoped in this application (a single "SNS-"/"PO-" sequence is
+ * shared across all companies — see index.html's getNextJobNum/getNextPONum,
+ * which scan the whole array with no `co` filter) — so these two doc types
+ * always use the fixed sentinel company value GLOBAL_COMPANY ('ALL')
+ * rather than the caller-supplied company, and `scanExistingNumbers` never
+ * filters them by `co`. No new table needed here either — same generic
+ * (company, doc_type) row shape, just a company value of 'ALL' instead of
+ * '1'/'2'/'4'.
+ *
  * The frontend calls POST /reserve with { company, docType }, gets back a
- * number, and uses it when creating the invoice/quote. Nothing else about
- * invoice/quote creation, editing, or the job workflow is changed by this
- * route.
+ * number, and uses it when creating the invoice/quote/job/PO. Nothing else
+ * about record creation/editing is changed by this route.
  *
  * ── Authentication (added 2026-08-06, audit finding B1) ──────────────────
  * Requires a valid, backend-issued JWT (Authorization: Bearer <token>) the
@@ -41,11 +56,24 @@ import { authenticate } from '../middleware/auth';
 const router = Router();
 router.use(authenticate);
 
-const VALID_COMPANIES = ['1', '2'];
-const VALID_DOC_TYPES = ['invoice', 'quote'] as const;
+// 2026-08-18: was ['1','2'] — missing company 4 ("Cover X Transform"),
+// which exists in the frontend's INITIAL_COMPANIES and is selectable in
+// CreateQuoteModal/AddJobModal today. Any quote/invoice number reservation
+// for company 4 was hard-failing with a 400 before this fix, blocking
+// quote/invoice creation for that company entirely — not a data-integrity
+// bug itself, but a directly-adjacent "currently-unsafe path" surfaced
+// while tracing company (`co`) propagation for this stabilisation pass.
+const VALID_COMPANIES = ['1', '2', '4'];
+const VALID_DOC_TYPES = ['invoice', 'quote', 'job', 'po'] as const;
 type DocType = (typeof VALID_DOC_TYPES)[number];
 
-const PREFIX: Record<DocType, string> = { invoice: 'INV-', quote: 'SQ-' };
+// Job and PO numbers are global (not per-company) — see the Phase 3 note
+// above. Any request for these doc types is always reserved against this
+// fixed sentinel row, regardless of what `company` the caller sends.
+const GLOBAL_DOC_TYPES: ReadonlySet<DocType> = new Set(['job', 'po']);
+const GLOBAL_COMPANY = 'ALL';
+
+const PREFIX: Record<DocType, string> = { invoice: 'INV-', quote: 'SQ-', job: 'SNS-', po: 'PO-' };
 
 function formatNumber(docType: DocType, n: number): string {
   return PREFIX[docType] + String(n).padStart(5, '0');
@@ -55,15 +83,18 @@ function escapeForRegex(s: string): string {
   return s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
 }
 
-// Scans the live platform_state for every existing number already used by
-// this company for this doc type. For invoices this covers THREE sources
-// (job-derived invoices, manual accInvoices, and — 2026-08-17 follow-up to
-// the INV-00068/INV-00033 fix — any quote's persisted legacy proformaNum,
-// which is a RESERVED future invoice number and must not be handed out to a
-// different customer); for quotes it covers the `quotes` array's own `num`.
-// Only records whose `co` field strictly equals the requested company are
-// counted — a record with a missing/null company marker is never silently
-// claimed by either company here.
+// Scans the live platform_state for every existing number already used for
+// this doc type (and, for invoice/quote, this company specifically). For
+// invoices this covers THREE sources (job-derived invoices, manual
+// accInvoices, and — 2026-08-17 follow-up to the INV-00068/INV-00033 fix —
+// any quote's persisted legacy proformaNum, which is a RESERVED future
+// invoice number and must not be handed out to a different customer); for
+// quotes it covers the `quotes` array's own `num`; for jobs, `jobs[].num`;
+// for POs, `purchaseOrders[].num`. Invoice/quote scans only count records
+// whose `co` field strictly equals the requested company — a record with a
+// missing/null company marker is never silently claimed by either company
+// here. Job/PO scans deliberately do NOT filter by `co` at all (see the
+// Phase 3 note above — those numbers are shared across every company).
 function scanExistingNumbers(data: Record<string, any> | null | undefined, company: string, docType: DocType): Set<string> {
   const found = new Set<string>();
   if (!data) return found;
@@ -102,6 +133,20 @@ function scanExistingNumbers(data: Record<string, any> | null | undefined, compa
         found.add(q.num.trim().toUpperCase());
       }
     }
+  } else if (docType === 'job') {
+    const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+    for (const j of jobs) {
+      if (j && typeof j.num === 'string' && j.num.trim()) {
+        found.add(j.num.trim().toUpperCase());
+      }
+    }
+  } else if (docType === 'po') {
+    const pos = Array.isArray(data.purchaseOrders) ? data.purchaseOrders : [];
+    for (const p of pos) {
+      if (p && typeof p.num === 'string' && p.num.trim()) {
+        found.add(p.num.trim().toUpperCase());
+      }
+    }
   }
 
   return found;
@@ -120,8 +165,77 @@ function highestNumericValue(numbers: Set<string>, docType: DocType): number {
   return max;
 }
 
+// Core atomic reservation, factored out so other routes (see
+// routes/quoteConversions.ts) can reserve a job number inside their OWN
+// transaction on the same client, rather than making a second HTTP call to
+// this route from the backend. MUST be called between BEGIN and COMMIT on
+// `client` — it does not manage the transaction itself. Throws on failure;
+// callers are expected to ROLLBACK in their own catch block.
+async function reserveDocumentNumberWithClient(client: PoolClient, companyIn: string, docType: DocType): Promise<string> {
+  const company = GLOBAL_DOC_TYPES.has(docType) ? GLOBAL_COMPANY : companyIn;
+
+  // Seed the counter row on first-ever use for this company/docType,
+  // WITHOUT overwriting one that already exists. ON CONFLICT DO NOTHING
+  // makes a concurrent first-request race harmless: at most one insert
+  // wins, every request then proceeds to the row lock below.
+  const existingRowRes = await client.query(
+    'SELECT 1 FROM document_number_counters WHERE company = $1 AND doc_type = $2',
+    [company, docType]
+  );
+
+  if (existingRowRes.rowCount === 0) {
+    const stateRes = await client.query('SELECT data FROM platform_state WHERE id = 1');
+    const data = stateRes.rowCount ? stateRes.rows[0].data || {} : {};
+    const seedValue = highestNumericValue(scanExistingNumbers(data, company, docType), docType);
+
+    await client.query(
+      `INSERT INTO document_number_counters (company, doc_type, last_number)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (company, doc_type) DO NOTHING`,
+      [company, docType, seedValue]
+    );
+  }
+
+  // Row lock — concurrent reservations for this company/docType now queue
+  // on this lock instead of racing for the same next number.
+  const lockedRes = await client.query(
+    'SELECT last_number FROM document_number_counters WHERE company = $1 AND doc_type = $2 FOR UPDATE',
+    [company, docType]
+  );
+  if (lockedRes.rowCount === 0) {
+    throw new Error(`document number counter row missing after seed for ${company}/${docType}`);
+  }
+
+  let candidate = (lockedRes.rows[0].last_number || 0) + 1;
+
+  // Extra safety net beyond the atomic counter itself: confirm the
+  // candidate isn't already present anywhere in the relevant live records
+  // before handing it out. Guards against any historical or otherwise-
+  // created number sitting above the counter. Never touches or repairs
+  // existing duplicates.
+  const stateRes2 = await client.query('SELECT data FROM platform_state WHERE id = 1');
+  const liveData = stateRes2.rowCount ? stateRes2.rows[0].data || {} : {};
+  const liveNumbers = scanExistingNumbers(liveData, company, docType);
+
+  let guard = 0;
+  while (liveNumbers.has(formatNumber(docType, candidate).toUpperCase()) && guard < 1000) {
+    candidate += 1;
+    guard += 1;
+  }
+
+  await client.query(
+    `UPDATE document_number_counters SET last_number = $1, updated_at = NOW()
+     WHERE company = $2 AND doc_type = $3`,
+    [candidate, company, docType]
+  );
+
+  return formatNumber(docType, candidate);
+}
+
 // POST /api/document-numbers/reserve
-// body: { company: 1 | 2 | '1' | '2', docType?: 'invoice' | 'quote' }
+// body: { company: 1 | 2 | 4 | '1' | '2' | '4', docType?: 'invoice' | 'quote' | 'job' | 'po' }
+//   `company` is required for docType invoice/quote; ignored (job/PO are
+//   global) for docType job/po.
 // → 200 { number: 'INV-00066', company: '1', docType: 'invoice' }
 // → 400 invalid company/docType
 // → 500 reservation failed (no number issued, nothing to roll back on the caller's side)
@@ -129,84 +243,24 @@ router.post('/reserve', async (req: Request, res: Response): Promise<void> => {
   const rawCompany = req.body && req.body.company;
   const rawDocType = (req.body && req.body.docType) || 'invoice';
 
-  const company = rawCompany === undefined || rawCompany === null ? '' : String(rawCompany);
   const docType = String(rawDocType) as DocType;
-
-  if (!VALID_COMPANIES.includes(company)) {
-    res.status(400).json({ error: 'Invalid or missing company. Must be 1 or 2.' });
+  if (!(VALID_DOC_TYPES as readonly string[]).includes(docType)) {
+    res.status(400).json({ error: `Unsupported docType "${docType}". Must be one of ${VALID_DOC_TYPES.join(', ')}.` });
     return;
   }
-  if (!(VALID_DOC_TYPES as readonly string[]).includes(docType)) {
-    res.status(400).json({ error: `Unsupported docType "${docType}". Must be "invoice" or "quote".` });
+
+  const company = rawCompany === undefined || rawCompany === null ? '' : String(rawCompany);
+  if (!GLOBAL_DOC_TYPES.has(docType) && !VALID_COMPANIES.includes(company)) {
+    res.status(400).json({ error: `Invalid or missing company. Must be one of ${VALID_COMPANIES.join(', ')}.` });
     return;
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // Seed the counter row on first-ever use for this company/docType,
-    // WITHOUT overwriting one that already exists. ON CONFLICT DO NOTHING
-    // makes a concurrent first-request race harmless: at most one insert
-    // wins, every request then proceeds to the row lock below.
-    const existingRowRes = await client.query(
-      'SELECT 1 FROM document_number_counters WHERE company = $1 AND doc_type = $2',
-      [company, docType]
-    );
-
-    if (existingRowRes.rowCount === 0) {
-      const stateRes = await client.query('SELECT data FROM platform_state WHERE id = 1');
-      const data = stateRes.rowCount ? stateRes.rows[0].data || {} : {};
-      const seedValue = highestNumericValue(scanExistingNumbers(data, company, docType), docType);
-
-      await client.query(
-        `INSERT INTO document_number_counters (company, doc_type, last_number)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (company, doc_type) DO NOTHING`,
-        [company, docType, seedValue]
-      );
-    }
-
-    // Row lock — concurrent reservations for this company/docType now queue
-    // on this lock instead of racing for the same next number.
-    const lockedRes = await client.query(
-      'SELECT last_number FROM document_number_counters WHERE company = $1 AND doc_type = $2 FOR UPDATE',
-      [company, docType]
-    );
-    if (lockedRes.rowCount === 0) {
-      await client.query('ROLLBACK');
-      console.error('document-numbers/reserve: counter row missing after seed for', company, docType);
-      res.status(500).json({ error: 'Failed to reserve a document number' });
-      return;
-    }
-
-    let candidate = (lockedRes.rows[0].last_number || 0) + 1;
-
-    // Extra safety net beyond the atomic counter itself: confirm the
-    // candidate isn't already present anywhere in this company's live
-    // invoice records (job-derived or accInvoices) — or, for docType
-    // 'invoice', reserved as a quote's proformaNum — before handing it out.
-    // Guards against any historical or otherwise-created number sitting
-    // above the counter. Never touches or repairs existing duplicates.
-    const stateRes2 = await client.query('SELECT data FROM platform_state WHERE id = 1');
-    const liveData = stateRes2.rowCount ? stateRes2.rows[0].data || {} : {};
-    const liveNumbers = scanExistingNumbers(liveData, company, docType);
-
-    let guard = 0;
-    while (liveNumbers.has(formatNumber(docType, candidate).toUpperCase()) && guard < 1000) {
-      candidate += 1;
-      guard += 1;
-    }
-
-    await client.query(
-      `UPDATE document_number_counters SET last_number = $1, updated_at = NOW()
-       WHERE company = $2 AND doc_type = $3`,
-      [candidate, company, docType]
-    );
-
+    const number = await reserveDocumentNumberWithClient(client, company, docType);
     await client.query('COMMIT');
-
-    res.json({ number: formatNumber(docType, candidate), company, docType });
+    res.json({ number, company: GLOBAL_DOC_TYPES.has(docType) ? GLOBAL_COMPANY : company, docType });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     console.error('POST /api/document-numbers/reserve failed:', err);
@@ -217,3 +271,5 @@ router.post('/reserve', async (req: Request, res: Response): Promise<void> => {
 });
 
 export default router;
+export { reserveDocumentNumberWithClient };
+export type { DocType };

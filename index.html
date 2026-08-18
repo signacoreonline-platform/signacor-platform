@@ -126,6 +126,15 @@ const { useState, useEffect, useRef, useMemo } = React;
 const DATA_VERSION = 4; // bump this to wipe stale localStorage caches
 const API_STATE_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/platform-state';
 const API_DOC_NUMBER_RESERVE_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/document-numbers/reserve';
+// 2026-08-18 (production stabilisation): job numbers and PO numbers were
+// still being generated purely client-side (max()+1 over the local array),
+// which is what produced the confirmed SQ-00014 double-conversion (two
+// sessions independently computed the same "next" job number). These reuse
+// the exact same backend-atomic document_number_counters mechanism already
+// proven for quotes/invoices, via the same /reserve endpoint with
+// docType:'job'/'po' (job/PO numbers are NOT company-scoped, so no
+// `company` needs to be sent for these two types — see documentNumbers.ts).
+const API_QUOTE_CONVERSION_RESERVE_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/quote-conversions/reserve';
 // ── Authentication (added 2026-08-06, audit finding B1) ────────────────────
 // API_STATE_URL and API_DOC_NUMBER_RESERVE_URL above now both require a
 // valid backend-issued JWT. Login used to be a purely local comparison
@@ -2189,10 +2198,91 @@ async function reserveQuoteNumber(co) {
 // reservation + duplicate check — mirrors invoiceNumberExists() above.
 // Should not normally trigger; quote creation must stop rather than proceed
 // if it ever does.
+//
+// 2026-08-18 (production stabilisation): was previously scoped to `co`
+// (`q.co===co`), which is the same class of bug already fixed for invoice
+// numbers on 2026-08-17 — each company keeps its own independent
+// document_number_counters row, so two companies' counters can legitimately
+// converge on the same formatted "SQ-#####" string, which carries no
+// company marker of its own. This check must be global (like
+// invoiceNumberExists) to actually catch that collision. The `co` parameter
+// is kept for call-site compatibility but is no longer used for filtering.
 function quoteNumberExists(number, co, quotes) {
   const target = (number||'').trim().toUpperCase();
   if (!target) return false;
-  return (quotes||[]).some(q=>q && String(q.co)===String(co) && (q.num||'').trim().toUpperCase()===target);
+  return (quotes||[]).some(q=>q && (q.num||'').trim().toUpperCase()===target);
+}
+
+// ── Job / PO number reservation (2026-08-18 production stabilisation) ──────
+// Same backend-atomic pattern as reserveQuoteNumber/reserveInvoiceNumber
+// above. Job and PO numbers are global (not per-company), so `company` is
+// omitted from the request — the backend treats docType 'job'/'po' as
+// always scoped to a single shared counter regardless of what's sent.
+async function reservePONumber() {
+  try {
+    const res = await fetch(API_DOC_NUMBER_RESERVE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ docType: 'po' }),
+    });
+    if (res.status === 401) { forceLogoutExpiredSession(); return null; }
+    if (!res.ok) return null;
+    const result = await res.json();
+    return (result && result.number) ? result.number : null;
+  } catch (e) {
+    console.warn('PO number reservation failed', e);
+    return null;
+  }
+}
+
+// Reserves a job number AND atomically claims "this quote may be converted
+// at most once" in the same backend transaction (see backend
+// routes/quoteConversions.ts + the additive `quote_conversions` table).
+// Returns { jobNumber, reused } on success, or { error } on failure/
+// already-converted. Passing the SAME quoteId again after a failed save
+// (e.g. a network timeout right after reservation) safely returns the SAME
+// job number rather than minting a new one — retries cannot create a
+// second job for the same quote, matching the required idempotency rule.
+async function reserveJobForQuote(quoteId) {
+  try {
+    const res = await fetch(API_QUOTE_CONVERSION_RESERVE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ quoteId }),
+    });
+    if (res.status === 401) { forceLogoutExpiredSession(); return { error: 'Not logged in — please sign in again.' }; }
+    const result = await res.json().catch(()=>null);
+    if (res.status === 409) {
+      return { error: (result && result.error) || 'This quote has already been converted to a job.', jobNumber: result && result.jobNumber };
+    }
+    if (!res.ok || !result || !result.jobNumber) {
+      return { error: (result && result.error) || 'Could not reserve a job number. Please check your connection and try again.' };
+    }
+    return { jobNumber: result.jobNumber, reused: !!result.reused };
+  } catch (e) {
+    console.warn('Job-for-quote reservation failed', e);
+    return { error: 'Could not reserve a job number. Please check your connection and try again.' };
+  }
+}
+
+// Manual/direct job creation (AddJobModal) has no source quote, so it uses
+// the plain job-number reservation (no conversion-idempotency table
+// involved — nothing to dedupe against).
+async function reserveJobNumber() {
+  try {
+    const res = await fetch(API_DOC_NUMBER_RESERVE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ docType: 'job' }),
+    });
+    if (res.status === 401) { forceLogoutExpiredSession(); return null; }
+    if (!res.ok) return null;
+    const result = await res.json();
+    return (result && result.number) ? result.number : null;
+  } catch (e) {
+    console.warn('Job number reservation failed', e);
+    return null;
+  }
 }
 
 /* ═══════════════════════════════════════════
@@ -2387,7 +2477,26 @@ function resolveQuotePaymentSource(quote, jobs, accInvoices) {
     }
     const jobHasOwnInvoice = !!linkedJob.invoiceCreated || (!!linkedJob.invoiceNum && (parseFloat(linkedJob.stage) || 0) >= 9);
     if (jobHasOwnInvoice) {
-      return { kind: 'job', record: linkedJob, invoice: null, job: linkedJob, payments: linkedJob.payments || [], label: `Job ${linkedJob.num} invoice payments` };
+      // 2026-08-18 (payment-consistency follow-up): this used to return
+      // linkedJob.payments alone, unlike resolvePaymentSource's equivalent
+      // 'job' branch (used by JobPaymentHistoryModal), which always merges
+      // in the source quote's own payments via reconcileJobInvoice. That
+      // mismatch meant a payment recorded on quote.payments while a job
+      // existed but jobHasOwnInvoice was still false (i.e. while THIS
+      // resolver was still returning kind:'quote') could become invisible
+      // here the moment jobHasOwnInvoice flipped true — Job Payments would
+      // still show it (merged), but Quote Payments would not, even though
+      // both are viewing the exact same underlying transaction. Merging the
+      // same way here closes that display divergence. This only changes
+      // what is DISPLAYED — see persist()/applyIfOwned() below for how
+      // writes stay correctly targeted per-id instead of copying entries
+      // between arrays.
+      const ownJobPayments = Array.isArray(linkedJob.payments) ? linkedJob.payments : [];
+      const seenIds = new Set(ownJobPayments.map(p => p && p.id));
+      const mergedPayments = ownJobPayments.concat(
+        (quote.payments || []).filter(p => p && !seenIds.has(p.id))
+      );
+      return { kind: 'job', record: linkedJob, invoice: null, job: linkedJob, payments: mergedPayments, label: `Job ${linkedJob.num} invoice payments` };
     }
   }
   return { kind: 'quote', record: quote, invoice: null, job: linkedJob, payments: quote.payments || [], label: 'Quote deposit payments' };
@@ -2417,6 +2526,29 @@ function updatePaymentInSource(payments, paymentId, patch) {
 // funded) is the caller's responsibility, same as before.
 function deletePaymentFromSource(payments, paymentId) {
   return (payments || []).filter(p => !(p && p.id === paymentId));
+}
+// ── Payment-consistency helper (2026-08-18, QuotePaymentsModal follow-up) ──
+// Several payment views (JobPaymentHistoryModal, QuotePaymentsModal) show a
+// MERGED array — job.payments ∪ the source quote's own payments, deduped by
+// id — because a job converted from a quote carries a snapshot of the
+// quote's deposits forward (see handleConvertToJob), and a quote can also
+// still gain a payment of its own in the narrow window after a job exists
+// but before it has its own invoice yet. Editing/deleting from that MERGED
+// view must never write the merged array straight back as the new
+// job.payments (or quote.payments) — doing so would silently COPY every
+// entry that only ever lived on the OTHER array into this one, creating
+// exactly the kind of unnecessary second mirror this pass is required to
+// avoid (see Section 7 of the payment-consistency brief).
+// `applyIfOwned` keeps each array independently authoritative for the ids
+// it actually contains: it only ever applies `transform` to `paymentsArr`
+// when `paymentId` is already present there, and returns the array
+// completely untouched otherwise — so calling this once against job.payments
+// and once against quote.payments naturally updates/removes the id in EVERY
+// array that actually owns it, and never introduces it into one that
+// didn't already have it.
+function applyIfOwned(paymentsArr, paymentId, transform) {
+  const arr = Array.isArray(paymentsArr) ? paymentsArr : [];
+  return arr.some(p => p && p.id === paymentId) ? transform(arr) : arr;
 }
 // Shared "edit a payment" prompt used by every payment modal — gathers and
 // validates amount/date/method/notes for one payment. Returns a patch object
@@ -4266,7 +4398,7 @@ function NumInput({ value, onChange, placeholder, disabled, small }) {
 /* ═══════════════════════════════════════════
    ADD JOB MODAL
 ═══════════════════════════════════════════ */
-function AddJobModal({ companies, onClose, onAdd, nextNum }) {
+function AddJobModal({ companies, onClose, onAdd }) {
   const [client,setClient]=useState(''); const [desc,setDesc]=useState('');
   // Default to the first company this user is allowed to create under
   // (companies is already scoped by creatableCompanies() at the call site —
@@ -4274,10 +4406,26 @@ function AddJobModal({ companies, onClose, onAdd, nextNum }) {
   // Holdings). Falls back to Signacore (id 2) if the list is ever empty.
   const [status,setStatus]=useState('lead'); const [co,setCo]=useState(String((companies&&companies[0]&&companies[0].id)||2));
   const [value,setValue]=useState(''); const [notes,setNotes]=useState('');
-  function submit(e) {
+  // 2026-08-18 (production stabilisation): the job number used to be
+  // passed in as a `nextNum` prop pre-computed client-side from the local
+  // `jobs` array (getNextJobNum) — a pure max()+1 scan with no backend
+  // reservation, the confirmed mechanism behind a real historical
+  // duplicate-job-number incident. It is now reserved atomically from the
+  // backend at submit time instead, the same pattern already used by
+  // CreateQuoteModal for quote numbers.
+  const [saving,setSaving]=useState(false);
+  const [saveErr,setSaveErr]=useState('');
+  async function submit(e) {
     e.preventDefault();
-    if (!client.trim()) return;
-    onAdd({ id:Date.now(), num:nextNum, client:client.trim(), desc:desc.trim(), status, co:parseInt(co),
+    if (!client.trim() || saving) return;
+    setSaving(true); setSaveErr('');
+    const jobNum = await reserveJobNumber();
+    if(!jobNum){
+      setSaving(false);
+      setSaveErr('A job number could not be reserved. The job was not created. Please check your connection and try again.');
+      return;
+    }
+    onAdd({ id:Date.now(), num:jobNum, client:client.trim(), desc:desc.trim(), status, co:parseInt(co),
              value:parseFloat(value)||0, stage:STATUS_TO_STAGE[status]||0, breakdown:null, notes:notes.trim() });
     onClose();
   }
@@ -4289,7 +4437,7 @@ function AddJobModal({ companies, onClose, onAdd, nextNum }) {
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="block text-xs font-semibold text-gray-500 mb-1.5">Job Number</label>
-            <div className="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm bg-gray-50 text-brand-600 font-bold tracking-wide">{nextNum}</div>
+            <div className="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm bg-gray-50 text-brand-600 font-bold tracking-wide">{saving?'Reserving…':'Assigned automatically on save'}</div>
           </div>
           <div><label className="block text-xs font-semibold text-gray-500 mb-1.5">Company</label>
             <select value={co} onChange={e=>setCo(e.target.value)} className={inputCls}>
@@ -4307,9 +4455,10 @@ function AddJobModal({ companies, onClose, onAdd, nextNum }) {
         <div><label className="block text-xs font-semibold text-gray-500 mb-1.5">Job Value (R)</label><input type="number" value={value} onChange={e=>setValue(e.target.value)} className={inputCls} placeholder="0.00"/></div>
         <div><label className="block text-xs font-semibold text-gray-500 mb-1.5">📝 Special Notes <span className="font-normal text-gray-400">(optional)</span></label><textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} className={inputCls+' resize-none'} placeholder="Internal notes, special requirements, reminders…"/></div>
         <div className="bg-blue-50 border border-blue-100 rounded-xl p-3"><p className="text-xs text-blue-600">💡 Add cost breakdown after creating the job by opening it and clicking <strong>Edit Cost Breakdown</strong>.</p></div>
+        {saveErr && <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-xs text-red-600 font-semibold">{saveErr}</div>}
         <div className="flex gap-3 pt-2">
-          <button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Cancel</button>
-          <button type="submit" className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold">Add Job</button>
+          <button type="button" disabled={saving} onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50 disabled:opacity-50">Cancel</button>
+          <button type="submit" disabled={saving} className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-50">{saving?'Adding…':'Add Job'}</button>
         </div>
       </form>
     </Modal>
@@ -5929,7 +6078,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
    Invoice view. Before an invoice exists, quote.payments is still
    authoritative and persisted via onUpdate (platform_state), same as before.
 ═══════════════════════════════════════════ */
-function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose, creditNotes, setCreditNotes, linkedJob, linkedJobHasInvoice, linkedCustomer, onOpenJob, onOpenInvoice, onOpenCustomer, accInvoices, setAccInvoices, jobs, setJobs, forceSaveSections }) {
+function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose, creditNotes, setCreditNotes, linkedJob, linkedJobHasInvoice, linkedCustomer, onOpenJob, onOpenInvoice, onOpenCustomer, accInvoices, setAccInvoices, jobs, setJobs, quotes, setQuotes, forceSaveSections }) {
   // Resolved once per mount via the quote-specific chain-walking resolver
   // (quote's own invoice → linked job's invoice → linked job's own
   // job-created invoice → quote.payments) — matches exactly what
@@ -5982,17 +6131,31 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
   // — the linked invoice (accInvoices), the linked job (job.payments — a
   // job-created invoice with no accInvoices record), or quote.payments (via
   // onUpdateConfirmed/saveQuotePayments in QuotesPage, which also mirrors
-  // handleUpdate's linked-job payment-sync cascade). `patch` carries the
-  // status/paidAt-style fields appropriate to that record; only one
-  // destination is ever written per save, so a payment is never written to
-  // two places at once. `creditDelta` (Credit-method payments only) is
-  // resolved to the next creditNotes array and saved in the SAME backend
-  // write as the payment change — never as a separate save — so credit-note
-  // usage and the payment it belongs to can never end up out of step if the
-  // save fails partway. Local state (payments/creditNotes) is only ever
-  // updated AFTER the backend confirms; throws (never silently no-ops) on
-  // failure so callers can show a clear error and leave the modal open.
-  async function persist(updated, patch, creditDelta){
+  // the linked-job payment-sync cascade). `patch` carries the status/
+  // paidAt-style fields appropriate to that record. `creditDelta`
+  // (Credit-method payments only) is resolved to the next creditNotes array
+  // and saved in the SAME backend write as the payment change — never as a
+  // separate save — so credit-note usage and the payment it belongs to can
+  // never end up out of step if the save fails partway. Local state
+  // (payments/creditNotes) is only ever updated AFTER the backend confirms;
+  // throws (never silently no-ops) on failure so callers can show a clear
+  // error and leave the modal open.
+  //
+  // `jobPayload`/`quotePayload` (2026-08-18, payment-consistency follow-up):
+  // when paySource.kind==='job', `updated` is the MERGED display array (see
+  // resolveQuotePaymentSource's job branch, which now also merges in the
+  // source quote's own payments so a payment recorded before the linked job
+  // had its own invoice doesn't become invisible here later). Writing
+  // `updated` straight back as job.payments would silently copy every
+  // quote-only entry into job.payments — an unwanted second mirror. Callers
+  // (below) compute `jobPayload` via applyIfOwned() so job.payments is only
+  // ever touched for ids it already owns, and `quotePayload` (only for an
+  // edit/delete whose id ALSO still lives on quote.payments — e.g. a
+  // deposit carried over at conversion time) so that copy is kept in sync
+  // in the SAME save rather than left behind to resurrect/revert the change
+  // later via reconcileJobInvoice. A brand-new payment is never mirrored
+  // onto the quote — only edits/deletes of an id the quote already owns.
+  async function persist(updated, patch, creditDelta, jobPayload, quotePayload){
     setSaving(true); setSaveErr('');
     try {
       const nextCreditNotes = creditDelta
@@ -6008,16 +6171,24 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
         setAccInvoices(nextAccInvoices);
         if(nextCreditNotes) setCreditNotes(nextCreditNotes);
       } else if(paySource.kind==='job'){
-        const nextJobs = jobs.map(j=>j.id===paySource.record.id?{...j,payments:updated,...(patch||{})}:j);
+        const jobPaymentsToWrite = jobPayload !== undefined ? jobPayload : updated;
+        const nextJobs = jobs.map(j=>j.id===paySource.record.id?{...j,payments:jobPaymentsToWrite,...(patch||{})}:j);
         const overrides = {jobs: nextJobs};
+        let nextQuotesArr = null;
+        if(quotePayload !== undefined && quotes){
+          nextQuotesArr = quotes.map(q=>q.id===quote.id?{...q,payments:quotePayload}:q);
+          overrides.quotes = nextQuotesArr;
+        }
         if(nextCreditNotes) overrides.creditNotes = nextCreditNotes;
         await forceSaveSections(overrides);
         setJobs(nextJobs);
+        if(nextQuotesArr && setQuotes) setQuotes(nextQuotesArr);
         if(nextCreditNotes) setCreditNotes(nextCreditNotes);
       } else {
         // 'quote' kind — onUpdateConfirmed (saveQuotePayments in QuotesPage)
-        // saves quotes (+ linked job cascade, if any) and creditNotes
-        // together in one call, and commits all of it itself on success.
+        // saves quotes (+ linked job payment-sync cascade, if any — see
+        // saveQuotePayments) and creditNotes together in one call, and
+        // commits all of it itself on success.
         await onUpdateConfirmed({...quote, payments:updated}, nextCreditNotes);
       }
       setPayments(updated);
@@ -6040,9 +6211,10 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
       }
       creditDelta = {type:'apply', amount:amt};
     }
-    const updated = [...payments,{id:Date.now(),date,method,amount:amt,notes:notes.trim()}];
+    const newPayment = {id:Date.now(),date,method,amount:amt,notes:notes.trim()};
+    const updated = [...payments,newPayment];
     const newTotal = updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-    let patch;
+    let patch, jobPayload;
     if(paySource.kind==='invoice'){
       const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':paySource.record.status;
       const paidDate  = newTotal>=statusTotal?(paySource.record.paidDate||date||new Date().toISOString().slice(0,10)):(paySource.record.paidDate||null);
@@ -6051,9 +6223,12 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
       const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':'pending';
       const paidAt    = newTotal>=statusTotal?(date||new Date().toISOString().slice(0,10)):paySource.record.paidAt||null;
       patch = {invoiceStatus:newStatus, paidAt};
+      // A brand-new payment is always written to job.payments ONLY — never
+      // mirrored onto the quote merely for symmetry (Section 7).
+      jobPayload = [...(Array.isArray(paySource.record.payments) ? paySource.record.payments : []), newPayment];
     }
     try {
-      await persist(updated, patch, creditDelta);
+      await persist(updated, patch, creditDelta, jobPayload);
       setAmount(''); setNotes('');
     } catch(e){ /* saveErr already shown; amount/notes deliberately left as typed */ }
   }
@@ -6064,15 +6239,22 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
     if(!patch0) return;
     const updated = updatePaymentInSource(payments, pid, patch0);
     const newTotal = updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-    let patch;
+    let patch, jobPayload, quotePayload;
     if(paySource.kind==='invoice'){
       const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':paySource.record.status;
       patch = {status:newStatus, paidDate:newTotal>=statusTotal?paySource.record.paidDate:null};
     } else if(paySource.kind==='job'){
       const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':'pending';
       patch = {invoiceStatus:newStatus, paidAt:newTotal>=statusTotal?paySource.record.paidAt:null};
+      // Update the id wherever it's actually represented — job.payments if
+      // owned there, quote.payments if ALSO owned there (a deposit carried
+      // over at conversion time) — never in an array that never had it.
+      jobPayload = applyIfOwned(paySource.record.payments, pid, arr=>updatePaymentInSource(arr, pid, patch0));
+      if((quote.payments||[]).some(p=>p&&p.id===pid)){
+        quotePayload = applyIfOwned(quote.payments, pid, arr=>updatePaymentInSource(arr, pid, patch0));
+      }
     }
-    try { await persist(updated, patch, null); } catch(e){ /* saveErr already shown */ }
+    try { await persist(updated, patch, null, jobPayload, quotePayload); } catch(e){ /* saveErr already shown */ }
   }
   async function deletePayment(pid){
     if(saving) return;
@@ -6083,15 +6265,23 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
       : null;
     const updated = deletePaymentFromSource(payments, pid);
     const newTotal = updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-    let patch;
+    let patch, jobPayload, quotePayload;
     if(paySource.kind==='invoice'){
       const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':'sent';
       patch = {status:newStatus, paidDate:newTotal>=statusTotal?paySource.record.paidDate:null};
     } else if(paySource.kind==='job'){
       const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':'pending';
       patch = {invoiceStatus:newStatus, paidAt:newTotal>=statusTotal?paySource.record.paidAt:null};
+      // Permanently remove this id from EVERY active representation that
+      // could otherwise feed it back via reconciliation — job.payments if
+      // owned there, quote.payments if ALSO owned there — in this SAME
+      // confirmed save. See applyIfOwned's note above.
+      jobPayload = applyIfOwned(paySource.record.payments, pid, arr=>deletePaymentFromSource(arr, pid));
+      if((quote.payments||[]).some(p=>p&&p.id===pid)){
+        quotePayload = applyIfOwned(quote.payments, pid, arr=>deletePaymentFromSource(arr, pid));
+      }
     }
-    try { await persist(updated, patch, creditDelta); } catch(e){ /* saveErr already shown */ }
+    try { await persist(updated, patch, creditDelta, jobPayload, quotePayload); } catch(e){ /* saveErr already shown */ }
   }
 
   return (
@@ -6201,7 +6391,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
   );
 }
 
-function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvertToJob, companies, logoDataUrl, onEdit, jobs, setJobs, creditNotes, setCreditNotes, isAdmin, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob, customers, onOpenCustomer, accInvoices, setAccInvoices, onCreateInvoiceFromQuote, onOpenQuoteInvoice, forceSaveSections }) {
+function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvertToJob, companies, logoDataUrl, onEdit, jobs, setJobs, quotes, setQuotes, creditNotes, setCreditNotes, isAdmin, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob, customers, onOpenCustomer, accInvoices, setAccInvoices, onCreateInvoiceFromQuote, onOpenQuoteInvoice, forceSaveSections }) {
   const [showEmailFlow, setShowEmailFlow] = useState(false);
   const [showProformaEmail, setShowProformaEmail] = useState(false);
   const [showPayments, setShowPayments] = useState(false);
@@ -6633,6 +6823,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
           onOpenJob={onOpenJob} onOpenInvoice={onOpenInvoice} onOpenCustomer={onOpenCustomer}
           accInvoices={accInvoices} setAccInvoices={setAccInvoices}
           jobs={jobs} setJobs={setJobs}
+          quotes={quotes} setQuotes={setQuotes}
           forceSaveSections={forceSaveSections}
         />
       )}
@@ -6667,6 +6858,8 @@ function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[], quotes
   const [lines,        setLines]        = useState(_invDraft?.lines || (job.lines ? job.lines.map(l=>({...l})) : []));
   const [discount,     setDiscount]     = useState(_invDraft?.discount     ?? (job.discount||''));
   const [activeLineId, setActiveLineId] = useState(null);
+  const [saving,       setSaving]       = useState(false);
+  const [saveErr,      setSaveErr]      = useState('');
 
   const linesSubtotal  = lines.reduce((s,l)=>s+(l.subtotal||0),0);
   const linesDiscPct   = parseFloat(discount)||0;
@@ -6723,7 +6916,8 @@ function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[], quotes
 
   const hasPayments = (job.payments||[]).length>0;
 
-  function save(){
+  async function save(){
+    if(saving) return;
     const finalValue = hasLines ? linesTotal : parseFloat(value)||0;
 
     // ── Block silent duplicate invoice numbers ──
@@ -6780,8 +6974,21 @@ function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[], quotes
       if (!ok) return;
     }
 
-    onSave({...job, client, invoiceNum, invoiceDate, invoiceDue, value:finalValue, notes, invoiceStatus, paidAt, lines:hasLines?lines:job.lines, discount:hasLines?discount:job.discount});
-    try { localStorage.removeItem(_invDraftKey); } catch(e){}
+    // 2026-08-18 (production stabilisation, Section 11): wait for the
+    // caller's onSave to actually confirm the write (it now awaits
+    // forceSaveSections — see the call site) before treating this as
+    // successful. On failure, keep the form open with all entered data
+    // intact (the localStorage draft is deliberately NOT cleared) and show
+    // a clear error instead of silently closing as if it had saved.
+    setSaving(true); setSaveErr('');
+    try {
+      await onSave({...job, client, invoiceNum, invoiceDate, invoiceDue, value:finalValue, notes, invoiceStatus, paidAt, lines:hasLines?lines:job.lines, discount:hasLines?discount:job.discount});
+      try { localStorage.removeItem(_invDraftKey); } catch(e){}
+    } catch(err){
+      setSaveErr((err && err.message) ? err.message : 'Save failed. Please check your connection and try again.');
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -6956,9 +7163,10 @@ function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[], quotes
       </div>
 
       <div><label className="text-xs font-bold text-gray-500 block mb-1">Notes</label><textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} className={iCls+' resize-none'}/></div>
+      {saveErr && <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-xs text-red-600 font-semibold">{saveErr}</div>}
       <div className="flex gap-3 pt-2">
-        <button onClick={save} className="flex-1 text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#06065c'}}>💾 Save Changes</button>
-        <button onClick={onClose} className="px-4 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600">Cancel</button>
+        <button disabled={saving} onClick={save} className="flex-1 text-white font-bold py-2.5 rounded-xl text-sm disabled:opacity-50" style={{background:'#06065c'}}>{saving?'Saving…':'💾 Save Changes'}</button>
+        <button disabled={saving} onClick={onClose} className="px-4 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600 disabled:opacity-50">Cancel</button>
       </div>
     </div>
   );
@@ -7232,16 +7440,58 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // forceSaveSections call as the quote/job change — so a Credit-method
   // payment's credit-note usage can never be saved out of step with the
   // payment itself (see QuotePaymentsModal.persist).
+  // 2026-08-18 (payment-consistency follow-up): this used to cascade a
+  // quote payment change into any linked job purely via
+  // reconcileJobInvoice(j, [updated]) — but that function only ever ADDS a
+  // quote payment id the job doesn't already have; it never removes or
+  // updates an id the job already owns a (now stale) copy of. Concretely:
+  // if a deposit was carried into job.payments at conversion time (same
+  // id), then EDITED or DELETED here via QuotePaymentsModal (kind==='quote'
+  // — before the linked job has its own invoice), the old cascade left
+  // job.payments completely untouched for that id — own already "knew"
+  // the id, so reconcileJobInvoice's add-only merge never revisited it.
+  // The result: a deletion never actually removed the payment from the
+  // job's own array (an immediate, same-save resurrection, not merely a
+  // later-reconciliation one), and an edit silently reverted on the job
+  // side. Fixed by diffing the quote's payments before/after and applying
+  // ONLY that exact change (delete/edit) to the job's own array, and ONLY
+  // when the job already owns that id — this can never inject a brand-new
+  // quote-only payment into job.payments (no new mirroring; see Section 7
+  // of the payment-consistency brief). Status/total still derive from the
+  // full effective (merged) set via reconcileJobInvoice, used here purely
+  // as a read-time calculation, never as what gets written to job.payments.
   async function saveQuotePayments(updated, creditNotesOverride){
+    const prevQuote = quotes.find(q=>q.id===updated.id);
+    const prevPayments = (prevQuote && Array.isArray(prevQuote.payments)) ? prevQuote.payments : [];
+    const nextPayments = Array.isArray(updated.payments) ? updated.payments : [];
+    const prevById = new Map(prevPayments.filter(p=>p&&p.id!=null).map(p=>[p.id,p]));
+    const nextById = new Map(nextPayments.filter(p=>p&&p.id!=null).map(p=>[p.id,p]));
+    const deletedIds = [...prevById.keys()].filter(id=>!nextById.has(id));
+    const editedIds  = [...nextById.keys()].filter(id=>prevById.has(id) && JSON.stringify(nextById.get(id))!==JSON.stringify(prevById.get(id)));
+
     const nextQuotes = quotes.map(q=>q.id===updated.id?updated:q);
     let nextJobs = jobs, jobsChanged = false;
     if(updated && updated.num){
       const mapped = jobs.map(j=>{
         if(j.quoteNum!==updated.num) return j;
-        jobsChanged = true;
-        const rec = reconcileJobInvoice(j, [updated]);
+        let ownPayments = Array.isArray(j.payments) ? j.payments : [];
+        let ownChanged = false;
+        deletedIds.forEach(id=>{
+          if(ownPayments.some(p=>p&&p.id===id)){ ownPayments = deletePaymentFromSource(ownPayments, id); ownChanged = true; }
+        });
+        editedIds.forEach(id=>{
+          if(ownPayments.some(p=>p&&p.id===id)){ ownPayments = updatePaymentInSource(ownPayments, id, nextById.get(id)); ownChanged = true; }
+        });
+        jobsChanged = true; // status/stage may still need recomputing even with ownChanged===false (e.g. a new quote-only payment)
+        // Status/total reflect the FULL effective set (this job's own,
+        // now-corrected payments, unioned with whatever the quote still
+        // carries that the job doesn't have its own copy of) — purely a
+        // calculation, matching what resolvePaymentSource/JobPaymentHistoryModal
+        // already show. `ownPayments` (not this merged view) is what's
+        // actually written below.
+        const rec = reconcileJobInvoice({...j, payments: ownPayments}, [updated]);
         const bumpDeposit = rec.totalPaid>0 && (parseFloat(j.stage)||0)<5;
-        return {...j, payments:rec.payments, invoiceStatus:rec.invoiceStatus,
+        return {...j, payments: ownPayments, invoiceStatus:rec.invoiceStatus,
           ...(bumpDeposit ? {stage:5, status:'deposit_received'} : {})};
       });
       if(jobsChanged) nextJobs = mapped;
@@ -7339,7 +7589,45 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // job intentionally has no invoiceNum until the user genuinely clicks
     // "Create Invoice" (JobDetail / createInvoiceNow), which reserves one
     // atomically from the backend at that moment.
-    const jobNum = getNextJobNum(jobs);
+    //
+    // 2026-08-18 (production stabilisation): job numbers used to come from
+    // getNextJobNum(jobs), a pure client-side max()+1 scan of the LOCAL
+    // `jobs` array — with no backend reservation, two sessions converting
+    // different (or even the same) quotes at nearly the same time could
+    // independently compute the identical "next" number, and nothing
+    // stopped two sessions from converting the SAME quote at all. This is
+    // the confirmed mechanism behind the SQ-00014 double-conversion found
+    // by the production integrity audit. Job numbers now come from the
+    // backend-atomic reservation below, and for a normal (non-restore)
+    // conversion that same call also atomically claims "this quote may be
+    // converted at most once" (quote_conversions, UNIQUE(quote_id)) — a
+    // real database-level guarantee the in-memory `matches`/convertingRef
+    // checks above cannot provide across two different sessions. If the
+    // save further below ultimately fails, the claim is not wasted: a
+    // retry with the same quote id gets the SAME job number back rather
+    // than being blocked or minting a new one (see reserveJobForQuote).
+    let jobNum;
+    if(restore){
+      // Restore intentionally creates a genuinely NEW job (see the confirm
+      // dialog above: "This creates a brand-new job..."). The quote is
+      // already marked converted from its original conversion, which
+      // already consumed the quote_conversions claim, so this deliberately
+      // uses the plain (non-idempotent) job-number reservation rather than
+      // reserveJobForQuote, which would otherwise reject with "already
+      // converted" every time.
+      jobNum = await reserveJobNumber();
+      if(!jobNum){
+        alert('Job could NOT be restored — a job number could not be reserved. Nothing was changed. Please check your connection and try again.');
+        return;
+      }
+    } else {
+      const reservation = await reserveJobForQuote(q.id);
+      if(reservation.error){
+        alert('Job could NOT be created.\n\n'+reservation.error+(reservation.jobNumber?(' (job '+reservation.jobNumber+')'):'')+'\n\nNothing was changed. If you believe this quote was NOT actually converted, please refresh Jobs and check before trying again.');
+        return;
+      }
+      jobNum = reservation.jobNumber;
+    }
     const today  = new Date().toISOString().slice(0,10);
     const dueDate= new Date(Date.now()+30*864e5).toISOString().slice(0,10);
     const _qSub      = q.lines.reduce(function(s,l){return s+(l.subtotal||0);},0);
@@ -7427,10 +7715,29 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       }
     }
     let nextPurchaseOrders = purchaseOrders;
+    // 2026-08-18: PO numbers now come from the same backend-atomic counter
+    // as job/quote/invoice numbers (reservePONumber), not a client-side
+    // max()+1 scan — closes the same duplicate-number race class for
+    // auto-generated low-stock POs. Reserved one at a time (not in
+    // parallel) so each call's counter update is visible to the next; this
+    // only runs for the handful of supplier groups a single conversion's
+    // low-stock lines produced, so the sequential awaits are not a
+    // meaningful slowdown. A reservation failure here does not block the
+    // job/quote conversion itself — the PO is a supplementary auto-reorder
+    // side effect, not the record the user asked to create — but that
+    // item's PO is skipped rather than saved with a blank/guessed number,
+    // and the user is told below so nothing is silently lost.
+    let poReservationFailed = false;
+    let numberedPOCount = 0;
     if(newPOs.length){
-      let counter = purchaseOrders.length;
-      const numbered = newPOs.map(po=>({...po, num:getNextPONum([...purchaseOrders,...newPOs.slice(0,counter++)])}));
-      nextPurchaseOrders = [...numbered,...purchaseOrders];
+      const numberedPOs = [];
+      for(const po of newPOs){
+        const poNum = await reservePONumber();
+        if(poNum){ numberedPOs.push({...po, num:poNum}); }
+        else { poReservationFailed = true; }
+      }
+      numberedPOCount = numberedPOs.length;
+      if(numberedPOs.length) nextPurchaseOrders = [...numberedPOs,...purchaseOrders];
     }
 
     const updated={...q,status:'converted',convertedJobId:newJob.id};
@@ -7480,8 +7787,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     setViewQuote(null); // close the quote view
 
     if(lowItems.length>0){
-      const count = newPOs.length;
-      setTimeout(()=>alert('⚠ '+lowItems.length+' inventory item'+(lowItems.length>1?'s are':' is')+' at or below reorder level.\n'+count+' Purchase Order'+(count>1?'s have':' has')+' been generated automatically.\n\nGo to Purchase Orders to review, approve, and email to suppliers.'),300);
+      const failureNote = poReservationFailed ? '\n\n⚠ One or more Purchase Orders could NOT be numbered (connection issue) and were skipped — check Inventory/low-stock items manually.' : '';
+      setTimeout(()=>alert('⚠ '+lowItems.length+' inventory item'+(lowItems.length>1?'s are':' is')+' at or below reorder level.\n'+numberedPOCount+' Purchase Order'+(numberedPOCount!==1?'s have':' has')+' been generated automatically.'+failureNote+'\n\nGo to Purchase Orders to review, approve, and email to suppliers.'),300);
     }
     // Show a confirmation with the new job number instead of silently
     // auto-navigating away — the user chooses whether to open it now. Only
@@ -7516,7 +7823,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // both companies exactly as before. Only ever updates the existing
   // accInvoices record; never creates a second invoice.
   async function saveManualInvoiceFromSales(inv) {
-    const ok = await saveManualInvoice(inv, { user, jobsAll: jobs, accInvoicesAll: accInvoices, quotesAll: quotes, setAccInvoices });
+    const ok = await saveManualInvoice(inv, { user, jobsAll: jobs, accInvoicesAll: accInvoices, quotesAll: quotes, setAccInvoices, forceSaveSections });
     if(ok){ setShowManualInvModal(false); setEditManualInv(null); }
   }
   async function createInvoiceNow(job){
@@ -7744,7 +8051,32 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // creditNotes array for a Credit-method payment change — it is saved in
     // the SAME forceSaveSections call as the payment so the two can never
     // drift apart (audit requirement E).
-    async function persist(updated, jobPatch, invoicePatch, creditNotesOverride){
+    // `quotesOverride` (2026-08-18, production stabilisation, Section 8.C/8.B):
+    // when this modal's payments came from the merged job+quote view
+    // (paySource.kind==='job' — see resolvePaymentSource, which merges
+    // job.payments ∪ the source quote's payments for a job with no linked
+    // invoice yet), a delete or edit must be reflected on the SOURCE QUOTE's
+    // own payments array too, in this SAME save. Without this, deleting on
+    // the job side only ever touched job.payments — the id stayed in
+    // quote.payments, so ANY later, unrelated save of that quote
+    // (QuotesPage.handleUpdate/saveQuotePayments — Mark Sent, Approve, a new
+    // quote payment) would re-merge the "missing" id back into job.payments
+    // via reconcileJobInvoice, resurrecting a payment the user had just
+    // deleted (and, if it was credit-funded, leaving the credit note's
+    // `used` total stale at the same time). See deletePayment/editPayment
+    // below for how this is computed.
+    // `jobPayload` (2026-08-18, payment-consistency follow-up): when
+    // paySource.kind==='job', `updated` is the MERGED display array (see
+    // resolvePaymentSource's job branch, which merges job.payments ∪ the
+    // source quote's own payments). Writing `updated` straight back as the
+    // new job.payments would silently COPY every quote-only entry into
+    // job.payments — an unwanted second mirror, exactly what this pass must
+    // avoid. `jobPayload`, when provided, is what actually gets written to
+    // job.payments instead — computed by the caller via applyIfOwned() so
+    // only ids that already belonged to job.payments are touched there.
+    // Falls back to `updated` if a caller doesn't supply it (defensive only
+    // — every call site below now always supplies it for the job branch).
+    async function persist(updated, jobPatch, invoicePatch, creditNotesOverride, quotesOverride, jobPayload){
       setSaveErr('');
       setSaving(true);
       try {
@@ -7757,14 +8089,17 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           setAccInvoices(nextAccInvoices);
           if(creditNotesOverride) setCreditNotes(creditNotesOverride);
         } else {
-          const saved={...job, payments:updated, ...(jobPatch||{})};
+          const jobPaymentsToWrite = jobPayload !== undefined ? jobPayload : updated;
+          const saved={...job, payments:jobPaymentsToWrite, ...(jobPatch||{})};
           const nextJobs = jobs.map(j=>j.id===saved.id?saved:j);
           const overrides = { jobs: nextJobs };
           if(creditNotesOverride) overrides.creditNotes = creditNotesOverride;
+          if(quotesOverride) overrides.quotes = quotesOverride;
           await forceSaveSections(overrides);
           setPayments(updated);
           setJobs(nextJobs);
           if(creditNotesOverride) setCreditNotes(creditNotesOverride);
+          if(quotesOverride) setQuotes(quotesOverride);
           setJobPayModal(saved);
         }
       } catch(err) {
@@ -7773,6 +8108,19 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       } finally {
         setSaving(false);
       }
+    }
+    // Shared helper for deletePayment/editPayment below: if this job's
+    // payments view is the merged job+quote view and the source quote's OWN
+    // payments array still carries this payment id, returns the next
+    // `quotes` array with that quote's payments patched/stripped the same
+    // way; otherwise returns null (nothing to sync — either this is an
+    // invoice-sourced payment, or the source quote never had this id).
+    function syncedQuotesOverride(pid, transform){
+      if(paySource.kind==='invoice') return null;
+      const srcQuote = (quotes||[]).find(q=>q && q.num && job.quoteNum && q.num===job.quoteNum);
+      if(!srcQuote || !Array.isArray(srcQuote.payments) || !srcQuote.payments.some(p=>p && p.id===pid)) return null;
+      const nextPayments = transform(srcQuote.payments);
+      return quotes.map(q=>q.id===srcQuote.id?{...q, payments:nextPayments}:q);
     }
     async function addPayment() {
       if(saving) return;
@@ -7801,7 +8149,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           // Received (stage 5) the first time money comes in, never regressing a job
           // that is already further along.
           const bumpDeposit = newTotal>0 && (parseFloat(job.stage)||0)<5;
-          await persist(updated, {invoiceStatus:newStatus, paidAt, ...(bumpDeposit ? {stage:5, status:'deposit_received'} : {})}, null, creditNotesOverride);
+          // New payments are always written to job.payments ONLY — never
+          // mirrored onto the source quote merely for symmetry (see
+          // applyIfOwned's note above / Section 7 of the payment-consistency
+          // brief). `updated` (the merged display array) is never used as
+          // the job write payload — job's own array plus the new payment is.
+          const jobPayload = [...(Array.isArray(job.payments) ? job.payments : []), newP];
+          await persist(updated, {invoiceStatus:newStatus, paidAt, ...(bumpDeposit ? {stage:5, status:'deposit_received'} : {})}, null, creditNotesOverride, null, jobPayload);
         }
       } catch(e) { return; }
       setAmount(''); setNotes('');
@@ -7817,13 +8171,20 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       }
       const updated=deletePaymentFromSource(payments, pid);
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+      // See syncedQuotesOverride/persist above — permanently strips this id
+      // from the source quote's own payments too, so it cannot resurrect.
+      const quotesOverride = syncedQuotesOverride(pid, srcPayments=>deletePaymentFromSource(srcPayments, pid));
+      // applyIfOwned: only strips pid from job.payments if it was actually
+      // there — never copies unrelated quote-only ids into job.payments as
+      // a side effect of this delete (see persist()'s jobPayload note).
+      const jobPayload = applyIfOwned(job.payments, pid, arr => deletePaymentFromSource(arr, pid));
       try {
         if(paySource.kind==='invoice'){
           const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'sent';
           await persist(updated, null, {status:newStatus, paidDate:newTotal>=invTotal?paySource.record.paidDate:null}, creditNotesOverride);
         } else {
           const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
-          await persist(updated, {invoiceStatus:newStatus, paidAt:newTotal>=invTotal?job.paidAt:null}, null, creditNotesOverride);
+          await persist(updated, {invoiceStatus:newStatus, paidAt:newTotal>=invTotal?job.paidAt:null}, null, creditNotesOverride, quotesOverride, jobPayload);
         }
       } catch(e) {}
     }
@@ -7835,13 +8196,19 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       if(!patch) return;
       const updated = updatePaymentInSource(payments, pid, patch);
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+      // Keep the source quote's own copy of this payment in step too (see
+      // syncedQuotesOverride/persist above) — an edit made from the Job view
+      // must be reflected everywhere, not just in job.payments.
+      const quotesOverride = syncedQuotesOverride(pid, srcPayments=>updatePaymentInSource(srcPayments, pid, patch));
+      // Same applyIfOwned protection as deletePayment above.
+      const jobPayload = applyIfOwned(job.payments, pid, arr => updatePaymentInSource(arr, pid, patch));
       try {
         if(paySource.kind==='invoice'){
           const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':paySource.record.status;
           await persist(updated, null, {status:newStatus, paidDate:newTotal>=invTotal?paySource.record.paidDate:null});
         } else {
           const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
-          await persist(updated, {invoiceStatus:newStatus, paidAt:newTotal>=invTotal?job.paidAt:null});
+          await persist(updated, {invoiceStatus:newStatus, paidAt:newTotal>=invTotal?job.paidAt:null}, null, null, quotesOverride, jobPayload);
         }
       } catch(e) {}
     }
@@ -8545,6 +8912,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         companies={companies} logoDataUrl={logoDataUrl}
         onEdit={handleEditQuote}
         jobs={jobs} setJobs={setJobs}
+        quotes={quotes} setQuotes={setQuotes}
         companyJobs={myJobs}
         onOpenJob={openJobFromQuote}
         onCreateInvoice={createInvoiceNow}
@@ -8566,7 +8934,20 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
               <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>✏️ EDIT INVOICE — {editInvoice.invoiceNum}</p>
               <button onClick={()=>setEditInvoice(null)} className="text-white/60 hover:text-white text-xl">✕</button>
             </div>
-            <EditInvoiceForm job={editInvoice} jobs={jobs} accInvoices={accInvoices} quotes={quotes} onSave={updated=>{ setJobs(prev=>prev.map(j=>j.id===updated.id?updated:j)); setEditInvoice(null); }} onClose={()=>setEditInvoice(null)}/>
+            <EditInvoiceForm job={editInvoice} jobs={jobs} accInvoices={accInvoices} quotes={quotes} onSave={async updated=>{
+              // 2026-08-18 (production stabilisation, Section 11): this used
+              // to call setJobs directly and close the modal unconditionally
+              // — the actual write only happened later via the ordinary
+              // debounced autosave, invisible to the user if it failed. Now
+              // waits for a backend-CONFIRMED save (forceSaveSections)
+              // before touching local state; a rejection here propagates to
+              // EditInvoiceForm.save(), which keeps the form open and shows
+              // the error instead of a false "saved".
+              const nextJobs = jobs.map(j=>j.id===updated.id?updated:j);
+              await forceSaveSections({ jobs: nextJobs });
+              setJobs(nextJobs);
+              setEditInvoice(null);
+            }} onClose={()=>setEditInvoice(null)}/>
           </div>
         </div>
       )}
@@ -8579,6 +8960,16 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
 ═══════════════════════════════════════════ */
 function AddEditAssetModal({ asset, onClose, onSave }) {
   const isEdit = !!asset;
+  // 2026-08-18 (production stabilisation, Section 12): onSave is now the
+  // confirmed-save handler (AssetsPage.handleSave / handleUpdate), which is
+  // async and returns true only after a backend-confirmed save succeeds.
+  // Previously this modal called onSave then unconditionally closed itself
+  // on the same tick — a failed save still closed the modal, showing the
+  // user a false "saved" outcome and discarding their edits. Now the modal
+  // stays open with an error banner (and the form data intact) until the
+  // save is actually confirmed.
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState('');
   const [cat,     setCat]     = useState(asset?.cat||'vehicle');
   const [name,    setName]    = useState(asset?.name||'');
   // Vehicle fields
@@ -8600,19 +8991,33 @@ function AddEditAssetModal({ asset, onClose, onSave }) {
   const isVeh = isVehicleCat(cat);
   const iCls = "w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 bg-white";
 
-  function submit(e) {
+  async function submit(e) {
     e.preventDefault();
-    onSave({
-      ...(asset||{}), id:asset?.id||Date.now(),
-      cat, name:name.trim()||reg||serial||'Asset',
-      reg, make, model, year, color, vin, licExp, rwExp,
-      serial, mfr, modelNo, purDate, notes,
-      odoReadings: asset?.odoReadings||[],
-      maintenance: asset?.maintenance||[],
-      tyres:       asset?.tyres||[],
-      documents:   asset?.documents||[],
-    });
-    onClose();
+    if (saving) return;
+    setSaving(true);
+    setErr('');
+    try {
+      const ok = await onSave({
+        ...(asset||{}), id:asset?.id||Date.now(),
+        cat, name:name.trim()||reg||serial||'Asset',
+        reg, make, model, year, color, vin, licExp, rwExp,
+        serial, mfr, modelNo, purDate, notes,
+        odoReadings: asset?.odoReadings||[],
+        maintenance: asset?.maintenance||[],
+        tyres:       asset?.tyres||[],
+        documents:   asset?.documents||[],
+      });
+      // onSave's own handler (handleSave/handleUpdate) already alerts the
+      // user with the specific reason on failure — this modal just needs to
+      // decide whether to close. Treat undefined (legacy/no-op callers) as
+      // success so this stays backward-compatible; only an explicit false
+      // keeps the modal open.
+      if (ok !== false) onClose();
+    } catch (e2) {
+      setErr('This asset could not be saved. Please check your connection and try again.');
+    } finally {
+      setSaving(false);
+    }
   }
   return (
     <Modal onClose={onClose} wide>
@@ -8678,9 +9083,10 @@ function AddEditAssetModal({ asset, onClose, onSave }) {
         <div><label className="block text-xs font-semibold text-gray-500 mb-1">Notes</label>
           <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} className={iCls+' resize-none'} placeholder="Any additional information..."/></div>
 
+        {err && <div className="bg-red-50 border border-red-200 text-red-700 text-xs font-semibold rounded-xl px-3 py-2">{err}</div>}
         <div className="flex gap-3 pt-1">
-          <button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Cancel</button>
-          <button type="submit" className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold">{isEdit?'Save Changes':'Add Asset'}</button>
+          <button type="button" onClick={onClose} disabled={saving} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50 disabled:opacity-50">Cancel</button>
+          <button type="submit" disabled={saving} className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-60">{saving?'Saving…':(isEdit?'Save Changes':'Add Asset')}</button>
         </div>
       </form>
     </Modal>
@@ -8784,13 +9190,25 @@ function AssetDetail({ asset, onBack, onUpdate }) {
   function addMaint(r){ onUpdate({...asset,maintenance:[r,...(asset.maintenance||[])]}); }
   function addTyre(r){  onUpdate({...asset,tyres:[r,...(asset.tyres||[])]}); }
 
+  // 2026-08-18 (production stabilisation, Section 12): document uploads now
+  // go through the confirmed-save `onUpdate` (AssetsPage.handleUpdate),
+  // which only calls setAssets — updating what this component actually
+  // renders, since `asset` here is just a prop — AFTER a backend-confirmed
+  // save succeeds. If the save fails, onUpdate already alerts the user and
+  // returns false; this component never applied the new document to its
+  // own local state, so a failed upload was never able to show as
+  // "attached" in the UI. We still await it (rather than fire-and-forget)
+  // so the file input can be reset on failure, letting the user immediately
+  // retry the same file.
   function handleDocUpload(e) {
     const file = e.target.files[0];
     if (!file) return;
+    const inputEl = e.target;
     const reader = new FileReader();
-    reader.onload = ev => {
+    reader.onload = async ev => {
       const doc = {id:Date.now(), name:file.name, size:file.size, type:file.type, dataUrl:ev.target.result};
-      onUpdate({...asset, documents:[doc,...(asset.documents||[])]});
+      const ok = await onUpdate({...asset, documents:[doc,...(asset.documents||[])]});
+      if (!ok && inputEl) inputEl.value = '';
     };
     reader.readAsDataURL(file);
   }
@@ -8950,7 +9368,7 @@ function AssetDetail({ asset, onBack, onUpdate }) {
         </div>
       )}
 
-      {showEdit&&<AddEditAssetModal asset={asset} onClose={()=>setShowEdit(false)} onSave={a=>{onUpdate(a);setShowEdit(false);}}/>}
+      {showEdit&&<AddEditAssetModal asset={asset} onClose={()=>setShowEdit(false)} onSave={onUpdate}/>}
       {showOdo&&<OdoModal onClose={()=>setShowOdo(false)} onSave={addOdo}/>}
       {showMaint&&<MaintenanceModal onClose={()=>setShowMaint(false)} onSave={addMaint} isVehicle={isVeh}/>}
       {showTyre&&<TyreModal onClose={()=>setShowTyre(false)} onSave={addTyre}/>}
@@ -8961,18 +9379,40 @@ function AssetDetail({ asset, onBack, onUpdate }) {
 /* ═══════════════════════════════════════════
    ASSETS — MAIN PAGE
 ═══════════════════════════════════════════ */
-function AssetsPage({ assets, setAssets }) {
+function AssetsPage({ assets, setAssets, forceSaveSections }) {
   const [catTab,    setCatTab]    = useState('vehicle');
   const [selected,  setSelected]  = useState(null);
   const [showAdd,   setShowAdd]   = useState(false);
 
-  function handleSave(a) {
-    setAssets(prev => prev.find(x=>x.id===a.id) ? prev.map(x=>x.id===a.id?a:x) : [a,...prev]);
+  // 2026-08-18 (production stabilisation, Section 12): asset saves/updates
+  // — including document uploads, which go through handleUpdate — used to
+  // call setAssets directly with no backend confirmation at all (this page
+  // wasn't even given forceSaveSections). A failed/slow autosave was
+  // completely invisible: the UI already showed the asset/document as
+  // saved. Both now wait for a backend-CONFIRMED save before updating local
+  // state, matching every other confirmed-save path in this app. Returns
+  // true/false so callers (AddEditAssetModal, AssetDetail's document
+  // upload) can show an error and keep the user's input instead of
+  // silently losing it.
+  async function handleSave(a) {
+    const next = assets.find(x=>x.id===a.id) ? assets.map(x=>x.id===a.id?a:x) : [a,...assets];
+    if(forceSaveSections){
+      try { await forceSaveSections({ assets: next }); }
+      catch(err){ alert('The asset could NOT be saved.\n\nReason: '+(err&&err.message?err.message:'unknown error')+'\n\nPlease check your connection and try again.'); return false; }
+    }
+    setAssets(next);
     setSelected(a);
+    return true;
   }
-  function handleUpdate(a) {
-    setAssets(prev=>prev.map(x=>x.id===a.id?a:x));
+  async function handleUpdate(a) {
+    const next = assets.map(x=>x.id===a.id?a:x);
+    if(forceSaveSections){
+      try { await forceSaveSections({ assets: next }); }
+      catch(err){ alert('The change could NOT be saved.\n\nReason: '+(err&&err.message?err.message:'unknown error')+'\n\nPlease check your connection and try again — the file/change shown may not actually be saved yet.'); return false; }
+    }
+    setAssets(next);
     setSelected(a);
+    return true;
   }
 
   const catGroups = [
@@ -9059,7 +9499,7 @@ function AssetsPage({ assets, setAssets }) {
           })}
         </div>
       )}
-      {showAdd&&<AddEditAssetModal onClose={()=>setShowAdd(false)} onSave={a=>{handleSave(a);setShowAdd(false);}}/>}
+      {showAdd&&<AddEditAssetModal onClose={()=>setShowAdd(false)} onSave={handleSave}/>}
     </div>
   );
 }
@@ -12473,7 +12913,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
 
   return (
     <div className="p-4 space-y-4">
-      {showAdd&&<AddJobModal companies={addableCompanies} onClose={()=>setShowAdd(false)} onAdd={job=>setJobs(prev=>[...prev,job])} nextNum={getNextJobNum(jobs)}/>}
+      {showAdd&&<AddJobModal companies={addableCompanies} onClose={()=>setShowAdd(false)} onAdd={job=>setJobs(prev=>[...prev,job])}/>}
 
       {/* ── Active / Completed tab switcher ── */}
       <div className="flex gap-2">
@@ -14597,6 +15037,8 @@ function CreateCustomPOModal({ onClose, onSave, suppliers }) {
   const [notes, setNotes] = useState('');
   const [jobRef, setJobRef] = useState('');
   const [lines, setLines] = useState([{id:1, desc:'', qty:1, unit:'unit', unitCost:0}]);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState('');
 
   function addLine(){ setLines(prev=>[...prev,{id:Date.now(),desc:'',qty:1,unit:'unit',unitCost:0}]); }
   function removeLine(id){ setLines(prev=>prev.filter(l=>l.id!==id)); }
@@ -14607,13 +15049,14 @@ function CreateCustomPOModal({ onClose, onSave, suppliers }) {
   const fmt = n=>'R '+Number(n||0).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,',');
   const iCls = "w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-blue-400 bg-white";
 
-  function submit(e){
+  async function submit(e){
     e.preventDefault();
+    if(saving) return;
     const resolvedSuppId = supplierMode==='saved' ? (supplierId?parseInt(supplierId):null) : null;
     const resolvedSupplierName = supplierMode==='custom' ? customSupplier.trim() : (suppliers.find(s=>s.id===resolvedSuppId)?.name||'Unknown');
     const po = {
       id: Date.now(),
-      num: '', // set by page
+      num: '', // reserved atomically by onSave (handleCreateCustomPO) below
       supplierId: resolvedSuppId,
       customSupplierName: supplierMode==='custom' ? customSupplier.trim() : null,
       jobNum: jobRef,
@@ -14627,7 +15070,13 @@ function CreateCustomPOModal({ onClose, onSave, suppliers }) {
       })),
       notes: notes||('Custom PO'+(jobRef?' for Job '+jobRef:'')),
     };
-    onSave(po);
+    setSaving(true); setErr('');
+    const ok = await onSave(po);
+    if(ok===false){
+      setSaving(false);
+      setErr('A PO number could not be reserved. The Purchase Order was not created. Please check your connection and try again.');
+      return;
+    }
     onClose();
   }
 
@@ -14704,9 +15153,10 @@ function CreateCustomPOModal({ onClose, onSave, suppliers }) {
           <label className="block text-xs font-semibold text-gray-500 mb-1">Notes</label>
           <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} placeholder="Delivery instructions, payment terms..." className={iCls+' resize-none'}/>
         </div>
+        {err && <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-xs text-red-600 font-semibold">{err}</div>}
         <div className="flex gap-3 pt-1">
-          <button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Cancel</button>
-          <button type="submit" className="flex-1 bg-blue-800 hover:bg-blue-900 text-white rounded-xl py-2.5 text-sm font-bold">💾 Create Purchase Order</button>
+          <button type="button" disabled={saving} onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50 disabled:opacity-50">Cancel</button>
+          <button type="submit" disabled={saving} className="flex-1 bg-blue-800 hover:bg-blue-900 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-50">{saving?'Reserving PO number…':'💾 Create Purchase Order'}</button>
         </div>
       </form>
     </Modal>
@@ -14746,12 +15196,25 @@ function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user
     setViewPO(null);
   }
 
-  function handleCreateCustomPO(po) {
-    const coTag = isHoldingsUser(user) ? HOLDINGS_CO_ID : (po.co ?? null);
-    setPurchaseOrders(prev=>{
-      const num = getNextPONum(prev);
-      return [{...po, co:coTag, num}, ...prev];
-    });
+  // 2026-08-18 (production stabilisation): two fixes.
+  // (1) PO number now comes from the backend-atomic counter
+  //     (reservePONumber) instead of getNextPONum(prev)'s client-side
+  //     max()+1 scan, which could hand the same number to two concurrent
+  //     "New Custom PO" submissions.
+  // (2) `co` used to fall back to `po.co ?? null` for non-Holdings users —
+  //     but CreateCustomPOModal has no company-selector field at all, so
+  //     `po.co` is always undefined and this always silently landed on
+  //     `null`. It now falls back to the logged-in user's own company
+  //     (`user.co`), matching "derived records inherit co from...current
+  //     company context" rather than an untagged/uncategorised PO.
+  // Returns true/false so the modal can show an error instead of closing
+  // on a failed reservation.
+  async function handleCreateCustomPO(po) {
+    const coTag = isHoldingsUser(user) ? HOLDINGS_CO_ID : (user && user.co !== undefined && user.co !== null ? user.co : (po.co ?? null));
+    const num = await reservePONumber();
+    if(!num) return false;
+    setPurchaseOrders(prev=>[{...po, co:coTag, num}, ...prev]);
+    return true;
   }
 
   return (
@@ -17492,11 +17955,22 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 // own modal state), false if validation/reservation failed (modal stays open
 // so the user can retry) — never throws.
 // ═══════════════════════════════════════════
-async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll, setAccInvoices }) {
+async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll, setAccInvoices, forceSaveSections }) {
   if(!inv.contactName){ alert('Contact name is required.'); return false; }
+  // 2026-08-18 (production stabilisation): `co` used to hardcode
+  // `isHoldingsUser(user) ? HOLDINGS_CO_ID : 2` — this modal has no company
+  // selector at all, so any non-Holdings user working under a company OTHER
+  // than 2 (e.g. company 4, "Cover X Transform") got their manual invoice
+  // silently mistagged as company 2. `user.co` (the logged-in user's own
+  // company, already used elsewhere for the same purpose — see
+  // isHoldingsUser) is the correct "current company context" per-user, and
+  // is used here instead, falling back to 2 only if a user record somehow
+  // has no `co` at all (should not happen in practice, but never worse than
+  // the prior behaviour).
+  const currentUserCo = (user && user.co !== undefined && user.co !== null) ? user.co : 2;
   let working = inv;
   if(!working.number){
-    const co = isHoldingsUser(user) ? HOLDINGS_CO_ID : 2;
+    const co = isHoldingsUser(user) ? HOLDINGS_CO_ID : currentUserCo;
     const reserved = await reserveInvoiceNumber(co);
     if(!reserved || invoiceNumberExists(reserved, co, jobsAll, accInvoicesAll, quotesAll, inv.quoteId ?? null)){
       alert('An invoice number could not be reserved. The invoice was not created. Please try again after checking your connection.');
@@ -17509,8 +17983,34 @@ async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll
     alert('⚠ Invoice number "'+working.number+'" is already used by another invoice. Please choose a unique number.');
     return false;
   }
-  const tagged = { ...working, co: working.co !== undefined ? working.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : null) };
-  setAccInvoices(prev => prev.find(i=>i.id===tagged.id) ? prev.map(i=>i.id===tagged.id?tagged:i) : [tagged,...prev]);
+  const tagged = { ...working, co: working.co !== undefined ? working.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : currentUserCo) };
+  // 2026-08-18 (production stabilisation, Section 11): this used to call
+  // setAccInvoices directly here and return true immediately — the caller
+  // (InvoiceModal/EditInvoiceForm's Sales wrapper) then closed the modal
+  // treating that as "saved", while the actual write only happened later on
+  // whatever the ordinary 800ms-debounced autosave managed. A slow/cold-
+  // started backend or a genuine failure there was invisible to the user —
+  // the modal had already closed showing success. Now waits for a
+  // backend-CONFIRMED save (forceSaveSections, same pattern already used by
+  // quote/job/payment saves) before ever touching local state or returning
+  // true; on failure, local state is untouched and false is returned so the
+  // caller keeps its modal open and shows an error, exactly like every
+  // other confirmed-save path in this app. `forceSaveSections` is optional
+  // only for backward safety (falls back to the old optimistic write) —
+  // every real call site now provides it (see saveManualInvoiceFromSales /
+  // AccountingPage.saveInvoice).
+  const nextAccInvoices = (accInvoicesAll||[]).find(i=>i.id===tagged.id)
+    ? (accInvoicesAll||[]).map(i=>i.id===tagged.id?tagged:i)
+    : [tagged,...(accInvoicesAll||[])];
+  if(forceSaveSections){
+    try {
+      await forceSaveSections({ accInvoices: nextAccInvoices });
+    } catch(err){
+      alert('The invoice could NOT be saved.\n\nThe save was not confirmed by the server, so nothing was changed.\n\nReason: '+(err&&err.message?err.message:'unknown error')+'\n\nPlease check your connection and try again.');
+      return false;
+    }
+  }
+  setAccInvoices(nextAccInvoices);
   return true;
 }
 
@@ -17824,7 +18324,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   // calls, so the two pages can never diverge. Only what's specific to this
   // page (which local modal state to close on success) lives here.
   async function saveInvoice(inv) {
-    const ok = await saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll: quotes, setAccInvoices });
+    const ok = await saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll: quotes, setAccInvoices, forceSaveSections });
     if(ok){ setShowInvModal(false); setEditInv(null); }
   }
   function saveBill(bill) {
@@ -17862,8 +18362,15 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     const nums = (creditNotesAll||[]).map(c=>parseInt((c.number||'').replace(/\D/g,''))||0);
     return 'CN-' + String((Math.max(0,...nums)+1)).padStart(4,'0');
   }
+  // 2026-08-18 (production stabilisation): CreditNoteModal has no company
+  // selector, so a brand-new credit note's `co` used to fall back to `null`
+  // for every non-Holdings user — untagged, matching neither company in any
+  // strict `===` comparison. Falls back to the logged-in user's own company
+  // (`user.co`) instead, the same "current company context" fix applied to
+  // saveManualInvoice/handleCreateCustomPO.
   function saveCreditNote(cn){
-    const tagged = { ...cn, co: cn.co !== undefined ? cn.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : null) };
+    const fallbackCo = (user && user.co !== undefined && user.co !== null) ? user.co : null;
+    const tagged = { ...cn, co: cn.co !== undefined ? cn.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : fallbackCo) };
     setCreditNotes(prev => prev.find(c=>c.id===tagged.id) ? prev.map(c=>c.id===tagged.id?tagged:c) : [tagged,...prev]);
     setShowCnModal(false); setEditCn(null);
   }
@@ -20306,8 +20813,34 @@ function App() {
   // new client/quote vanishing when the assistant autosaved).
   // Returns true only when the backend save is confirmed; false when there was
   // nothing of ours to push. Throws on a failed PUT so callers show the error.
-  async function mergeAndSave(snapshot) {
-    const ownBaseline = serverBaselineRef.current;
+  //
+  // `capturedBaseline` (2026-08-18, production stabilisation — closes a
+  // confirmed stale-save race): the baseline this SPECIFIC snapshot should
+  // be diffed against — i.e. whatever serverBaselineRef.current was at the
+  // moment `snapshot` itself was captured, NOT whatever it is right now.
+  // Previously this function always re-read serverBaselineRef.current fresh
+  // at merge-EXECUTION time. That is correct when a save runs promptly, but
+  // a snapshot captured by the 800ms-debounced autosave effect can sit
+  // queued for a while (e.g. behind a slow/cold-started confirmed save from
+  // forceSaveSections/savePartialSectionsNow triggered by a different,
+  // LATER action — such as Convert to Job). If that other, newer save
+  // confirms and advances serverBaselineRef.current BEFORE this older,
+  // already-scheduled autosave timer fires, re-reading the ref here would
+  // make this stale snapshot's own baseline (and therefore its
+  // `_knownSectionIds`) already include the newer record — even though this
+  // snapshot was taken before that record existed. mergeSectionArray/the
+  // backend's own id-merge (platformState.ts) then both conclude "this
+  // client already knew about that id and chose to omit it — a deliberate
+  // delete", and silently drop the newer, already-confirmed record on this
+  // write. Passing the baseline in from the moment of capture (see the two
+  // call sites of enqueueMergeAndSave below) instead of re-deriving it here
+  // means a stale snapshot's diff is always computed against what IT
+  // actually knew, so a record that didn't exist yet is correctly treated
+  // as "added elsewhere" (kept) rather than "known and deleted" (dropped).
+  // Falls back to the live ref only if no captured value was passed in, to
+  // stay safe if this is ever called another way.
+  async function mergeAndSave(snapshot, capturedBaseline) {
+    const ownBaseline = capturedBaseline !== undefined ? capturedBaseline : serverBaselineRef.current;
     // Sections THIS user edited, measured against the state they last synced from.
     const changed = ownBaseline ? locallyChangedSections(snapshot, ownBaseline) : null;
     const hasChanges = changed ? Object.values(changed).some(Boolean) : true;
@@ -20439,10 +20972,10 @@ function App() {
   // writes, so a just-created credit note can never be clobbered by a save that
   // started earlier but happened to finish later.
   const saveQueueRef = useRef(Promise.resolve());
-  function enqueueMergeAndSave(snapshot) {
+  function enqueueMergeAndSave(snapshot, capturedBaseline) {
     const run = saveQueueRef.current.then(
-      () => mergeAndSave(snapshot),
-      () => mergeAndSave(snapshot) // previous save in the queue failed — still attempt this one
+      () => mergeAndSave(snapshot, capturedBaseline),
+      () => mergeAndSave(snapshot, capturedBaseline) // previous save in the queue failed — still attempt this one
     );
     // Keep the chain alive even if this save throws, so later queued saves aren't blocked.
     saveQueueRef.current = run.catch(() => {});
@@ -20506,6 +21039,18 @@ function App() {
   // rejected, so a caller's try/catch is always trustworthy.
   async function savePartialSectionsNow(overrides){
     if(!apiReadyRef.current) throw new Error('Not yet connected to the server — please wait a moment and try again.');
+    // 2026-08-18 (production stabilisation, second layer of protection for
+    // the stale-save race described on mergeAndSave/capturedBaseline above):
+    // a confirmed save is about to advance serverBaselineRef.current. Cancel
+    // any pending (not-yet-fired) regular debounced autosave timer right
+    // now, synchronously, before this save even starts — if it hasn't fired
+    // yet, it never will with its now-stale snapshot, and the next state
+    // change this action makes (setJobs/setQuotes etc., right after this
+    // resolves) schedules a fresh one from current data instead. This does
+    // not by itself fully close the race (a timer that already fired a
+    // moment earlier is unaffected — that's what capturedBaseline is for),
+    // but it removes the common case outright.
+    if (apiSaveTimerRef.current) { clearTimeout(apiSaveTimerRef.current); apiSaveTimerRef.current = null; }
     const keys = Object.keys(overrides||{});
     const data = {...overrides};
     const knownSectionIds = {};
@@ -20603,8 +21148,12 @@ function App() {
         apiSaveTimerRef.current = setTimeout(async () => {
           const snapshot = currentSnapshotRef.current;
           if (!snapshot) return;
+          // Read together, at the same instant, so this save's baseline
+          // always matches what this exact snapshot knew about — see the
+          // capturedBaseline note on mergeAndSave() for why that matters.
+          const capturedBaseline = serverBaselineRef.current;
           try {
-            const saved = await enqueueMergeAndSave(snapshot);
+            const saved = await enqueueMergeAndSave(snapshot, capturedBaseline);
             if (saved) setApiMsg('Saved ✓');
           } catch(e) {
             setApiMsg(e && e.message ? ('Save failed — ' + e.message) : 'Save failed — kept locally');
@@ -20670,6 +21219,17 @@ function App() {
   useEffect(()=>{
     const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, logo:logoDataUrl, utLogo:utLogoDataUrl, holdingsLogo:holdingsLogoDataUrl, sigOTSmit, savedAt:lastSaved};
     currentSnapshotRef.current = snapshot; // keep ref current for poll effect
+    // 2026-08-18 (production stabilisation): captured HERE, at the same
+    // instant as `snapshot` itself, and carried through the closure below to
+    // whatever this render's debounce timer eventually sends — NOT re-read
+    // inside the timeout callback or inside mergeAndSave. If a different,
+    // newer confirmed save (forceSaveSections/savePartialSectionsNow, e.g.
+    // Convert to Job) advances serverBaselineRef.current while THIS timer is
+    // still pending, this snapshot's own merge must still be diffed against
+    // the baseline as it was when the snapshot was taken — see the
+    // capturedBaseline note on mergeAndSave() for the full explanation of
+    // the race this closes.
+    const capturedBaseline = serverBaselineRef.current;
     // Backup to localStorage (safety net — DB is source of truth).
     //
     // 2026-08-04 FIX: this backup previously carried no _autoSavedAt, so on
@@ -20700,7 +21260,9 @@ function App() {
         // user changed — never overwrite another user's concurrent edits with stale data.
         // Routed through enqueueMergeAndSave so this call can never race ahead of or
         // behind another in-flight save (see enqueueMergeAndSave for why that matters).
-        const saved = await enqueueMergeAndSave(snapshot);
+        // capturedBaseline (see above) ensures this specific, possibly-delayed
+        // snapshot is diffed against what it actually knew at capture time.
+        const saved = await enqueueMergeAndSave(snapshot, capturedBaseline);
         if (saved) setApiMsg('Saved ✓');
       } catch (e) {
         // A blocked/failed save must never look like a successful one — the
@@ -20952,7 +21514,7 @@ function App() {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={accInvoices}/>,
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} onOpenJob={openJobRecord} forceSaveSections={forceSaveSections}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
-    assets:      <AssetsPage      assets={assets} setAssets={setAssets}/>,
+    assets:      <AssetsPage      assets={assets} setAssets={setAssets} forceSaveSections={forceSaveSections}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user}/>,
