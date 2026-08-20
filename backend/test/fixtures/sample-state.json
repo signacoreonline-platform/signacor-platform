@@ -1,0 +1,88 @@
+{
+  "customers": [
+    { "id": 1001, "companyName": "Axara Paarl", "contactPerson": "Rhuda Brummer", "vatNumber": "", "address": "23 Optenhorst Street, Paarl", "email": "", "tel": "0825646162", "notes": "" },
+    { "id": 1002, "companyName": "ERESA", "contactPerson": "Jan Botha", "vatNumber": "4123456789", "address": "12 Main Rd, George", "email": "jan@eresa.co.za", "tel": "0441234567", "notes": "" },
+    { "id": 1003, "companyName": "Boer & Brit", "contactPerson": "Sam", "vatNumber": "", "address": "", "email": "", "tel": "", "notes": "" },
+    { "id": 1004, "companyName": "Duplicate Co A", "contactPerson": "First copy", "vatNumber": "", "address": "", "email": "", "tel": "", "notes": "" },
+    { "id": 1004, "companyName": "Duplicate Co A", "contactPerson": "Second copy (historical collision)", "vatNumber": "", "address": "", "email": "", "tel": "", "notes": "" }
+  ],
+  "suppliers": [
+    { "id": 2001, "name": "Signacore Supply", "contactPerson": "Warehouse", "phone": "0440000000", "email": "supply@signacore.co.za", "city": "George", "postalCode": "6529", "paymentTerms": "30 days", "accountNumber": "SUP-001", "notes": "" }
+  ],
+  "inventory": [
+    { "id": 3001, "cat": "Vinyl", "sku": "SNS-PVNL-W-PAPER", "cost": 222.15, "name": "Wall Paper - Printable", "sell": 444.50, "unit": "m", "stock": 8, "reorder": 10, "supplierId": "2001" },
+    { "id": 3002, "cat": "Vinyl", "sku": "SNS-PVNL-B", "cost": 100, "name": "Basic Vinyl", "sell": 200, "unit": "m", "stock": 50, "reorder": 5, "supplierId": null }
+  ],
+  "quickRates": [
+    { "id": 4001, "cat": "", "sku": "SGR-001", "cost": 0, "name": "10mm Cast Acrylic", "sell": 3504, "unit": "SQ", "stock": 0, "reorder": 0, "supplierId": null },
+    { "id": 4002, "cat": "", "sku": "SGR-002", "cost": 0, "name": "Duplicate rate A", "sell": 100, "unit": "SQ", "stock": 0, "reorder": 0, "supplierId": null },
+    { "id": 4002, "cat": "", "sku": "SGR-002B", "cost": 0, "name": "Duplicate rate A (historical collision copy)", "sell": 150, "unit": "SQ", "stock": 0, "reorder": 0, "supplierId": null }
+  ],
+  "quotes": [
+    {
+      "id": 5001, "num": "SQ-00001", "co": "2", "client": "ERESA", "contact": "Jan Botha", "email": "jan@eresa.co.za",
+      "tel": "0441234567", "address": "12 Main Rd, George", "vatNum": "4123456789",
+      "lines": [ { "desc": "Reflective markings", "qty": 1, "unitPrice": 5000, "subtotal": 5000, "itemId": 3001 } ],
+      "discount": 0, "setupFee": 0, "salesperson": "Alice", "preparedBy": "Alice", "poRef": "", "reference": "",
+      "notes": "", "status": "converted", "payments": [], "convertedJobId": 6001, "proformaNum": ""
+    },
+    {
+      "id": 5002, "num": "SQ-00002", "co": "3", "client": "Boer & Brit", "contact": "Sam", "email": "",
+      "tel": "", "address": "", "vatNum": "",
+      "lines": [ { "desc": "Outdoor signage", "qty": 2, "unitPrice": 1500, "subtotal": 3000 } ],
+      "discount": 10, "setupFee": 200, "salesperson": "Bob", "preparedBy": "Bob", "poRef": "", "reference": "",
+      "notes": "", "status": "sent", "payments": [ { "amount": 500, "date": "2026-07-01", "method": "EFT", "reference": "DEP1" } ],
+      "convertedJobId": null, "proformaNum": "PRO-00042"
+    }
+  ],
+  "jobs": [
+    {
+      "id": 6001, "num": "SNS-00001", "co": "2", "client": "ERESA", "contact": "Jan Botha", "email": "jan@eresa.co.za",
+      "tel": "0441234567", "address": "12 Main Rd, George", "vatNum": "4123456789",
+      "desc": "From Quote SQ-00001 — Reflective markings", "status": "invoiced", "stage": 9, "value": 5750,
+      "lines": [ { "desc": "Reflective markings", "qty": 1, "unitPrice": 5000, "subtotal": 5000, "itemId": 3001 } ],
+      "quoteNum": "SQ-00001", "notes": "", "setupFee": "", "discount": "", "salesperson": "Alice", "preparedBy": "Alice",
+      "poRef": "", "reference": "", "invoiceDue": "2026-08-15", "invoiceNum": "INV-00001", "invoiceDate": "2026-07-16",
+      "invoiceCreated": true, "invoiceStatus": "paid",
+      "payments": [ { "amount": 5750, "date": "2026-07-20", "method": "EFT", "reference": "PAY1" } ]
+    },
+    {
+      "id": 6002, "num": "SNS-00002", "co": "3", "client": "Boer & Brit", "contact": "Sam", "email": "",
+      "tel": "", "address": "", "vatNum": "",
+      "desc": "Outdoor pylon sign", "status": "in_production", "stage": 6, "value": 3000,
+      "lines": [], "quoteNum": "", "notes": "", "setupFee": "", "discount": "", "salesperson": "Bob", "preparedBy": "Bob",
+      "poRef": "", "reference": "", "invoiceDue": "2026-08-20", "invoiceNum": "", "invoiceDate": "", "invoiceCreated": false,
+      "invoiceStatus": "pending", "payments": []
+    }
+  ],
+  "accInvoices": [
+    {
+      "id": 7001, "number": "INV-00042", "co": "3", "date": "2026-07-05", "dueDate": "2026-08-04",
+      "contactName": "Boer & Brit", "contactEmail": "", "contactAddress": "",
+      "reference": "", "jobId": null, "jobNum": "", "quoteId": 5002, "quoteNum": "SQ-00002",
+      "status": "partial",
+      "lineItems": [ { "description": "Outdoor signage", "qty": 2, "unitAmount": 1500, "accountCode": "4000", "taxType": "15%" } ],
+      "payments": [ { "amount": 500, "date": "2026-07-01", "method": "EFT", "reference": "DEP1" } ]
+    }
+  ],
+  "creditNotes": [
+    { "id": 8001, "number": "CN-0001", "type": "customer", "contactName": "ERESA", "date": "2026-07-10", "amount": 100, "reason": "Overpayment", "appliedTo": "", "notes": "", "status": "open", "used": 0 }
+  ],
+  "purchaseOrders": [
+    {
+      "id": 9001, "num": "PO-00001", "supplierId": "2001", "jobNum": "SNS-00001", "quoteNum": "SQ-00001", "co": "2",
+      "date": "2026-07-01", "status": "draft",
+      "items": [ { "inventoryId": 3001, "sku": "SNS-PVNL-W-PAPER", "name": "Wall Paper", "unit": "m", "qtyNeeded": 5, "qtyOrdered": 5, "unitCost": 222.15 } ],
+      "notes": "Auto-generated"
+    }
+  ],
+  "employees": [
+    { "id": 10001, "name": "Alice Employee", "role": "Sales", "co": "2" }
+  ],
+  "leaveRequests": [
+    { "id": 11001, "employeeId": 10001, "startDate": "2026-08-01", "endDate": "2026-08-05", "status": "approved" }
+  ],
+  "disciplinary": [
+    { "id": 12001, "employeeId": 10001, "date": "2026-06-01", "notes": "Verbal warning" }
+  ]
+}

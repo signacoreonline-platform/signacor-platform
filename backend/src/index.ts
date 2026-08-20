@@ -16,7 +16,10 @@ import importsRoutes from './routes/imports';
 import platformStateRoutes from './routes/platformState';
 import documentNumbersRoutes from './routes/documentNumbers';
 import quoteConversionsRoutes from './routes/quoteConversions';
+import relationalApiRoutes from './relational/api';
+import fullBackupRoutes from './routes/fullBackup';
 import { errorHandler, notFound } from './middleware/errorHandler';
+import { ALL_SECTIONS, isSectionCutOver } from './relational/cutover';
 
 dotenv.config();
 
@@ -42,7 +45,25 @@ app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 // ── Health check ──────────────────────────────────────────────
-app.get('/health', (_req: Request, res: Response) => {
+// 2026-08-20 STAGE 2 Phase 9: extended with non-sensitive relational-
+// cutover status. Deliberately excludes anything sensitive: no DB
+// connection strings, no row data, no user/auth info — just booleans and
+// the master env-switch state, safe to expose on an unauthenticated
+// health endpoint (this route has never required auth, and Stage 2 does
+// not change that).
+app.get('/health', async (_req: Request, res: Response) => {
+  const relationalAuthorityMasterSwitch = process.env.RELATIONAL_AUTHORITY_ENABLED === 'true';
+  let relationalSections: Record<string, boolean> = {};
+  let relationalStatusError: string | null = null;
+  try {
+    for (const s of ALL_SECTIONS) relationalSections[s] = await isSectionCutOver(s);
+  } catch (err) {
+    // A DB hiccup must never take /health down with it — health checks are
+    // used to decide whether a deploy is safe to resume traffic on, so this
+    // endpoint always responds 200 with what it knows, and reports the
+    // relational-status lookup itself as failed rather than 500ing.
+    relationalStatusError = 'relational_status_unavailable';
+  }
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -51,6 +72,11 @@ app.get('/health', (_req: Request, res: Response) => {
     // platformState.ts's merge/conflict logic changes, so a deploy can be
     // confirmed live (GET /health) before users are told to resume work.
     platformStateSafetyVersion: '2026-08-20-id-map-stale-safe-v1',
+    relational: {
+      masterSwitchEnabled: relationalAuthorityMasterSwitch,
+      cutOverSections: relationalSections,
+      ...(relationalStatusError ? { error: relationalStatusError } : {}),
+    },
   });
 });
 
@@ -67,6 +93,8 @@ app.use('/api/imports',       importsRoutes);
 app.use('/api/platform-state', platformStateRoutes);
 app.use('/api/document-numbers', documentNumbersRoutes);
 app.use('/api/quote-conversions', quoteConversionsRoutes);
+app.use('/api/relational', relationalApiRoutes);
+app.use('/api/full-backup', fullBackupRoutes);
 
 // ── Error handling ────────────────────────────────────────────
 app.use(notFound);

@@ -167,6 +167,102 @@ function forceLogoutExpiredSession() {
   try { localStorage.removeItem('sgr_user'); localStorage.removeItem(SGR_TOKEN_KEY); } catch (e) {}
   if (window.__sgrOnAuthExpired) { window.__sgrOnAuthExpired(); }
 }
+
+/* ═══════════════════════════════════════════════════════════
+   RELATIONAL PERSISTENCE ABSTRACTION (Stage 2 Phase 4)
+   A small, centralized client for the Stage 2 REST API
+   (backend/src/relational/api.ts). This does NOT replace the existing
+   fetchFromServer/saveToServer JSON platform-state persistence — it is an
+   ADDITIONAL, narrow layer used only by the specific workflows that have
+   been wired to call it directly (see relationalApi below and its call
+   sites: customer create/edit, quote creation, quote→job conversion,
+   proforma/invoice finalisation, and payment recording). Every other
+   workflow in this file continues to go through the existing
+   mergeAndSave/forceSaveSections/savePartialSectionsNow -> saveToServer(...)
+   path exactly as before, unchanged.
+
+   Which sections are "relational-authoritative" right now is decided
+   SERVER-SIDE (never here, and never by inspecting anything the frontend
+   controls) — GET /api/platform-state includes a top-level
+   `relationalAuthoritativeSections` array whenever any section is cut
+   over (see backend/src/routes/platformState.ts's applyRelationalReadOverlay).
+   fetchFromServer/applyServerData below thread that array into
+   relationalAuthoritativeSectionsRef so the rest of the app can consult it
+   synchronously without a separate round trip. ═══════════════════════════════════════════════════════════ */
+const API_RELATIONAL_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/relational';
+const relationalAuthoritativeSectionsRef = { current: [] };
+function isRelationalAuthoritative(section) {
+  return relationalAuthoritativeSectionsRef.current.indexOf(section) !== -1;
+}
+
+// Mirrors saveToServer's auth/error conventions (401 -> forced logout,
+// non-2xx -> thrown Error). The parsed body (when present) is attached as
+// `.body` so callers can inspect `.body.type` for 'stale_record' /
+// 'business_rule' / 'not_cut_over' the same way existing code already
+// handles platform-state's `stale_revision` 409 via `.conflict`.
+async function relationalFetch(path, options) {
+  options = options || {};
+  const res = await fetch(API_RELATIONAL_URL + path, Object.assign({
+    headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders())
+  }, options));
+  if (res.status === 401) { forceLogoutExpiredSession(); throw new Error('Session expired — please log in again.'); }
+  let body = null;
+  try { body = await res.json(); } catch (e) { /* no JSON body */ }
+  if (!res.ok) {
+    const err = new Error((body && body.error) || ('Relational API error (HTTP ' + res.status + ')'));
+    err.body = body;
+    err.status = res.status;
+    throw err;
+  }
+  return body;
+}
+
+// Thin wrappers, one per wired workflow. Every one of these is a direct,
+// minimal HTTP adapter over backend/src/relational/api.ts — no business
+// logic lives here; the caller in the relevant page component is
+// responsible for deciding WHEN to call these instead of (or alongside)
+// the normal JSON save path.
+const relationalApi = {
+  createCustomer(data) { return relationalFetch('/customers', { method: 'POST', body: JSON.stringify(data) }); },
+  updateCustomer(id, expectedVersion, patch) { return relationalFetch('/customers/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
+  createQuote(data) { return relationalFetch('/quotes', { method: 'POST', body: JSON.stringify(data) }); },
+  updateQuote(id, expectedVersion, patch) { return relationalFetch('/quotes/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
+  convertQuoteToJob(quoteId) { return relationalFetch('/quotes/' + quoteId + '/convert-to-job', { method: 'POST' }); },
+  finalizeProforma(quoteId) { return relationalFetch('/quotes/' + quoteId + '/finalize-proforma', { method: 'POST' }); },
+  updateJob(id, expectedVersion, patch) { return relationalFetch('/jobs/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
+  createInvoiceForJob(jobId) { return relationalFetch('/jobs/' + jobId + '/create-invoice', { method: 'POST' }); },
+  recordPayment(ownerType, ownerId, amount, extra) { return relationalFetch('/payments', { method: 'POST', body: JSON.stringify(Object.assign({ ownerType: ownerType, ownerId: ownerId, amount: amount }, extra || {})) }); },
+};
+
+// ── Systemic safety guard ────────────────────────────────────────────────
+// Only the workflows wired to relationalApi (above) persist their changes
+// relationally. Everything else in this file still mutates React state and
+// relies on the JSON mergeAndSave/forceSaveSections/savePartialSectionsNow
+// save path. Once a section is cut over to relational authority,
+// platformState.ts's Stage 1 write-isolation strips that section out of any
+// JSON PUT server-side WITHOUT complaint (by design — GET for a cut-over
+// section is served from the relational tables regardless of what a JSON
+// PUT contained). That means an unwired edit to a cut-over section would
+// otherwise look like it saved (the request succeeds) while the actual
+// edit silently vanishes — nobody would ever see it again. That "silently
+// vanishes" failure mode is far worse than a loud error, so this guard
+// converts it into an explicit, visible, BEFORE-the-network-call failure at
+// the two choke points every JSON save path funnels through
+// (forceSaveSections/savePartialSectionsNow and mergeAndSave), using the
+// SAME try/catch+alert/setApiMsg conventions already present at every
+// existing call site — nothing else needs to change for those call sites
+// to behave safely.
+function assertNoUnwiredRelationalSections(sectionNames, contextLabel) {
+  const blocked = (sectionNames || []).filter(isRelationalAuthoritative);
+  if (blocked.length > 0) {
+    throw new Error(
+      'Cannot save "' + blocked.join(', ') + '" here — ' + (contextLabel || 'this save path') +
+      ' is not yet wired to relational persistence, and this section is now relational-authoritative. ' +
+      'Your edit was NOT saved. Please use the specific workflow action for this change (or contact support if none exists yet).'
+    );
+  }
+}
+
 const STORAGE_KEY = 'sgr_platform_data';
 
 function validState(d) {
@@ -5129,7 +5225,38 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
     (c.contactPerson||'').toLowerCase().includes(search.toLowerCase()) ||
     (c.email||'').toLowerCase().includes(search.toLowerCase())
   );
-  function handleSave(c) {
+  // Stage 2 Phase 4: customer create/edit is one of the named workflows
+  // wired to the relational REST API (backend/src/relational/api.ts) when
+  // — and only when — 'customers' is relational-authoritative. In this
+  // build that is ALWAYS false: 'customers' is one of the two sections
+  // permanently hard-blocked from cutover (see
+  // backend/src/relational/cutoverCli.ts's HARD_BLOCKED_SECTIONS and the
+  // 179/178-unique historical id-collision reason documented in the Stage
+  // 2 handoff) — so this branch exists as tested, working infrastructure
+  // that demonstrates the architecture, not as a live production path. The
+  // else branch is the original, unchanged JSON behaviour.
+  async function handleSave(c) {
+    if (isRelationalAuthoritative('customers')) {
+      try {
+        const isNew = !customers.find(x=>x.id===c.id);
+        const patch = {
+          companyName: c.companyName, contactPerson: c.contactPerson,
+          email: c.email, phone: c.tel, address: c.address,
+          vatNumber: c.vatNumber, notes: c.notes,
+        };
+        if (isNew) {
+          const result = await relationalApi.createCustomer(patch);
+          setCustomers(prev => [{ ...c, id: result.id, _relRowVersion: result.rowVersion }, ...prev]);
+        } else {
+          const existing = customers.find(x=>x.id===c.id);
+          const result = await relationalApi.updateCustomer(c.id, existing && existing._relRowVersion, patch);
+          setCustomers(prev => prev.map(x=>x.id===c.id ? { ...c, _relRowVersion: result.rowVersion } : x));
+        }
+      } catch (e) {
+        alert('Save failed — ' + e.message);
+      }
+      return;
+    }
     setCustomers(prev => prev.find(x=>x.id===c.id) ? prev.map(x=>x.id===c.id?c:x) : [c,...prev]);
   }
   function handleBulkImport(newCustomers) {
@@ -5747,17 +5874,44 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       // created and the person sees a clear error instead.
       const quoteCo = parseInt(co);
       setSaving(true);
-      const reserved = await reserveQuoteNumber(quoteCo);
-      if(!reserved || quoteNumberExists(reserved, quoteCo, quotes)){
-        setSaving(false);
-        alert('A quote number could not be reserved. The quote was not created. Please check your connection and try again.');
-        return;
+      // Stage 2 Phase 4: when 'quotes' is relational-authoritative, create
+      // the quote directly through the relational REST API instead of
+      // reserving a number here and going through the JSON save path —
+      // backend/src/relational/services.ts's createQuote() reserves the
+      // SQ-##### number itself, atomically, via the exact same
+      // reserveDocumentNumberWithClient() the JSON path's
+      // reserveQuoteNumber() below calls. Calling both would waste a
+      // second, unused reservation for no benefit, so this branch never
+      // calls reserveQuoteNumber at all.
+      if(isRelationalAuthoritative('quotes')){
+        try {
+          const result = await relationalApi.createQuote({
+            companyCode: quoteCo, customerNameRaw: client.trim(),
+            lines, discountPct: parseFloat(discount)||0, setupFee: parseFloat(setupFee)||0, notes,
+          });
+          payload = {
+            id: result.id, num: result.quoteNumber, status:'draft',
+            convertedJobId: null, payments: [],
+            ...formFields,
+          };
+        } catch(saveError){
+          setSaving(false);
+          setSaveErr((saveError && saveError.message) ? saveError.message : 'Save failed. Please check your connection and try again.');
+          return;
+        }
+      } else {
+        const reserved = await reserveQuoteNumber(quoteCo);
+        if(!reserved || quoteNumberExists(reserved, quoteCo, quotes)){
+          setSaving(false);
+          alert('A quote number could not be reserved. The quote was not created. Please check your connection and try again.');
+          return;
+        }
+        payload = {
+          id: Date.now(), num: reserved, status:'draft',
+          convertedJobId: null, payments: [],
+          ...formFields,
+        };
       }
-      payload = {
-        id: Date.now(), num: reserved, status:'draft',
-        convertedJobId: null, payments: [],
-        ...formFields,
-      };
     }
 
     // Confirmed-save-before-success (2026-08-06): onSave (QuotesPage's
@@ -7609,6 +7763,27 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   async function handleSave(q){
     // If editing an existing quote, update it; otherwise prepend as new
     const isEdit = !!(quotes||[]).find(x=>x.id===q.id);
+    // Stage 2 Phase 4: a brand-new quote, when 'quotes' is
+    // relational-authoritative, was already created via
+    // relationalApi.createQuote() inside CreateQuoteModal.submit() (see
+    // that function's fork) — q.id/q.num are already the real relational
+    // id/quote-number returned from that call. This is therefore a pure
+    // local-state append with nothing further to persist: no
+    // forceSaveSections call for 'quotes' (which the systemic safety guard
+    // would refuse anyway now that the section is cut over), and
+    // jobsChanged can never legitimately be true here since no existing
+    // job can already reference a quote number that didn't exist a moment
+    // ago. Editing an existing quote (isEdit true) intentionally still
+    // falls through to the unchanged logic below, including its final
+    // forceSaveSections call — quote-edit's job-sync cascade is a
+    // documented, deliberate gap (see the Stage 2 handoff) and is meant to
+    // fail loudly via the systemic guard once 'quotes' is cut over, rather
+    // than silently lose the edit.
+    if(!isEdit && isRelationalAuthoritative('quotes')){
+      setQuotes(prev=>[q,...prev]);
+      setEditQuote(null);
+      return;
+    }
     const live = (quotes||[]).find(x=>x.id===q.id);
     let nextQuotes;
     if(!live){
@@ -7836,6 +8011,44 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         }
         return;
       }
+    }
+    // Stage 2 Phase 4: when BOTH 'quotes' and 'jobs' are cut over to
+    // relational authority, conversion goes entirely through
+    // relationalApi.convertQuoteToJob(), which atomically creates the job,
+    // claims the quote_conversions row, and reserves the job number
+    // server-side in a single transaction (backend/src/relational/
+    // services.ts's convertQuoteToJob). This is a DELIBERATE, documented
+    // scope reduction versus the JSON path below: it does NOT reproduce
+    // the inventory-deduction or automatic low-stock purchase-order
+    // generation, and does not attempt the quote-invoice relink step (see
+    // the Stage 2 handoff's "known gaps" section). `restore` is
+    // intentionally excluded from this branch — it always falls through to
+    // the JSON path, which will fail loudly via the systemic safety guard
+    // if 'jobs' is cut over, rather than silently miss those side effects.
+    if(!restore && isRelationalAuthoritative('quotes') && isRelationalAuthoritative('jobs')){
+      try {
+        const result = await relationalApi.convertQuoteToJob(q.id);
+        // Reflect locally with a minimal stub — the fully authoritative
+        // version of this job (and quote) is served by the next GET's
+        // relational read-overlay (backend/src/relational/read.ts); this
+        // object only avoids the UI looking empty in the meantime.
+        const stubJob = {
+          id: result.jobId, num: result.jobNumber, client: q.client,
+          contact: q.contact||'', email: q.email||'', tel: q.tel||'',
+          address: q.address||'', vatNum: q.vatNum||'',
+          desc: 'From Quote '+q.num, status: 'quote_approved', co: q.co,
+          lines: q.lines, quoteNum: q.num, notes: q.notes||'',
+          setupFee: q.setupFee||'', discount: q.discount||'',
+          stage: STATUS_TO_STAGE['quote_approved']||4, payments: [],
+        };
+        setJobs(prev=>[stubJob, ...prev]);
+        setQuotes(prev=>prev.map(qx=>qx.id===q.id?{...qx,status:'converted',convertedJobId:result.jobId}:qx));
+        setViewQuote(null);
+        setConvertedInfo({jobId: result.jobId, jobNum: result.jobNumber, linkedInvoiceNum: null});
+      } catch(saveErr){
+        alert('Job could NOT be created.\n\n'+(saveErr&&saveErr.message?saveErr.message:'unknown error')+'\n\nNothing was changed. Please check your connection and try again.');
+      }
+      return;
     }
     // Converting a quote only creates the JOB — it is not itself the
     // creation of a final tax invoice, so no invoice number is assigned
@@ -8120,6 +8333,28 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       revealJobInvoice(job);
       return;
     }
+    // Stage 2 Phase 4: when both 'jobs' and 'accInvoices' are cut over,
+    // "Create Invoice" goes entirely through
+    // relationalApi.createInvoiceForJob(), which reserves the INV-#####
+    // number atomically server-side (backend/src/relational/services.ts's
+    // createInvoiceForJob, sharing the SAME atomic document-number pool as
+    // quotes/proformas). This deliberately bypasses both the
+    // already-has-invoiceNum branch and the proforma-reuse check below —
+    // those are JSON-path-only historical/legacy accommodations; if either
+    // situation applies to a relational-authoritative job, this call will
+    // simply fail with a clear business-rule error from the backend rather
+    // than silently behaving differently.
+    if(isRelationalAuthoritative('jobs') && isRelationalAuthoritative('accInvoices')){
+      try {
+        const result = await relationalApi.createInvoiceForJob(job.id);
+        const nextJobs = jobs.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:result.invoiceNumber, invoiceDate:new Date().toISOString().slice(0,10), stage:9, status:'invoiced'}:j);
+        setJobs(nextJobs);
+        setInvoiceCreatedInfo({ job, invoiceNum: result.invoiceNumber });
+      } catch(saveErr){
+        alert('Invoice could NOT be created.\n\n'+(saveErr&&saveErr.message?saveErr.message:'unknown error')+'\n\nNothing was changed. Please check your connection and try again.');
+      }
+      return;
+    }
     const today=new Date().toISOString().slice(0,10);
     const due=new Date(Date.now()+30*864e5).toISOString().slice(0,10);
 
@@ -8208,6 +8443,34 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       alert(`An invoice already exists for quote ${quote.num||''} (${existing.number}). Opening it instead of creating another.`);
       setViewQuote(null);
       revealJobInvoice({id:existing.id});
+      return;
+    }
+    // Stage 2 Phase 4: this is the single "Proforma Invoice" action (per
+    // the Stage 2 brief — there is deliberately no separate "Reserve
+    // Proforma Number" button anywhere in this file, before or after this
+    // change). When both 'quotes' and 'accInvoices' are cut over, it goes
+    // entirely through relationalApi.finalizeProforma(), which maps
+    // directly onto backend/src/relational/services.ts's
+    // finalizeProformaToInvoice — the exact same proforma-reuse /
+    // atomic-numbering rule this JSON path implements below, just enforced
+    // server-side instead.
+    if(isRelationalAuthoritative('quotes') && isRelationalAuthoritative('accInvoices')){
+      try {
+        const result = await relationalApi.finalizeProforma(quote.id);
+        const stubInvoice = {
+          id: result.invoiceId, number: result.invoiceNumber, co: quote.co,
+          date: new Date().toISOString().slice(0,10),
+          contactName: quote.client||'', contactEmail: quote.email||'', contactAddress: quote.address||'',
+          reference:'', jobId:null, jobNum:'',
+          quoteId: quote.id, quoteNum: quote.num,
+          status:'sent', lineItems: [], payments: (quote.payments||[]).map(p=>({...p})),
+        };
+        setAccInvoices(prev=>[stubInvoice, ...prev]);
+        setViewQuote(null);
+        revealJobInvoice({id: result.invoiceId});
+      } catch(saveErr){
+        alert('Invoice could NOT be created.\n\n'+(saveErr&&saveErr.message?saveErr.message:'unknown error')+'\n\nNothing was changed. Please check your connection and try again.');
+      }
       return;
     }
     const today = new Date().toISOString().slice(0,10);
@@ -8401,6 +8664,37 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       if(saving) return;
       if(!amount||parseFloat(amount)<=0){alert('Enter a valid amount');return;}
       const amt = parseFloat(amount);
+      // Stage 2 Phase 4: the one payment-recording path wired to the
+      // relational REST API — a NEW, non-credit payment against whichever
+      // record resolvePaymentSource() picked (this job, or its inherited
+      // invoice), when that record's owning section is cut over.
+      // Credit-method payments are deliberately excluded here: they carry
+      // a credit-note usage side effect (applyCreditNoteUsage/creditNotes)
+      // with no relational counterpart yet, so they — like payment EDIT
+      // and DELETE, which also have no relational service yet — continue
+      // through the JSON path below (see the Stage 2 handoff's known
+      // gaps). This branch does not attempt to reproduce the local
+      // invoiceStatus/stage bump either; the server is authoritative and
+      // the next GET's relational read-overlay (backend/src/relational/
+      // read.ts) reflects it.
+      const relSection = paySource.kind==='invoice' ? 'accInvoices' : 'jobs';
+      if(method!=='Credit' && isRelationalAuthoritative(relSection)){
+        setSaveErr('');
+        setSaving(true);
+        try {
+          const ownerType = paySource.kind==='invoice' ? 'invoice' : 'job';
+          const ownerId = paySource.kind==='invoice' ? paySource.record.id : job.id;
+          await relationalApi.recordPayment(ownerType, ownerId, amt, { date, method, notes: notes.trim() });
+          const newP={id:Date.now(),date,method,amount:amt,notes:notes.trim()};
+          setPayments(prev=>[...prev,newP]);
+          setAmount(''); setNotes('');
+        } catch(e){
+          setSaveErr((e && e.message) ? e.message : 'Save failed. Please check your connection and try again.');
+        } finally {
+          setSaving(false);
+        }
+        return;
+      }
       let creditNotesOverride = null;
       if(method==='Credit'){
         if(amt > availableCredit + 0.005){
@@ -21016,6 +21310,14 @@ function App() {
     if (data && typeof data === 'object' && result && result.updated_at !== undefined) {
       data._serverRevision = result.updated_at;
     }
+    // Stage 2 Phase 4: carry the server's authoritative list of cut-over
+    // sections along with the data (see the persistence-abstraction block
+    // near the top of this file) — applyServerData reads this and updates
+    // relationalAuthoritativeSectionsRef so the systemic safety guard has
+    // an always-current view without a separate round trip.
+    if (data && typeof data === 'object') {
+      data._relationalAuthoritativeSections = (result && Array.isArray(result.relationalAuthoritativeSections)) ? result.relationalAuthoritativeSections : [];
+    }
     return data;
   }
 
@@ -21066,6 +21368,14 @@ function App() {
   // (pass a selective object to update only specific sections)
   function applyServerData(dbData) {
     if (!dbData) return;
+    // Stage 2 Phase 4: keep the module-level ref current every time we
+    // apply a server read — this is a plain array assignment (not React
+    // state) so every subsequent forceSaveSections/savePartialSectionsNow/
+    // mergeAndSave call in this session sees an up-to-date view
+    // synchronously, with no extra fetch and no render dependency.
+    if (Array.isArray(dbData._relationalAuthoritativeSections)) {
+      relationalAuthoritativeSectionsRef.current = dbData._relationalAuthoritativeSections;
+    }
     if (Array.isArray(dbData.jobs))             setJobs(dbData.jobs);
     if (Array.isArray(dbData.inventory))        setInventory(dbData.inventory);
     if (Array.isArray(dbData.quotes))           setQuotes(dbData.quotes);
@@ -21231,6 +21541,22 @@ function App() {
     const changed = ownBaseline ? locallyChangedSections(snapshot, ownBaseline) : null;
     const hasChanges = changed ? Object.values(changed).some(Boolean) : true;
     if (ownBaseline && !hasChanges) return false; // nothing of ours to push
+
+    // Systemic safety guard (Stage 2 Phase 4) — see
+    // assertNoUnwiredRelationalSections's definition near the top of this
+    // file. `changed` (when we have a baseline to diff against) is exactly
+    // the set of sections THIS save intends to modify; with no baseline yet
+    // (first save this session) `changed` is null and, per the comment on
+    // locallyChangedSections, everything is treated as potentially changed,
+    // so every section is checked. This throws BEFORE the network
+    // round-trip below, and propagates through the existing callers exactly
+    // like any other mergeAndSave failure already does (enqueueMergeAndSave
+    // -> the debounced-autosave effect's setApiMsg('Save failed — ' + ...),
+    // or a direct awaiter's own try/catch).
+    assertNoUnwiredRelationalSections(
+      changed ? Object.keys(changed).filter(k => changed[k]) : STATE_SECTIONS,
+      'the autosave path'
+    );
 
     // Pull the freshest server state to merge onto. If offline, fall back to our
     // last known baseline so availability does not regress.
@@ -21414,6 +21740,18 @@ function App() {
   function forceSaveSections(overrides){
     if(!apiReadyRef.current){
       return Promise.reject(new Error('Not yet connected to the server — please wait a moment and try again.'));
+    }
+    // Systemic safety guard (Stage 2 Phase 4) — see
+    // assertNoUnwiredRelationalSections's definition near the top of this
+    // file. `overrides`' keys are, by construction, exactly the sections
+    // THIS caller intends to change — every existing call site already
+    // wraps its call to forceSaveSections in try/catch (+ alert/setApiMsg),
+    // so a thrown Error here surfaces exactly the same way a network
+    // failure already would, with no other code needing to change.
+    try {
+      assertNoUnwiredRelationalSections(Object.keys(overrides || {}), 'forceSaveSections');
+    } catch (e) {
+      return Promise.reject(e);
     }
     return enqueueSavePartialSections(overrides);
   }

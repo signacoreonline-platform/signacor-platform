@@ -104,7 +104,7 @@ function uid(): string {
   // Node script re-run against a persistent test database, and needs fresh
   // ids/numbers on every invocation so repeated runs don't collide with
   // leftover rows from a previous run.
-  uid.counter = ((uid as any).counter || 0) + 1;
+  (uid as any).counter = ((uid as any).counter || 0) + 1;
   return String(Date.now()) + String((uid as any).counter).padStart(4, '0');
 }
 (uid as any).counter = 0;
@@ -1107,3 +1107,13 @@ main().catch((err) => {
   console.error('[hardening-stress] Fatal error:', err);
   process.exit(1);
 });
+
+// 2026-08-20 STAGE 2: this file has no import/export of its own (always
+// run as a standalone ts-node script), so TypeScript treats it as a global
+// SCRIPT rather than a module — harmless compiled alone, but it collides
+// with other same-named top-level declarations (BASE, DB_URL, ok, etc.)
+// when Stage 2's compiled-test build (tsconfig.test.json) compiles every
+// test/*.ts file together in one program. A trailing `export {}` is the
+// standard, zero-behavior-change way to mark a file as a module purely
+// for scoping purposes — nothing above this line changes.
+export {};

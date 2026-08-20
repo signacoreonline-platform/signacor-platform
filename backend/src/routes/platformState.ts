@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import { query } from '../db/pool';
 import pool from '../db/pool';
 import { authenticate, AuthRequest } from '../middleware/auth';
+import { cutOverSections, CutoverSection } from '../relational/cutover';
+import { getAuthoritativeJson, SECTION_JSON_KEY } from '../relational/read';
 
 /**
  * /api/platform-state
@@ -614,6 +616,52 @@ function assertNoDuplicateIds(existingData: Record<string, any> | null, finalDat
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// 2026-08-20 STAGE 2 Phase 3 — SERVER-SIDE AUTHORITY-AWARE READ LAYER
+// ══════════════════════════════════════════════════════════════════════
+// The frontend must NEVER decide for itself whether a section is JSON- or
+// relational-authoritative (per the migration brief). This is the one
+// place that decision is made on the read side: after loading whatever is
+// currently stored in platform_state.data (which, for a cut-over section,
+// is a FROZEN copy — the PUT handler above stops writing it the moment
+// cutOverSections() includes it), every section that IS cut over right
+// now has its array REPLACED with a freshly-assembled, JSON-compatible
+// representation built live from the rel_* tables (see
+// backend/src/relational/read.ts). A section that is NOT cut over is
+// returned completely unchanged — this overlay is strictly additive over
+// the existing GET behavior, byte-identical to before Stage 2 whenever
+// cutOverSections() is empty (i.e. always, until a human deliberately
+// cuts a section over).
+//
+// This is "relational -> JSON-compatibility representation", explicitly
+// allowed by the brief — never the reverse. Nothing here writes anything;
+// nothing here ever seeds a rel_* table from platform_state.data.
+async function applyRelationalReadOverlay(
+  data: Record<string, any>
+): Promise<{ data: Record<string, any>; relationalAuthoritativeSections: string[] }> {
+  const cutOver = await cutOverSections();
+  if (cutOver.size === 0) return { data, relationalAuthoritativeSections: [] };
+
+  const out = { ...data };
+  const applied: string[] = [];
+  for (const section of cutOver) {
+    const jsonKey = SECTION_JSON_KEY[section];
+    if (!jsonKey) continue; // e.g. 'payments' — no standalone JSON key, see read.ts
+    try {
+      out[jsonKey] = await getAuthoritativeJson(section);
+      applied.push(jsonKey);
+    } catch (err) {
+      // A read-layer failure for one section must never take down the
+      // whole GET (users would lose access to everything else too) — log
+      // loudly and fall back to whatever was already in `data` for this
+      // section (the last frozen JSON copy) rather than serving a 500 or
+      // an empty array. This is a degraded-but-safe read, never a wipe.
+      console.error(`[platform-state] relational read overlay FAILED for "${section}" — falling back to frozen JSON copy for "${jsonKey}":`, err);
+    }
+  }
+  return { data: out, relationalAuthoritativeSections: applied };
+}
+
 // GET /api/platform-state — returns { data, updated_at } (updated_at also
 // serves as the revision token for optimistic-concurrency checks on PUT).
 router.get('/', async (_req: Request, res: Response): Promise<void> => {
@@ -628,12 +676,20 @@ router.get('/', async (_req: Request, res: Response): Promise<void> => {
          VALUES (1, '{}'::jsonb)
          ON CONFLICT (id) DO NOTHING`
       );
-      res.json({ data: {}, updated_at: null });
+      const overlay = await applyRelationalReadOverlay({});
+      res.json({
+        data: overlay.data, updated_at: null,
+        ...(overlay.relationalAuthoritativeSections.length ? { relationalAuthoritativeSections: overlay.relationalAuthoritativeSections } : {}),
+      });
       return;
     }
 
     const row = result.rows[0];
-    res.json({ data: row.data ?? {}, updated_at: row.updated_at });
+    const overlay = await applyRelationalReadOverlay(row.data ?? {});
+    res.json({
+      data: overlay.data, updated_at: row.updated_at,
+      ...(overlay.relationalAuthoritativeSections.length ? { relationalAuthoritativeSections: overlay.relationalAuthoritativeSections } : {}),
+    });
   } catch (err) {
     console.error('GET /api/platform-state failed:', err);
     res.status(500).json({ error: 'Failed to load platform state' });
@@ -657,6 +713,41 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
   const client = await pool.connect();
   try {
     const data = { ...(body.data || {}) };
+
+    // ══════════════════════════════════════════════════════════════════
+    // RELATIONAL CUTOVER WRITE-ISOLATION (JSON -> relational migration,
+    // Phase 8) — see backend/src/relational/cutover.ts for the two-switch
+    // gate this depends on (env master switch AND a per-section DB row,
+    // BOTH must be true; every row is seeded false by
+    // database/migrations/007_relational_core.sql, so this block is a
+    // total no-op — cutOverSectionsNow is always empty — until a human
+    // deliberately flips both switches for a specific section, which never
+    // happens as a side effect of a migration, backfill, reconciliation,
+    // or deploy).
+    //
+    // Once a section genuinely IS cut over, platform_state must never be
+    // able to make it authoritative again — an old cached browser tab (or
+    // any other future caller of this endpoint) still sending, say,
+    // `data.jobs` is silently prevented from mutating relational-
+    // authoritative jobs through this path. The key is simply dropped from
+    // this save's `data` before the merge below ever sees it — exactly as
+    // if that browser tab had not sent that section at all (a normal,
+    // already-supported partial-save shape), so nothing else in this file
+    // needs to change to accommodate it. The rest of THIS SAME save (any
+    // section that is NOT cut over) proceeds completely normally.
+    const cutOverSectionsNow = await cutOverSections();
+    let strippedCutOverSections: string[] = [];
+    if (cutOverSectionsNow.size > 0) {
+      for (const key of Object.keys(data)) {
+        if (cutOverSectionsNow.has(key as CutoverSection) && Array.isArray(data[key])) {
+          delete data[key];
+          strippedCutOverSections.push(key);
+        }
+      }
+      if (strippedCutOverSections.length > 0) {
+        console.warn(`[platform-state] Ignored relational-authoritative section(s) from this save (JSON can no longer write these): ${strippedCutOverSections.join(', ')}`);
+      }
+    }
 
     // Legacy fields from pre-2026-08-20 clients — accepted (so an old
     // cached tab never gets a hard error) and stripped, but never acted on.
@@ -882,7 +973,10 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
       `counts=${JSON.stringify(buildRecordCounts(finalData))} deletes=${totalDeleteCount}`
     );
 
-    res.json({ success: true, data: finalData, revision: writeRes.rows[0].updated_at });
+    res.json({
+      success: true, data: finalData, revision: writeRes.rows[0].updated_at,
+      ...(strippedCutOverSections.length > 0 ? { relationalAuthoritativeSectionsIgnored: strippedCutOverSections } : {}),
+    });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     console.error('PUT /api/platform-state failed:', err);

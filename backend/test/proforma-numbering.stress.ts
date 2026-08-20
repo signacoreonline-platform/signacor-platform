@@ -276,3 +276,7 @@ main().catch((err) => {
   console.error('[proforma-numbering] Fatal error:', err);
   process.exit(1);
 });
+
+// 2026-08-20 STAGE 2: see the identical note at the end of
+// test/hardening.stress.ts — same fix, same reason (module-scoping only).
+export {};

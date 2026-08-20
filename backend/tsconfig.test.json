@@ -1,0 +1,25 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "./dist",
+    "lib": ["ES2020", "DOM"],
+    "declaration": false,
+    "declarationMap": false,
+    // Test files here were always run via `ts-node --transpile-only`
+    // (types erased, never checked) — several pre-existing Stage 1 test
+    // files (hardening.stress.ts, proforma-numbering.stress.ts, etc.) rely
+    // on that and are not strict-mode clean (fetch's `.json()` returning
+    // `unknown`, a couple of duplicate-name quirks from being transpiled
+    // standalone before). Compiling them for the FIRST time here is only
+    // meant to prove "runs without ts-node", not to retroactively enforce
+    // strict typing on tests that were never written against it — doing
+    // that would mean editing pre-existing Stage 1 test files' logic
+    // outside what Stage 2 actually asked for. Strict checks stay fully on
+    // for src/ via the main tsconfig.json/`npm run build`.
+    "strict": false,
+    "noImplicitAny": false
+  },
+  "include": ["src/**/*", "test/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
