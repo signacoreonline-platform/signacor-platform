@@ -145,6 +145,9 @@ const API_QUOTE_CONVERSION_REASSIGN_URL = (window.SIGNACORE_API_URL || 'https://
 // the next free one" flow instead of a dead-end alert on collision — see
 // checkDocumentNumber below.
 const API_DOC_NUMBER_CHECK_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/document-numbers/check';
+// 2026-08-20 Stage 2 hotfix: Full Backup V2 — the authenticated endpoint
+// backend/src/routes/fullBackup.ts mounts (see exportFullBackup below).
+const API_FULL_BACKUP_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/full-backup';
 // ── Authentication (added 2026-08-06, audit finding B1) ────────────────────
 // API_STATE_URL and API_DOC_NUMBER_RESERVE_URL above now both require a
 // valid backend-issued JWT. Login used to be a purely local comparison
@@ -12397,7 +12400,7 @@ function Header({ page, onMenu, onLogout, user, onSave, saveMsg, lastSaved, logo
       <h1 className="text-base font-bold flex-1" style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'1.1rem',letterSpacing:'0.05em',color:'#06065c',textTransform:'uppercase'}}>{titles[page]||page}</h1>
       <span className="text-xs text-gray-400 hidden sm:block">{today}</span>
       {isAssistant&&<span className="hidden sm:inline-flex items-center gap-1 text-xs rounded-lg px-2 py-1 font-semibold" style={{background:'#e6e6ff',border:'1px solid #9999ff',color:'#06065c'}}>👤 {user.title}</span>}
-      {canExportBackup&&<button onClick={onExportBackup} title="Downloads a full, unfiltered JSON backup of both companies' data" className="hidden sm:inline-flex items-center gap-1 text-xs text-gray-500 border border-gray-200 rounded-lg px-3 py-1.5 hover:bg-gray-50">⬇ Export Full Backup</button>}
+      {canExportBackup&&<button onClick={onExportBackup} title="Downloads a full platform backup (.zip) of both companies' data" className="hidden sm:inline-flex items-center gap-1 text-xs text-gray-500 border border-gray-200 rounded-lg px-3 py-1.5 hover:bg-gray-50">⬇ Export Full Backup</button>}
       <button onClick={onLogout} className="text-xs text-gray-500 border border-gray-200 rounded-lg px-3 py-1.5 hover:bg-gray-50">Sign Out</button>
     </header>
   );
@@ -21227,6 +21230,9 @@ function App() {
   // see mergeAndSave() below. Guards against a transient/failed fetch being
   // mistaken for "empty database" and silently wiping real data.
   const dbConfirmedEmptyRef = useRef(false);
+  // Re-entrancy lock for exportFullBackup below — blocks a rapid
+  // double-click from firing two overlapping /api/full-backup downloads.
+  const fullBackupInFlightRef = useRef(false);
   const [apiMsg, setApiMsg] = useState('');
 
   // ── Hydration gate (2026-08-18 hydration-reliability fix) ───────────────
@@ -22192,14 +22198,22 @@ function App() {
     }
   }
 
-  // ── Admin-only: Export Full Platform Backup (JSON, download-only) ──────
-  // Built directly from this component's own top-level state — the same
-  // arrays every page's filtered views are derived FROM, never the other
-  // way around — so this is always the full, unfiltered, both-companies
-  // source of truth regardless of which page/company/role view is on
-  // screen right now. Read-only: never calls saveToServer/mergeAndSave,
-  // never touches platform_state, never mutates any state here.
-  function exportFullBackup() {
+  // ── Admin-only: Export Full Platform Backup (Stage 2: Full Backup V2) ──
+  // 2026-08-20 Stage 2 PRODUCTION HOTFIX: this function used to build the
+  // backup entirely client-side from React's own top-level state and
+  // download it as JSON — a leftover from before Full Backup V2
+  // (backend/src/relational/fullBackupV2.ts, mounted at
+  // /api/full-backup — see backend/src/routes/fullBackup.ts) existed. That
+  // client-side path was never removed when Full Backup V2 shipped, so
+  // this button kept downloading the old JSON no matter what the backend
+  // could now produce — it never once called the new endpoint. Fixed: this
+  // is now a thin, authenticated download trigger against the real
+  // backend export. It does NOT build, assemble, or fall back to any
+  // client-side JSON backup of its own anymore — a failed server export is
+  // shown as a clear, visible error, never silently replaced by an
+  // incomplete local approximation. Same button, same click, same
+  // Admin-only/apiReady guards as before.
+  async function exportFullBackup() {
     // Defense in depth: the button is already hidden for non-admins, but the
     // function itself must also refuse, in case it's ever invoked another way.
     if (!user || user.role !== 'admin') {
@@ -22208,94 +22222,56 @@ function App() {
       return;
     }
     // Guard: refuse to export until the initial GET from the backend has
-    // succeeded. Before that, App()'s state may still be a localStorage
-    // fallback or the INITIAL_* seed/demo constants rather than the real
-    // database — exporting it and calling it a "full platform backup" would
-    // be misleading. This never triggers a save/PUT and never changes data.
+    // succeeded. This never triggers a save/PUT and never changes data —
+    // the actual export below is a read-only GET against the backend.
     if (!apiReadyRef.current) {
       console.warn('Export Full Backup blocked: apiReadyRef.current is false — live data has not finished loading from the server yet.');
       alert('Backup export blocked. The platform has not finished loading live data from the server yet. Please wait until the platform is fully loaded and saved data is visible, then try again.');
       return;
     }
+    if (fullBackupInFlightRef.current) return; // guard against a double-click firing two overlapping downloads
+    fullBackupInFlightRef.current = true;
     try {
-      const now = new Date();
-      // signacore-platform-full-backup-YYYY-MM-DD-HHMMSS.json
-      const pad = (n) => String(n).padStart(2, '0');
-      const fileStamp = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-
-      // Full, unfiltered platform state — every section, both companies,
-      // exactly as stored/synced with the backend (see STATE_SECTIONS above).
-      const fullState = {
-        v: DATA_VERSION,
-        companies, jobs, inventory, quotes, customers, suppliers, assets,
-        employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders,
-        savedImports, bankTxns, chartOfAccounts, accInvoices, accBills,
-        completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes,
-        logo: logoDataUrl, utLogo: utLogoDataUrl, holdingsLogo: holdingsLogoDataUrl,
-        sigOTSmit, savedAt: lastSaved,
-      };
-
-      // Simple, best-effort counts — not a substitute for the full `data` export above.
-      const countByCo = (list) => {
-        const out = { co1: 0, co2: 0, unspecified: 0 };
-        (Array.isArray(list) ? list : []).forEach((r) => {
-          if (!r) return;
-          if (r.co === 1) out.co1++;
-          else if (r.co === 2) out.co2++;
-          else out.unspecified++;
-        });
-        return out;
-      };
-      const companyTaggedSections = [jobs, quotes, accInvoices, accBills, creditNotes, purchaseOrders, proposedProjects];
-      const byCompany = companyTaggedSections.reduce((acc, list) => {
-        const c = countByCo(list);
-        acc.co1 += c.co1; acc.co2 += c.co2; acc.unspecified += c.unspecified;
-        return acc;
-      }, { co1: 0, co2: 0, unspecified: 0 });
-
-      const sumPayments = (list) => (Array.isArray(list) ? list : [])
-        .reduce((s, r) => s + (Array.isArray(r && r.payments) ? r.payments.length : 0), 0);
-
-      const backup = {
-        backupMeta: {
-          type: 'manual-full-platform-export',
-          exportedAt: now.toISOString(),
-          exportedByRole: user.role + (isHoldingsUser(user) ? ' (Holdings)' : ' (Original)'),
-          includes: 'full-platform-state-both-companies',
-          version: 1,
-        },
-        recordCounts: {
-          jobs: (jobs||[]).length,
-          quotes: (quotes||[]).length,
-          invoices: (accInvoices||[]).length,
-          bills: (accBills||[]).length,
-          payments: sumPayments(jobs) + sumPayments(accInvoices) + sumPayments(accBills),
-          creditNotes: (creditNotes||[]).length,
-          customers: (customers||[]).length,
-          suppliers: (suppliers||[]).length,
-          inventory: (inventory||[]).length,
-          // Not tracked as separate platform_state sections in this version —
-          // included for forward-compatibility with the requested shape.
-          tasks: 0,
-          documents: 0,
-          reports: 0,
-          byCompany,
-        },
-        data: fullState,
-      };
-
-      const json = JSON.stringify(backup, null, 2);
-      const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
-      const url  = URL.createObjectURL(blob);
-      const a    = document.createElement('a');
-      a.href     = url;
-      a.download = `signacore-platform-full-backup-${fileStamp}.json`;
+      const res = await fetch(API_FULL_BACKUP_URL, { headers: { ...authHeaders() } });
+      if (res.status === 401) {
+        forceLogoutExpiredSession();
+        throw new Error('Session expired — please log in again.');
+      }
+      if (!res.ok) {
+        // Surface the backend's own error/reason when it sends one (same
+        // convention as saveToServer's error handling) instead of a bare
+        // HTTP status — and, per the fix above, there is no JSON fallback
+        // path below this to silently slip into.
+        let detail = '';
+        try { const body = await res.json(); detail = (body && (body.detail || body.error || body.reason)) || ''; } catch (_) { /* not JSON */ }
+        throw new Error(detail || ('Backup request failed (HTTP ' + res.status + ')'));
+      }
+      const blob = await res.blob();
+      // Prefer the server-provided filename (Content-Disposition) so the
+      // download always matches whatever backend/src/routes/fullBackup.ts
+      // actually named it; only fall back to a locally-stamped name if
+      // that header is missing or unparseable.
+      const cd = res.headers.get('Content-Disposition') || '';
+      const cdMatch = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd);
+      let filename = cdMatch ? decodeURIComponent(cdMatch[1]) : null;
+      if (!filename) {
+        const now = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        const fileStamp = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+        filename = `signacore-platform-full-backup-${fileStamp}.zip`;
+      }
+      const url = URL.createObjectURL(blob);
+      const a   = document.createElement('a');
+      a.href    = url;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch (e) {
-      alert('Full backup export failed: ' + e.message);
+      alert('Full backup export failed: ' + (e && e.message ? e.message : 'unknown error') + '\n\nNo backup file was downloaded.');
+    } finally {
+      fullBackupInFlightRef.current = false;
     }
   }
 

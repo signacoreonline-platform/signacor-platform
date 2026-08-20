@@ -15,6 +15,8 @@
     "test:proforma-frontend": "ts-node --transpile-only test/proforma-frontend-logic.test.ts",
     "test:relational-frontend-guard": "ts-node --transpile-only test/relational-frontend-guard.test.ts",
     "test:relational-frontend-guard:compiled": "node dist/test/relational-frontend-guard.test.js",
+    "test:fullbackup-frontend-fix": "ts-node --transpile-only test/fullbackup-frontend-fix.test.ts",
+    "test:fullbackup-frontend-fix:compiled": "node dist/test/fullbackup-frontend-fix.test.js",
     "test:relational": "ts-node --transpile-only test/relational.stress.ts",
     "test:relational:compiled": "node dist/test/relational.stress.js",
     "test:relational:mixed-mode": "node dist/test/relational.mixed-mode.stress.js",
