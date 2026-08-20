@@ -2098,9 +2098,10 @@ async function reserveInvoiceNumber(co) {
        proformaNum as reserving the same-suffix invoice number, exactly
        like a legacy INV-style proformaNum already did.
    Existing quotes are NEVER touched by this — proformaNum stays whatever
-   it already was (unset, or a legacy INV-style value) until a user
-   explicitly clicks "Reserve Proforma Number". Nothing here mass-converts
-   or renumbers historical proformas.
+   it already was (unset, or a legacy INV-style value) until a user opens
+   this quote's proforma (Proforma Invoice or Email Proforma — see
+   ensureProformaNumber() below, which reserves at most once per quote).
+   Nothing here mass-converts or renumbers historical proformas.
    These two helpers are also used, unchanged in shape, by
    resolveProformaInvoiceNumber() below (which now derives the reserved
    invoice number from EITHER a legacy INV-style or new PRO-style
@@ -2125,13 +2126,14 @@ function proformaToReservedInvoiceNumber(proformaNum) {
   if (v.startsWith('INV-')) return v;
   return null;
 }
-// User-initiated only (QuoteViewModal's "Reserve Proforma Number" button) —
-// never called automatically for every quote. Reserves a real invoice
-// number from the same backend-atomic counter reserveInvoiceNumber() uses
-// (never a local max()+1, never reserved independently in the browser),
-// then derives its PRO-##### display/storage form. Returns
-// { number: 'PRO-#####', reservedInvoiceNumber: 'INV-#####' } on success,
-// or { error } — callers must not persist anything on error.
+// Called from QuoteViewModal's "Proforma Invoice"/"Email Proforma" actions —
+// never called automatically for every quote, only when the user actually
+// opens a proforma. Reserves a real invoice number from the same backend-
+// atomic counter reserveInvoiceNumber() uses (never a local max()+1, never
+// reserved independently in the browser), then derives its PRO-#####
+// display/storage form. Returns { number: 'PRO-#####', reservedInvoiceNumber:
+// 'INV-#####' } on success, or { error } — callers must not persist
+// anything on error.
 async function reserveProformaNumber(co) {
   const reservedInvoice = await reserveInvoiceNumber(co);
   if (!reservedInvoice) {
@@ -2142,6 +2144,45 @@ async function reserveProformaNumber(co) {
     return { error: `Reserved invoice number ${reservedInvoice} was not in the expected "INV-#####" format — please try again or contact support.` };
   }
   return { number: proNumber, reservedInvoiceNumber: reservedInvoice };
+}
+// 2026-08-20 (UI simplification): folds "reserve a proforma number" into
+// the existing Proforma Invoice / Email Proforma actions themselves,
+// instead of a separate visible "Reserve Proforma Number" button the user
+// had to click first as its own step. Idempotent per quote: if `quote`
+// already carries ANY proformaNum (a new-style PRO-##### from an earlier
+// call, or a legacy INV-##### value), nothing is reserved and that exact
+// value is reused — only a quote with no proformaNum yet actually reserves.
+// Whichever of the two buttons the user clicks FIRST performs the (at most
+// one) reservation for that quote; the other reuses it.
+// `quotes`/`forceSaveSections`/`onUpdate` are passed in explicitly (matching
+// this file's existing style for standalone helpers — see saveManualInvoice)
+// rather than closed over, so this works from any caller and stays unit-
+// testable on its own.
+// A confirmed-save failure here leaves the reservation made but unused
+// server-side, on purpose — the exact same "reserved number simply goes
+// unused" tradeoff already accepted throughout this file's other
+// reservation flows (see saveManualInvoice/handleConvertToJob). Returns the
+// resolved proforma number (existing or freshly reserved) to use
+// immediately, or null if reservation/save failed — caller must not
+// proceed (print/email) in that case; this function has already alerted.
+async function ensureProformaNumber(quote, quotes, forceSaveSections, onUpdate) {
+  if (quote && quote.proformaNum) return quote.proformaNum;
+  const result = await reserveProformaNumber(quote.co);
+  if (result.error) { alert(result.error); return null; }
+  const updatedQuote = { ...quote, proformaNum: result.number };
+  try {
+    await forceSaveSections({ quotes: (quotes||[]).map(q=>q.id===quote.id?updatedQuote:q) });
+  } catch(err) {
+    alert(`Could not save the proforma number.\n\nThe reservation ${result.number} was made but the save was not confirmed by the server, so nothing was changed on this quote — the reserved number simply goes unused.\n\nReason: ${err&&err.message?err.message:'unknown error'}\n\nPlease try again.`);
+    return null;
+  }
+  // Syncs local `quotes` state AND (via QuoteViewModal's onUpdate prop,
+  // which also calls setViewQuote) the modal's own `quote` prop, so an
+  // immediate second click (or the Email Proforma button, or the "Proforma
+  // No." display row) sees the reservation that was just made without
+  // waiting on a fetch/re-render race.
+  onUpdate(updatedQuote);
+  return result.number;
 }
 
 // Final frontend safeguard in addition to the backend's own atomic
@@ -2204,8 +2245,9 @@ function invoiceNumberExists(number, co, jobs, accInvoices, quotes, excludeQuote
    PROFORMA-TO-INVOICE NUMBER REUSE (2026-08-17, extended 2026-08-20)
    New business rule: if the quote that produced an invoice already carries a
    `proformaNum` — either a legacy already-persisted INV-xxxxx-style value,
-   or a new-style PRO-##### reservation made via "Reserve Proforma Number"
-   (see the FORWARD-ONLY PRO-##### PROFORMA NUMBERING block above) — the
+   or a new-style PRO-##### reservation made via ensureProformaNumber() when
+   the user opened this quote's Proforma Invoice/Email Proforma (see the
+   FORWARD-ONLY PRO-##### PROFORMA NUMBERING block above) — the
    FINAL invoice must reuse the EXACT invoice number that proformaNum
    implies instead of reserving a fresh one from the atomic counter, so a
    customer's proforma and their tax invoice are never two different
@@ -6598,9 +6640,10 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
   //   - a legacy proformaNum (an already-persisted INV-xxxxx-style value
   //     from before the 2026-08-20 PRO numbering rule) — kept exactly as
   //     stored, never regenerated;
-  //   - a new-style PRO-##### reservation, made explicitly via the
-  //     "Reserve Proforma Number" button below, which pre-empts the exact
-  //     same-suffix INV-##### from the atomic invoice pool (see the
+  //   - a new-style PRO-##### reservation, made automatically (at most
+  //     once) the first time the user opens Proforma Invoice or Email
+  //     Proforma below — see ensureProformaNumber() — which pre-empts the
+  //     exact same-suffix INV-##### from the atomic invoice pool (see the
   //     FORWARD-ONLY PRO-##### PROFORMA NUMBERING block near
   //     reserveInvoiceNumber()).
   // Quotes with neither (the default) show quote.num here and reserve a
@@ -6867,51 +6910,38 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
               ✏️ Edit Quote
             </button>
           )}
+          {/* ── Proforma Invoice / Email Proforma (2026-08-20: reservation
+                folded in, no separate step) ──
+                Whichever of these two the user clicks FIRST is what
+                reserves this quote's PRO-##### number, via
+                ensureProformaNumber() (defined near reserveProformaNumber()
+                above) — a real invoice number from the SAME atomic pool
+                every other invoice creation path uses, immediately making
+                the matching INV-##### unavailable elsewhere (see
+                documentNumbers.ts deriveReservedInvoiceNumber). If the
+                quote already carries a proformaNum (new-style PRO- from an
+                earlier click, or a legacy INV- value), ensureProformaNumber
+                reserves nothing and just reuses it — so neither button ever
+                reserves a second number for the same quote, and there is no
+                separate "reserve first" step for the user to remember. ── */}
           {quote.status!=='declined'&&(
-            <button onClick={()=>{ printProformaWindow(quote,proformaNum,companies,logoDataUrl); }}
+            <button onClick={async ()=>{
+                const num = await ensureProformaNumber(quote, quotes, forceSaveSections, onUpdate);
+                if (!num) return; // reservation/save failed — ensureProformaNumber already alerted; nothing to print
+                printProformaWindow(quote,num,companies,logoDataUrl);
+              }}
               className="flex items-center gap-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded-xl px-4 py-2.5 font-bold">
               📄 Proforma Invoice
             </button>
           )}
           {quote.status!=='declined'&&(
-            <button onClick={()=>setShowProformaEmail(true)}
+            <button onClick={async ()=>{
+                const num = await ensureProformaNumber(quote, quotes, forceSaveSections, onUpdate);
+                if (!num) return; // reservation/save failed — ensureProformaNumber already alerted; nothing to email
+                setShowProformaEmail(true);
+              }}
               className="flex items-center gap-1.5 text-xs bg-violet-100 hover:bg-violet-200 text-violet-800 rounded-xl px-4 py-2.5 font-bold border border-violet-300">
               📧 Email Proforma
-            </button>
-          )}
-          {/* ── Reserve Proforma Number (2026-08-20, forward-only) ──
-                User-initiated only — never happens automatically. Reserves a
-                real invoice number from the SAME atomic pool every other
-                invoice creation path uses (reserveProformaNumber() ->
-                reserveInvoiceNumber()), displays/stores it as PRO-#####, and
-                immediately makes the matching INV-##### unavailable to any
-                other invoice (see documentNumbers.ts
-                deriveReservedInvoiceNumber). Only offered once — hidden once
-                quote.proformaNum is already set (legacy or new-style), and
-                once this quote is already invoiced by any path (a real
-                invoice number already exists at that point; reserving a
-                second one would be meaningless and could never be
-                consumed). A confirmed-save failure here leaves the
-                reservation made but unused server-side, on purpose — the
-                exact same "reserved number simply goes unused" tradeoff
-                already accepted throughout this file's other reservation
-                flows (see saveManualInvoice/handleConvertToJob). ── */}
-          {quote.status!=='declined'&&!quote.proformaNum&&!quoteInvoice&&!linkedJobHasInvoice&&(
-            <button onClick={async ()=>{
-                const result = await reserveProformaNumber(quote.co);
-                if (result.error) { alert(result.error); return; }
-                if (!window.confirm(`Reserve ${result.number} for this quote?\n\nThis immediately reserves invoice number ${result.reservedInvoiceNumber} — no other invoice can use it until this proforma is finalised into an invoice (or the reservation is explicitly changed). Continue?`)) return;
-                const nextQuotes = quotes.map(q=>q.id===quote.id?{...q, proformaNum: result.number}:q);
-                try {
-                  await forceSaveSections({ quotes: nextQuotes });
-                } catch(err) {
-                  alert(`Could not save the proforma number.\n\nThe reservation ${result.number} was made but the save was not confirmed by the server, so nothing was changed on this quote — the reserved number simply goes unused.\n\nReason: ${err&&err.message?err.message:'unknown error'}\n\nPlease try again.`);
-                  return;
-                }
-                setQuotes(nextQuotes);
-              }}
-              className="flex items-center gap-1.5 text-xs bg-violet-700 hover:bg-violet-800 text-white rounded-xl px-4 py-2.5 font-bold">
-              🔒 Reserve Proforma Number
             </button>
           )}
           {(quote.status==='approved'||quote.status==='converted')&&(

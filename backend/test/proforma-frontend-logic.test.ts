@@ -10,6 +10,9 @@
  *   - invoiceNumberToProformaNumber
  *   - proformaToReservedInvoiceNumber
  *   - reserveProformaNumber
+ *   - ensureProformaNumber (2026-08-20: folds reservation into the
+ *     Proforma Invoice / Email Proforma actions themselves — reserves at
+ *     most once per quote, reuses an existing proformaNum otherwise)
  *   - invoiceNumberExists
  *   - resolveProformaInvoiceNumber
  *   - reserveInvoiceNumber / authHeaders / getAuthToken / setAuthToken
@@ -118,15 +121,18 @@ async function main() {
     extractFunction(appSrc, 'invoiceNumberToProformaNumber'),
     extractFunction(appSrc, 'proformaToReservedInvoiceNumber'),
     extractFunction(appSrc, 'reserveProformaNumber'),
+    extractFunction(appSrc, 'ensureProformaNumber'),
     extractFunction(appSrc, 'invoiceNumberExists'),
     extractFunction(appSrc, 'findSourceQuoteForJob'),
     extractFunction(appSrc, 'resolveProformaInvoiceNumber'),
   ].join('\n\n');
 
   const store: Record<string, string> = {};
+  const alertCalls: string[] = [];
   const sandbox: any = {
     console,
     fetch,
+    alert: (msg: string) => { alertCalls.push(msg); },
     localStorage: {
       getItem: (k: string) => (k in store ? store[k] : null),
       setItem: (k: string, v: string) => { store[k] = v; },
@@ -138,7 +144,7 @@ async function main() {
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
 
-  const runnable = `${extracted}\nglobalThis.__api = { reserveInvoiceNumber, invoiceNumberToProformaNumber, proformaToReservedInvoiceNumber, reserveProformaNumber, invoiceNumberExists, findSourceQuoteForJob, resolveProformaInvoiceNumber, setAuthToken };`;
+  const runnable = `${extracted}\nglobalThis.__api = { reserveInvoiceNumber, invoiceNumberToProformaNumber, proformaToReservedInvoiceNumber, reserveProformaNumber, ensureProformaNumber, invoiceNumberExists, findSourceQuoteForJob, resolveProformaInvoiceNumber, setAuthToken };`;
 
   try {
     vm.runInContext(runnable, sandbox, { filename: 'index.html-extracted.js' });
@@ -203,6 +209,50 @@ async function main() {
   const guardQuote = { id: 'Q-GUARD', num: 'SQ-GUARD', co: '1', proformaNum: r2.number };
   ok(api.invoiceNumberExists(r2.reservedInvoiceNumber, '1', [], [], [guardQuote]) === true, 'invoiceNumberExists() true for the INV number implied by a PRO proformaNum');
   ok(api.invoiceNumberExists(r2.reservedInvoiceNumber, '1', [], [], [guardQuote], 'Q-GUARD') === false, 'invoiceNumberExists() excludes the quote\'s own reservation via excludeQuoteId, matching resolveProformaInvoiceNumber\'s own reuse path');
+
+  console.log('\n[7] ensureProformaNumber() — Proforma Invoice/Email Proforma folded reservation, reserves EXACTLY once per quote');
+  {
+    let savedCalls: any[][] = [];
+    let updateCalls: any[] = [];
+    const fakeForceSaveSections = async (overrides: any) => { savedCalls.push([overrides]); };
+    const fakeOnUpdate = (q: any) => { updateCalls.push(q); };
+
+    const freshQuote = { id: 'Q-FRESH-1', num: 'SQ-FRESH-1', co: '1' };
+    const firstNum = await api.ensureProformaNumber(freshQuote, [freshQuote], fakeForceSaveSections, fakeOnUpdate);
+    ok(!!firstNum && /^PRO-\d{5,}$/.test(firstNum), 'first call on an unreserved quote reserves and returns a PRO-##### number', firstNum);
+    ok(savedCalls.length === 1, 'exactly one forceSaveSections call happened (one reservation persisted)', savedCalls.length);
+    ok(updateCalls.length === 1 && updateCalls[0].proformaNum === firstNum, 'onUpdate was called once with the quote carrying the new proformaNum (keeps the modal\'s local state in sync)', updateCalls);
+
+    // Second call, simulating "click again" — pass the UPDATED quote object
+    // (what onUpdate would have produced, exactly as QuoteViewModal's own
+    // `quote` prop now is after the first call) — must NOT reserve again.
+    const updatedQuote = updateCalls[0];
+    const secondNum = await api.ensureProformaNumber(updatedQuote, [updatedQuote], fakeForceSaveSections, fakeOnUpdate);
+    ok(secondNum === firstNum, 'clicking again (Proforma Invoice or Email Proforma) reuses the SAME PRO number — no second reservation', { firstNum, secondNum });
+    ok(savedCalls.length === 1 && updateCalls.length === 1, 'no additional forceSaveSections/onUpdate call happened on the second click', { saves: savedCalls.length, updates: updateCalls.length });
+  }
+
+  console.log('\n[8] ensureProformaNumber() — legacy proformaNum is reused as-is, never re-reserved');
+  {
+    let savedCalls: any[] = [];
+    const fakeForceSaveSections = async () => { savedCalls.push(1); };
+    const fakeOnUpdate = () => { throw new Error('onUpdate should never be called when proformaNum already exists'); };
+    const legacyQuote2 = { id: 'Q-LEGACY-2', num: 'SQ-LEGACY-2', co: '1', proformaNum: 'INV-00077' };
+    const num = await api.ensureProformaNumber(legacyQuote2, [legacyQuote2], fakeForceSaveSections, fakeOnUpdate);
+    ok(num === 'INV-00077', 'a quote with an existing legacy INV-style proformaNum returns it unchanged', num);
+    ok(savedCalls.length === 0, 'no reservation/save was attempted for an already-proforma\'d quote', savedCalls.length);
+  }
+
+  console.log('\n[9] ensureProformaNumber() — a save failure leaves the reservation unused and alerts, never proceeds');
+  {
+    const alertCountBefore = alertCalls.length;
+    const failingForceSaveSections = async () => { throw new Error('simulated save failure'); };
+    const fakeOnUpdate = () => { throw new Error('onUpdate should never be called when the save failed'); };
+    const anotherFreshQuote = { id: 'Q-FRESH-2', num: 'SQ-FRESH-2', co: '1' };
+    const result = await api.ensureProformaNumber(anotherFreshQuote, [anotherFreshQuote], failingForceSaveSections, fakeOnUpdate);
+    ok(result === null, 'returns null when the confirmed save fails, so the caller does not proceed to print/email', result);
+    ok(alertCalls.length === alertCountBefore + 1 && /reserved number simply goes unused/.test(alertCalls[alertCalls.length - 1]), 'user is alerted that the reservation was made but not saved', alertCalls[alertCalls.length - 1]);
+  }
 
   console.log(`\n${'='.repeat(60)}\n${passed} passed, ${failures} failed\n${'='.repeat(60)}`);
   process.exit(failures > 0 ? 1 : 0);
