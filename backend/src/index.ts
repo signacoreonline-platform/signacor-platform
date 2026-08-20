@@ -46,7 +46,11 @@ app.get('/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    service: 'Signacore API'
+    service: 'Signacore API',
+    // 2026-08-20 SECOND HARDENING PASS — bump this string any time
+    // platformState.ts's merge/conflict logic changes, so a deploy can be
+    // confirmed live (GET /health) before users are told to resume work.
+    platformStateSafetyVersion: '2026-08-20-id-map-stale-safe-v1',
   });
 });
 

@@ -421,7 +421,7 @@ async function scenarioJ_partialSaveOfFewJobsAgainstLargeServerSet() {
   // Simulate a UI that only knows about / sends 5 of those jobs (e.g. one
   // page of a filtered list), editing exactly one of them.
   const visibleFive = bulk.slice(0, 5).map((j: any, i: number) => (i === 0 ? { ...j, notes: 'edited via small partial save' } : j));
-  const res = await putState({ jobs: visibleFive, _partial: true });
+  const res = await putState({ jobs: visibleFive, _partial: true, _baseRevision: seeded.updated_at });
   ok(res.status === 200, 'small partial save (5 of 100+ jobs) is NOT blocked as a wipe', JSON.stringify(res.body));
 
   const finalState = await getState();
@@ -442,11 +442,12 @@ async function scenarioK_companyFilteredViewNeverTouchesOtherCompany() {
   const co1Jobs = seedJobs(60, () => ({ co: '1' }));
   const co2Jobs = seedJobs(15, () => ({ co: '2' }));
   await putState({ jobs: [...existingJobs, ...co1Jobs, ...co2Jobs], _partial: true });
+  const seeded = await getState();
 
   // "Company 1 view" save: sends ONLY company 1's jobs (a realistic shape
   // for a company-scoped save), with one edited.
   const co1View = co1Jobs.map((j: any, i: number) => (i === 0 ? { ...j, notes: 'co1 edit' } : j));
-  const res = await putState({ jobs: co1View, _partial: true });
+  const res = await putState({ jobs: co1View, _partial: true, _baseRevision: seeded.updated_at });
   ok(res.status === 200, 'company-scoped partial save is not blocked', JSON.stringify(res.body));
 
   const finalState = await getState();
@@ -465,10 +466,11 @@ async function scenarioL_statusFilteredViewNeverTouchesOtherStatus() {
   const wipJobs = seedJobs(11, () => ({ status: 'in_production' }));
   const completedJobs = seedJobs(81, () => ({ status: 'complete' }));
   await putState({ jobs: [...existingJobs, ...wipJobs, ...completedJobs], _partial: true });
+  const seeded = await getState();
 
   // "Work In Progress" tab save: sends only the WIP-status jobs, one edited.
   const wipView = wipJobs.map((j: any, i: number) => (i === 0 ? { ...j, notes: 'wip edit' } : j));
-  const res = await putState({ jobs: wipView, _partial: true });
+  const res = await putState({ jobs: wipView, _partial: true, _baseRevision: seeded.updated_at });
   ok(res.status === 200, 'status-scoped partial save (11 of 92) is not blocked', JSON.stringify(res.body));
 
   const finalState = await getState();
@@ -492,14 +494,23 @@ async function scenarioM_staleFilteredTabCannotDestroyNewerRecords() {
   const bJobs = seedJobs(3, () => ({ co: '2', client: 'Session B (newer)' }));
   await putState({ jobs: [...(afterSeed.data.jobs || []), ...bJobs], _partial: true });
 
-  // Session A, still only aware of its original 5-job filtered view, edits one and saves.
+  // Session A, still only aware of its original 5-job filtered view (no
+  // `_baseRevision` matching current — its baseline predates Session B's
+  // addition), edits one and saves.
+  //
+  // 2026-08-20 SECOND HARDENING PASS: this now carries a genuine update
+  // with no proof of freshness, so it fails closed (409) rather than being
+  // silently accepted — the explicitly-authorized fallback for this shape
+  // ("otherwise stale one gets 409, but no data loss"). What must still
+  // hold: Session B's jobs are completely unaffected either way, since a
+  // blocked save writes nothing at all.
   const staleEdit = staleFilteredView.map((j: any, i: number) => (i === 0 ? { ...j, notes: 'stale session edit' } : j));
   const res = await putState({ jobs: staleEdit, _partial: true });
-  ok(res.status === 200, 'stale filtered-view save is not blocked', JSON.stringify(res.body));
+  ok(res.status === 409 && !!res.body?.conflict, 'stale filtered-view save with no baseRevision is blocked (409)', JSON.stringify(res.body));
 
   const finalState = await getState();
   const finalIds = idsOf(finalState.data.jobs);
-  ok(bJobs.every((j: any) => finalIds.has(String(j.id))), 'Session B\'s newer jobs survive Session A\'s stale filtered-view save', JSON.stringify(bJobs.map((j: any) => j.id).filter((id: any) => !finalIds.has(String(id)))));
+  ok(bJobs.every((j: any) => finalIds.has(String(j.id))), 'Session B\'s newer jobs are unaffected by the blocked save', JSON.stringify(bJobs.map((j: any) => j.id).filter((id: any) => !finalIds.has(String(id)))));
 }
 
 // N — Explicit real deletion at production scale still works, and ONLY via
@@ -594,7 +605,12 @@ function makeNumericJob(over: Partial<any> = {}) {
 // that shipped the duplication bug (mergeAndSave never sets `_partial`).
 async function fullSave(overrides: Record<string, any>): Promise<{ status: number; body: any }> {
   const current = await getState();
-  return putState({ ...current.data, ...overrides });
+  // 2026-08-20 SECOND HARDENING PASS: a real client (mergeAndSave) always
+  // carries `_baseRevision` — the backend now requires it whenever a save
+  // contains a genuine update to an already-existing record (not just
+  // deletions), to close the stale-same-record-overwrite hole. `current` was
+  // just fetched fresh above, so its revision is the correct basis here.
+  return putState({ ...current.data, ...overrides, _baseRevision: current.updated_at });
 }
 
 // P (req. A) — Full save: server has 111 numeric-id jobs, a full-state save
@@ -632,7 +648,7 @@ async function scenarioQ_partialSaveFiveExistingEditsNeverDuplicates() {
   const totalBefore = seeded.data.jobs.length;
 
   const fiveEdited = batch.slice(0, 5).map((j: any, i: number) => ({ ...j, notes: `edit ${i}` }));
-  const res = await putState({ jobs: fiveEdited, _partial: true });
+  const res = await putState({ jobs: fiveEdited, _partial: true, _baseRevision: seeded.updated_at });
   ok(res.status === 200, 'partial save of 5 existing numeric-id jobs is accepted', JSON.stringify(res.body));
 
   const finalState = await getState();
@@ -763,10 +779,18 @@ async function scenarioU_explicitDeleteOfOneNumericJob() {
   ok(idsOf(finalState.data.jobs).size === finalState.data.jobs.length, 'no id duplicated by the delete save');
 }
 
-// V (req. G) — Stale full-save payload (mergeAndSave shape) — a newer
-// session's unrelated records survive, and nothing is duplicated.
-async function scenarioV_staleFullSavePayloadNeverDuplicatesOrDropsNewer() {
-  console.log('\n[Scenario V] (req. G) Stale full-save payload — newer unrelated records survive, nothing duplicated');
+// V (req. G) — Stale full-save payload (mergeAndSave shape), sent with NO
+// `_baseRevision` (or a stale one) after an unrelated concurrent addition.
+// 2026-08-20 SECOND HARDENING PASS: this save now carries a GENUINE update
+// (Session A edits its own job's notes) with no proof of freshness, so the
+// backend fails closed with a structured 409 rather than guessing whether
+// it's safe — exactly the explicitly-authorized fallback for this case
+// ("otherwise stale one gets 409, but no data loss"). The important
+// guarantee is unchanged: nothing is duplicated, nothing is lost, and
+// Session B's concurrent addition is completely unaffected either way,
+// because a blocked save writes nothing at all.
+async function scenarioV_staleFullSavePayloadBlockedNoDataLoss() {
+  console.log('\n[Scenario V] (req. G) Stale full-save payload with no baseRevision — blocked (409), zero data loss');
   const start = await getState();
   const beforeJobs = start.data.jobs || [];
   const aBatch = Array.from({ length: 8 }, () => makeNumericJob({ client: 'Session A (stale)' }));
@@ -779,16 +803,17 @@ async function scenarioV_staleFullSavePayloadNeverDuplicatesOrDropsNewer() {
 
   // Session A performs a FULL save (mergeAndSave shape) built from its
   // STALE snapshot — one of its OWN jobs edited — excluding B's jobs
-  // entirely, with no _deletedIds at all.
+  // entirely, with no _deletedIds and no _baseRevision at all (simulating an
+  // old/cached client, or one whose baseline predates B's save).
   const staleEdited = aBaseline.data.jobs.map((j: any) => (String(j.id) === String(aBatch[0].id) ? { ...j, notes: 'stale session edit' } : j));
   const res = await putState({ ...aBaseline.data, jobs: staleEdited });
-  ok(res.status === 200, 'stale full-state save is accepted', JSON.stringify(res.body));
+  ok(res.status === 409 && !!res.body?.conflict, 'stale full-state save with no baseRevision is blocked with a structured 409', JSON.stringify(res.body));
 
   const finalState = await getState();
   const finalIds = idsOf(finalState.data.jobs);
-  ok(bBatch.every((j: any) => finalIds.has(String(j.id))), 'Session B\'s newer jobs all survive the stale save', JSON.stringify(bBatch.map((j: any) => j.id).filter((id: any) => !finalIds.has(String(id)))));
-  ok(idsOf(finalState.data.jobs).size === finalState.data.jobs.length, 'no id was duplicated by the stale save');
-  ok(finalState.data.jobs.length === afterB.data.jobs.length, `job count unchanged from before the stale save (${afterB.data.jobs.length})`, String(finalState.data.jobs.length));
+  ok(bBatch.every((j: any) => finalIds.has(String(j.id))), 'Session B\'s newer jobs all survive the blocked save', JSON.stringify(bBatch.map((j: any) => j.id).filter((id: any) => !finalIds.has(String(id)))));
+  ok(idsOf(finalState.data.jobs).size === finalState.data.jobs.length, 'no id was duplicated');
+  ok(finalState.data.jobs.length === afterB.data.jobs.length, `job count unchanged — the blocked save wrote nothing (${afterB.data.jobs.length})`, String(finalState.data.jobs.length));
 }
 
 // W (req. H) — Wipe guard remains fully active after BOTH post-deploy
@@ -816,6 +841,77 @@ async function scenarioW_wipeGuardStillBlocksRealDestructiveLossAfterBothFixes()
   ok(idsOf(finalState.data.jobs).size === finalState.data.jobs.length, 'no duplication side effect either');
 }
 
+// X (req. F, 2026-08-20 SECOND HARDENING PASS) — SAME-RECORD CONFLICT.
+// Session A and B both load job X. B changes its notes and saves (succeeds,
+// revision advances). A later saves an OLDER copy of the SAME job X, built
+// from its now-stale baseline (predates B's save), carrying no
+// `_baseRevision` that matches the current server revision. B's newer notes
+// must never be silently reverted — the save is either detected as a
+// conflict (409, this implementation's chosen behavior) or, if somehow
+// accepted, must still show B's content, never A's.
+async function scenarioX_sameRecordConflictNeverSilentlyReverted() {
+  console.log('\n[Scenario X] (req. F, 2nd pass) Same-record conflict — B\'s newer edit must never be silently reverted by A\'s stale save');
+  const start = await getState();
+  const job = makeNumericJob({ client: 'Shared Job X', notes: 'original' });
+  await putState({ jobs: [...(start.data.jobs || []), job], _partial: true, _baseRevision: start.updated_at });
+
+  // Both A and B "load" job X at this point.
+  const aView = await getState();
+  const bView = await getState();
+
+  // B edits and saves first — succeeds, revision advances.
+  const bEdited = bView.data.jobs.map((j: any) => (String(j.id) === String(job.id) ? { ...j, notes: 'B notes — newer' } : j));
+  const bRes = await putState({ jobs: [bEdited.find((j: any) => String(j.id) === String(job.id))], _partial: true, _baseRevision: bView.updated_at });
+  ok(bRes.status === 200, 'B\'s edit (based on a current baseline) is accepted', JSON.stringify(bRes.body));
+
+  // A now saves its OWN (older, pre-B) copy of the SAME job, via a
+  // mergeAndSave-shaped full save — no _baseRevision matching the CURRENT
+  // (post-B) server revision, because A's snapshot predates B's save.
+  const aStaleEdited = aView.data.jobs.map((j: any) => (String(j.id) === String(job.id) ? { ...j, notes: 'A notes — stale, should not win' } : j));
+  const aRes = await putState({ ...aView.data, jobs: aStaleEdited, _baseRevision: aView.updated_at });
+
+  const finalState = await getState();
+  const finalJob = finalState.data.jobs.find((j: any) => String(j.id) === String(job.id));
+  if (aRes.status === 200) {
+    // Accepted only if the architecture judged it provably safe — even then,
+    // B's content must never have been silently reverted.
+    ok(finalJob && finalJob.notes === 'B notes — newer', 'if A\'s save was accepted anyway, B\'s newer notes still won (never silently reverted)', JSON.stringify(finalJob));
+  } else {
+    ok(aRes.status === 409 && !!aRes.body?.conflict, 'A\'s stale same-record save is blocked with a structured 409', JSON.stringify(aRes.body));
+    ok(finalJob && finalJob.notes === 'B notes — newer', 'B\'s newer notes are intact — nothing was reverted', JSON.stringify(finalJob));
+  }
+}
+
+// Y (req. M, 2026-08-20 SECOND HARDENING PASS) — NEGATIVE CONTROL. Runs the
+// OLD "incoming array + filtered-existing array" concatenation formula
+// (exact shape of the confirmed production bug — a Set<string> compared
+// against a raw, un-stringified numeric id) against the SAME 111 server +
+// 111 incoming input the new mergeSectionById() implementation is proven
+// safe against elsewhere in this suite. Proves the old shape really did
+// double records (111 -> 222) and the new implementation, run on identical
+// input, does not (111 -> 111) — a pure, isolated, in-process comparison
+// requiring no HTTP call.
+function scenarioY_negativeControlOldAlgorithmDoubles() {
+  console.log('\n[Scenario Y] (req. M) Negative control — old concatenation algorithm doubles, new Map merge does not');
+  const existingList = Array.from({ length: 111 }, () => makeNumericJob({ client: 'NegControl' }));
+  const incoming = existingList; // "same 111 ids", exactly the production shape
+
+  // ── OLD (buggy) implementation, reproduced verbatim from the pre-fix
+  //    source: incomingIds is Set<string>, but existing x.id is compared in
+  //    its RAW (numeric) form — always false, so nothing is ever filtered
+  //    out, and incoming + existing concatenates to double every record. ──
+  const incomingIdsOld = new Set(incoming.map((x: any) => String(x.id)));
+  const preservedOld = existingList.filter((x: any) => x && !incomingIdsOld.has(x.id as any)); // BUG: no String(x.id)
+  const oldResult = [...incoming, ...preservedOld];
+  ok(oldResult.length === 222, 'OLD algorithm: 111 existing + 111 incoming (same ids) doubles to 222 (reproduces the production bug)', String(oldResult.length));
+
+  // ── NEW implementation (mirrors mergeSectionById's Map formula exactly) ──
+  const resultById = new Map(existingList.map((r: any) => [String(r.id), r]));
+  for (const rec of incoming) resultById.set(String(rec.id), rec);
+  const newResult = Array.from(resultById.values());
+  ok(newResult.length === 111, 'NEW Map-merge algorithm: 111 existing + 111 incoming (same ids) stays 111', String(newResult.length));
+}
+
 async function main() {
   await login();
   console.log(`[hardening-stress] Logged in. Target: ${BASE}. DB: ${DB_URL.replace(/:[^:@]*@/, ':***@')}`);
@@ -841,8 +937,28 @@ async function main() {
   await scenarioS_duplicateIdsInIncomingHardBlocked();
   await scenarioT_duplicateIdsFromPreexistingCorruptionHardBlocked();
   await scenarioU_explicitDeleteOfOneNumericJob();
-  await scenarioV_staleFullSavePayloadNeverDuplicatesOrDropsNewer();
+  await scenarioV_staleFullSavePayloadBlockedNoDataLoss();
   await scenarioW_wipeGuardStillBlocksRealDestructiveLossAfterBothFixes();
+  await scenarioX_sameRecordConflictNeverSilentlyReverted();
+  scenarioY_negativeControlOldAlgorithmDoubles();
+
+  // req. B repeated 10x: full save of the SAME ids back (one re-edited each
+  // time) must stay at the same count every single time — never creep up.
+  console.log('\n[Scenario Z] (req. B x10) Repeat full-save-of-same-ids 10 times — count never changes');
+  {
+    const seeded = await getState();
+    const before = seeded.data.jobs.length;
+    let ok10 = true;
+    for (let i = 0; i < 10; i++) {
+      const cur = await getState();
+      const edited = cur.data.jobs.map((j: any, idx: number) => (idx === 0 ? { ...j, notes: `repeat-${i}` } : j));
+      const res = await putState({ ...cur.data, jobs: edited, _baseRevision: cur.updated_at });
+      if (res.status !== 200) { ok10 = false; console.log(`  ✗ iteration ${i} rejected:`, JSON.stringify(res.body)); break; }
+      const after = await getState();
+      if (after.data.jobs.length !== before) { ok10 = false; console.log(`  ✗ iteration ${i}: count changed ${before} -> ${after.data.jobs.length}`); break; }
+    }
+    ok(ok10, `job count stayed at ${before} across all 10 repeated full saves`, String(before));
+  }
 
   console.log(`\n${'='.repeat(60)}\n${passed} passed, ${failures} failed\n${'='.repeat(60)}`);
   process.exit(failures > 0 ? 1 : 0);

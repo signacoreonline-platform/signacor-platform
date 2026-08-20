@@ -21308,6 +21308,17 @@ function App() {
     if (apiSaveTimerRef.current) { clearTimeout(apiSaveTimerRef.current); apiSaveTimerRef.current = null; }
     const data = {...overrides};
     data._partial = true;
+    // 2026-08-20 SECOND HARDENING PASS: carry the server revision this
+    // partial save was built on top of, same as mergeAndSave already does.
+    // forceSaveSections/savePartialSectionsNow is documented as purely
+    // additive (creates/updates only the sections the caller explicitly
+    // passed in), but the backend's stable-id merge can still detect a
+    // GENUINE content change to a record that already exists server-side
+    // (e.g. two rapid partial saves racing) — without `_baseRevision` the
+    // backend cannot tell that update apart from a stale one and must fail
+    // closed (409) rather than guess. Sending it costs nothing when this
+    // save turns out to be pure creates.
+    data._baseRevision = serverBaselineRef.current ? (serverBaselineRef.current._serverRevision || null) : null;
     data.v = DATA_VERSION;
     const savedAt = new Date().toISOString();
     data._autoSavedAt = savedAt;

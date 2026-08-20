@@ -139,6 +139,121 @@ function idsOf(list: any[]): Set<string> {
   return s;
 }
 
+// Key-sorted, recursive JSON serialization — used to decide whether an
+// incoming record for an id that already exists is a GENUINE content change
+// or just a harmless re-send of what the server already has. Key order can
+// legitimately differ between a browser tab's own JSON and the server's
+// stored copy, so a plain JSON.stringify comparison would false-positive.
+function stableStringify(v: any): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(stableStringify).join(',') + ']';
+  const keys = Object.keys(v).sort();
+  return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableStringify(v[k])).join(',') + '}';
+}
+
+// id -> occurrence count, for ids appearing MORE THAN ONCE in `list`.
+function duplicateCountsOf(list: any[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const r of list) {
+    if (!r || r.id === undefined || r.id === null) continue;
+    const id = String(r.id);
+    counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  for (const [id, n] of [...counts]) if (n <= 1) counts.delete(id);
+  return counts;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 2026-08-20 SECOND HARDENING PASS — DETERMINISTIC STABLE-ID MAP MERGE
+// ══════════════════════════════════════════════════════════════════════
+// REPLACES the "incoming array + filtered-existing array" concatenation
+// merge entirely (that shape is exactly what produced the production
+// incident: 111 incoming + 111 "not seen as already incoming" existing =
+// 222). There is now exactly ONE merge implementation for every protected
+// section, and it can never append/concatenate/rebuild an array from two
+// separately-filtered halves — it only ever mutates single Map entries.
+//
+//   resultById = Map(existing records keyed by String(id))
+//   for each incoming record: resultById.set(String(id), incomingRecord)
+//   for each explicitly-deleted id:  resultById.delete(String(id))
+//   finalArray = Array.from(resultById.values())
+//
+// A record whose id is simply absent from `incoming` is never touched —
+// deletion is ONLY ever driven by `deletedIds` (see resolveDeletedIds).
+//
+// FAIL CLOSED ON EXISTING SERVER-SIDE DUPLICATE IDS: if the section's
+// CURRENT server data already contains more than one record under the same
+// id, building `resultById` as a plain Map would SILENTLY collapse that
+// duplicate down to whichever copy happens to be last in array order —
+// exactly the "silently collapse or compound corruption" this must not do.
+// So this refuses to merge that section at all rather than guess which
+// duplicate copy is authoritative. (Two sections — quickRates, customers —
+// are known to carry a small number of INTENTIONALLY-preserved historical
+// id collisions from before this incident, verified and signed off during
+// the 2026-08-20 backup-vs-live reconstruction and explicitly never to be
+// "fixed" by an ordinary save. This still blocks ordinary edits to those
+// specific sections' pre-existing colliding ids — that is the correct,
+// honest behavior: a ordinary ave genuinely cannot safely id-merge a
+// section with a duplicate id, whether that duplicate is new corruption or
+// old, already-accepted corruption. Resolving those specific historical
+// collisions is a separate, out-of-scope task.)
+interface SectionMergeResult {
+  finalList: any[];
+  hasGenuineUpdate: boolean; // an existing id's content actually changed
+  error?: string;
+}
+
+function mergeSectionById(key: string, incoming: any[], existingList: any[], deletedIds: Set<string>): SectionMergeResult {
+  // 1. Validate SERVER (existing) input first.
+  const serverSeen = new Set<string>();
+  for (const rec of existingList) {
+    if (!rec || rec.id === undefined || rec.id === null) {
+      return { finalList: [], hasGenuineUpdate: false, error: `server "${key}" contains a record with no stable id — cannot safely merge` };
+    }
+    const id = String(rec.id);
+    if (serverSeen.has(id)) {
+      return { finalList: [], hasGenuineUpdate: false, error: `server "${key}" already contains duplicate id "${id}" — ordinary saves to this section are blocked until that pre-existing collision is resolved separately (never auto-collapsed)` };
+    }
+    serverSeen.add(id);
+  }
+
+  // 2. Validate INCOMING input.
+  const incomingSeen = new Set<string>();
+  for (const rec of incoming) {
+    if (!rec || rec.id === undefined || rec.id === null) {
+      return { finalList: [], hasGenuineUpdate: false, error: `incoming "${key}" contains a record with no stable id — save blocked` };
+    }
+    const id = String(rec.id);
+    if (incomingSeen.has(id)) {
+      return { finalList: [], hasGenuineUpdate: false, error: `incoming "${key}" contains duplicate id "${id}" — save blocked` };
+    }
+    incomingSeen.add(id);
+  }
+
+  // 3. resultById = server records keyed by String(id).
+  const resultById = new Map<string, any>(existingList.map((r) => [String(r.id), r]));
+
+  // 4. Apply only the intended record changes.
+  let hasGenuineUpdate = false;
+  for (const rec of incoming) {
+    const id = String(rec.id);
+    const prior = resultById.get(id);
+    if (prior === undefined) {
+      resultById.set(id, rec); // create — always safe, nothing to conflict with
+    } else if (stableStringify(prior) !== stableStringify(rec)) {
+      hasGenuineUpdate = true; // genuine edit to a record that already exists
+      resultById.set(id, rec);
+    }
+    // else: byte-identical to what the server already has — harmless no-op
+  }
+
+  // 5. Apply only explicit deletions.
+  for (const id of deletedIds) resultById.delete(id);
+
+  // 6. finalArray.
+  return { finalList: Array.from(resultById.values()), hasGenuineUpdate };
+}
+
 // Counts records per `co` (company) tag, for sections that carry one
 // (jobs, quotes, purchaseOrders, etc.). Sections with no `co` field on their
 // records simply produce an empty count map and are skipped by that check.
@@ -380,21 +495,36 @@ function assertNoUnexplainedRemovals(
 // pairs, same id, same job number, every field identical) after one normal
 // job save. This check does not know or care why a duplicate might exist —
 // it only guarantees one can never be written.
-function assertNoDuplicateIds(finalData: Record<string, any>): void {
+// 2026-08-20 SECOND HARDENING PASS: made non-regression-aware. `finalData`
+// for a PARTIAL save always includes every existing section spread in
+// verbatim (see `finalData = isPartial ? {...existingData, ...data} : ...`
+// below), including sections this particular save never touched. Two
+// sections (quickRates, customers) are known to carry a small number of
+// INTENTIONALLY-preserved historical id collisions from before this
+// incident (see reconstructPlatformStateAfterDuplicationAugust2026.ts) —
+// comparing `finalData` against a flat "zero duplicates allowed" rule would
+// trip this backstop on EVERY save, forever, the instant that reconstructed
+// state is live, since those old collisions are still there by design.
+// Comparing against `existingData` (the state immediately before this save)
+// instead preserves the actual guarantee this backstop exists for — an
+// ordinary save can never INCREASE how duplicated an id is — while never
+// treating already-accepted, already-signed-off historical corruption this
+// save didn't touch as a fresh violation. A genuinely NEW duplicate (id not
+// previously duplicated at all) is caught exactly as before: existing count
+// is 0/1, final count is compared as > 0/1 → always trips.
+function assertNoDuplicateIds(existingData: Record<string, any> | null, finalData: Record<string, any>): void {
   for (const key of PROTECTED_SECTIONS) {
-    const list = arr(finalData[key]);
-    if (list.length === 0) continue;
-    const seen = new Set<string>();
-    const dupes = new Set<string>();
-    for (const rec of list) {
-      if (!rec || rec.id === undefined || rec.id === null) continue;
-      const id = String(rec.id);
-      if (seen.has(id)) dupes.add(id);
-      else seen.add(id);
+    const finalCounts = duplicateCountsOf(arr(finalData[key]));
+    if (finalCounts.size === 0) continue;
+    const existingCounts = duplicateCountsOf(arr(existingData && existingData[key]));
+    const worsened: string[] = [];
+    for (const [id, finalCount] of finalCounts) {
+      const existingCount = existingCounts.get(id) || 0;
+      if (finalCount > existingCount) worsened.push(`${id} (was ${existingCount}, would become ${finalCount})`);
     }
-    if (dupes.size > 0) {
+    if (worsened.length > 0) {
       throw new Error(
-        `SAFETY BACKSTOP TRIPPED: "${key}" would persist duplicate id(s) [${[...dupes].join(', ')}] — save aborted, nothing written. This indicates a bug in the merge logic (or another code path) producing more than one record for the same stable id, not a normal rejection.`
+        `SAFETY BACKSTOP TRIPPED: "${key}" would persist NEW or WORSENED duplicate id(s) [${worsened.join(', ')}] — save aborted, nothing written. This indicates a bug in the merge logic (or another code path) producing more than one record for the same stable id, not a normal rejection. (Already-existing, previously-accepted duplicate ids for this section are not re-flagged here — see comment above.)`
       );
     }
   }
@@ -482,58 +612,54 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
     const anyExplicitDeletion = Object.values(resolvedDeletedIdsBySection).some((s) => s.size > 0);
     const totalDeleteCount = Object.values(resolvedDeletedIdsBySection).reduce((n, s) => n + s.size, 0);
 
-    // ── Union-merge every protected section present in this save
-    //    (2026-08-20 hardening — replaces the old separate creditNotes
-    //    block and MERGE_SECTIONS loop with one explicit-delete-aware
-    //    formula; see header comment for the full rationale).
+    // ── ONE deterministic stable-id Map merge for every protected section
+    //    present in this save (2026-08-20 SECOND HARDENING PASS — see
+    //    mergeSectionById() above for the full formula and rationale). This
+    //    REPLACES the old "incoming array + filtered-existing array"
+    //    concatenation entirely — that shape (`[...incoming, ...preserved]`)
+    //    is exactly what produced the production incident (a Set<string> vs.
+    //    raw-number id comparison meant `preserved` kept EVERY existing
+    //    record, every time: 111 incoming + 111 "preserved" = 222). There is
+    //    no other merge/append/concatenation path for protected sections
+    //    anywhere else in this file now.
     //
-    //    2026-08-20 POST-DEPLOY FIX: this merge now runs BEFORE detectWipe()
-    //    (previously it ran after). detectWipe() must judge what will
-    //    ACTUALLY be persisted, not the raw pre-merge payload — otherwise a
-    //    genuinely safe, purely-additive partial save (e.g. `{jobs:
-    //    [oneEditedJob], _partial:true}`, exactly what savePartialSectionsNow
-    //    is documented to send) looks like a catastrophic wipe to detectWipe
-    //    even though the merge immediately below would have preserved every
-    //    untouched record. Confirmed reproducible: a 2-job additive partial
-    //    save against a 92-job baseline was rejected with "would drop from
-    //    92 record(s) to 2 (over 80% loss)" even though the post-merge
-    //    result is a full, correct 92-job set. See
-    //    backend/test/hardening.stress.ts Scenarios J–K for the regression
-    //    coverage this closes (100+ server jobs / company-filtered view /
-    //    status-filtered view all editing safely; explicit deletion and the
-    //    wipe guard itself remain fully enforced). ─────────────────────────
+    //    Still runs BEFORE detectWipe() so the wipe guard judges what will
+    //    ACTUALLY be persisted (a small additive partial save must not look
+    //    like an 80%+ loss just because it only mentions a few records).
+    const mergeErrors: string[] = [];
+    let anyGenuineUpdate = false;
     for (const key of PROTECTED_SECTIONS) {
       if (!Array.isArray(data[key])) continue; // section not part of this save — leave untouched
       const incoming = data[key];
       const existingList = arr(existingData && existingData[key]);
-      if (existingList.length === 0) continue; // nothing live to protect for this section
-
-      const idsOk = incoming.every((x: any) => x && x.id !== undefined && x.id !== null)
-                 && existingList.every((x: any) => x && x.id !== undefined && x.id !== null);
-      if (!idsOk) continue; // cannot safely id-merge — saved as sent, no extra protection this time
-
-      const incomingIds = idsOf(incoming);
       const deleted = resolvedDeletedIdsBySection[key] || new Set<string>();
-      // 2026-08-20 POST-DEPLOY FIX #2 (duplication incident): `incomingIds`
-      // is a Set<string> (idsOf() stringifies every id). This filter used to
-      // test `!incomingIds.has(x.id)` — comparing the SET's string keys
-      // against `x.id` in its RAW type. When ids are JS numbers (they are —
-      // job/quote/etc ids are `Date.now()`-style numeric values), a number
-      // never strict-equals its own string form (`1786972817796 !==
-      // "1786972817796"`), so `.has(x.id)` was FALSE for every existing
-      // record — even ones genuinely present in `incoming` — and the "not
-      // already in incoming" filter therefore kept EVERY existing record,
-      // every time. A normal full-state save (existing ids === incoming
-      // ids) produced `data[key] = [...incoming(111), ...preserved(111)]` =
-      // 222 records, each id duplicated exactly once — precisely the
-      // production incident (222 jobs / 111 unique ids / 111 exact-duplicate
-      // pairs). Fix: stringify `x.id` the same way `incomingIds` was built,
-      // so both sides of the comparison use the same type.
-      const preserved = existingList.filter((x: any) => x && !incomingIds.has(String(x.id)) && !deleted.has(String(x.id)));
-      if (preserved.length) {
-        data[key] = [...incoming, ...preserved];
+
+      if (existingList.length === 0 && deleted.size === 0) {
+        // Nothing live to protect for this section yet — still reject
+        // duplicate ids WITHIN the incoming payload itself (fail closed, not
+        // "saved as sent, no extra protection"), but there is no id-merge to
+        // perform.
+        const seen = new Set<string>();
+        for (const rec of incoming) {
+          if (!rec || rec.id === undefined || rec.id === null) { mergeErrors.push(`incoming "${key}" contains a record with no stable id`); break; }
+          const id = String(rec.id);
+          if (seen.has(id)) { mergeErrors.push(`incoming "${key}" contains duplicate id "${id}"`); break; }
+          seen.add(id);
+        }
+        continue;
       }
-      // else: nothing to add back — incoming already covers everything that survives
+
+      const merged = mergeSectionById(key, incoming, existingList, deleted);
+      if (merged.error) { mergeErrors.push(merged.error); continue; }
+      if (merged.hasGenuineUpdate) anyGenuineUpdate = true;
+      data[key] = merged.finalList;
+    }
+
+    if (mergeErrors.length > 0) {
+      await client.query('ROLLBACK');
+      console.error(`[platform-state] BLOCKED (merge validation) ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'}: ${mergeErrors.join('; ')}`);
+      res.status(500).json({ error: 'Save blocked — server or incoming data failed a stable-id integrity check', details: mergeErrors });
+      return;
     }
 
     const finalData = isPartial ? { ...(existingData || {}), ...data } : data;
@@ -557,21 +683,37 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
       return;
     }
 
-    // ── Revision / optimistic-concurrency check (2026-08-20 hardening,
-    //    Part 4) — scoped ONLY to saves that carry an explicit deletion.
-    //    Additive-only saves can never destroy data (see merge above) so
-    //    they are never blocked here, regardless of revision drift — this
-    //    keeps ordinary concurrent work from ever hitting a conflict loop.
-    if (anyExplicitDeletion && baseRevision && existingUpdatedAt) {
-      const serverRevision = new Date(existingUpdatedAt).toISOString();
-      const clientRevision = new Date(baseRevision).toISOString();
-      if (serverRevision !== clientRevision) {
+    // ── Revision / optimistic-concurrency check (2026-08-20 SECOND
+    //    HARDENING PASS — extended beyond just deletions). Scoped to saves
+    //    that either delete something explicitly OR carry a GENUINE update
+    //    to a record that already existed (mergeSectionById's
+    //    `hasGenuineUpdate` — a real content change, not just a re-send of
+    //    what the server already has). Pure creates/no-ops can never destroy
+    //    or overwrite anything (see the Map merge above) so they are never
+    //    blocked here, regardless of revision drift — that keeps ordinary
+    //    concurrent work (different users adding different records) from
+    //    ever hitting a conflict loop.
+    //
+    //    THIS is what closes the stale-same-record-overwrite hole: if
+    //    Session A saves an older copy of a job Session B already edited and
+    //    saved, A's incoming record differs from the server's CURRENT copy
+    //    (hasGenuineUpdate=true), and A's `_baseRevision` (captured before
+    //    B's save landed) no longer matches the server's current
+    //    `updated_at` — this always fails closed with a structured 409
+    //    rather than silently overwriting B's newer data. A save that
+    //    modifies/deletes an existing record with NO `_baseRevision` at all
+    //    is treated the same as a stale one — "no revision" can never prove
+    //    freshness, and guessing is exactly what must not happen here.
+    if (anyExplicitDeletion || anyGenuineUpdate) {
+      const serverRevision = existingUpdatedAt ? new Date(existingUpdatedAt).toISOString() : null;
+      const clientRevision = baseRevision ? new Date(baseRevision).toISOString() : null;
+      if (!clientRevision || serverRevision !== clientRevision) {
         await client.query('ROLLBACK');
-        console.warn(`[platform-state] BLOCKED (stale revision, ${totalDeleteCount} pending delete(s)) ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'} serverRevision=${serverRevision} yourRevision=${clientRevision}`);
+        console.warn(`[platform-state] BLOCKED (stale revision, ${totalDeleteCount} pending delete(s), genuineUpdate=${anyGenuineUpdate}) ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'} serverRevision=${serverRevision} yourRevision=${clientRevision}`);
         res.status(409).json({
           conflict: true,
           type: 'stale_revision',
-          error: 'Server state has changed since your last sync — refresh and retry before deleting records.',
+          error: 'Data changed elsewhere — refresh and retry.',
           serverRevision,
           yourRevision: clientRevision,
         });
@@ -615,7 +757,7 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
     // ── Mechanical backstop — proves the merge above did what it claims.
     try {
       assertNoUnexplainedRemovals(existingData, finalData, resolvedDeletedIdsBySection);
-      assertNoDuplicateIds(finalData);
+      assertNoDuplicateIds(existingData, finalData);
     } catch (backstopErr) {
       await client.query('ROLLBACK').catch(() => undefined);
       console.error(`[platform-state] SAFETY BACKSTOP TRIPPED ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'}:`, backstopErr);
