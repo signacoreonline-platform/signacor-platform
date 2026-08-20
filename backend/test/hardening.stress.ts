@@ -563,6 +563,259 @@ async function scenarioO_wipeGuardStillBlocksDeliberateDestruction() {
   ok(toDelete.every((id: any) => finalIds.has(String(id))), 'none of the targeted jobs were actually removed — the blocked save wrote nothing');
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// 2026-08-20 POST-DEPLOY FIX #2 — Scenarios P–W (jobs-duplication incident)
+// ══════════════════════════════════════════════════════════════════════
+// A live "edit one job, save" action doubled the ENTIRE jobs collection:
+// 222 total jobs / 111 unique ids / every id present exactly twice, every
+// field identical. Root cause (proven, see platformState.ts's "POST-DEPLOY
+// FIX #2" comment on the merge loop): `incomingIds` is a Set<string>
+// (idsOf() stringifies), but the preserved-existing filter compared it
+// against the RAW, non-stringified `x.id`. Real job/quote/etc ids are JS
+// NUMBERS (Date.now()-style), so `Set<string>.has(number)` was ALWAYS
+// false — every existing record looked "not already in incoming", even
+// when it genuinely was, and got re-appended. None of Scenarios A-O above
+// ever exercised this: `makeJob()`'s ids are STRINGS (`uid()` returns a
+// string), which never triggers the type mismatch. These scenarios use
+// NUMERIC ids (`makeNumericJob()`) specifically to match production data
+// and actually exercise the bug that shipped. Mapped 1:1 to the incident
+// report's required regression scenarios A-H (lettered P-W here since A-O
+// are already in use).
+let numIdCounter = 0;
+function numUid(): number {
+  numIdCounter += 1;
+  return Date.now() + numIdCounter; // JS number — matches real job/quote ids
+}
+function makeNumericJob(over: Partial<any> = {}) {
+  return { id: numUid(), num: `SNS-TEST-${uid()}`, client: 'Test Client', co: '1', status: 'quote_approved', quoteNum: null, ...over };
+}
+// A real `mergeAndSave`-shaped full-state save: spreads the CURRENT live
+// state and overrides only the given sections — this is the exact shape
+// that shipped the duplication bug (mergeAndSave never sets `_partial`).
+async function fullSave(overrides: Record<string, any>): Promise<{ status: number; body: any }> {
+  const current = await getState();
+  return putState({ ...current.data, ...overrides });
+}
+
+// P (req. A) — Full save: server has 111 numeric-id jobs, a full-state save
+// sends the SAME ids back (one edited) — final must be 111, NOT 222.
+async function scenarioP_fullSaveSameIdsNeverDuplicates() {
+  console.log('\n[Scenario P] (req. A) Full save of unchanged ids (one edited) — 111 jobs stay 111, never become 222');
+  const start = await getState();
+  const beforeJobs = Array.isArray(start.data.jobs) ? start.data.jobs : [];
+  const batch = Array.from({ length: 111 }, () => makeNumericJob({ client: 'Batch P' }));
+  await putState({ jobs: [...beforeJobs, ...batch], _partial: true });
+  const seeded = await getState();
+  const totalBefore = seeded.data.jobs.length;
+  ok(idsOf(seeded.data.jobs).size === totalBefore, 'setup: no duplicate ids before the test save', String(totalBefore));
+
+  const edited = seeded.data.jobs.map((j: any) => (String(j.id) === String(batch[0].id) ? { ...j, notes: 'edited via full save' } : j));
+  const res = await fullSave({ jobs: edited });
+  ok(res.status === 200, 'full save of unchanged ids is accepted', JSON.stringify(res.body));
+
+  const finalState = await getState();
+  ok(finalState.data.jobs.length === totalBefore, `job count is UNCHANGED (${totalBefore}), not doubled`, String(finalState.data.jobs.length));
+  ok(idsOf(finalState.data.jobs).size === totalBefore, 'no id occurs more than once after the save');
+  const editedJob = finalState.data.jobs.find((j: any) => String(j.id) === String(batch[0].id));
+  ok(!!editedJob && editedJob.notes === 'edited via full save', 'the one edited job carries the edit exactly once');
+}
+
+// Q (req. B) — Partial save of 5 EXISTING numeric-id jobs (edits only) —
+// final count unchanged, none duplicated.
+async function scenarioQ_partialSaveFiveExistingEditsNeverDuplicates() {
+  console.log('\n[Scenario Q] (req. B) Partial save of 5 EXISTING numeric-id jobs (edits only) — none duplicated');
+  const start = await getState();
+  const beforeJobs = Array.isArray(start.data.jobs) ? start.data.jobs : [];
+  const batch = Array.from({ length: 20 }, () => makeNumericJob({ client: 'Batch Q' }));
+  await putState({ jobs: [...beforeJobs, ...batch], _partial: true });
+  const seeded = await getState();
+  const totalBefore = seeded.data.jobs.length;
+
+  const fiveEdited = batch.slice(0, 5).map((j: any, i: number) => ({ ...j, notes: `edit ${i}` }));
+  const res = await putState({ jobs: fiveEdited, _partial: true });
+  ok(res.status === 200, 'partial save of 5 existing numeric-id jobs is accepted', JSON.stringify(res.body));
+
+  const finalState = await getState();
+  ok(finalState.data.jobs.length === totalBefore, `job count unchanged (${totalBefore})`, String(finalState.data.jobs.length));
+  ok(idsOf(finalState.data.jobs).size === totalBefore, 'no id duplicated');
+  const stillFive = batch.slice(0, 5).every((j: any, i: number) => {
+    const rec = finalState.data.jobs.find((x: any) => String(x.id) === String(j.id));
+    return rec && rec.notes === `edit ${i}`;
+  });
+  ok(stillFive, 'all 5 edits landed, each id appears exactly once');
+}
+
+// R (req. C) — One brand-new numeric-id job + one edit — count grows by
+// exactly 1, no duplication.
+async function scenarioR_newNumericJobAddsExactlyOne() {
+  console.log('\n[Scenario R] (req. C) One brand-new numeric-id job + one edit — count grows by exactly 1, no duplication');
+  const start = await getState();
+  const beforeJobs = Array.isArray(start.data.jobs) ? start.data.jobs : [];
+  const batch = Array.from({ length: 10 }, () => makeNumericJob({ client: 'Batch R' }));
+  await putState({ jobs: [...beforeJobs, ...batch], _partial: true });
+  const seeded = await getState();
+  const totalBefore = seeded.data.jobs.length;
+
+  const newJob = makeNumericJob({ client: 'Brand New R' });
+  const changedId = batch[0].id;
+  const payload = seeded.data.jobs
+    .map((j: any) => (String(j.id) === String(changedId) ? { ...j, notes: 'changed' } : j))
+    .concat([newJob]);
+  const res = await fullSave({ jobs: payload });
+  ok(res.status === 200, 'full save with one new + one changed job is accepted', JSON.stringify(res.body));
+
+  const finalState = await getState();
+  ok(finalState.data.jobs.length === totalBefore + 1, `job count grew by exactly 1 (${totalBefore} -> ${totalBefore + 1})`, String(finalState.data.jobs.length));
+  ok(idsOf(finalState.data.jobs).has(String(newJob.id)), 'the new job is present');
+  ok(idsOf(finalState.data.jobs).size === finalState.data.jobs.length, 'no id duplicated');
+}
+
+// S (req. D) — Duplicate ids ACCIDENTALLY present in the incoming payload
+// itself (a client-side bug) — hard blocked by the independent backstop,
+// nothing written.
+async function scenarioS_duplicateIdsInIncomingHardBlocked() {
+  console.log('\n[Scenario S] (req. D) Duplicate ids accidentally present in the incoming payload — hard blocked, nothing written');
+  const start = await getState();
+  const before = start.data.jobs || [];
+  const beforeCount = before.length;
+  const job = makeNumericJob({ client: 'Dup Incoming' });
+  const res = await putState({ jobs: [...before, job, { ...job, notes: 'accidental client-side dup' }], _partial: true });
+  ok(res.status !== 200, 'save with a duplicate id inside the incoming array is rejected', JSON.stringify(res.body));
+
+  const finalState = await getState();
+  ok(finalState.data.jobs.length === beforeCount, 'nothing was written — job count unchanged', String(finalState.data.jobs.length));
+  ok(!idsOf(finalState.data.jobs).has(String(job.id)), 'the duplicated job was not partially written either');
+}
+
+// T (req. E) — Duplicate ids already sitting in EXISTING data (simulated
+// legacy corruption predating this fix), carried forward by an UNRELATED,
+// correctly-shaped additive save that never mentions those ids at all. This
+// proves the backstop is independent of the merge implementation: the merge
+// here is doing exactly what it's supposed to (preserving untouched
+// existing records) — the corruption is pre-existing, not caused by this
+// save — and the backstop must still refuse to persist it.
+async function scenarioT_duplicateIdsFromPreexistingCorruptionHardBlocked() {
+  console.log('\n[Scenario T] (req. E) Duplicate ids already present in EXISTING data, preserved by an unrelated additive save — hard blocked');
+  const { Client } = await import('pg');
+  const pgClient = new Client({ connectionString: DB_URL });
+  await pgClient.connect();
+  let cur: { data: any; updated_at: string | null } | null = null;
+  try {
+    cur = await getState();
+    const corruptJob = makeNumericJob({ client: 'Legacy Corrupt' });
+    const corruptedJobs = [...(cur.data.jobs || []), corruptJob, { ...corruptJob }];
+    await pgClient.query(
+      `UPDATE platform_state SET data = jsonb_set(data, '{jobs}', $1::jsonb) WHERE id = 1`,
+      [JSON.stringify(corruptedJobs)]
+    );
+
+    const beforeUnrelated = await getState();
+    ok(idsOf(beforeUnrelated.data.jobs).size < beforeUnrelated.data.jobs.length, 'setup: DB now genuinely contains a duplicate id (simulated legacy corruption)', String(beforeUnrelated.data.jobs.length));
+
+    const unrelated = makeNumericJob({ client: 'Unrelated T' });
+    const res = await putState({ jobs: [unrelated], _partial: true });
+    ok(res.status !== 200, 'unrelated additive save that would carry forward a pre-existing duplicate id is blocked', JSON.stringify(res.body));
+
+    const afterState = await getState();
+    ok(!idsOf(afterState.data.jobs).has(String(unrelated.id)), 'the unrelated new job was NOT written either — the whole save aborted');
+    ok(afterState.data.jobs.length === corruptedJobs.length, 'the corrupted state itself is unchanged (save aborted before any write)', String(afterState.data.jobs.length));
+  } finally {
+    // This scenario deliberately injects a duplicate-id corruption directly
+    // via SQL (bypassing the API entirely) to prove the backstop is
+    // independent of the merge. That corruption must NOT leak into every
+    // scenario that runs after this one against the same persistent test
+    // DB — restore the pre-corruption jobs array here, regardless of
+    // whether the assertions above passed or failed.
+    if (cur) {
+      await pgClient.query(
+        `UPDATE platform_state SET data = jsonb_set(data, '{jobs}', $1::jsonb) WHERE id = 1`,
+        [JSON.stringify(cur.data.jobs || [])]
+      );
+    }
+    await pgClient.end();
+  }
+}
+
+// U (req. F) — Explicit delete of one numeric-id job — final = existing - 1,
+// no duplication side-effect.
+async function scenarioU_explicitDeleteOfOneNumericJob() {
+  console.log('\n[Scenario U] (req. F) Explicit delete of one numeric-id job — final = existing - 1, no duplication side-effect');
+  const start = await getState();
+  const beforeJobs = start.data.jobs || [];
+  const batch = Array.from({ length: 6 }, () => makeNumericJob({ client: 'Batch U' }));
+  await putState({ jobs: [...beforeJobs, ...batch], _partial: true });
+  const seeded = await getState();
+  const totalBefore = seeded.data.jobs.length;
+
+  const target = batch[0];
+  const jobsWithoutTarget = seeded.data.jobs.filter((j: any) => String(j.id) !== String(target.id));
+  const del = await putState({
+    ...seeded.data,
+    jobs: jobsWithoutTarget,
+    _deletedIds: { jobs: [target.id] },
+    _baseRevision: seeded.updated_at,
+  });
+  ok(del.status === 200, 'explicit delete of one numeric-id job succeeds', JSON.stringify(del.body));
+
+  const finalState = await getState();
+  ok(finalState.data.jobs.length === totalBefore - 1, `job count is exactly one less (${totalBefore - 1})`, String(finalState.data.jobs.length));
+  ok(!idsOf(finalState.data.jobs).has(String(target.id)), 'the deleted job is actually gone');
+  ok(idsOf(finalState.data.jobs).size === finalState.data.jobs.length, 'no id duplicated by the delete save');
+}
+
+// V (req. G) — Stale full-save payload (mergeAndSave shape) — a newer
+// session's unrelated records survive, and nothing is duplicated.
+async function scenarioV_staleFullSavePayloadNeverDuplicatesOrDropsNewer() {
+  console.log('\n[Scenario V] (req. G) Stale full-save payload — newer unrelated records survive, nothing duplicated');
+  const start = await getState();
+  const beforeJobs = start.data.jobs || [];
+  const aBatch = Array.from({ length: 8 }, () => makeNumericJob({ client: 'Session A (stale)' }));
+  await putState({ jobs: [...beforeJobs, ...aBatch], _partial: true });
+  const aBaseline = await getState(); // "Session A" captures its full snapshot here
+
+  const bBatch = Array.from({ length: 4 }, () => makeNumericJob({ client: 'Session B (newer)' }));
+  await putState({ jobs: [...aBaseline.data.jobs, ...bBatch], _partial: true });
+  const afterB = await getState();
+
+  // Session A performs a FULL save (mergeAndSave shape) built from its
+  // STALE snapshot — one of its OWN jobs edited — excluding B's jobs
+  // entirely, with no _deletedIds at all.
+  const staleEdited = aBaseline.data.jobs.map((j: any) => (String(j.id) === String(aBatch[0].id) ? { ...j, notes: 'stale session edit' } : j));
+  const res = await putState({ ...aBaseline.data, jobs: staleEdited });
+  ok(res.status === 200, 'stale full-state save is accepted', JSON.stringify(res.body));
+
+  const finalState = await getState();
+  const finalIds = idsOf(finalState.data.jobs);
+  ok(bBatch.every((j: any) => finalIds.has(String(j.id))), 'Session B\'s newer jobs all survive the stale save', JSON.stringify(bBatch.map((j: any) => j.id).filter((id: any) => !finalIds.has(String(id)))));
+  ok(idsOf(finalState.data.jobs).size === finalState.data.jobs.length, 'no id was duplicated by the stale save');
+  ok(finalState.data.jobs.length === afterB.data.jobs.length, `job count unchanged from before the stale save (${afterB.data.jobs.length})`, String(finalState.data.jobs.length));
+}
+
+// W (req. H) — Wipe guard remains fully active after BOTH post-deploy
+// fixes: a deliberately destructive explicit bulk-delete is still blocked.
+async function scenarioW_wipeGuardStillBlocksRealDestructiveLossAfterBothFixes() {
+  console.log('\n[Scenario W] (req. H) Wipe guard still blocks a genuinely destructive explicit bulk-delete, after both post-deploy fixes');
+  const seeded = await getState();
+  const currentJobs = Array.isArray(seeded.data.jobs) ? seeded.data.jobs : [];
+  const deleteCount = Math.ceil(currentJobs.length * 0.85);
+  const toDelete = currentJobs.slice(0, deleteCount).map((j: any) => j.id);
+  const survivors = currentJobs.filter((j: any) => !toDelete.map(String).includes(String(j.id)));
+  ok(survivors.length <= currentJobs.length * 0.2, 'setup: this deletion is genuinely a >80% loss', `${survivors.length}/${currentJobs.length}`);
+
+  const res = await putState({
+    ...seeded.data,
+    jobs: survivors,
+    _deletedIds: { jobs: toDelete },
+    _baseRevision: seeded.updated_at,
+  });
+  ok(res.status === 409, 'deliberately destructive bulk-delete is still blocked', JSON.stringify(res.body));
+
+  const finalState = await getState();
+  const finalIds = idsOf(finalState.data.jobs);
+  ok(toDelete.every((id: any) => finalIds.has(String(id))), 'none of the targeted jobs were removed — blocked save wrote nothing');
+  ok(idsOf(finalState.data.jobs).size === finalState.data.jobs.length, 'no duplication side effect either');
+}
+
 async function main() {
   await login();
   console.log(`[hardening-stress] Logged in. Target: ${BASE}. DB: ${DB_URL.replace(/:[^:@]*@/, ':***@')}`);
@@ -582,6 +835,14 @@ async function main() {
   await scenarioM_staleFilteredTabCannotDestroyNewerRecords();
   await scenarioN_explicitDeletionAtScaleStillWorks();
   await scenarioO_wipeGuardStillBlocksDeliberateDestruction();
+  await scenarioP_fullSaveSameIdsNeverDuplicates();
+  await scenarioQ_partialSaveFiveExistingEditsNeverDuplicates();
+  await scenarioR_newNumericJobAddsExactlyOne();
+  await scenarioS_duplicateIdsInIncomingHardBlocked();
+  await scenarioT_duplicateIdsFromPreexistingCorruptionHardBlocked();
+  await scenarioU_explicitDeleteOfOneNumericJob();
+  await scenarioV_staleFullSavePayloadNeverDuplicatesOrDropsNewer();
+  await scenarioW_wipeGuardStillBlocksRealDestructiveLossAfterBothFixes();
 
   console.log(`\n${'='.repeat(60)}\n${passed} passed, ${failures} failed\n${'='.repeat(60)}`);
   process.exit(failures > 0 ? 1 : 0);

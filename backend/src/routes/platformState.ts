@@ -367,6 +367,39 @@ function assertNoUnexplainedRemovals(
   }
 }
 
+// ── Server-side backstop 2 (2026-08-20 post-deploy, duplication incident) ─
+// Independent of the merge implementation above by design: even if a FUTURE
+// bug (in this merge, or any other code path that ever writes to a
+// PROTECTED_SECTIONS array) produces a duplicate id, this refuses to
+// persist it — a duplicate-id bug fails CLOSED (save blocked, nothing
+// written) instead of silently doubling records. This is exactly the class
+// of incident being closed here: a Set/string-vs-number id-comparison
+// mismatch in the merge filter (see the fix above) caused every existing
+// job to be treated as "not already in incoming" and re-appended, taking
+// the live jobs collection from 111 records to 222 (111 exact duplicate
+// pairs, same id, same job number, every field identical) after one normal
+// job save. This check does not know or care why a duplicate might exist —
+// it only guarantees one can never be written.
+function assertNoDuplicateIds(finalData: Record<string, any>): void {
+  for (const key of PROTECTED_SECTIONS) {
+    const list = arr(finalData[key]);
+    if (list.length === 0) continue;
+    const seen = new Set<string>();
+    const dupes = new Set<string>();
+    for (const rec of list) {
+      if (!rec || rec.id === undefined || rec.id === null) continue;
+      const id = String(rec.id);
+      if (seen.has(id)) dupes.add(id);
+      else seen.add(id);
+    }
+    if (dupes.size > 0) {
+      throw new Error(
+        `SAFETY BACKSTOP TRIPPED: "${key}" would persist duplicate id(s) [${[...dupes].join(', ')}] — save aborted, nothing written. This indicates a bug in the merge logic (or another code path) producing more than one record for the same stable id, not a normal rejection.`
+      );
+    }
+  }
+}
+
 // GET /api/platform-state — returns { data, updated_at } (updated_at also
 // serves as the revision token for optimistic-concurrency checks on PUT).
 router.get('/', async (_req: Request, res: Response): Promise<void> => {
@@ -481,7 +514,22 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
 
       const incomingIds = idsOf(incoming);
       const deleted = resolvedDeletedIdsBySection[key] || new Set<string>();
-      const preserved = existingList.filter((x: any) => x && !incomingIds.has(x.id) && !deleted.has(String(x.id)));
+      // 2026-08-20 POST-DEPLOY FIX #2 (duplication incident): `incomingIds`
+      // is a Set<string> (idsOf() stringifies every id). This filter used to
+      // test `!incomingIds.has(x.id)` — comparing the SET's string keys
+      // against `x.id` in its RAW type. When ids are JS numbers (they are —
+      // job/quote/etc ids are `Date.now()`-style numeric values), a number
+      // never strict-equals its own string form (`1786972817796 !==
+      // "1786972817796"`), so `.has(x.id)` was FALSE for every existing
+      // record — even ones genuinely present in `incoming` — and the "not
+      // already in incoming" filter therefore kept EVERY existing record,
+      // every time. A normal full-state save (existing ids === incoming
+      // ids) produced `data[key] = [...incoming(111), ...preserved(111)]` =
+      // 222 records, each id duplicated exactly once — precisely the
+      // production incident (222 jobs / 111 unique ids / 111 exact-duplicate
+      // pairs). Fix: stringify `x.id` the same way `incomingIds` was built,
+      // so both sides of the comparison use the same type.
+      const preserved = existingList.filter((x: any) => x && !incomingIds.has(String(x.id)) && !deleted.has(String(x.id)));
       if (preserved.length) {
         data[key] = [...incoming, ...preserved];
       }
@@ -567,6 +615,7 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
     // ── Mechanical backstop — proves the merge above did what it claims.
     try {
       assertNoUnexplainedRemovals(existingData, finalData, resolvedDeletedIdsBySection);
+      assertNoDuplicateIds(finalData);
     } catch (backstopErr) {
       await client.query('ROLLBACK').catch(() => undefined);
       console.error(`[platform-state] SAFETY BACKSTOP TRIPPED ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'}:`, backstopErr);
