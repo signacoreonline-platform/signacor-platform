@@ -386,6 +386,183 @@ async function scenarioI_reproduceHistoricalBugShape() {
   ok(survived, 'Session B\'s jobs SURVIVE even the exact historical bug-shaped request (this is the core proof)', `missing: ${JSON.stringify(bJobs.map(j=>j.id).filter(id=>!finalIds.has(String(id))))}`);
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// 2026-08-20 POST-DEPLOY FIX — Scenarios J–O
+// ══════════════════════════════════════════════════════════════════════
+// Added after a live production report: an ordinary single-job text edit
+// was rejected by detectWipe() with "would drop ... (over 80% loss)". Root
+// cause (proven, see platformState.ts's "POST-DEPLOY FIX" comment on the
+// merge loop): detectWipe() was evaluating the RAW pre-merge payload rather
+// than the post-merge result, so ANY save that legitimately sends fewer
+// records than currently exist for a protected section — which the
+// "purely additive" partial-save design explicitly allows — looked like a
+// catastrophic wipe even though the merge would have safely preserved
+// every untouched record. None of Scenarios A–I above ever had >=10
+// existing records in a CRITICAL_KEYS section, so this exact interaction
+// was structurally invisible to the suite until now — these scenarios
+// close that coverage gap at production-realistic scale (100+ jobs).
+function seedJobs(n: number, over: (i: number) => Partial<any> = () => ({})): any[] {
+  return Array.from({ length: n }, (_, i) => makeJob({ client: `Seed ${i}`, ...over(i) }));
+}
+
+// J — Server has 100+ jobs, current user's view only shows/sends a handful.
+// Editing ONE of those visible jobs via a small additive partial save must
+// only change that job — all 100+ server jobs must remain.
+async function scenarioJ_partialSaveOfFewJobsAgainstLargeServerSet() {
+  console.log('\n[Scenario J] Server has 100+ jobs, partial save sends only a handful (e.g. a filtered UI view) — all others must survive');
+  const start = await getState();
+  const existingJobs = Array.isArray(start.data.jobs) ? start.data.jobs : [];
+  const bulk = seedJobs(100);
+  await putState({ jobs: [...existingJobs, ...bulk], _partial: true });
+  const seeded = await getState();
+  const totalBefore = idsOf(seeded.data.jobs).size;
+  ok(totalBefore >= existingJobs.length + 100, 'setup: 100+ jobs now live', String(totalBefore));
+
+  // Simulate a UI that only knows about / sends 5 of those jobs (e.g. one
+  // page of a filtered list), editing exactly one of them.
+  const visibleFive = bulk.slice(0, 5).map((j: any, i: number) => (i === 0 ? { ...j, notes: 'edited via small partial save' } : j));
+  const res = await putState({ jobs: visibleFive, _partial: true });
+  ok(res.status === 200, 'small partial save (5 of 100+ jobs) is NOT blocked as a wipe', JSON.stringify(res.body));
+
+  const finalState = await getState();
+  const diff = assertOnlyExpectedChanges(seeded.data.jobs, finalState.data.jobs, [], []);
+  ok(diff.unexpectedRemoved.length === 0, 'no job was unexpectedly removed', JSON.stringify(diff.unexpectedRemoved));
+  ok(idsOf(finalState.data.jobs).size === totalBefore, 'total job count is unchanged', `${idsOf(finalState.data.jobs).size} vs ${totalBefore}`);
+  const edited = finalState.data.jobs.find((j: any) => String(j.id) === String(bulk[0].id));
+  ok(!!edited && edited.notes === 'edited via small partial save', 'the one edited job actually carries the edit');
+}
+
+// K — Company-filtered job view: editing one job belonging to company '1'
+// via a save that only mentions company '1' jobs must never touch company
+// '2' jobs.
+async function scenarioK_companyFilteredViewNeverTouchesOtherCompany() {
+  console.log('\n[Scenario K] Company-filtered job view — editing one job must never touch another company\'s jobs');
+  const start = await getState();
+  const existingJobs = Array.isArray(start.data.jobs) ? start.data.jobs : [];
+  const co1Jobs = seedJobs(60, () => ({ co: '1' }));
+  const co2Jobs = seedJobs(15, () => ({ co: '2' }));
+  await putState({ jobs: [...existingJobs, ...co1Jobs, ...co2Jobs], _partial: true });
+
+  // "Company 1 view" save: sends ONLY company 1's jobs (a realistic shape
+  // for a company-scoped save), with one edited.
+  const co1View = co1Jobs.map((j: any, i: number) => (i === 0 ? { ...j, notes: 'co1 edit' } : j));
+  const res = await putState({ jobs: co1View, _partial: true });
+  ok(res.status === 200, 'company-scoped partial save is not blocked', JSON.stringify(res.body));
+
+  const finalState = await getState();
+  const finalIds = idsOf(finalState.data.jobs);
+  ok(co2Jobs.every((j: any) => finalIds.has(String(j.id))), 'every company-2 job survives a company-1-only save', JSON.stringify(co2Jobs.map((j: any) => j.id).filter((id: any) => !finalIds.has(String(id)))));
+  ok(co1Jobs.every((j: any) => finalIds.has(String(j.id))), 'every company-1 job survives too (none dropped)');
+}
+
+// L — Status-filtered view: editing one WIP job via a save that only
+// mentions WIP-status jobs must never touch Completed jobs outside that
+// filter.
+async function scenarioL_statusFilteredViewNeverTouchesOtherStatus() {
+  console.log('\n[Scenario L] Status-filtered view — editing one WIP job must never touch Completed jobs');
+  const start = await getState();
+  const existingJobs = Array.isArray(start.data.jobs) ? start.data.jobs : [];
+  const wipJobs = seedJobs(11, () => ({ status: 'in_production' }));
+  const completedJobs = seedJobs(81, () => ({ status: 'complete' }));
+  await putState({ jobs: [...existingJobs, ...wipJobs, ...completedJobs], _partial: true });
+
+  // "Work In Progress" tab save: sends only the WIP-status jobs, one edited.
+  const wipView = wipJobs.map((j: any, i: number) => (i === 0 ? { ...j, notes: 'wip edit' } : j));
+  const res = await putState({ jobs: wipView, _partial: true });
+  ok(res.status === 200, 'status-scoped partial save (11 of 92) is not blocked', JSON.stringify(res.body));
+
+  const finalState = await getState();
+  const finalIds = idsOf(finalState.data.jobs);
+  ok(completedJobs.every((j: any) => finalIds.has(String(j.id))), 'every Completed job survives a WIP-only save', JSON.stringify(completedJobs.map((j: any) => j.id).filter((id: any) => !finalIds.has(String(id)))));
+}
+
+// M — Stale tab + filtered view combined: an old/stale session that only
+// ever knew about a small filtered slice of jobs performs a partial save;
+// a DIFFERENT, newer session's brand-new jobs (created in between) must
+// still survive.
+async function scenarioM_staleFilteredTabCannotDestroyNewerRecords() {
+  console.log('\n[Scenario M] Stale tab + filtered view — newer session\'s jobs survive a stale filtered-view save');
+  const start = await getState();
+  const existingJobs = Array.isArray(start.data.jobs) ? start.data.jobs : [];
+  const staleFilteredView = seedJobs(5, () => ({ co: '4' })); // "Session A" only ever knew these 5
+  await putState({ jobs: [...existingJobs, ...staleFilteredView], _partial: true });
+
+  // "Session B" (newer) creates fresh jobs Session A's filtered view never knew about.
+  const afterSeed = await getState();
+  const bJobs = seedJobs(3, () => ({ co: '2', client: 'Session B (newer)' }));
+  await putState({ jobs: [...(afterSeed.data.jobs || []), ...bJobs], _partial: true });
+
+  // Session A, still only aware of its original 5-job filtered view, edits one and saves.
+  const staleEdit = staleFilteredView.map((j: any, i: number) => (i === 0 ? { ...j, notes: 'stale session edit' } : j));
+  const res = await putState({ jobs: staleEdit, _partial: true });
+  ok(res.status === 200, 'stale filtered-view save is not blocked', JSON.stringify(res.body));
+
+  const finalState = await getState();
+  const finalIds = idsOf(finalState.data.jobs);
+  ok(bJobs.every((j: any) => finalIds.has(String(j.id))), 'Session B\'s newer jobs survive Session A\'s stale filtered-view save', JSON.stringify(bJobs.map((j: any) => j.id).filter((id: any) => !finalIds.has(String(id)))));
+}
+
+// N — Explicit real deletion at production scale still works, and ONLY via
+// the explicit _deletedIds mechanism — the fix to detectWipe's evaluation
+// order must not accidentally block (or accidentally allow via omission) a
+// normal, small, legitimate deletion.
+async function scenarioN_explicitDeletionAtScaleStillWorks() {
+  console.log('\n[Scenario N] Explicit real job deletion at scale — still works ONLY via the explicit mechanism');
+  const start = await getState();
+  const existingJobs = Array.isArray(start.data.jobs) ? start.data.jobs : [];
+  const bulk = seedJobs(50);
+  await putState({ jobs: [...existingJobs, ...bulk], _partial: true });
+  const seeded = await getState();
+
+  const target = bulk[0];
+  const jobsWithoutTarget = seeded.data.jobs.filter((j: any) => String(j.id) !== String(target.id));
+  const del = await putState({
+    ...seeded.data,
+    jobs: jobsWithoutTarget,
+    _deletedIds: { jobs: [target.id] },
+    _baseRevision: seeded.updated_at,
+  });
+  ok(del.status === 200, 'explicit single-job deletion at scale succeeds', JSON.stringify(del.body));
+  const finalState = await getState();
+  const finalIds = idsOf(finalState.data.jobs);
+  ok(!finalIds.has(String(target.id)), 'the explicitly-deleted job is actually gone');
+  ok(bulk.slice(1).every((j: any) => finalIds.has(String(j.id))), 'every OTHER seeded job survives — deletion touched only the named id');
+}
+
+// O — The wipe guard remains fully active: a deliberately destructive
+// request (an EXPLICIT bulk deletion removing the vast majority of a
+// section) must still be blocked. This is the direct check that the
+// detectWipe fix did not weaken the guard — it only corrected what the
+// guard measures.
+async function scenarioO_wipeGuardStillBlocksDeliberateDestruction() {
+  console.log('\n[Scenario O] Wipe guard remains active — blocks a deliberately destructive explicit bulk-delete request');
+  const seeded = await getState();
+  const currentJobs = Array.isArray(seeded.data.jobs) ? seeded.data.jobs : [];
+  // By this point in the suite, `jobs` has accumulated a large amount from
+  // every prior scenario — delete a fraction of the CURRENT total (not a
+  // fixed count) so this reliably exceeds the 80%-loss threshold regardless
+  // of exactly how much has accumulated before this scenario runs.
+  const deleteCount = Math.ceil(currentJobs.length * 0.85);
+  const toDelete = currentJobs.slice(0, deleteCount).map((j: any) => j.id);
+  const survivors = currentJobs.filter((j: any) => !toDelete.map(String).includes(String(j.id)));
+  ok(survivors.length <= currentJobs.length * 0.2, 'setup: this deletion is genuinely a >80% loss', `${survivors.length}/${currentJobs.length}`);
+
+  // A legitimate-shaped request (real _deletedIds, real _baseRevision) but
+  // one whose scale should still trip the coarse wipe guard as a
+  // belt-and-suspenders check on top of the id-level mechanisms.
+  const res = await putState({
+    ...seeded.data,
+    jobs: survivors,
+    _deletedIds: { jobs: toDelete },
+    _baseRevision: seeded.updated_at,
+  });
+  ok(res.status === 409, 'a deliberately destructive explicit bulk-delete is still blocked by the wipe guard', JSON.stringify(res.body));
+
+  const finalState = await getState();
+  const finalIds = idsOf(finalState.data.jobs);
+  ok(toDelete.every((id: any) => finalIds.has(String(id))), 'none of the targeted jobs were actually removed — the blocked save wrote nothing');
+}
+
 async function main() {
   await login();
   console.log(`[hardening-stress] Logged in. Target: ${BASE}. DB: ${DB_URL.replace(/:[^:@]*@/, ':***@')}`);
@@ -399,6 +576,12 @@ async function main() {
   await scenarioG_concurrentReservationsUnique();
   await scenarioH_oldTabCannotDestroyNewerRecords();
   await scenarioI_reproduceHistoricalBugShape();
+  await scenarioJ_partialSaveOfFewJobsAgainstLargeServerSet();
+  await scenarioK_companyFilteredViewNeverTouchesOtherCompany();
+  await scenarioL_statusFilteredViewNeverTouchesOtherStatus();
+  await scenarioM_staleFilteredTabCannotDestroyNewerRecords();
+  await scenarioN_explicitDeletionAtScaleStillWorks();
+  await scenarioO_wipeGuardStillBlocksDeliberateDestruction();
 
   console.log(`\n${'='.repeat(60)}\n${passed} passed, ${failures} failed\n${'='.repeat(60)}`);
   process.exit(failures > 0 ? 1 : 0);

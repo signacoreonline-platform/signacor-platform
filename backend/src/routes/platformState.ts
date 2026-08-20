@@ -439,18 +439,6 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
     const existingData: Record<string, any> | null = existingRes.rowCount ? (existingRes.rows[0].data || {}) : null;
     const existingUpdatedAt: string | null = existingRes.rowCount ? existingRes.rows[0].updated_at : null;
 
-    // ── Save protection: block obvious wipe/partial/empty saves ──────────
-    const wipeReason = detectWipe(existingData, data, isPartial);
-    if (wipeReason) {
-      await client.query('ROLLBACK');
-      console.warn(`[platform-state] BLOCKED (wipe guard) ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'} role=${auditMeta.userRole ?? '—'} reason="${wipeReason}"`);
-      res.status(409).json({
-        error: 'Save blocked to protect existing data',
-        reason: wipeReason,
-      });
-      return;
-    }
-
     // ── Resolve explicit deletions PER SECTION now (needed for both the
     //    merge below and the revision-conflict decision). ─────────────────
     const resolvedDeletedIdsBySection: Record<string, Set<string>> = {};
@@ -461,9 +449,69 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
     const anyExplicitDeletion = Object.values(resolvedDeletedIdsBySection).some((s) => s.size > 0);
     const totalDeleteCount = Object.values(resolvedDeletedIdsBySection).reduce((n, s) => n + s.size, 0);
 
+    // ── Union-merge every protected section present in this save
+    //    (2026-08-20 hardening — replaces the old separate creditNotes
+    //    block and MERGE_SECTIONS loop with one explicit-delete-aware
+    //    formula; see header comment for the full rationale).
+    //
+    //    2026-08-20 POST-DEPLOY FIX: this merge now runs BEFORE detectWipe()
+    //    (previously it ran after). detectWipe() must judge what will
+    //    ACTUALLY be persisted, not the raw pre-merge payload — otherwise a
+    //    genuinely safe, purely-additive partial save (e.g. `{jobs:
+    //    [oneEditedJob], _partial:true}`, exactly what savePartialSectionsNow
+    //    is documented to send) looks like a catastrophic wipe to detectWipe
+    //    even though the merge immediately below would have preserved every
+    //    untouched record. Confirmed reproducible: a 2-job additive partial
+    //    save against a 92-job baseline was rejected with "would drop from
+    //    92 record(s) to 2 (over 80% loss)" even though the post-merge
+    //    result is a full, correct 92-job set. See
+    //    backend/test/hardening.stress.ts Scenarios J–K for the regression
+    //    coverage this closes (100+ server jobs / company-filtered view /
+    //    status-filtered view all editing safely; explicit deletion and the
+    //    wipe guard itself remain fully enforced). ─────────────────────────
+    for (const key of PROTECTED_SECTIONS) {
+      if (!Array.isArray(data[key])) continue; // section not part of this save — leave untouched
+      const incoming = data[key];
+      const existingList = arr(existingData && existingData[key]);
+      if (existingList.length === 0) continue; // nothing live to protect for this section
+
+      const idsOk = incoming.every((x: any) => x && x.id !== undefined && x.id !== null)
+                 && existingList.every((x: any) => x && x.id !== undefined && x.id !== null);
+      if (!idsOk) continue; // cannot safely id-merge — saved as sent, no extra protection this time
+
+      const incomingIds = idsOf(incoming);
+      const deleted = resolvedDeletedIdsBySection[key] || new Set<string>();
+      const preserved = existingList.filter((x: any) => x && !incomingIds.has(x.id) && !deleted.has(String(x.id)));
+      if (preserved.length) {
+        data[key] = [...incoming, ...preserved];
+      }
+      // else: nothing to add back — incoming already covers everything that survives
+    }
+
+    const finalData = isPartial ? { ...(existingData || {}), ...data } : data;
+
+    // ── Save protection: block obvious wipe/partial/empty saves ──────────
+    // Evaluates `finalData` (POST-merge) rather than the raw incoming `data`
+    // — see the fix note on the merge loop above for why. For a section that
+    // could NOT be safely id-merged above (missing ids) or had nothing
+    // existing to protect, finalData[key] is identical to the raw incoming
+    // array, so this guard's behavior for those cases — the scenarios it was
+    // originally written for — is completely unchanged; it only becomes more
+    // accurate for the normal, id-mergeable case.
+    const wipeReason = detectWipe(existingData, finalData, isPartial);
+    if (wipeReason) {
+      await client.query('ROLLBACK');
+      console.warn(`[platform-state] BLOCKED (wipe guard) ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'} role=${auditMeta.userRole ?? '—'} reason="${wipeReason}"`);
+      res.status(409).json({
+        error: 'Save blocked to protect existing data',
+        reason: wipeReason,
+      });
+      return;
+    }
+
     // ── Revision / optimistic-concurrency check (2026-08-20 hardening,
     //    Part 4) — scoped ONLY to saves that carry an explicit deletion.
-    //    Additive-only saves can never destroy data (see merge below) so
+    //    Additive-only saves can never destroy data (see merge above) so
     //    they are never blocked here, regardless of revision drift — this
     //    keeps ordinary concurrent work from ever hitting a conflict loop.
     if (anyExplicitDeletion && baseRevision && existingUpdatedAt) {
@@ -515,31 +563,6 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
         console.warn('platform_state_backups retention prune skipped:', pruneErr);
       }
     }
-
-    // ── Union-merge every protected section present in this save
-    //    (2026-08-20 hardening — replaces the old separate creditNotes
-    //    block and MERGE_SECTIONS loop with one explicit-delete-aware
-    //    formula; see header comment for the full rationale). ─────────────
-    for (const key of PROTECTED_SECTIONS) {
-      if (!Array.isArray(data[key])) continue; // section not part of this save — leave untouched
-      const incoming = data[key];
-      const existingList = arr(existingData && existingData[key]);
-      if (existingList.length === 0) continue; // nothing live to protect for this section
-
-      const idsOk = incoming.every((x: any) => x && x.id !== undefined && x.id !== null)
-                 && existingList.every((x: any) => x && x.id !== undefined && x.id !== null);
-      if (!idsOk) continue; // cannot safely id-merge — saved as sent, no extra protection this time
-
-      const incomingIds = idsOf(incoming);
-      const deleted = resolvedDeletedIdsBySection[key] || new Set<string>();
-      const preserved = existingList.filter((x: any) => x && !incomingIds.has(x.id) && !deleted.has(String(x.id)));
-      if (preserved.length) {
-        data[key] = [...incoming, ...preserved];
-      }
-      // else: nothing to add back — incoming already covers everything that survives
-    }
-
-    const finalData = isPartial ? { ...(existingData || {}), ...data } : data;
 
     // ── Mechanical backstop — proves the merge above did what it claims.
     try {
