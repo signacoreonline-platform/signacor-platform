@@ -203,55 +203,139 @@ interface SectionMergeResult {
   error?: string;
 }
 
+// 2026-08-20 THIRD HARDENING PASS: step 1 used to fail the WHOLE save the
+// instant a section's EXISTING data held any duplicate id — even when the
+// incoming payload never touched that id at all. Confirmed live (repro
+// script) as the exact cause of "harmless edit blocked": mergeAndSave's
+// full-array compatibility path re-sends every section it thinks changed,
+// UNTOUCHED, byte-identical — including `customers`/`quickRates`, which
+// carry the intentionally-preserved historical id collisions (1 group / 27
+// groups) from the reconstruction. Re-sending those sections VERBATIM
+// alongside an edited job tripped the old "server already has a duplicate"
+// guard for the whole request, blocking a job edit that never went near a
+// colliding id.
+//
+// FIX — relative, per-id semantics, not a section-wide flag: a pre-existing
+// duplicate id group (>1 record sharing an id, already true in
+// `existingList` before this save) is treated as a frozen, opaque unit.
+//   - Not mentioned by `incoming` at all -> passed through UNCHANGED, every
+//     copy preserved exactly (this is what "harmless, unrelated edit"
+//     produces — allowed).
+//   - Mentioned by `incoming` in any way (an id-merge only has room for ONE
+//     record per id, so touching an ambiguous multi-copy id can never
+//     unambiguously mean "keep both, but here's an edit to one of them") ->
+//     BLOCKED — this is exactly "changed membership" / "changed content
+//     within an ambiguous group", which must still hard-block. Guessing
+//     which copy the caller meant is exactly what must not happen.
+//   - Listed in `_deletedIds` -> the ENTIRE group is removed. Deleting a
+//     whole ambiguous group is unambiguous (no copy is kept, so there is
+//     nothing to guess) and is the one explicit way to resolve one of these
+//     historical collisions going forward.
+// A NORMAL (non-duplicated) id keeps the exact same Map-upsert semantics as
+// before. No new duplicate id (id not already duplicated pre-save) can ever
+// be created this way — that is still caught by the incoming-side
+// validation immediately below, unchanged.
+// Two id-groups are an "exact, faithful resend" of each other when they
+// contain the same MULTISET of record content — same count, same set of
+// distinct copies with the same multiplicity each. This is what a
+// mergeAndSave-shaped full save naturally produces when it re-sends a
+// pre-existing duplicate group it never touched: every copy it fetched,
+// unchanged, in whatever order. Order is deliberately ignored (sort both
+// sides' content strings before comparing) — order is not meaningful here
+// and must never be treated as "membership changed".
+function isExactGroupResend(a: any[], b: any[]): boolean {
+  if (a.length !== b.length) return false;
+  const as = a.map(stableStringify).sort();
+  const bs = b.map(stableStringify).sort();
+  return as.every((s, i) => s === bs[i]);
+}
+
 function mergeSectionById(key: string, incoming: any[], existingList: any[], deletedIds: Set<string>): SectionMergeResult {
-  // 1. Validate SERVER (existing) input first.
-  const serverSeen = new Set<string>();
+  // 1. Validate SERVER (existing) input first — only for missing ids.
+  //    Duplicate ids are grouped and handled per-id below, not rejected
+  //    outright (see the header comment above this function).
+  const existingGroups = new Map<string, any[]>();
   for (const rec of existingList) {
     if (!rec || rec.id === undefined || rec.id === null) {
       return { finalList: [], hasGenuineUpdate: false, error: `server "${key}" contains a record with no stable id — cannot safely merge` };
     }
     const id = String(rec.id);
-    if (serverSeen.has(id)) {
-      return { finalList: [], hasGenuineUpdate: false, error: `server "${key}" already contains duplicate id "${id}" — ordinary saves to this section are blocked until that pre-existing collision is resolved separately (never auto-collapsed)` };
-    }
-    serverSeen.add(id);
+    if (!existingGroups.has(id)) existingGroups.set(id, []);
+    existingGroups.get(id)!.push(rec);
   }
 
-  // 2. Validate INCOMING input.
-  const incomingSeen = new Set<string>();
+  // 2. Validate INCOMING input — same treatment: group by id rather than
+  //    rejecting on sight, because the full-array compatibility path
+  //    faithfully re-sends an untouched pre-existing duplicate group AS
+  //    MULTIPLE RECORDS SHARING AN ID (that's the only way to losslessly
+  //    represent "I didn't touch this, here's what I have"). Only a group
+  //    that ISN'T an exact resend of what the server already has is
+  //    rejected (steps 3–4 below) — a genuinely NEW multi-copy id (one the
+  //    server did not already have as a duplicate) is always rejected,
+  //    since there is nothing for it to "faithfully match".
+  const incomingGroups = new Map<string, any[]>();
   for (const rec of incoming) {
     if (!rec || rec.id === undefined || rec.id === null) {
       return { finalList: [], hasGenuineUpdate: false, error: `incoming "${key}" contains a record with no stable id — save blocked` };
     }
     const id = String(rec.id);
-    if (incomingSeen.has(id)) {
-      return { finalList: [], hasGenuineUpdate: false, error: `incoming "${key}" contains duplicate id "${id}" — save blocked` };
-    }
-    incomingSeen.add(id);
+    if (!incomingGroups.has(id)) incomingGroups.set(id, []);
+    incomingGroups.get(id)!.push(rec);
   }
 
-  // 3. resultById = server records keyed by String(id).
-  const resultById = new Map<string, any>(existingList.map((r) => [String(r.id), r]));
-
-  // 4. Apply only the intended record changes.
+  const finalList: any[] = [];
   let hasGenuineUpdate = false;
-  for (const rec of incoming) {
-    const id = String(rec.id);
-    const prior = resultById.get(id);
-    if (prior === undefined) {
-      resultById.set(id, rec); // create — always safe, nothing to conflict with
-    } else if (stableStringify(prior) !== stableStringify(rec)) {
-      hasGenuineUpdate = true; // genuine edit to a record that already exists
-      resultById.set(id, rec);
+  const allIds = new Set<string>([...existingGroups.keys(), ...incomingGroups.keys()]);
+
+  for (const id of allIds) {
+    if (deletedIds.has(id)) continue; // explicit delete — whole group removed, unambiguous
+
+    const existingGroup = existingGroups.get(id) || [];
+    const incomingGroup = incomingGroups.get(id) || [];
+
+    if (existingGroup.length <= 1 && incomingGroup.length <= 1) {
+      // Normal, non-duplicated id — exact same Map-upsert semantics as
+      // the very first version of this function.
+      const prior = existingGroup[0];
+      const incomingRec = incomingGroup[0];
+      if (incomingRec === undefined) {
+        finalList.push(prior); // not mentioned — preserved
+      } else if (prior === undefined) {
+        finalList.push(incomingRec); // create — always safe
+      } else if (stableStringify(prior) !== stableStringify(incomingRec)) {
+        hasGenuineUpdate = true;
+        finalList.push(incomingRec);
+      } else {
+        finalList.push(incomingRec); // byte-identical re-send — harmless no-op
+      }
+      continue;
     }
-    // else: byte-identical to what the server already has — harmless no-op
+
+    if (existingGroup.length > 1 && incomingGroup.length === 0) {
+      finalList.push(...existingGroup); // untouched pre-existing group — preserved exactly
+      continue;
+    }
+
+    if (existingGroup.length > 1 && isExactGroupResend(existingGroup, incomingGroup)) {
+      finalList.push(...existingGroup); // faithful, unchanged resend of the whole group — allowed
+      continue;
+    }
+
+    // Anything else touching a multi-copy id: a genuinely NEW duplicate
+    // group (existingGroup.length <= 1, incomingGroup.length > 1), or an
+    // existing ambiguous group whose incoming copies don't exactly match
+    // (fewer/more copies, or different content) — always blocked. Guessing
+    // which copy is intended, or silently accepting a NEW collision, is
+    // exactly what must never happen.
+    return {
+      finalList: [], hasGenuineUpdate: false,
+      error: existingGroup.length > 1
+        ? `incoming "${key}" touches id "${id}" (${existingGroup.length} distinct pre-existing copies server-side) with a payload that isn't an exact, unchanged resend of that group — cannot safely resolve which copy is intended (this historical collision must be resolved separately, not guessed at)`
+        : `incoming "${key}" contains ${incomingGroup.length} records sharing id "${id}", which the server does not already have as a pre-existing collision — save blocked (new duplicate-id corruption)`,
+    };
   }
 
-  // 5. Apply only explicit deletions.
-  for (const id of deletedIds) resultById.delete(id);
-
-  // 6. finalArray.
-  return { finalList: Array.from(resultById.values()), hasGenuineUpdate };
+  return { finalList, hasGenuineUpdate };
 }
 
 // Counts records per `co` (company) tag, for sections that carry one

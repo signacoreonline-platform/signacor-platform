@@ -703,15 +703,21 @@ async function scenarioS_duplicateIdsInIncomingHardBlocked() {
   ok(!idsOf(finalState.data.jobs).has(String(job.id)), 'the duplicated job was not partially written either');
 }
 
-// T (req. E) — Duplicate ids already sitting in EXISTING data (simulated
-// legacy corruption predating this fix), carried forward by an UNRELATED,
-// correctly-shaped additive save that never mentions those ids at all. This
-// proves the backstop is independent of the merge implementation: the merge
-// here is doing exactly what it's supposed to (preserving untouched
-// existing records) — the corruption is pre-existing, not caused by this
-// save — and the backstop must still refuse to persist it.
+// T (req. E, REVISED 2026-08-20 THIRD HARDENING PASS) — Duplicate ids
+// already sitting in EXISTING data (simulated legacy corruption predating
+// this fix). This scenario originally asserted that ANY save touching a
+// section containing such corruption — even one that never mentions the
+// corrupted id at all — was hard blocked. That was the exact section-wide,
+// non-relative check that caused the live production incident this pass
+// fixes (it fired on ordinary customers/quickRates historical-duplicate
+// resends). The corrected, intentional behavior is RELATIVE per-id
+// integrity: an unrelated save that never touches the corrupted id must
+// succeed, and the untouched corrupt group must survive EXACTLY as it was
+// (never silently deduplicated/resolved) — while any save that actually
+// touches that id with something other than an exact, faithful resend of
+// the whole group must still be hard blocked. Both halves are verified here.
 async function scenarioT_duplicateIdsFromPreexistingCorruptionHardBlocked() {
-  console.log('\n[Scenario T] (req. E) Duplicate ids already present in EXISTING data, preserved by an unrelated additive save — hard blocked');
+  console.log('\n[Scenario T] (req. E, revised) Duplicate ids already present in EXISTING data: an unrelated save succeeds & leaves the corrupt group untouched; a save that actually touches the corrupted id non-faithfully is still hard blocked');
   const { Client } = await import('pg');
   const pgClient = new Client({ connectionString: DB_URL });
   await pgClient.connect();
@@ -728,13 +734,28 @@ async function scenarioT_duplicateIdsFromPreexistingCorruptionHardBlocked() {
     const beforeUnrelated = await getState();
     ok(idsOf(beforeUnrelated.data.jobs).size < beforeUnrelated.data.jobs.length, 'setup: DB now genuinely contains a duplicate id (simulated legacy corruption)', String(beforeUnrelated.data.jobs.length));
 
+    // T1 — an unrelated additive save that never mentions the corrupted id
+    // must succeed, and the pre-existing corrupt pair must survive exactly
+    // as-is (same relative-integrity rule that fixes the production bug).
     const unrelated = makeNumericJob({ client: 'Unrelated T' });
-    const res = await putState({ jobs: [unrelated], _partial: true });
-    ok(res.status !== 200, 'unrelated additive save that would carry forward a pre-existing duplicate id is blocked', JSON.stringify(res.body));
+    const res1 = await putState({ jobs: [unrelated], _partial: true });
+    ok(res1.status === 200, 'unrelated additive save that never touches the pre-existing duplicate id succeeds', JSON.stringify(res1.body));
 
-    const afterState = await getState();
-    ok(!idsOf(afterState.data.jobs).has(String(unrelated.id)), 'the unrelated new job was NOT written either — the whole save aborted');
-    ok(afterState.data.jobs.length === corruptedJobs.length, 'the corrupted state itself is unchanged (save aborted before any write)', String(afterState.data.jobs.length));
+    const afterUnrelated = await getState();
+    ok(idsOf(afterUnrelated.data.jobs).has(String(unrelated.id)), 'the unrelated new job WAS written');
+    const corruptCountAfterUnrelated = afterUnrelated.data.jobs.filter((j: any) => String(j.id) === String(corruptJob.id)).length;
+    ok(corruptCountAfterUnrelated === 2, 'the pre-existing corrupt duplicate pair still has exactly 2 copies — preserved untouched, never silently deduplicated', String(corruptCountAfterUnrelated));
+
+    // T2 — a save that actually TOUCHES the corrupted id with a payload that
+    // is NOT an exact, faithful resend of the whole group (here: only one of
+    // the two copies, edited) must still be hard blocked.
+    const partialTouch = { ...corruptJob, client: 'Attempted Edit' };
+    const res2 = await putState({ jobs: [partialTouch], _partial: true });
+    ok(res2.status !== 200, 'a save that touches the corrupted id with a non-faithful (partial/changed) payload is still hard blocked', JSON.stringify(res2.body));
+
+    const afterTouch = await getState();
+    const stillOriginalPair = afterTouch.data.jobs.filter((j: any) => String(j.id) === String(corruptJob.id) && j.client === 'Legacy Corrupt').length;
+    ok(stillOriginalPair === 2, 'the corrupted pair is still exactly as it was — the blocked save wrote nothing', String(stillOriginalPair));
   } finally {
     // This scenario deliberately injects a duplicate-id corruption directly
     // via SQL (bypassing the API entirely) to prove the backstop is
@@ -912,6 +933,116 @@ function scenarioY_negativeControlOldAlgorithmDoubles() {
   ok(newResult.length === 111, 'NEW Map-merge algorithm: 111 existing + 111 incoming (same ids) stays 111', String(newResult.length));
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// 2026-08-20 THIRD HARDENING PASS — "harmless edit blocked" regression
+// ══════════════════════════════════════════════════════════════════════
+// Reproduces the exact guard that fired live: mergeSectionById's server-
+// side duplicate check used to fail the WHOLE save the instant a section's
+// EXISTING data held any duplicate id — even when the incoming payload
+// never touched that id. A mergeAndSave-shaped full save re-sends every
+// section it believes changed, VERBATIM — including `customers`/
+// `quickRates`, which carry INTENTIONALLY-preserved historical duplicate-id
+// groups from the platform_state reconstruction. Helper below seeds that
+// exact shape: clean jobs (via the normal API) + a customers/quickRates
+// duplicate group injected directly via SQL (the only way such a group can
+// exist — the hardened API itself correctly refuses to ever CREATE one).
+async function seedCleanBaselineWithHistoricalDuplicates() {
+  const { Client } = await import('pg');
+  const pgClient = new Client({ connectionString: DB_URL });
+  await pgClient.connect();
+  try {
+    const jobs = Array.from({ length: 5 }, () => makeNumericJob({ client: 'Clean Job' }));
+    await putState({ jobs, _partial: true });
+    const dupCustomerId = numUid();
+    const customers = [
+      { id: numUid(), name: 'Normal Customer' },
+      { id: dupCustomerId, name: 'Variant A' },
+      { id: dupCustomerId, name: 'Variant B' }, // pre-existing 1-group collision
+    ];
+    const dupQuickRateId = numUid();
+    const quickRates = [
+      { id: dupQuickRateId, rate: 100 },
+      { id: dupQuickRateId, rate: 200 }, // pre-existing collision group
+    ];
+    await pgClient.query(
+      `UPDATE platform_state SET data = data || jsonb_build_object('customers', $1::jsonb, 'quickRates', $2::jsonb) WHERE id = 1`,
+      [JSON.stringify(customers), JSON.stringify(quickRates)]
+    );
+    return { jobs, dupCustomerId, dupQuickRateId, customers, quickRates };
+  } finally {
+    await pgClient.end();
+  }
+}
+
+// AA — Clean baseline WITH historical duplicate groups + a harmless,
+// unrelated job edit sent via the mergeAndSave full-array shape (every
+// section re-sent verbatim) → must SUCCEED, the edit must persist, and
+// every unrelated record (including both historical duplicate groups, in
+// full) must survive completely unchanged. This is the exact live failure.
+async function scenarioAA_harmlessEditWithHistoricalDuplicatesSucceeds() {
+  console.log('\n[Scenario AA] (3rd pass, repro #1) Clean baseline + historical dup groups + harmless job edit — must succeed, nothing lost');
+  const { jobs, dupCustomerId, dupQuickRateId } = await seedCleanBaselineWithHistoricalDuplicates();
+  const seeded = await getState();
+
+  const editedJobs = seeded.data.jobs.map((j: any) => (String(j.id) === String(jobs[0].id) ? { ...j, notes: 'harmless edit' } : j));
+  const res = await putState({ ...seeded.data, jobs: editedJobs, _baseRevision: seeded.updated_at });
+  ok(res.status === 200, 'harmless job edit (full-save shape, untouched dup sections re-sent verbatim) succeeds', JSON.stringify(res.body));
+
+  const finalState = await getState();
+  const editedJob = finalState.data.jobs.find((j: any) => String(j.id) === String(jobs[0].id));
+  ok(!!editedJob && editedJob.notes === 'harmless edit', 'the job edit persisted');
+  const finalCustomerCount = finalState.data.customers.filter((c: any) => String(c.id) === String(dupCustomerId)).length;
+  const finalQuickRateCount = finalState.data.quickRates.filter((q: any) => String(q.id) === String(dupQuickRateId)).length;
+  ok(finalCustomerCount === 2, 'the pre-existing customers duplicate group (2 copies) survives completely untouched', String(finalCustomerCount));
+  ok(finalQuickRateCount === 2, 'the pre-existing quickRates duplicate group (2 copies) survives completely untouched', String(finalQuickRateCount));
+}
+
+// BB — A brand-new duplicate-id group (an id the server did NOT already
+// have as a duplicate) must still hard-block, even after the AA fix.
+async function scenarioBB_newDuplicateGroupStillBlocked() {
+  console.log('\n[Scenario BB] (3rd pass, repro #2) A NEW duplicate-id group (not pre-existing) is still hard-blocked');
+  await seedCleanBaselineWithHistoricalDuplicates();
+  const seeded = await getState();
+  const freshId = numUid();
+  const res = await putState({
+    ...seeded.data,
+    jobs: [...seeded.data.jobs, { ...makeNumericJob(), id: freshId }, { ...makeNumericJob(), id: freshId }],
+    _baseRevision: seeded.updated_at,
+  });
+  ok(res.status !== 200, 'a save introducing a brand-new duplicate id is blocked', JSON.stringify(res.body));
+  const finalState = await getState();
+  ok(finalState.data.jobs.length === seeded.data.jobs.length, 'nothing was written — job count unchanged', String(finalState.data.jobs.length));
+}
+
+// CC — Worsening an existing historical duplicate group (adding a 3rd
+// copy under an already-duplicated id) must still hard-block.
+async function scenarioCC_worsenedHistoricalGroupBlocked() {
+  console.log('\n[Scenario CC] (3rd pass, repro #3) Worsening a pre-existing duplicate group (2 -> 3 copies) is blocked');
+  const { dupCustomerId, customers } = await seedCleanBaselineWithHistoricalDuplicates();
+  const seeded = await getState();
+  const worsened = [...seeded.data.customers, { id: dupCustomerId, name: 'Variant C (new, worsens it)' }];
+  const res = await putState({ ...seeded.data, customers: worsened, _baseRevision: seeded.updated_at });
+  ok(res.status !== 200, 'a save that would grow a pre-existing duplicate group from 2 to 3 copies is blocked', JSON.stringify(res.body));
+  const finalState = await getState();
+  const finalCount = finalState.data.customers.filter((c: any) => String(c.id) === String(dupCustomerId)).length;
+  ok(finalCount === customers.filter((c: any) => c.id === dupCustomerId).length, 'the group is still exactly its original size — nothing written', String(finalCount));
+}
+
+// DD — Modifying (not just adding to) one copy inside an ambiguous
+// historical duplicate group must still hard-block — the payload is no
+// longer an exact, faithful resend of that group.
+async function scenarioDD_modifiedAmbiguousCopyBlocked() {
+  console.log('\n[Scenario DD] (3rd pass, repro #4) Modifying one copy of a pre-existing duplicate group is blocked');
+  const { dupQuickRateId } = await seedCleanBaselineWithHistoricalDuplicates();
+  const seeded = await getState();
+  const modified = seeded.data.quickRates.map((q: any, i: number) => (String(q.id) === String(dupQuickRateId) && i === 0 ? { ...q, rate: 999 } : q));
+  const res = await putState({ ...seeded.data, quickRates: modified, _baseRevision: seeded.updated_at });
+  ok(res.status !== 200, 'a save that edits one copy of an ambiguous pre-existing group is blocked', JSON.stringify(res.body));
+  const finalState = await getState();
+  const stillOriginal = finalState.data.quickRates.filter((q: any) => String(q.id) === String(dupQuickRateId) && q.rate === 999).length;
+  ok(stillOriginal === 0, 'the modified-rate copy was never written', String(stillOriginal));
+}
+
 async function main() {
   await login();
   console.log(`[hardening-stress] Logged in. Target: ${BASE}. DB: ${DB_URL.replace(/:[^:@]*@/, ':***@')}`);
@@ -941,6 +1072,14 @@ async function main() {
   await scenarioW_wipeGuardStillBlocksRealDestructiveLossAfterBothFixes();
   await scenarioX_sameRecordConflictNeverSilentlyReverted();
   scenarioY_negativeControlOldAlgorithmDoubles();
+
+  // 2026-08-20 THIRD HARDENING PASS — reproduces & fixes the live
+  // "harmless edit blocked" regression (relative, per-id duplicate-group
+  // integrity instead of a section-wide fail-closed check).
+  await scenarioAA_harmlessEditWithHistoricalDuplicatesSucceeds();
+  await scenarioBB_newDuplicateGroupStillBlocked();
+  await scenarioCC_worsenedHistoricalGroupBlocked();
+  await scenarioDD_modifiedAmbiguousCopyBlocked();
 
   // req. B repeated 10x: full save of the SAME ids back (one re-edited each
   // time) must stay at the same count every single time — never creep up.
