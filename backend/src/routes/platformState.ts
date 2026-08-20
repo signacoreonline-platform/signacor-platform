@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { query } from '../db/pool';
 import pool from '../db/pool';
-import { authenticate } from '../middleware/auth';
+import { authenticate, AuthRequest } from '../middleware/auth';
 
 /**
  * /api/platform-state
@@ -17,58 +17,126 @@ import { authenticate } from '../middleware/auth';
  * ── Authentication (added 2026-08-06, audit finding B1) ──────────────────
  * Both GET and PUT below now require a valid, backend-issued JWT
  * (`Authorization: Bearer <token>`, verified by `authenticate` — see
- * backend/src/middleware/auth.ts). Previously this endpoint had no
- * authentication at all: since it holds every job/quote/invoice/payment/
- * customer/supplier record for both companies, plus (until this same change)
- * login credentials, it was readable and writable by anyone with the URL —
- * which is not a secret, it's hard-coded in index.html. Tokens are obtained
- * from POST /api/auth/login, which now checks a real backend `app_users`
- * table instead of data stored inside this endpoint's own payload. Nothing
- * about the save/merge/backup/wipe-guard logic below this line was changed.
+ * backend/src/middleware/auth.ts).
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 2026-08-20 DATA-SAFETY HARDENING — EXPLICIT-DELETE MERGE MODEL
+ * ══════════════════════════════════════════════════════════════════════
+ *
+ * ROOT CAUSE BEING CLOSED: the previous merge design inferred a delete from
+ * OMISSION — "this id was in `_knownSectionIds`/`_knownCreditNoteIds` but is
+ * absent from the incoming array" was treated as "the client knew about it
+ * and chose to delete it." That inference is only trustworthy if the
+ * `_knownSectionIds` sent with a given save were captured at EXACTLY the
+ * same moment as the array it accompanies. On the partial-save path
+ * (savePartialSectionsNow / forceSaveSections), `_knownSectionIds` was
+ * historically read from `serverBaselineRef.current` fresh at send time,
+ * while the array itself could have been built earlier from stale
+ * closure-captured React state (see index.html for the frontend half of
+ * this fix). When a poll or another confirmed save advanced the baseline
+ * in between, the backend saw "known id, omitted" for a record the payload
+ * never actually knew about — and deleted it. Confirmed as the mechanism
+ * behind SNS-00120–124 (and others) vanishing after being restored live —
+ * reproduced exactly by backend/test/hardening.stress.ts Scenario I against
+ * the pre-hardening version of this file (fails there, passes here).
+ *
+ * NEW RULE — deletion is never inferred from omission. It is enforced ONLY
+ * from an explicit, caller-declared list:
+ *
+ *   data._deletedIds = { jobs: [id, id, ...], quotes: [...], ... }
+ *
+ * For every PROTECTED_SECTION present in `data`, the merge is:
+ *   finalList = incoming records (by id; incoming always wins for a given
+ *               id — this is how edits/creates take effect)
+ *             + existing records whose id is NOT in incoming
+ *               AND NOT in _deletedIds[key]           (preserved)
+ *   (existing records whose id IS in _deletedIds[key] are dropped, even if
+ *    the incoming payload also happens to include them — an explicit
+ *    delete always wins)
+ *
+ * A section a caller never mentions at all (partial save omits the whole
+ * key) is untouched, exactly as before. A section a caller DOES send, but
+ * with some ids simply missing and NOT listed in `_deletedIds`, no longer
+ * loses those ids — they are preserved. This makes the merge safe
+ * regardless of how stale the array a caller sent was: staleness can now
+ * only cause a save to "not know about" a record (which is always the safe
+ * direction — the record survives), never to delete one it didn't intend to.
+ *
+ * The OLD `_knownSectionIds`/`_knownCreditNoteIds`-vs-incoming inference is
+ * deliberately NOT kept as a "backward-compatible" fallback — that
+ * inference IS the vulnerability. Those legacy fields are still accepted
+ * and stripped from the payload (so an old cached browser tab never gets a
+ * hard error) but never acted on. See resolveDeletedIds() below for the
+ * full rationale — in short, this makes the failure mode of a not-yet-
+ * updated client fail SAFE (a delete that doesn't take effect until reload)
+ * rather than fail dangerously (a delete that removes the wrong thing).
+ *
+ * SERVER-SIDE BACKSTOP: after computing the merged result for every
+ * protected section, `assertNoUnexplainedRemovals()` re-derives which ids
+ * vanished and throws (failing the whole save, before any write) if any
+ * vanished id is not accounted for by that section's resolved deletedIds.
+ * This should be structurally unreachable given the merge formula above —
+ * it exists as a mechanical, code-level proof that no save path in this
+ * file can silently drop a record, not just a claim.
+ *
+ * REVISION / OPTIMISTIC CONCURRENCY: a save that carries any explicit
+ * deletion (resolvedDeletedIds non-empty for at least one section) may
+ * optionally include `data._baseRevision` (the `updated_at` value the
+ * caller last fetched). If provided and it no longer matches the CURRENT
+ * live `updated_at` (read after the row lock below), the save is rejected
+ * with a structured 409 conflict instead of proceeding — a deletion must
+ * never be applied against a server state newer than what the caller
+ * actually saw. Saves with no explicit deletions are never blocked by this
+ * check (they cannot destroy data under the merge formula above, so
+ * blocking them would only cost availability for no safety benefit — and
+ * risks the "endless retry loop" the hardening brief explicitly warns
+ * against).
  */
 const router = Router();
 router.use(authenticate);
 
-/**
- * ── Backup-before-save + wipe protection ─────────────────────────────
- *
- * Added 2026-07-14 after confirmed loss of June/July business data.
- *
- * Every PUT below now:
- *   1. Locks the platform_state row and reads what is CURRENTLY live.
- *   2. Runs detectWipe() to reject payloads that look like an accidental
- *      wipe/partial/filtered/empty save relative to what's live right now.
- *   3. Inserts the CURRENT (pre-overwrite) state into platform_state_backups.
- *      If that insert fails, the whole PUT is rolled back and fails —
- *      the live row is never overwritten without a successful backup first.
- *   4. Only then performs the existing UPSERT.
- *
- * None of this changes what gets stored in platform_state.data or how
- * company/role filtering works — it only guards the write path.
- */
-
 // Every array-type section persisted inside platform_state.data (mirrors
-// STATE_SECTIONS in the frontend's index.html).
+// STATE_SECTIONS in the frontend's index.html). `userAccounts` was missing
+// from this list before the 2026-08-20 hardening pass even though the
+// frontend has always saved it — it had NO wipe/merge protection at all.
 const STATE_ARRAY_KEYS = [
   'jobs', 'inventory', 'quotes', 'customers', 'suppliers', 'assets',
   'employees', 'leaveRequests', 'disciplinary', 'savedCalcs', 'purchaseOrders',
   'savedImports', 'bankTxns', 'chartOfAccounts', 'accInvoices', 'accBills',
   'completeProducts', 'payrollRecords', 'quickRates', 'proposedProjects', 'creditNotes',
+  'userAccounts',
 ];
 
 // Sections whose sudden loss is most consequential for the business — used
-// for the "obvious wipe" guard. Smaller/optional lists are intentionally left
-// out so trimming them never trips the guard.
-// `proposedProjects` (the "📌 Proposed Projects" notes on the Jobs page) was
-// added 2026-07-27 after a report that notes typed there don't reliably
-// stick — this section previously had no wipe protection at all, so a stale
-// client save (e.g. an old browser tab syncing after being left open) could
-// silently overwrite newer notes with nothing blocking it, unlike every
-// other section here.
-const CRITICAL_KEYS = ['jobs', 'customers', 'suppliers', 'inventory', 'quotes', 'accInvoices', 'accBills', 'creditNotes', 'proposedProjects'];
+// for the "obvious wipe" guard (detectWipe). `userAccounts` added
+// 2026-08-20 — losing every login account is exactly the kind of thing this
+// guard exists to catch.
+const CRITICAL_KEYS = ['jobs', 'customers', 'suppliers', 'inventory', 'quotes', 'accInvoices', 'accBills', 'creditNotes', 'proposedProjects', 'userAccounts'];
+
+// Sections that get id-based merge protection (2026-08-20: generalized to
+// EVERY section from Part 3 of the hardening brief — jobs, quotes,
+// customers, purchaseOrders, accInvoices, creditNotes, inventory,
+// suppliers, proposedProjects, userAccounts — plus the pre-existing extras
+// (accBills, quickRates, employees, leaveRequests, disciplinary), which is
+// a superset and therefore strictly more protective. `creditNotes` no
+// longer needs its own separate code path — see the header comment above,
+// this generalized mechanism now handles it identically.
+const PROTECTED_SECTIONS = [
+  'jobs', 'quotes', 'customers', 'suppliers', 'inventory',
+  'accInvoices', 'accBills', 'purchaseOrders', 'quickRates', 'employees',
+  'leaveRequests', 'disciplinary', 'creditNotes', 'proposedProjects', 'userAccounts',
+];
 
 function arr(v: unknown): any[] {
   return Array.isArray(v) ? v : [];
+}
+
+function idsOf(list: any[]): Set<string> {
+  const s = new Set<string>();
+  for (const rec of list) {
+    if (rec && rec.id !== undefined && rec.id !== null) s.add(String(rec.id));
+  }
+  return s;
 }
 
 // Counts records per `co` (company) tag, for sections that carry one
@@ -95,20 +163,9 @@ function buildRecordCounts(data: Record<string, any>): Record<string, number> {
 // reason if it looks like it would wipe/partially-wipe existing data.
 // Deliberately conservative: small/normal edits and deletions must never
 // trip this guard — only clearly-accidental full/partial wipes should.
-//
-// `isPartial` (added 2026-08-04 for the Convert-to-Job payload-size hotfix):
-// true only for saves explicitly marked `data._partial` — i.e. the caller
-// intentionally sent just a few sections (e.g. {jobs, quotes}) instead of
-// the whole platform state, because the omitted sections (customers,
-// accInvoices, etc.) genuinely weren't touched and will be preserved
-// unchanged from the live row (see the partial-merge block below). For
-// those saves, a critical key being entirely ABSENT from the payload is
-// expected and must never trip the "missing from payload" wipe check — that
-// check exists to catch a FULL-state save that accidentally dropped a
-// section, which is a different situation. Every other check (a key that
-// IS present dropping to zero, or dropping >80%, or losing a whole
-// company's slice) still applies exactly as before, for any key the
-// payload actually includes — a partial save is not exempt from those.
+// This is a SEPARATE, coarser-grained guard from the id-level merge below —
+// it catches whole-array wipes even in sections/shapes the id-merge can't
+// safely reason about (e.g. records with no stable id).
 function detectWipe(existingData: Record<string, any> | null, incomingData: any, isPartial: boolean = false): string | null {
   if (!existingData || typeof existingData !== 'object' || Object.keys(existingData).length === 0) {
     return null; // nothing live yet to protect — first-ever save, allow it
@@ -117,10 +174,6 @@ function detectWipe(existingData: Record<string, any> | null, incomingData: any,
     return 'incoming payload is not a valid state object';
   }
 
-  // Whole-state shape check: if the live data clearly has real records in it,
-  // an incoming payload with NONE of the expected sections present as arrays
-  // looks like an empty/default/broken state, not a real edit. Skipped for
-  // partial saves, which are allowed to include only one or two sections.
   if (!isPartial) {
     const existingHasData = STATE_ARRAY_KEYS.some((k) => arr(existingData[k]).length > 0);
     const incomingHasAnySection = STATE_ARRAY_KEYS.some((k) => Array.isArray(incomingData[k]));
@@ -135,30 +188,16 @@ function detectWipe(existingData: Record<string, any> | null, incomingData: any,
     const incomingIsArray = Array.isArray(incomingData[k]);
     const incomingLen = incomingIsArray ? incomingData[k].length : 0;
 
-    // A previously-populated critical section missing entirely from the
-    // payload (not even sent as an empty array) is always suspicious for a
-    // full-state save — but expected/intentional for a partial save, whose
-    // omitted sections are preserved from the live row, not wiped.
     if (!isPartial && existingLen >= 3 && !incomingIsArray) {
       return `"${k}" is missing from the incoming payload (currently has ${existingLen} record(s))`;
     }
-    // The remaining checks only make sense for a key the payload actually
-    // included — for a partial save, a key that's simply absent (not sent
-    // as an array at all) was never a candidate to compare lengths against;
-    // it's preserved untouched below, not "dropped to 0".
     if (!incomingIsArray && isPartial) continue;
-    // Dropping to zero from a meaningful size.
     if (existingLen >= 5 && incomingLen === 0) {
       return `"${k}" would drop from ${existingLen} record(s) to 0`;
     }
-    // Dramatic drop (more than 80%) from a meaningful size — catches
-    // "invoices basically disappeared" without blocking small cleanups.
     if (existingLen >= 10 && incomingLen <= existingLen * 0.2) {
       return `"${k}" would drop from ${existingLen} record(s) to ${incomingLen} (over 80% loss)`;
     }
-    // One company's entire slice of a shared section vanishing while the
-    // section itself is not empty — e.g. a single-company filtered view
-    // saved as though it were the whole database.
     if (incomingIsArray && existingLen > 0) {
       const existingByCo = countByCo(existingList);
       const incomingByCo = countByCo(incomingData[k]);
@@ -172,54 +211,48 @@ function detectWipe(existingData: Record<string, any> | null, incomingData: any,
   return null;
 }
 
+// ── Explicit-delete resolution (2026-08-20 hardening) ─────────────────────
+// For a given section, returns the SET of ids this save is explicitly
+// deleting. ONLY the new `_deletedIds[key]` field can ever cause a
+// deletion — the caller states its intent directly, which is trustworthy
+// regardless of any baseline timing, because it does not depend on
+// comparing two possibly-mismatched snapshots at all.
+//
+// Deliberately NOT falling back to the OLD `_knownSectionIds`/
+// `_knownCreditNoteIds`-vs-incoming inference: that inference is exactly
+// the mechanism this hardening pass closes (see the file header). Keeping
+// it as a "backward-compatible" fallback would keep the vulnerability
+// alive for any caller — old, new, or future — that ever sends those
+// legacy fields with a baseline captured at a different moment than the
+// array it accompanies, which is precisely the failure mode already
+// confirmed in production. The legacy fields are still accepted and
+// stripped from the payload below (so an old cached browser tab does not
+// get a hard error), they are just never acted on. The practical effect
+// during a rollout is fail-SAFE, not fail-silent-unsafe: an old tab's own
+// deletes (e.g. deleteJob) stop taking effect until it reloads and picks
+// up the paired frontend change (see index.html), rather than risking
+// deleting the wrong thing. A record that fails to delete is always
+// recoverable by trying again after a reload; a record wrongly deleted is
+// not.
+function resolveDeletedIds(
+  key: string,
+  explicitDeletedIds: Record<string, any[]> | null
+): Set<string> {
+  if (explicitDeletedIds && Array.isArray(explicitDeletedIds[key])) {
+    return new Set(explicitDeletedIds[key].map((x) => String(x)));
+  }
+  return new Set();
+}
+
 // ── New-record validation: co presence + no NEW duplicate numbers ────────
-// (2026-08-18, production stabilisation, Section 14)
-//
-// This is an ADDITIVE, forward-only guard: it only ever inspects records
-// that are NEW in this save (their `id` was not present in the currently
-// live section array) and only ever blocks the save outright (409) when a
-// NEW record would either omit `co` or collide on its document number with
-// another record. It never inspects, flags, or rejects anything about
-// records that already existed before this save — historical duplicates
-// and historical missing-co records (several confirmed by the production
-// integrity audit) are left completely alone and remain exactly as they
-// are today; this can never reject a save for something that was already
-// true before the save arrived.
-//
-// This exists as defense-in-depth alongside (not instead of) the
-// frontend's own checks (quoteNumberExists/invoiceNumberExists, the
-// co-from-auth-context fixes) and the atomic /document-numbers and
-// /quote-conversions reservation endpoints — per the stabilisation brief,
-// no invariant like this should rely solely on the frontend, since nothing
-// stops a stale/buggy/future client from calling this endpoint directly.
-//
-// Scope is intentionally narrow: `num`/`number` on the four sections whose
-// numbering scheme is already fully understood and backend-reserved
-// (quotes, jobs, purchaseOrders, accInvoices). It deliberately does NOT
-// also cross-check the invoice-number ALIASES living on other sections
-// (job.invoiceNum, quote.proformaNum) — the frontend's existing
-// invoiceNumberExists() already covers that at creation time, and
-// replicating its exact cross-section logic here risks producing false
-// rejections of legitimate saves without a much deeper re-verification
-// pass than this stabilisation change warrants. This is a deliberate
-// scoping decision (documented in the final report), not an oversight.
-//
-// Number-collision scoping matches how each section's numbers are actually
-// reserved (see documentNumbers.ts): quotes and accInvoices are reserved
-// PER COMPANY, so two different companies legitimately sharing the same
-// number string is not a duplicate — only a collision within the SAME `co`
-// is checked. jobs and purchaseOrders are reserved from one GLOBAL
-// sequence, so any collision regardless of `co` is checked.
+// (2026-08-18, production stabilisation, Section 14 — unchanged by this
+// pass except where noted)
 const NUMBER_CHECK_SECTIONS: Array<{ key: string; field: string; scopeByCo: boolean }> = [
   { key: 'quotes',         field: 'num',    scopeByCo: true  },
   { key: 'accInvoices',    field: 'number', scopeByCo: true  },
   { key: 'jobs',           field: 'num',    scopeByCo: false },
   { key: 'purchaseOrders', field: 'num',    scopeByCo: false },
 ];
-// Sections where every NEW record is expected to carry a company tag from
-// here on, matching the frontend fixes made in this same pass (co always
-// taken from the logged-in user's own company context, never a
-// hardcoded/blank fallback).
 const CO_REQUIRED_SECTIONS = ['quotes', 'jobs', 'purchaseOrders', 'accInvoices'];
 
 function newRecordValidationError(existingData: Record<string, any> | null, finalData: Record<string, any>): string | null {
@@ -229,7 +262,7 @@ function newRecordValidationError(existingData: Record<string, any> | null, fina
     const existingIds = new Set(arr(existingData && existingData[key]).map((x: any) => x && x.id));
     for (const rec of finalList) {
       if (!rec || rec.id === undefined || rec.id === null) continue;
-      if (existingIds.has(rec.id)) continue; // pre-existing record — never inspected
+      if (existingIds.has(rec.id)) continue;
       if (rec.co === undefined || rec.co === null || rec.co === '') {
         return `a new "${key}" record (id ${rec.id}) is missing its company (co) — save blocked to prevent an orphaned/company-1-default record`;
       }
@@ -249,36 +282,93 @@ function newRecordValidationError(existingData: Record<string, any> | null, fina
       return scopeByCo ? `${String(rec.co)}::${norm}` : norm;
     };
 
-    // Group the post-save records by normalized number (+ co, if scoped).
     const groups = new Map<string, any[]>();
     for (const rec of finalList) {
       if (!rec) continue;
       const gk = groupKeyOf(rec);
-      if (gk === null) continue; // no number yet — not this guard's concern
+      if (gk === null) continue;
       if (!groups.has(gk)) groups.set(gk, []);
       groups.get(gk)!.push(rec);
     }
 
     for (const [groupKey, recs] of groups) {
-      if (recs.length < 2) continue; // no collision at all
+      if (recs.length < 2) continue;
       const anyNew = recs.some((r: any) => r.id !== undefined && r.id !== null && !existingIds.has(r.id));
-      if (!anyNew) continue; // collision is entirely between pre-existing records — historical, leave alone
+      if (!anyNew) continue;
 
-      // Was a collision this size (or larger) already present live before
-      // this save? If so, this save isn't introducing anything new here —
-      // never block it (e.g. two historical dupes plus an unrelated edit
-      // to one of them must still be allowed to save).
       const existingGroupCount = existingList.filter((r: any) => r && groupKeyOf(r) === groupKey).length;
-      if (existingGroupCount >= recs.length) continue; // not a NEW duplicate
+      if (existingGroupCount >= recs.length) continue;
 
       return `a new "${key}" record would duplicate document number "${recs[0][field]}"${scopeByCo ? ` for company "${recs[0].co}"` : ''} — save blocked to prevent a new duplicate`;
+    }
+  }
+
+  // ── 2026-08-20 hardening addition: duplicate conversion of one quote ────
+  // Blocks a save that would introduce TWO (or more) jobs claiming the SAME
+  // quoteNum, when at least one of those jobs is NEW in this save. Relative
+  // validation, same pattern as above: a pre-existing duplicate (historical
+  // corruption) is never blocked, only a save that WORSENS it.
+  {
+    const finalJobs = arr(finalData.jobs);
+    if (finalJobs.length > 0) {
+      const existingJobs = arr(existingData && existingData.jobs);
+      const existingJobIds = new Set(existingJobs.map((x: any) => x && x.id));
+      const groups = new Map<string, any[]>();
+      for (const j of finalJobs) {
+        if (!j || typeof j.quoteNum !== 'string' || !j.quoteNum.trim()) continue;
+        const gk = j.quoteNum.trim().toUpperCase();
+        if (!groups.has(gk)) groups.set(gk, []);
+        groups.get(gk)!.push(j);
+      }
+      for (const [quoteNum, recs] of groups) {
+        if (recs.length < 2) continue;
+        const anyNew = recs.some((r: any) => r.id !== undefined && r.id !== null && !existingJobIds.has(r.id));
+        if (!anyNew) continue;
+        const existingGroupCount = existingJobs.filter((r: any) => r && typeof r.quoteNum === 'string' && r.quoteNum.trim().toUpperCase() === quoteNum).length;
+        if (existingGroupCount >= recs.length) continue;
+        return `a new "jobs" record would duplicate the quote→job conversion for quote "${quoteNum}" (${recs.length} jobs would reference it) — save blocked to prevent a second job for one quote`;
+      }
     }
   }
 
   return null;
 }
 
-// GET /api/platform-state — returns { data: <jsonb>, updated_at: <iso> }
+// ── Server-side backstop (2026-08-20 hardening) ────────────────────────────
+// Mechanically proves the merge above never drops a record it didn't mean
+// to. For every protected section present in BOTH existingData and
+// finalData, any id that existed before and is absent afterward MUST be
+// present in that section's resolved deletedIds set — otherwise this
+// throws and the whole save is aborted before any write happens. This
+// should be unreachable given how finalData is built below; it exists as a
+// standing, testable guarantee rather than a claim.
+function assertNoUnexplainedRemovals(
+  existingData: Record<string, any> | null,
+  finalData: Record<string, any>,
+  resolvedDeletedIdsBySection: Record<string, Set<string>>
+): void {
+  if (!existingData) return;
+  for (const key of PROTECTED_SECTIONS) {
+    const existingList = arr(existingData[key]);
+    if (existingList.length === 0) continue;
+    const finalIds = idsOf(arr(finalData[key]));
+    const deleted = resolvedDeletedIdsBySection[key] || new Set<string>();
+    const unexplained: string[] = [];
+    for (const rec of existingList) {
+      if (!rec || rec.id === undefined || rec.id === null) continue;
+      const id = String(rec.id);
+      if (!finalIds.has(id) && !deleted.has(id)) unexplained.push(id);
+    }
+    if (unexplained.length > 0) {
+      throw new Error(
+        `SAFETY BACKSTOP TRIPPED: "${key}" would lose id(s) [${unexplained.join(', ')}] with no matching explicit delete — save aborted, nothing written. This indicates a bug in the merge logic itself, not a normal rejection.`
+      );
+    }
+  }
+}
+
+// GET /api/platform-state — returns { data, updated_at } (updated_at also
+// serves as the revision token for optimistic-concurrency checks on PUT).
 router.get('/', async (_req: Request, res: Response): Promise<void> => {
   try {
     const result = await query(
@@ -286,7 +376,6 @@ router.get('/', async (_req: Request, res: Response): Promise<void> => {
     );
 
     if (result.rowCount === 0) {
-      // No row yet — create the seed row and return empty data.
       await query(
         `INSERT INTO platform_state (id, data)
          VALUES (1, '{}'::jsonb)
@@ -305,88 +394,56 @@ router.get('/', async (_req: Request, res: Response): Promise<void> => {
 });
 
 // PUT /api/platform-state — body: { data: <any-json> }
-//
-// Every section of `data` is stored as a plain last-write-wins replace,
-// EXCEPT `creditNotes` and the sections listed in MERGE_SECTIONS below
-// (quotes, jobs, customers, suppliers, inventory, accInvoices, accBills,
-// purchaseOrders, quickRates, employees, leaveRequests, disciplinary),
-// which each get a small atomic id-based merge — see the two merge blocks
-// further down. Credit notes were the first, original case: a shared
-// financial record any logged-in role (Admin, Accounts, Assistant) can
-// create at any moment, and the frontend's optimistic save
-// flow (GET latest → merge locally → PUT full state) has an unavoidable
-// race: if two browsers/devices save around the same time, the second PUT
-// can be built from a GET that was issued before the first PUT committed,
-// so it silently overwrites the row with a creditNotes array that doesn't
-// yet include the other session's brand-new note. That is the confirmed
-// root cause of credit notes disappearing shortly after creation — no
-// amount of client-side merging fully closes it, because the frontend's
-// "freshest fetch" can still be stale relative to another session's
-// in-flight write. Locking this row for the duration of the transaction and
-// re-merging creditNotes against whatever is *actually* in the database
-// right now (not what some client fetched a moment ago) removes the race
-// entirely — concurrent PUTs simply queue on the row lock instead of racing.
-//
-// The optional `data._knownCreditNoteIds` array tells us which credit note
-// ids the saving client already knew about before this edit (its own last
-// sync point). A note id present in the CURRENT database row but absent
-// from both the incoming payload and `_knownCreditNoteIds` was added by a
-// different session since this client last synced, and must be preserved.
-// A note id the client used to know about but omitted from the incoming
-// array was a deliberate delete by that client and stays deleted. If the
-// caller omits `_knownCreditNoteIds` (older cached frontend, or any other
-// caller), we fail safe toward never losing data: everything currently
-// stored is preserved unless the incoming array already re-includes it.
-router.put('/', async (req: Request, res: Response): Promise<void> => {
+router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
   const body = req.body || {};
   if (!('data' in body)) {
     res.status(400).json({ error: 'Request body must include "data"' });
     return;
   }
 
+  const auditMeta = {
+    ts: new Date().toISOString(),
+    userId: req.user?.id ?? null,
+    userRole: req.user?.role ?? null,
+  };
+
   const client = await pool.connect();
   try {
     const data = { ...(body.data || {}) };
-    const knownCreditNoteIds = Array.isArray(data._knownCreditNoteIds) ? data._knownCreditNoteIds : null;
+
+    // Legacy fields from pre-2026-08-20 clients — accepted (so an old
+    // cached tab never gets a hard error) and stripped, but never acted on.
+    // See resolveDeletedIds()'s header comment for why they no longer
+    // influence deletion.
     delete data._knownCreditNoteIds;
-    // Generalized counterpart to _knownCreditNoteIds above — see the merge
-    // block near the bottom of this handler for what it's used for.
-    const knownSectionIds: Record<string, any[]> = (data._knownSectionIds && typeof data._knownSectionIds === 'object' && !Array.isArray(data._knownSectionIds))
-      ? data._knownSectionIds
-      : {};
     delete data._knownSectionIds;
-    // ── Partial save support (2026-08-04, Convert-to-Job payload-size hotfix) ──
-    // `data._partial === true` means the caller deliberately sent only some
-    // sections (e.g. {jobs, quotes}) instead of the full platform state — a
-    // full-state save's request body was hitting the ~5MB request-size limit
-    // once purchaseOrders/quotes grew large. Every section NOT present in a
-    // partial payload is preserved untouched from the live row (see the
-    // merge at the end of this handler) — it is never wiped, never
-    // implicitly emptied. Every existing protection (wipe guard, per-section
-    // id-based merge, backup-before-save) still applies in full to whichever
-    // sections the payload DOES include. Regular full-state saves (every
-    // existing caller — normal autosave, manual edits) are entirely
-    // unaffected: `isPartial` is false for them, and behaviour is identical
-    // to before this change.
+
+    // New, explicit deletion signal (2026-08-20 hardening).
+    const explicitDeletedIds: Record<string, any[]> | null =
+      (data._deletedIds && typeof data._deletedIds === 'object' && !Array.isArray(data._deletedIds))
+        ? data._deletedIds
+        : null;
+    delete data._deletedIds;
+
+    const baseRevision: string | null = typeof data._baseRevision === 'string' ? data._baseRevision : null;
+    delete data._baseRevision;
+
     const isPartial = data._partial === true;
     delete data._partial;
 
     await client.query('BEGIN');
 
-    // Row lock — any concurrent PUT to id=1 now waits for this transaction to
-    // commit before it can read/merge, instead of racing against it. This also
-    // gives us the "before" snapshot used for both the wipe check and the
-    // automatic backup below.
     const existingRes = await client.query(
-      'SELECT data FROM platform_state WHERE id = 1 FOR UPDATE'
+      'SELECT data, updated_at FROM platform_state WHERE id = 1 FOR UPDATE'
     );
     const existingData: Record<string, any> | null = existingRes.rowCount ? (existingRes.rows[0].data || {}) : null;
+    const existingUpdatedAt: string | null = existingRes.rowCount ? existingRes.rows[0].updated_at : null;
 
     // ── Save protection: block obvious wipe/partial/empty saves ──────────
     const wipeReason = detectWipe(existingData, data, isPartial);
     if (wipeReason) {
       await client.query('ROLLBACK');
-      console.warn('PUT /api/platform-state BLOCKED — possible data loss:', wipeReason);
+      console.warn(`[platform-state] BLOCKED (wipe guard) ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'} role=${auditMeta.userRole ?? '—'} reason="${wipeReason}"`);
       res.status(409).json({
         error: 'Save blocked to protect existing data',
         reason: wipeReason,
@@ -394,9 +451,40 @@ router.put('/', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    // ── Resolve explicit deletions PER SECTION now (needed for both the
+    //    merge below and the revision-conflict decision). ─────────────────
+    const resolvedDeletedIdsBySection: Record<string, Set<string>> = {};
+    for (const key of PROTECTED_SECTIONS) {
+      if (!Array.isArray(data[key])) continue;
+      resolvedDeletedIdsBySection[key] = resolveDeletedIds(key, explicitDeletedIds);
+    }
+    const anyExplicitDeletion = Object.values(resolvedDeletedIdsBySection).some((s) => s.size > 0);
+    const totalDeleteCount = Object.values(resolvedDeletedIdsBySection).reduce((n, s) => n + s.size, 0);
+
+    // ── Revision / optimistic-concurrency check (2026-08-20 hardening,
+    //    Part 4) — scoped ONLY to saves that carry an explicit deletion.
+    //    Additive-only saves can never destroy data (see merge below) so
+    //    they are never blocked here, regardless of revision drift — this
+    //    keeps ordinary concurrent work from ever hitting a conflict loop.
+    if (anyExplicitDeletion && baseRevision && existingUpdatedAt) {
+      const serverRevision = new Date(existingUpdatedAt).toISOString();
+      const clientRevision = new Date(baseRevision).toISOString();
+      if (serverRevision !== clientRevision) {
+        await client.query('ROLLBACK');
+        console.warn(`[platform-state] BLOCKED (stale revision, ${totalDeleteCount} pending delete(s)) ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'} serverRevision=${serverRevision} yourRevision=${clientRevision}`);
+        res.status(409).json({
+          conflict: true,
+          type: 'stale_revision',
+          error: 'Server state has changed since your last sync — refresh and retry before deleting records.',
+          serverRevision,
+          yourRevision: clientRevision,
+        });
+        return;
+      }
+    }
+
     // ── Backup-before-save: snapshot whatever is currently live BEFORE it is
-    //    overwritten. If this fails, the whole PUT fails safely — live data
-    //    is never overwritten without a successful backup first.
+    //    overwritten. If this fails, the whole PUT fails safely.
     if (existingData !== null) {
       try {
         const serialized = JSON.stringify(existingData);
@@ -409,14 +497,11 @@ router.put('/', async (req: Request, res: Response): Promise<void> => {
         );
       } catch (backupErr) {
         await client.query('ROLLBACK').catch(() => undefined);
-        console.error('PUT /api/platform-state: backup-before-save FAILED — aborting save to protect data:', backupErr);
+        console.error('PUT /api/platform-state: backup-before-save FAILED — aborting save to protect existing data:', backupErr);
         res.status(500).json({ error: 'Backup failed — save aborted to protect existing data' });
         return;
       }
 
-      // Conservative retention: keep at least the most recent 100 backups,
-      // only ever deleting older rows, and only after a new backup was just
-      // written successfully above. Best-effort — never fails the save.
       try {
         await client.query(
           `DELETE FROM platform_state_backups
@@ -431,101 +516,47 @@ router.put('/', async (req: Request, res: Response): Promise<void> => {
       }
     }
 
-    if (Array.isArray(data.creditNotes)) {
-      const existingNotes = Array.isArray(existingData && existingData.creditNotes) ? existingData!.creditNotes : [];
-
-      const incomingIds = new Set(data.creditNotes.map((c: any) => c && c.id));
-      const knownIds = new Set(knownCreditNoteIds ?? []); // fail-safe: empty = "nothing confirmed deleted"
-      const addedElsewhere = existingNotes.filter(
-        (c: any) => c && !incomingIds.has(c.id) && !knownIds.has(c.id)
-      );
-      if (addedElsewhere.length) {
-        data.creditNotes = [...data.creditNotes, ...addedElsewhere];
-      }
-    }
-
-    // ── Generalized non-destructive merge for other concurrently-editable
-    //    sections (2026-07-29) ────────────────────────────────────────────
-    // Same technique as the creditNotes merge directly above, and for the
-    // same reason (see that block's history) — generalized to every other
-    // section that more than one person can add records to at the same
-    // time: quotes, jobs, customers, suppliers, inventory, accInvoices,
-    // accBills, purchaseOrders, quickRates, employees, leaveRequests,
-    // disciplinary. Without this, a plain last-write-wins replace of these
-    // arrays let one session's save silently drop a record another session
-    // had just added a few seconds earlier — the same defect already fixed
-    // for credit notes, just never closed for these. This is the confirmed
-    // mechanism behind the Hennies SQ-00130 quote disappearing on
-    // 2026-07-29 when a near-simultaneous save (which created Cut & Style's
-    // own SQ-00130) committed afterward and silently overwrote it.
-    //
-    // `data._knownSectionIds` (optional) is a map of section name → array of
-    // record ids the saving client already knew about before this edit —
-    // the same idea as `_knownCreditNoteIds`, generalized. A record id
-    // present in the CURRENT database row (locked above, so this reads the
-    // true live state, not a possibly-stale earlier fetch) but absent from
-    // both the incoming array and that section's known-ids was added by a
-    // different session since this client last synced, and is preserved. An
-    // id the client used to know about but omitted from the incoming array
-    // was a deliberate delete by that client and stays deleted. If the
-    // caller omits `_knownSectionIds` entirely (older cached frontend, or
-    // any other caller), this fails safe toward never losing data —
-    // everything currently stored for that section is preserved unless the
-    // incoming array already re-includes it, exactly like the creditNotes
-    // fallback above.
-    //
-    // Matched on each record's stable `id` only — deliberately never on
-    // display numbers like quoteNum/invoiceNum, which this investigation
-    // found are not reliably unique and must not be used as an identity key.
-    //
-    // Never invents, deletes, renumbers, or picks one duplicate over
-    // another — this only decides which existing records survive being
-    // included in the array that gets saved.
-    const MERGE_SECTIONS = ['quotes', 'jobs', 'customers', 'suppliers', 'inventory',
-      'accInvoices', 'accBills', 'purchaseOrders', 'quickRates', 'employees',
-      'leaveRequests', 'disciplinary'];
-    for (const key of MERGE_SECTIONS) {
+    // ── Union-merge every protected section present in this save
+    //    (2026-08-20 hardening — replaces the old separate creditNotes
+    //    block and MERGE_SECTIONS loop with one explicit-delete-aware
+    //    formula; see header comment for the full rationale). ─────────────
+    for (const key of PROTECTED_SECTIONS) {
       if (!Array.isArray(data[key])) continue; // section not part of this save — leave untouched
       const incoming = data[key];
       const existingList = arr(existingData && existingData[key]);
       if (existingList.length === 0) continue; // nothing live to protect for this section
 
-      // Safety fallback: if any record (incoming or existing) lacks a
-      // stable `id`, skip the merge for this section on this save rather
-      // than risk matching/duplicating records incorrectly. Never worse
-      // than the previous plain-replace behaviour — the section is simply
-      // saved as sent, with no extra protection this time.
       const idsOk = incoming.every((x: any) => x && x.id !== undefined && x.id !== null)
                  && existingList.every((x: any) => x && x.id !== undefined && x.id !== null);
-      if (!idsOk) continue;
+      if (!idsOk) continue; // cannot safely id-merge — saved as sent, no extra protection this time
 
-      const incomingIds = new Set(incoming.map((x: any) => x.id));
-      const knownIds = new Set(Array.isArray(knownSectionIds[key]) ? knownSectionIds[key] : []);
-      const addedElsewhere = existingList.filter((x: any) => x && !incomingIds.has(x.id) && !knownIds.has(x.id));
-      if (addedElsewhere.length) {
-        data[key] = [...incoming, ...addedElsewhere];
+      const incomingIds = idsOf(incoming);
+      const deleted = resolvedDeletedIdsBySection[key] || new Set<string>();
+      const preserved = existingList.filter((x: any) => x && !incomingIds.has(x.id) && !deleted.has(String(x.id)));
+      if (preserved.length) {
+        data[key] = [...incoming, ...preserved];
       }
+      // else: nothing to add back — incoming already covers everything that survives
     }
 
-    // ── Partial-save merge (2026-08-04) ───────────────────────────────────
-    // A full-state save (isPartial false — every existing caller) keeps its
-    // exact previous behaviour: `data` is the complete new row, written as-is.
-    // A partial save (isPartial true) only ever contains the sections its
-    // caller actually changed — every other top-level key from the CURRENT
-    // live row (locked above) is carried forward untouched here, so nothing
-    // the payload didn't mention is ever lost. This is the only place a
-    // partial save's omitted sections are resolved — everywhere else in this
-    // handler (detectWipe, the merge loop above) already only looks at keys
-    // that are present in `data`.
     const finalData = isPartial ? { ...(existingData || {}), ...data } : data;
 
-    // ── Block NEW invariant violations only (Section 14, see the function's
-    //    own comment above for full scope/rationale) — never touches or
-    //    rejects anything that was already true before this save.
+    // ── Mechanical backstop — proves the merge above did what it claims.
+    try {
+      assertNoUnexplainedRemovals(existingData, finalData, resolvedDeletedIdsBySection);
+    } catch (backstopErr) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      console.error(`[platform-state] SAFETY BACKSTOP TRIPPED ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'}:`, backstopErr);
+      res.status(500).json({ error: 'Save aborted by internal safety check — no data was changed. Please report this.' });
+      return;
+    }
+
+    // ── Block NEW invariant violations only — never touches or rejects
+    //    anything already true before this save.
     const newRecordError = newRecordValidationError(existingData, finalData);
     if (newRecordError) {
       await client.query('ROLLBACK');
-      console.warn('PUT /api/platform-state BLOCKED — new-record validation failed:', newRecordError);
+      console.warn(`[platform-state] BLOCKED (invariant) ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'} reason="${newRecordError}"`);
       res.status(409).json({
         error: 'Save blocked to prevent a new data-integrity problem',
         reason: newRecordError,
@@ -533,17 +564,27 @@ router.put('/', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    await client.query(
+    const writeRes = await client.query(
       `INSERT INTO platform_state (id, data, updated_at)
        VALUES (1, $1::jsonb, NOW())
        ON CONFLICT (id) DO UPDATE
          SET data = EXCLUDED.data,
-             updated_at = NOW()`,
+             updated_at = NOW()
+       RETURNING updated_at`,
       [JSON.stringify(finalData)]
     );
 
     await client.query('COMMIT');
-    res.json({ success: true, data: finalData });
+
+    // ── Audit log (Part 17) — structured, no sensitive payload content. ──
+    const sectionsSent = STATE_ARRAY_KEYS.filter((k) => Array.isArray(data[k]));
+    console.log(
+      `[platform-state] SAVED ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'} role=${auditMeta.userRole ?? '—'} ` +
+      `revision=${writeRes.rows[0].updated_at} partial=${isPartial} sections=[${sectionsSent.join(',')}] ` +
+      `counts=${JSON.stringify(buildRecordCounts(finalData))} deletes=${totalDeleteCount}`
+    );
+
+    res.json({ success: true, data: finalData, revision: writeRes.rows[0].updated_at });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     console.error('PUT /api/platform-state failed:', err);

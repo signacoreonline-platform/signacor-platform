@@ -9,12 +9,7 @@
     "start": "node dist/index.js",
     "migrate": "node dist/db/migrate.js",
     "db:migrate": "psql $DATABASE_URL -f ../database/schema.sql",
-    "seed:platform-state": "node dist/db/seedPlatformStateFromIndex.js",
-    "fix:diaz-statement": "node dist/db/fixDiazStatementJuly2026.js",
-    "seed:app-users": "node dist/db/seedAppUsersFromPlatformState.js",
-    "remove-plaintext-passwords": "node dist/db/removePlaintextPasswordsFromPlatformState.js",
-    "find:inv00033": "node dist/db/findMissingInvoiceINV00033August2026.js",
-    "fix:inv00068-collision": "node dist/db/fixInvoiceCollisionINV00068August2026.js"
+    "test:hardening": "ts-node --transpile-only test/hardening.stress.ts"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

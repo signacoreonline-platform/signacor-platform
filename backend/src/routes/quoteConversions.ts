@@ -1,51 +1,48 @@
 import { Router, Request, Response } from 'express';
 import pool from '../db/pool';
 import { authenticate } from '../middleware/auth';
-import { reserveDocumentNumberWithClient } from './documentNumbers';
+import { reserveDocumentNumberWithClient, peekNextNumber } from './documentNumbers';
 
 /**
  * /api/quote-conversions
  *
- * Backend-enforced "convert this quote to a job at most once", added
- * 2026-08-18 as part of the production stabilisation pass.
+ * Backend-enforced "convert this quote to a job at most once" (see
+ * database/migrations/005_quote_conversions.sql for the original
+ * UNIQUE(quote_id) design and why it exists).
  *
- * Background: the production integrity audit confirmed a real historical
- * incident — quote SQ-00014 ended up referenced by TWO different jobs. The
- * only protection against this in the frontend (handleConvertToJob in
- * index.html) is a same-tab ref lock plus a check against that browser
- * tab's own local `jobs` array. Neither guard can see another session's
- * conversion that hasn't been saved/synced yet, so two people (or one
- * person in two tabs) converting the same quote at nearly the same moment
- * could both succeed, each minting their own client-side job number
- * (getNextJobNum), producing two jobs for one quote — sometimes with a
- * duplicate job NUMBER as well, since job numbers were never backend-
- * reserved either (see documentNumbers.ts Phase 3).
+ * ══════════════════════════════════════════════════════════════════════
+ * 2026-08-20 DATA-SAFETY HARDENING — RECOVERABLE MISSING-DOCUMENT CASE
+ * ══════════════════════════════════════════════════════════════════════
+ * SQ-00168 is the confirmed case this closes: a quote_conversions row
+ * exists (job_number reserved), but the job it names is not live — most
+ * likely because the earlier save-race described in platformState.ts
+ * removed it, or because the original save after reservation never
+ * completed. The PREVIOUS behaviour here silently returned
+ * `{ jobNumber: <old number>, reused: true }` and let the frontend build a
+ * brand-new job under that same, potentially-contaminated number with NO
+ * user visibility into what happened.
  *
- * This endpoint closes that gap with a real database-level guarantee: a
- * UNIQUE(quote_id) constraint on the new `quote_conversions` table (see
- * database/migrations/005_quote_conversions.sql). The frontend calls this
- * BEFORE building/saving the new job. Exactly one caller can ever win the
- * INSERT for a given quote_id — every other caller (concurrent or a later
- * accidental double-click that slipped past the frontend's own guards)
- * gets a clear 409, never a second job number.
+ * That is no longer automatic. When this endpoint finds a reservation
+ * whose job is missing live, it now returns a structured, RECOVERABLE
+ * conflict (`type: 'reservation_missing_document'`) instead — the caller
+ * must show the user what happened and get EXPLICIT confirmation before
+ * anything changes. Only POST /reassign (below), called after that
+ * confirmation, actually reassigns the reservation to a new number — and
+ * even then it re-verifies under lock that the old number still has no
+ * live job (defends against a second, slower TOCTOU race: someone else
+ * saving the missing job between the conflict response and the user's
+ * confirmation click).
  *
- * Retry safety: if a caller reserves a job number here and then the
- * FOLLOW-UP save (POST/PUT to /api/platform-state, actually creating the
- * job) fails or times out, the quote_conversions row now exists but no job
- * was ever actually created. A naive unique-constraint-only design would
- * permanently block that quote from ever being converted. Instead, this
- * endpoint checks live platform_state for a job matching the previously-
- * reserved number: if none exists, it hands back the SAME job number again
- * (reused:true) rather than erroring — safe to retry indefinitely, and
- * still impossible to ever produce two DIFFERENT job numbers for the same
- * quote. If a job with that number DOES already exist live, this is a
- * genuine already-converted quote and the caller gets 409.
- *
- * This route does not touch platform_state at all except to read it for
- * that live-existence check — it never writes quotes/jobs itself. The
- * frontend is still responsible for actually creating and saving the job
- * (via forceSaveSections), exactly as before; this only gates the number/
- * idempotency step ahead of that save.
+ * Audit trail: reassignment does not delete the original reservation row —
+ * it updates job_number in place but preserves the number it's replacing
+ * in `superseded_job_number`/`superseded_at`/`reassigned_reason` (see
+ * database/migrations/006_quote_conversions_audit_trail.sql, a minimal
+ * additive migration — three nullable columns, no data touched, safe to
+ * re-run). This is genuinely necessary: without it, a reassignment would
+ * be indistinguishable from the original reservation, and nobody could
+ * later answer "why does this quote's reserved job number not match what
+ * was first issued?" — exactly the kind of question this investigation
+ * itself needed to answer for SQ-00168.
  */
 
 const router = Router();
@@ -55,12 +52,20 @@ function up(v: unknown): string {
   return (v === undefined || v === null ? '' : String(v)).trim().toUpperCase();
 }
 
+async function liveJobExists(quoteId: string, jobNumber: string): Promise<boolean> {
+  const stateRes = await pool.query('SELECT data FROM platform_state WHERE id = 1');
+  const data = stateRes.rowCount ? stateRes.rows[0].data || {} : {};
+  const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+  return jobs.some((j: any) => j && up(j.num) === up(jobNumber));
+}
+
 // POST /api/quote-conversions/reserve
 // body: { quoteId: string | number }
-// → 200 { jobNumber: 'SNS-00142', reused: false }
-// → 200 { jobNumber: 'SNS-00142', reused: true }   (safe retry of a prior, never-completed reservation)
+// → 200 { jobNumber: 'SNS-00142', reused: false }               (brand-new reservation)
 // → 400 missing quoteId
-// → 409 { error, jobNumber } (this quote has a job already live under that number)
+// → 409 { error, jobNumber }                                     (job genuinely already exists live — real duplicate-conversion attempt)
+// → 409 { conflict:true, type:'reservation_missing_document', quoteId, previousJobNumber, suggestedNumber, canReassign:true }
+//        (a reservation exists but no live job matches it — 2026-08-20: no longer silently reused)
 // → 500 reservation failed
 router.post('/reserve', async (req: Request, res: Response): Promise<void> => {
   const rawQuoteId = req.body && req.body.quoteId;
@@ -83,11 +88,6 @@ router.post('/reserve', async (req: Request, res: Response): Promise<void> => {
   } catch (err: any) {
     await client.query('ROLLBACK').catch(() => undefined);
 
-    // 23505 = unique_violation on quote_conversions.quote_id — a
-    // reservation already exists for this quote (this session retrying, a
-    // genuinely concurrent duplicate attempt, or an already-converted
-    // quote). Look it up and decide which, using live platform_state as
-    // the source of truth for whether a job actually exists.
     if (err && err.code === '23505') {
       try {
         const existingRes = await pool.query(
@@ -97,15 +97,11 @@ router.post('/reserve', async (req: Request, res: Response): Promise<void> => {
         const existingJobNumber = existingRes.rowCount ? String(existingRes.rows[0].job_number) : null;
 
         if (!existingJobNumber) {
-          // Shouldn't happen (the conflict implies a row exists) — fail closed.
           res.status(500).json({ error: 'Failed to reserve a job number for this quote.' });
           return;
         }
 
-        const stateRes = await pool.query('SELECT data FROM platform_state WHERE id = 1');
-        const data = stateRes.rowCount ? stateRes.rows[0].data || {} : {};
-        const jobs = Array.isArray(data.jobs) ? data.jobs : [];
-        const jobExists = jobs.some((j: any) => j && up(j.num) === up(existingJobNumber));
+        const jobExists = await liveJobExists(quoteId, existingJobNumber);
 
         if (jobExists) {
           res.status(409).json({
@@ -113,10 +109,19 @@ router.post('/reserve', async (req: Request, res: Response): Promise<void> => {
             jobNumber: existingJobNumber,
           });
         } else {
-          // Reservation exists, but no job was ever actually saved with it
-          // — a prior attempt's save must have failed/timed out. Safe to
-          // hand the SAME number back out for a genuine retry.
-          res.json({ jobNumber: existingJobNumber, reused: true });
+          // 2026-08-20 hardening: reservation exists, job does not — this is
+          // now a RECOVERABLE conflict requiring explicit user confirmation
+          // via POST /reassign, never an automatic reuse. See header comment.
+          const suggestedNumber = await peekNextNumber('ALL', 'job');
+          res.status(409).json({
+            conflict: true,
+            type: 'reservation_missing_document',
+            quoteId,
+            previousJobNumber: existingJobNumber,
+            suggestedNumber,
+            canReassign: true,
+            error: `The previous job-number reservation ${existingJobNumber} no longer has a matching job. Confirm to assign a new number.`,
+          });
         }
       } catch (lookupErr) {
         console.error('POST /api/quote-conversions/reserve lookup after conflict failed:', lookupErr);
@@ -127,6 +132,82 @@ router.post('/reserve', async (req: Request, res: Response): Promise<void> => {
 
     console.error('POST /api/quote-conversions/reserve failed:', err);
     res.status(500).json({ error: 'Failed to reserve a job number for this quote.' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/quote-conversions/reassign — 2026-08-20 hardening.
+// body: { quoteId: string | number, confirm: true, reason?: string }
+// Only reachable AFTER the caller has shown the user the
+// 'reservation_missing_document' conflict from /reserve and gotten
+// explicit confirmation — `confirm !== true` is rejected outright, this is
+// never called automatically.
+// → 200 { jobNumber: <new>, reused:false, reassignedFrom: <old> }
+// → 409 { error, jobNumber } — the old number turned out to have a live job
+//        after all (re-checked under lock — a second session saved it in
+//        the window between the conflict and this confirmation)
+// → 400 missing quoteId/confirm, or no existing reservation to reassign
+// → 500 failure
+router.post('/reassign', async (req: Request, res: Response): Promise<void> => {
+  const rawQuoteId = req.body && req.body.quoteId;
+  const confirm = req.body && req.body.confirm === true;
+  const reason = typeof req.body?.reason === 'string' && req.body.reason.trim() ? req.body.reason.trim() : 'missing-document reassignment confirmed by user';
+
+  if (rawQuoteId === undefined || rawQuoteId === null || String(rawQuoteId).trim() === '') {
+    res.status(400).json({ error: 'quoteId is required.' });
+    return;
+  }
+  if (!confirm) {
+    res.status(400).json({ error: 'confirm:true is required — this endpoint never reassigns without explicit confirmation.' });
+    return;
+  }
+  const quoteId = String(rawQuoteId);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Lock the existing reservation row so a concurrent /reserve retry or
+    // /reassign call for the SAME quote can't race this one.
+    const existingRes = await client.query(
+      'SELECT job_number FROM quote_conversions WHERE quote_id = $1 FOR UPDATE',
+      [quoteId]
+    );
+    if (existingRes.rowCount === 0) {
+      await client.query('ROLLBACK');
+      res.status(400).json({ error: 'No existing reservation found for this quote — nothing to reassign. Use /reserve instead.' });
+      return;
+    }
+    const oldJobNumber = String(existingRes.rows[0].job_number);
+
+    // Re-verify under lock — closes the TOCTOU window between the original
+    // conflict response and this confirmation click.
+    const jobExistsNow = await liveJobExists(quoteId, oldJobNumber);
+    if (jobExistsNow) {
+      await client.query('ROLLBACK');
+      res.status(409).json({
+        error: `Job ${oldJobNumber} now exists live for this quote (created by another session since the conflict was shown) — this quote is already converted. Refresh and open the existing job instead.`,
+        jobNumber: oldJobNumber,
+      });
+      return;
+    }
+
+    const newJobNumber = await reserveDocumentNumberWithClient(client, 'ALL', 'job');
+    await client.query(
+      `UPDATE quote_conversions
+       SET job_number = $1, superseded_job_number = $2, superseded_at = NOW(), reassigned_reason = $3
+       WHERE quote_id = $4`,
+      [newJobNumber, oldJobNumber, reason, quoteId]
+    );
+
+    await client.query('COMMIT');
+    console.log(`[quote-conversions] REASSIGNED quoteId=${quoteId} ${oldJobNumber} -> ${newJobNumber} reason="${reason}"`);
+    res.json({ jobNumber: newJobNumber, reused: false, reassignedFrom: oldJobNumber });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    console.error('POST /api/quote-conversions/reassign failed:', err);
+    res.status(500).json({ error: 'Failed to reassign a job number for this quote.' });
   } finally {
     client.release();
   }

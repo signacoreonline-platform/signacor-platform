@@ -135,6 +135,16 @@ const API_DOC_NUMBER_RESERVE_URL = (window.SIGNACORE_API_URL || 'https://signaco
 // docType:'job'/'po' (job/PO numbers are NOT company-scoped, so no
 // `company` needs to be sent for these two types — see documentNumbers.ts).
 const API_QUOTE_CONVERSION_RESERVE_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/quote-conversions/reserve';
+// 2026-08-20 data-safety hardening: reached only after a
+// 'reservation_missing_document' conflict from the reserve call above has
+// been shown to the user and they've explicitly confirmed reassignment —
+// see reassignJobForQuote/handleConvertToJob. Never called automatically.
+const API_QUOTE_CONVERSION_REASSIGN_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/quote-conversions/reassign';
+// 2026-08-20 data-safety hardening: read-only pre-check for a manually-typed
+// document number, used to offer a recoverable "that number's taken, here's
+// the next free one" flow instead of a dead-end alert on collision — see
+// checkDocumentNumber below.
+const API_DOC_NUMBER_CHECK_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/document-numbers/check';
 // ── Authentication (added 2026-08-06, audit finding B1) ────────────────────
 // API_STATE_URL and API_DOC_NUMBER_RESERVE_URL above now both require a
 // valid backend-issued JWT. Login used to be a purely local comparison
@@ -2253,6 +2263,24 @@ async function reserveJobForQuote(quoteId) {
     if (res.status === 401) { forceLogoutExpiredSession(); return { error: 'Not logged in — please sign in again.' }; }
     const result = await res.json().catch(()=>null);
     if (res.status === 409) {
+      // 2026-08-20 hardening: a reservation whose job is missing live (the
+      // SQ-00168 case — see backend/src/routes/quoteConversions.ts) is now a
+      // RECOVERABLE conflict, not a dead end and never auto-reused. Surface
+      // it distinctly so the caller (handleConvertToJob) can show the user
+      // exactly what happened and get explicit confirmation before anything
+      // is reassigned, instead of just showing a generic "already converted"
+      // error and stopping.
+      if (result && result.conflict && result.type === 'reservation_missing_document') {
+        return {
+          error: result.error || 'This quote\'s previous job-number reservation no longer has a matching job.',
+          conflict: true,
+          type: 'reservation_missing_document',
+          quoteId: (result.quoteId !== undefined && result.quoteId !== null) ? result.quoteId : quoteId,
+          previousJobNumber: result.previousJobNumber,
+          suggestedNumber: result.suggestedNumber,
+          canReassign: !!result.canReassign,
+        };
+      }
       return { error: (result && result.error) || 'This quote has already been converted to a job.', jobNumber: result && result.jobNumber };
     }
     if (!res.ok || !result || !result.jobNumber) {
@@ -2262,6 +2290,63 @@ async function reserveJobForQuote(quoteId) {
   } catch (e) {
     console.warn('Job-for-quote reservation failed', e);
     return { error: 'Could not reserve a job number. Please check your connection and try again.' };
+  }
+}
+
+// 2026-08-20 hardening: reached ONLY after handleConvertToJob has shown the
+// user the 'reservation_missing_document' conflict above and they've
+// explicitly clicked confirm — this function itself always sends
+// confirm:true (the backend rejects the call outright without it, see
+// quoteConversions.ts POST /reassign), so nothing here can silently
+// reassign a number the user hasn't seen and approved. The backend
+// re-verifies under lock that the old number still has no live job before
+// reassigning (closes the window between the conflict being shown and the
+// user's click), so a 409 here means another session created that job in
+// the meantime — surfaced back to the caller as an error, not swallowed.
+async function reassignJobForQuote(quoteId, reason) {
+  try {
+    const res = await fetch(API_QUOTE_CONVERSION_REASSIGN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ quoteId, confirm: true, reason: reason || undefined }),
+    });
+    if (res.status === 401) { forceLogoutExpiredSession(); return { error: 'Not logged in — please sign in again.' }; }
+    const result = await res.json().catch(()=>null);
+    if (!res.ok || !result || !result.jobNumber) {
+      return { error: (result && result.error) || 'Could not reassign a job number. Please check your connection and try again.', jobNumber: result && result.jobNumber };
+    }
+    return { jobNumber: result.jobNumber, reused: false, reassignedFrom: result.reassignedFrom };
+  } catch (e) {
+    console.warn('Job-for-quote reassignment failed', e);
+    return { error: 'Could not reassign a job number. Please check your connection and try again.' };
+  }
+}
+
+// 2026-08-20 hardening (Parts 6-13): read-only pre-check for a manually
+// typed document number — lets a creation form offer "that number's
+// already used by X — use NNNN instead?" BEFORE attempting to save, instead
+// of only finding out on a rejected save. Never reserves/claims anything by
+// itself (see documentNumbers.ts POST /check). Returns
+// { available:true } or
+// { available:false, conflict:true, requestedNumber, conflictType, owner, suggestedNumber, canReassign }
+// or { error } on failure — callers should treat `error` as "couldn't
+// verify, don't block the user on this check alone".
+async function checkDocumentNumber(company, docType, requestedNumber) {
+  try {
+    const res = await fetch(API_DOC_NUMBER_CHECK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ company, docType, requestedNumber }),
+    });
+    if (res.status === 401) { forceLogoutExpiredSession(); return { error: 'Not logged in — please sign in again.' }; }
+    const result = await res.json().catch(()=>null);
+    if (!res.ok || !result) {
+      return { error: (result && result.error) || 'Could not check this number. Please try again.' };
+    }
+    return result;
+  } catch (e) {
+    console.warn('Document number check failed', e);
+    return { error: 'Could not check this number. Please check your connection and try again.' };
   }
 }
 
@@ -7622,11 +7707,32 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       }
     } else {
       const reservation = await reserveJobForQuote(q.id);
-      if(reservation.error){
+      if(reservation.error && reservation.conflict && reservation.type==='reservation_missing_document' && reservation.canReassign){
+        // 2026-08-20 hardening (SQ-00168 case — see reserveJobForQuote /
+        // reassignJobForQuote / backend quoteConversions.ts): a reservation
+        // exists for this quote but no live job matches it. This is now a
+        // RECOVERABLE decision, never a dead end and never an automatic
+        // reuse of the stale number. Show exactly what happened and require
+        // explicit confirmation before anything is reassigned — declining
+        // leaves everything untouched, same as cancelling any other convert.
+        const confirmMsg = 'This quote\'s previous job-number reservation ('+(reservation.previousJobNumber||'unknown')+') no longer has a matching job.\n\n'+
+          'This can happen if an earlier save was interrupted — no data has been changed by this check.\n\n'+
+          'Assign a NEW job number ('+(reservation.suggestedNumber||'next available')+') and continue converting this quote?';
+        if(!window.confirm(confirmMsg)){
+          return; // user declined — nothing changed
+        }
+        const reassignment = await reassignJobForQuote(q.id, 'user confirmed after missing-document conflict on convert-to-job');
+        if(reassignment.error){
+          alert('Job could NOT be created.\n\n'+reassignment.error+'\n\nNothing was changed. Please check your connection and try again.');
+          return;
+        }
+        jobNum = reassignment.jobNumber;
+      } else if(reservation.error){
         alert('Job could NOT be created.\n\n'+reservation.error+(reservation.jobNumber?(' (job '+reservation.jobNumber+')'):'')+'\n\nNothing was changed. If you believe this quote was NOT actually converted, please refresh Jobs and check before trying again.');
         return;
+      } else {
+        jobNum = reservation.jobNumber;
       }
-      jobNum = reservation.jobNumber;
     }
     const today  = new Date().toISOString().slice(0,10);
     const dueDate= new Date(Date.now()+30*864e5).toISOString().slice(0,10);
@@ -17980,6 +18086,24 @@ async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll
   }
   const duplicate = (accInvoicesAll||[]).find(i=>i.id!==working.id && i.number && i.number.trim().toLowerCase()===(working.number||'').trim().toLowerCase());
   if(duplicate){
+    // 2026-08-20 hardening (Parts 6-13): a manually-entered/edited invoice
+    // number that collides with an existing one used to be a dead end — an
+    // alert, then nothing but going back to guess a different number by
+    // hand. It is now RECOVERABLE: ask the backend's atomic reservation
+    // table (the same source of truth reserveInvoiceNumber uses, not just
+    // this local array — so the suggestion is genuinely free, not just
+    // locally-unique) for the next safe number, offer it, and — only with
+    // EXPLICIT confirmation — retry the save with that number instead of
+    // the one that collided. Declining leaves the modal open with nothing
+    // changed, same as before; the recursive retry re-runs every check
+    // above (including this one) against the suggested number itself.
+    const co = working.co !== undefined ? working.co : (isHoldingsUser(user) ? HOLDINGS_CO_ID : currentUserCo);
+    const check = await checkDocumentNumber(co, 'invoice', working.number);
+    const suggestion = (check && check.suggestedNumber) ? check.suggestedNumber : null;
+    const ownerDesc = (check && check.owner) ? (' ('+[check.owner.documentType, check.owner.client].filter(Boolean).join(' — ')+')') : '';
+    if(suggestion && window.confirm('⚠ Invoice number "'+working.number+'" is already used by another invoice'+ownerDesc+'.\n\nUse the next available number ('+suggestion+') instead? Nothing has been saved yet.')){
+      return saveManualInvoice({ ...inv, number: suggestion }, { user, jobsAll, accInvoicesAll, quotesAll, setAccInvoices, forceSaveSections });
+    }
     alert('⚠ Invoice number "'+working.number+'" is already used by another invoice. Please choose a unique number.');
     return false;
   }
@@ -20703,16 +20827,41 @@ function App() {
     'employees','leaveRequests','disciplinary','savedCalcs','purchaseOrders','savedImports',
     'bankTxns','chartOfAccounts','accInvoices','accBills','completeProducts','payrollRecords','quickRates','proposedProjects','creditNotes','userAccounts'];
 
-  // Fetch latest state from the backend
+  // Fetch latest state from the backend.
+  // 2026-08-20 hardening: the returned object now also carries
+  // `_serverRevision` (the backend's `updated_at` column value for this
+  // read) alongside the data sections — this is the revision token every
+  // baseline needs to carry forward so a LATER deletion-bearing save can
+  // tell the backend "I am building this on top of revision X" (see
+  // mergeAndSave's `_baseRevision`, and backend/src/routes/platformState.ts
+  // for how that's used). Stored as a plain field on the same object (not a
+  // separate side-channel) so it rides along naturally with
+  // serverBaselineRef.current/ownBaseline everywhere those are already
+  // threaded through.
   async function fetchFromServer() {
     const res = await fetch(API_STATE_URL, { headers: { ...authHeaders() } });
     if (res.status === 401) { forceLogoutExpiredSession(); throw new Error('Not logged in — please sign in again.'); }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const result = await res.json();
-    return (result && Object.prototype.hasOwnProperty.call(result, 'data')) ? result.data : result;
+    const data = (result && Object.prototype.hasOwnProperty.call(result, 'data')) ? result.data : result;
+    if (data && typeof data === 'object' && result && result.updated_at !== undefined) {
+      data._serverRevision = result.updated_at;
+    }
+    return data;
   }
 
-  // PUT a payload to the backend
+  // PUT a payload to the backend.
+  // 2026-08-20 hardening: returns the backend's response body (`{success,
+  // data, revision}`) on success instead of nothing — callers now update
+  // their baseline from the AUTHORITATIVE post-merge `data` the server
+  // actually wrote (which can include records the backend's own additive
+  // merge preserved from another session that this client's payload never
+  // mentioned), rather than assuming their own locally-built payload is
+  // exactly what ended up live. A structured 409 conflict (stale-revision,
+  // or a data-integrity block) is thrown as an Error whose `.conflict`
+  // property carries the parsed body, so callers can distinguish "state
+  // moved on, refresh and retry" from an ordinary failure instead of
+  // treating every rejected save the same way.
   async function saveToServer(payload) {
     const res = await fetch(API_STATE_URL, {
       method: 'PUT',
@@ -20721,18 +20870,23 @@ function App() {
     });
     if (res.status === 401) { forceLogoutExpiredSession(); throw new Error('Not logged in — please sign in again.'); }
     if (!res.ok) {
-      // The backend now rejects saves that look like an accidental wipe
-      // (empty/default/partial state, or a whole section/company vanishing)
-      // with a 409 and a plain-English `reason`. Surface that reason instead
-      // of a bare HTTP status so a blocked save is actually visible/useful —
-      // never silently treated the same as a normal success.
-      let detail = '';
-      try {
-        const errBody = await res.json();
-        detail = (errBody && (errBody.reason || errBody.error)) || '';
-      } catch (_) { /* response wasn't JSON — fall back to status below */ }
-      throw new Error(detail || ('HTTP ' + res.status));
+      // The backend rejects saves that look like an accidental wipe, a new
+      // data-integrity problem, or (2026-08-20) a deletion built on a
+      // revision the server has since moved past — each with a 409 and a
+      // plain-English `reason`/`error`. Surface that instead of a bare HTTP
+      // status so a blocked save is actually visible/useful — never
+      // silently treated the same as a normal success.
+      let errBody = null;
+      try { errBody = await res.json(); } catch (_) { /* response wasn't JSON — fall back to status below */ }
+      const detail = (errBody && (errBody.reason || errBody.error)) || '';
+      const message = errBody && errBody.conflict && errBody.type === 'stale_revision'
+        ? 'Data changed elsewhere — refresh and try again.'
+        : (detail || ('HTTP ' + res.status));
+      const err = new Error(message);
+      if (errBody && errBody.conflict) err.conflict = errBody;
+      throw err;
     }
+    return res.json().catch(() => null);
   }
 
   // Save-ordering stamp used to compare two platform_state snapshots.
@@ -20966,32 +21120,41 @@ function App() {
       // skipped it and blindly wrote back whatever creditNotes this client's own
       // fetch happened to return.
       payload.creditNotes = mergeCreditNotes(snapshot.creditNotes, mergeBase.creditNotes, ownBaseline ? ownBaseline.creditNotes : null);
-      // Tell the backend which credit note ids this client already knew about
-      // before this edit, so it can perform the same non-destructive merge
-      // atomically against whatever is *actually* in the database right now —
-      // closing the remaining race where this client's own "fresh" fetch above
-      // is itself stale relative to another session's concurrent save (see
-      // backend/src/routes/platformState.ts for why this is needed).
-      payload._knownCreditNoteIds = (ownBaseline && Array.isArray(ownBaseline.creditNotes)) ? ownBaseline.creditNotes.map(c=>c.id) : [];
-      // Generalized counterpart to _knownCreditNoteIds above (2026-07-29):
-      // tells the backend which ids THIS client already knew about, per
-      // section, before this edit — for every section most exposed to the
-      // "two sessions both add one new record, whichever PUT commits last
-      // wins and the other session's brand-new record silently vanishes"
-      // race (see backend/src/routes/platformState.ts). Closes the same
-      // residual race the client-side mergeSectionArray() above cannot: this
-      // client's own "fresh" fetchFromServer() call a few lines up can
-      // itself already be stale relative to another session's save that
-      // commits in the moments between that fetch and this PUT landing.
-      // Confirmed as the mechanism behind the Hennies SQ-00130 quote
-      // disappearing on 2026-07-29.
+      // 2026-08-20 hardening: explicit deletion, not inferred. This client
+      // is the ONLY save path that can genuinely reflect a user-initiated
+      // delete (e.g. deleteJob's setJobs(prev=>prev.filter(...)) — the
+      // partial-save path (forceSaveSections/savePartialSectionsNow below)
+      // is purely additive and never deletes anything, see its own comment).
+      // For every protected section, an id present in `ownBaseline[key]`
+      // (what this client knew before this edit) but absent from
+      // `snapshot[key]` (what this client intends to save now) was
+      // DELIBERATELY removed by this client and is reported to the backend
+      // as such — the backend enforces this as the ONLY source of truth for
+      // deletion (see backend/src/routes/platformState.ts); omission alone,
+      // with no id listed here, can never delete a record server-side
+      // anymore, regardless of any baseline timing. `ownBaseline` and
+      // `snapshot` here are the exact captured-together pair passed into
+      // this function (see capturedBaseline note above) — never re-read
+      // from a ref at some later, possibly-advanced moment.
       const BACKEND_MERGE_SECTIONS = ['quotes','jobs','customers','suppliers','inventory',
-        'accInvoices','accBills','purchaseOrders','quickRates','employees','leaveRequests','disciplinary'];
-      payload._knownSectionIds = {};
+        'accInvoices','accBills','purchaseOrders','quickRates','employees','leaveRequests',
+        'disciplinary','creditNotes','proposedProjects','userAccounts'];
+      payload._deletedIds = {};
       BACKEND_MERGE_SECTIONS.forEach(k=>{
-        const base = ownBaseline && Array.isArray(ownBaseline[k]) ? ownBaseline[k] : [];
-        payload._knownSectionIds[k] = base.map(x=>x && x.id).filter(id=>id!==undefined && id!==null);
+        const baseList = ownBaseline && Array.isArray(ownBaseline[k]) ? ownBaseline[k] : [];
+        const baseIds  = baseList.map(x=>x && x.id).filter(id=>id!==undefined && id!==null);
+        const nextList = Array.isArray(payload[k]) ? payload[k] : (Array.isArray(snapshot[k]) ? snapshot[k] : null);
+        if (nextList === null) return; // section not part of this save at all — nothing to diff
+        const nextIds = new Set(nextList.map(x=>x && x.id).filter(id=>id!==undefined && id!==null));
+        const removed = baseIds.filter(id=>!nextIds.has(id));
+        if (removed.length) payload._deletedIds[k] = removed;
       });
+      // Revision this save was built on top of — lets the backend refuse a
+      // deletion-bearing save whose baseline is already stale relative to
+      // the CURRENT live row, instead of silently applying it (Part 4 of
+      // the hardening brief). Only meaningful when this save is actually
+      // deleting something; harmless to always include otherwise.
+      payload._baseRevision = ownBaseline ? (ownBaseline._serverRevision || null) : null;
       payload.v            = DATA_VERSION;
       payload._autoSavedAt = new Date().toISOString();
       payload.savedAt      = snapshot.savedAt;
@@ -21009,8 +21172,16 @@ function App() {
       }
       payload = Object.assign({}, snapshot, { _autoSavedAt: new Date().toISOString() });
     }
-    await saveToServer(payload);
-    serverBaselineRef.current = payload;
+    const confirmed = await saveToServer(payload);
+    // 2026-08-20 hardening: prefer the AUTHORITATIVE data the server just
+    // confirmed writing (includes anything its own additive merge preserved
+    // that this payload never mentioned) over the locally-built `payload` —
+    // strictly more accurate as this session's new baseline. Falls back to
+    // `payload` if the server response is ever missing/malformed, matching
+    // the previous behaviour exactly.
+    const nextBaseline = (confirmed && confirmed.data) ? confirmed.data : payload;
+    if (confirmed && confirmed.revision !== undefined) nextBaseline._serverRevision = confirmed.revision;
+    serverBaselineRef.current = nextBaseline;
     return true;
   }
 
@@ -21094,12 +21265,33 @@ function App() {
   // Sends ONLY `overrides` (e.g. {jobs, quotes}) to the backend, tagged as a
   // partial save. Never touches or reads the other ~20 sections of local
   // state, so the request body stays proportional to what actually changed
-  // instead of the entire platform state. `_knownSectionIds` is built the
-  // same way as the full-state save (from this session's last confirmed
-  // server baseline) so the backend's existing per-section id-based merge
-  // still protects against losing another session's concurrent additions to
-  // these SAME sections. Throws (never silently no-ops) if the PUT is
-  // rejected, so a caller's try/catch is always trustworthy.
+  // instead of the entire platform state.
+  //
+  // 2026-08-20 data-safety hardening (Part 2/Part 3): this path is now
+  // PURELY ADDITIVE — it no longer computes or sends `_knownSectionIds` at
+  // all. The backend (see backend/src/routes/platformState.ts) no longer
+  // infers deletion from an omitted-but-"known" id under ANY circumstance;
+  // the ONLY thing that can ever make a save remove a record is an explicit
+  // `_deletedIds` list, and this function has no legitimate reason to ever
+  // delete anything — Convert-to-Job and every other current caller of
+  // forceSaveSections only adds or updates records. Not sending
+  // `_knownSectionIds` (rather than sending an empty/harmless one) makes
+  // that structurally obvious from the request body itself, and means this
+  // function cannot regress into a deletion path even if the backend's
+  // handling of that field ever changed. The backend still merges these
+  // sections onto the current row by id (anything present server-side that
+  // isn't in `overrides` is preserved untouched), so concurrent additions
+  // from another session to these SAME sections remain safe.
+  //
+  // The server's CONFIRMED response body becomes this session's new
+  // baseline (data + revision) instead of being locally reconstructed via
+  // spread — this closes the same captured-baseline-race class fixed on
+  // mergeAndSave above: the baseline this function leaves behind is exactly
+  // what the server actually has (including anything merged in from another
+  // session), not just a client guess of what was sent.
+  //
+  // Throws (never silently no-ops) if the PUT is rejected, so a caller's
+  // try/catch is always trustworthy.
   async function savePartialSectionsNow(overrides){
     if(!apiReadyRef.current) throw new Error('Not yet connected to the server — please wait a moment and try again.');
     // 2026-08-18 (production stabilisation, second layer of protection for
@@ -21114,24 +21306,25 @@ function App() {
     // moment earlier is unaffected — that's what capturedBaseline is for),
     // but it removes the common case outright.
     if (apiSaveTimerRef.current) { clearTimeout(apiSaveTimerRef.current); apiSaveTimerRef.current = null; }
-    const keys = Object.keys(overrides||{});
     const data = {...overrides};
-    const knownSectionIds = {};
-    keys.forEach(k=>{
-      const base = serverBaselineRef.current && Array.isArray(serverBaselineRef.current[k]) ? serverBaselineRef.current[k] : [];
-      knownSectionIds[k] = base.map(x=>x && x.id).filter(id=>id!==undefined && id!==null);
-    });
-    data._knownSectionIds = knownSectionIds;
     data._partial = true;
     data.v = DATA_VERSION;
     const savedAt = new Date().toISOString();
     data._autoSavedAt = savedAt;
-    await saveToServer(data);
-    // Fold the saved sections into this session's known server baseline —
-    // unrelated sections already in the baseline are left exactly as they
-    // were, since this save never touched or knew about them.
+    const confirmed = await saveToServer(data);
+    // Fold the server's CONFIRMED sections into this session's known server
+    // baseline — unrelated sections already in the baseline are left exactly
+    // as they were, since this save never touched or knew about them. Using
+    // confirmed.data (when the server returned one) rather than the
+    // locally-built `overrides` means the baseline reflects what the server
+    // actually wrote, including any concurrent merge from another session —
+    // not just an echo of what this session asked for.
     if(serverBaselineRef.current){
-      serverBaselineRef.current = {...serverBaselineRef.current, ...overrides, _autoSavedAt:savedAt};
+      const mergedOverrides = (confirmed && confirmed.data)
+        ? Object.keys(overrides||{}).reduce((acc,k)=>{ acc[k] = confirmed.data[k]; return acc; }, {})
+        : overrides;
+      serverBaselineRef.current = {...serverBaselineRef.current, ...mergedOverrides, _autoSavedAt:savedAt};
+      if(confirmed && confirmed.revision !== undefined) serverBaselineRef.current._serverRevision = confirmed.revision;
     }
     return true;
   }
