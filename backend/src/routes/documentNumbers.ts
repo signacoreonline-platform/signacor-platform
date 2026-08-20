@@ -37,6 +37,36 @@ import { authenticate } from '../middleware/auth';
  * A manually requested number below the counter's current frontier is
  * still honoured if free (a genuine numbering gap) — the counter itself
  * only ever moves forward, matching its existing "never regress" contract.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 2026-08-20 FORWARD-ONLY PRO-##### PROFORMA NUMBERING
+ * ══════════════════════════════════════════════════════════════════════
+ * New business rule (index.html QuoteViewModal's new "Reserve Proforma
+ * Number" action): a NEW proforma reserves a real invoice number from this
+ * SAME atomic 'invoice' pool — there is no separate PRO counter — and
+ * displays/stores it as quote.proformaNum = "PRO-#####", where the numeric
+ * suffix IS the exact invoice number reserved (PRO-00042 <=> INV-00042).
+ * The frontend does this by calling POST /reserve with docType:'invoice'
+ * exactly as it always has (via reserveInvoiceNumber()) and then swapping
+ * the "INV-" prefix for "PRO-" for display/storage — nothing new is added
+ * to this endpoint's contract for that half of the flow.
+ *
+ * What DOES need to change here: scanExistingNumbers()/findOwner() below,
+ * for docType 'invoice', already treat quote.proformaNum as occupying an
+ * invoice slot (this is what already made a LEGACY INV-style proformaNum
+ * block other invoices from reusing that number). That existing check
+ * compared the stored proformaNum to the candidate INV-##### string
+ * literally, which is correct for legacy INV-style values but would MISS a
+ * new PRO-##### value entirely (it doesn't equal "INV-#####" as a string),
+ * silently letting some other invoice creation path claim the exact number
+ * a live PRO reservation depends on. deriveReservedInvoiceNumber() below
+ * closes that gap: it derives the implied INV-##### for BOTH legacy
+ * (INV-style, unchanged) and new-style (PRO-style) proformaNum values, and
+ * both scanExistingNumbers and findOwner now check the derived value too.
+ *
+ * Legacy quotes are never rewritten by this — their proformaNum keeps
+ * whatever value it already had (see index.html resolveProformaInvoiceNumber
+ * for the matching frontend-side derivation used at finalisation).
  */
 
 const router = Router();
@@ -68,6 +98,26 @@ function escapeForRegex(s: string): string {
   return s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
 }
 
+// 2026-08-20 forward-only PRO numbering: given a quote's proformaNum value
+// (in ANY form it may legitimately take), returns the INV-##### invoice
+// number it implies is reserved — or null if the value implies no
+// reservation at all (should not normally happen; a defensive fallback).
+//   - New-style "PRO-00042"  -> "INV-00042" (the suffix IS the reservation)
+//   - Legacy   "INV-00033"   -> "INV-00033" (already IS the invoice number,
+//     unchanged behaviour from before this feature existed)
+//   - Anything else (unrecognised/custom legacy format) -> null; the raw
+//     value is still separately added verbatim by scanExistingNumbers, so
+//     this only ever ADDS a recognised equivalence, never removes the
+//     pre-existing literal-match behaviour.
+function deriveReservedInvoiceNumber(raw: string): string | null {
+  const v = (raw || '').trim().toUpperCase();
+  if (!v) return null;
+  const proMatch = /^PRO-(\d+)$/.exec(v);
+  if (proMatch) return PREFIX.invoice + proMatch[1];
+  if (v.startsWith(PREFIX.invoice)) return v;
+  return null;
+}
+
 // Scans the live platform_state for every existing number already used for
 // this doc type (and, for invoice/quote, this company specifically), and
 // separately returns a best-effort "owner" descriptor for a specific
@@ -93,7 +143,13 @@ function scanExistingNumbers(data: Record<string, any> | null | undefined, compa
     const quotesForInvoice = Array.isArray(data.quotes) ? data.quotes : [];
     for (const q of quotesForInvoice) {
       if (q && String(q.co) === company && typeof q.proformaNum === 'string' && q.proformaNum.trim()) {
-        found.add(q.proformaNum.trim().toUpperCase());
+        const raw = q.proformaNum.trim().toUpperCase();
+        found.add(raw); // preserves prior literal-match behaviour unchanged
+        // 2026-08-20: a PRO-##### proformaNum implies the same-suffix
+        // INV-##### is reserved too — add that derived equivalent so it
+        // actually blocks the auto-candidate loop / manual requests below.
+        const implied = deriveReservedInvoiceNumber(raw);
+        if (implied) found.add(implied);
       }
     }
   } else if (docType === 'quote') {
@@ -140,7 +196,15 @@ function findOwner(data: Record<string, any> | null | undefined, company: string
     if (job) return { documentType: 'job invoice', number: up, id: job.id, client: job.client ?? null };
     const inv = accInvoices.find((i: any) => i && String(i.co) === company && (i.number || '').trim().toUpperCase() === up);
     if (inv) return { documentType: 'invoice', number: up, id: inv.id, client: inv.client ?? null };
-    const q = quotes.find((qq: any) => qq && String(qq.co) === company && (qq.proformaNum || '').trim().toUpperCase() === up);
+    // 2026-08-20: matches a quote whose proformaNum literally equals `up`
+    // (legacy behaviour, unchanged) OR whose proformaNum is a PRO-#####
+    // value implying `up` as its reserved invoice number (new behaviour).
+    const q = quotes.find((qq: any) => {
+      if (!qq || String(qq.co) !== company || typeof qq.proformaNum !== 'string') return false;
+      const raw = qq.proformaNum.trim().toUpperCase();
+      if (!raw) return false;
+      return raw === up || deriveReservedInvoiceNumber(raw) === up;
+    });
     if (q) return { documentType: 'quote proforma reservation', number: up, id: q.id, client: q.client ?? null };
   } else if (docType === 'quote') {
     const q = quotes.find((qq: any) => qq && String(qq.co) === company && (qq.num || '').trim().toUpperCase() === up);
@@ -376,5 +440,5 @@ router.post('/check', async (req: Request, res: Response): Promise<void> => {
 });
 
 export default router;
-export { reserveDocumentNumberWithClient, peekNextNumber, findOwner, scanExistingNumbers };
+export { reserveDocumentNumberWithClient, peekNextNumber, findOwner, scanExistingNumbers, deriveReservedInvoiceNumber };
 export type { DocType };

@@ -10,6 +10,8 @@
     "migrate": "node dist/db/migrate.js",
     "db:migrate": "psql $DATABASE_URL -f ../database/schema.sql",
     "test:hardening": "ts-node --transpile-only test/hardening.stress.ts",
+    "test:proforma-numbering": "ts-node --transpile-only test/proforma-numbering.stress.ts",
+    "test:proforma-frontend": "ts-node --transpile-only test/proforma-frontend-logic.test.ts",
     "repair:duplicated-jobs": "ts-node --transpile-only src/db/repairDuplicatedJobsAugust2026.ts",
     "restore:pre-duplication-state": "node dist/db/restorePlatformStateBeforeDuplicationAugust2026.js",
     "export:live-state-readonly": "node dist/db/exportLivePlatformStateForComparisonAugust2026.js",
