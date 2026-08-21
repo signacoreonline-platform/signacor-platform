@@ -19,6 +19,8 @@
     "test:fullbackup-frontend-fix:compiled": "node dist/test/fullbackup-frontend-fix.test.js",
     "test:relational": "ts-node --transpile-only test/relational.stress.ts",
     "test:relational:compiled": "node dist/test/relational.stress.js",
+    "test:relational:stage3": "ts-node --transpile-only test/relational.stage3.stress.ts",
+    "test:relational:stage3:compiled": "node dist/test/relational.stage3.stress.js",
     "test:relational:mixed-mode": "node dist/test/relational.mixed-mode.stress.js",
     "test:relational:rest-api": "node dist/test/relational.rest-api.stress.js",
     "test:relational:cutover-cli": "node dist/test/relational.cutover-cli.stress.js",

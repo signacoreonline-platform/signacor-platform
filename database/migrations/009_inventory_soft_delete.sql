@@ -1,0 +1,65 @@
+-- 009_inventory_soft_delete.sql
+--
+-- MIGRATION CLOSURE Item 3 (2026-08-21) — inventory item DELETE redesign.
+--
+-- Prior to this migration, relational inventory had create/update/adjust
+-- services but NO delete at all (see services.ts's Stage 3 Phase 8 note) —
+-- removeItem() in index.html stayed JSON-only, and the systemic
+-- assertNoUnwiredRelationalSections guard refused any save that hit it once
+-- "inventory" was cut over, rather than silently losing the deletion. This
+-- migration and its accompanying services.ts/read.ts/index.html changes
+-- close that gap for real.
+--
+-- Design choice (documented, not left implicit): rel_quote_line_items and
+-- rel_job_line_items each carry an OPTIONAL inventory_item_id FK back to
+-- rel_inventory_items (no ON DELETE CASCADE/SET NULL — see 007's comment
+-- next to deleteSupplier's identical, already-shipped pattern for
+-- rel_suppliers). A PHYSICAL DELETE FROM rel_inventory_items would either
+-- (a) be silently blocked forever for any item ever used on any historical
+-- quote/job, however old and fully closed, with no path forward, or (b)
+-- require an ON DELETE CASCADE/SET NULL that could sever or corrupt that
+-- historical link — the task's own words: "never ON DELETE CASCADE
+-- destroying business history". Neither is acceptable, and unlike
+-- rel_suppliers (a genuinely rare delete, refuse-when-referenced is fine
+-- there), inventory items are routinely discontinued while old quotes/jobs
+-- that quoted them stay on file — a real, common business action, not an
+-- edge case.
+--
+-- So: a single additive is_active flag. deleteInventoryItem() (services.ts)
+-- becomes a soft delete — UPDATE ... SET is_active = false — under the
+-- SAME row-scoped optimistic-concurrency discipline (expectedVersion
+-- checked, row_version bumped) as every other relational mutation. No row
+-- is ever physically removed, so the inventory_item_id FK can never break
+-- and historical quote/job line items (which already store their OWN
+-- desc/qty/unit_price/subtotal at save time — see rel_quote_line_items/
+-- rel_job_line_items in 007 — and never re-read the parent inventory row to
+-- render) are completely unaffected either way. read.ts's buildInventoryJson
+-- deliberately does NOT filter inactive rows out (so full backups and
+-- reconciliation keep seeing 100% of inventory history, discontinued or
+-- not) — it exposes the new `active` field and the FRONTEND (InventoryPage)
+-- filters its own visible list, exactly matching removeItem's old
+-- "vanishes from the list" UX without ever destroying data server-side.
+--
+-- Idempotent and additive only:
+--   - ADD COLUMN IF NOT EXISTS
+--   - DEFAULT TRUE means every pre-existing row (anything already backfilled
+--     from the live JSON, where there is no concept of a "deleted" item —
+--     removeItem() just filtered items out of the array with nothing left
+--     behind to migrate) is correctly treated as active with zero backfill
+--     code changes required
+--   - never drops, renames, or retypes an existing column
+--   - never touches historical row data
+--   - safe to re-run
+
+ALTER TABLE rel_inventory_items ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- Deliberately NOT applied to rel_quick_rate_items — quickRates stays
+-- hard-blocked/out of scope for this entire migration (same table shape as
+-- rel_inventory_items, but a completely separate collection with its own
+-- cutover section that is never enabled — see cutoverCli/relational_cutover
+-- and every prior Stage/Migration report's explicit reconfirmation of this).
+
+-- A partial index keeps the common "active items only" query path
+-- (InventoryPage's default listing, and any future item picker) cheap even
+-- as discontinued items accumulate — optional but harmless to include here.
+CREATE INDEX IF NOT EXISTS idx_rel_inventory_items_active ON rel_inventory_items (is_active) WHERE is_active = true;

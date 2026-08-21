@@ -43,6 +43,43 @@ import { runReconciliation } from './reconcile';
 
 const HARD_BLOCKED_SECTIONS = new Set<string>(['customers', 'quickRates']);
 
+// ══════════════════════════════════════════════════════════════════════
+// STAGE 3 — DEPENDENCY-AWARE CUTOVER (2026-08-20)
+// ══════════════════════════════════════════════════════════════════════
+// Some sections cannot be safely enabled in isolation because a REAL
+// operation on them writes into OTHER sections' relational tables too.
+// The clearest example: services.ts's convertQuoteToJob (quote -> job)
+// creates a job, deducts inventory, and may auto-generate purchase orders,
+// all in ONE transaction, whenever a quote is converted — regardless of
+// which sections are cut over. If "quotes" is enabled but "jobs" is not,
+// that job still gets created in rel_jobs, but the live JSON-rendered app
+// (which reads jobs from platform_state, since "jobs" isn't cut over) would
+// never show it — a real record silently invisible to every normal user,
+// not corrupted, just unreachable. Same story for inventory (stock
+// deducted, but the JSON inventory view stays stale/wrong) and
+// purchaseOrders (an auto-PO created, never seen).
+//
+// Rather than have the operator remember this, `enable <section>` REFUSES
+// if any of that section's required dependencies are not ALREADY enabled.
+// This is deliberately NOT an --enable-all: it forces the operator to run
+// enable for jobs, inventory, and purchaseOrders individually (each with
+// its own explicit --confirm=ENABLE_<SECTION> phrase and its own fresh
+// reconciliation check) BEFORE quotes can be enabled — one named,
+// explicit, auditable step per section, never a bundled/blanket action.
+const DEPENDENCY_GROUPS: Record<string, { requires: string[]; reason: string }> = {
+  quotes: {
+    requires: ['jobs', 'inventory', 'purchaseOrders'],
+    reason:
+      'Quote -> Job conversion (services.ts convertQuoteToJob) creates a job, deducts inventory, and may auto-generate purchase orders in the SAME transaction as the conversion itself — regardless of which sections are cut over. If jobs/inventory/purchaseOrders are not ALSO relational-authoritative, those writes still happen but become invisible to the live JSON-rendered app (a real job/stock-adjustment/auto-PO existing in the database with no code path that ever surfaces it to a user). Enable jobs, inventory, and purchaseOrders individually FIRST (each with its own --confirm phrase), then enable quotes.',
+  },
+};
+
+function missingDependencies(section: string, enabledSections: Set<string>): string[] {
+  const group = DEPENDENCY_GROUPS[section];
+  if (!group) return [];
+  return group.requires.filter((dep) => !enabledSections.has(dep));
+}
+
 function confirmPhraseFor(action: 'enable' | 'disable', section: string): string {
   return action === 'enable'
     ? `ENABLE_${section.toUpperCase()}`
@@ -78,6 +115,18 @@ async function enableSection(section: string, apply: boolean, confirm: string | 
   }
   if (HARD_BLOCKED_SECTIONS.has(section)) {
     console.error(`REFUSED: "${section}" is permanently blocked from cutover by this tool (known historical duplicate-source-id collisions — see migration handoff). This is not a flag to override; resolving those collisions is a separate, deliberate, out-of-scope task.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const enabledRes = await pool.query('SELECT section FROM relational_cutover WHERE enabled = true');
+  const enabledSections = new Set<string>(enabledRes.rows.map((r) => r.section));
+  const missing = missingDependencies(section, enabledSections);
+  if (missing.length > 0) {
+    const group = DEPENDENCY_GROUPS[section];
+    console.error(`REFUSED: "${section}" cannot be safely enabled yet — it depends on: ${missing.join(', ')} (not yet enabled).`);
+    console.error(`  Reason: ${group.reason}`);
+    console.error(`  Enable each dependency individually first, e.g.: relational:cutover -- enable ${missing[0]} --apply --confirm=ENABLE_${missing[0].toUpperCase()}`);
     process.exitCode = 1;
     return;
   }

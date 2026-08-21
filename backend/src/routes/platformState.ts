@@ -202,6 +202,18 @@ function duplicateCountsOf(list: any[]): Map<string, number> {
 interface SectionMergeResult {
   finalList: any[];
   hasGenuineUpdate: boolean; // an existing id's content actually changed
+  // STAGE 3 FOLLOW-UP (record-scoped concurrency): WHICH id(s) within this
+  // section actually had a genuine content change, not just the section-wide
+  // boolean above. Populated only for the normal (non-duplicated) id case —
+  // a genuine change inside an ambiguous pre-existing duplicate group is
+  // never reachable (that shape is always either an exact resend or a hard
+  // block, see below), so it never needs to appear here. Used by the PUT
+  // handler below to evaluate a per-record "was THIS id's server copy
+  // exactly what the caller's editor started from" bypass of the global
+  // revision check, instead of forcing every genuine update anywhere on the
+  // platform to be judged by one whole-blob timestamp — see `_recordBase`
+  // handling below for the full rationale.
+  genuineUpdateIds: Set<string>;
   error?: string;
 }
 
@@ -259,7 +271,7 @@ function mergeSectionById(key: string, incoming: any[], existingList: any[], del
   const existingGroups = new Map<string, any[]>();
   for (const rec of existingList) {
     if (!rec || rec.id === undefined || rec.id === null) {
-      return { finalList: [], hasGenuineUpdate: false, error: `server "${key}" contains a record with no stable id — cannot safely merge` };
+      return { finalList: [], hasGenuineUpdate: false, genuineUpdateIds: new Set(), error: `server "${key}" contains a record with no stable id — cannot safely merge` };
     }
     const id = String(rec.id);
     if (!existingGroups.has(id)) existingGroups.set(id, []);
@@ -278,7 +290,7 @@ function mergeSectionById(key: string, incoming: any[], existingList: any[], del
   const incomingGroups = new Map<string, any[]>();
   for (const rec of incoming) {
     if (!rec || rec.id === undefined || rec.id === null) {
-      return { finalList: [], hasGenuineUpdate: false, error: `incoming "${key}" contains a record with no stable id — save blocked` };
+      return { finalList: [], hasGenuineUpdate: false, genuineUpdateIds: new Set(), error: `incoming "${key}" contains a record with no stable id — save blocked` };
     }
     const id = String(rec.id);
     if (!incomingGroups.has(id)) incomingGroups.set(id, []);
@@ -287,6 +299,7 @@ function mergeSectionById(key: string, incoming: any[], existingList: any[], del
 
   const finalList: any[] = [];
   let hasGenuineUpdate = false;
+  const genuineUpdateIds = new Set<string>();
   const allIds = new Set<string>([...existingGroups.keys(), ...incomingGroups.keys()]);
 
   for (const id of allIds) {
@@ -306,6 +319,7 @@ function mergeSectionById(key: string, incoming: any[], existingList: any[], del
         finalList.push(incomingRec); // create — always safe
       } else if (stableStringify(prior) !== stableStringify(incomingRec)) {
         hasGenuineUpdate = true;
+        genuineUpdateIds.add(id);
         finalList.push(incomingRec);
       } else {
         finalList.push(incomingRec); // byte-identical re-send — harmless no-op
@@ -330,14 +344,14 @@ function mergeSectionById(key: string, incoming: any[], existingList: any[], del
     // which copy is intended, or silently accepting a NEW collision, is
     // exactly what must never happen.
     return {
-      finalList: [], hasGenuineUpdate: false,
+      finalList: [], hasGenuineUpdate: false, genuineUpdateIds: new Set(),
       error: existingGroup.length > 1
         ? `incoming "${key}" touches id "${id}" (${existingGroup.length} distinct pre-existing copies server-side) with a payload that isn't an exact, unchanged resend of that group — cannot safely resolve which copy is intended (this historical collision must be resolved separately, not guessed at)`
         : `incoming "${key}" contains ${incomingGroup.length} records sharing id "${id}", which the server does not already have as a pre-existing collision — save blocked (new duplicate-id corruption)`,
     };
   }
 
-  return { finalList, hasGenuineUpdate };
+  return { finalList, hasGenuineUpdate, genuineUpdateIds };
 }
 
 // Counts records per `co` (company) tag, for sections that carry one
@@ -766,6 +780,25 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
     const baseRevision: string | null = typeof data._baseRevision === 'string' ? data._baseRevision : null;
     delete data._baseRevision;
 
+    // STAGE 3 FOLLOW-UP (2026-08-21) — RECORD-SCOPED CONCURRENCY / LONG-LIVED
+    // EDITOR SAFETY. Optional, purely additive, opt-in per save:
+    //   data._recordBase = { <section>: { <id>: <record exactly as the
+    //     caller's editor loaded it, before any local edits> }, ... }
+    // A caller that never sends this gets EXACTLY the pre-existing global
+    // `_baseRevision`-vs-`updated_at` behavior below, byte for byte — this
+    // field only ever WIDENS when a save is accepted, never narrows it, and
+    // never touches the merge, wipe-guard, dedup, or duplicate-id logic
+    // above/below, all of which run completely unchanged regardless of
+    // whether this is present. See the revision-check block further down for
+    // how it's used. Malformed input (not a plain object) is treated as
+    // absent rather than throwing — this is a pure optimization for saves
+    // that would otherwise be safe anyway, never a new way to fail a save.
+    const recordBase: Record<string, Record<string, any>> =
+      (data._recordBase && typeof data._recordBase === 'object' && !Array.isArray(data._recordBase))
+        ? data._recordBase
+        : {};
+    delete data._recordBase;
+
     const isPartial = data._partial === true;
     delete data._partial;
 
@@ -803,6 +836,12 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
     //    like an 80%+ loss just because it only mentions a few records).
     const mergeErrors: string[] = [];
     let anyGenuineUpdate = false;
+    // Per-section, per-id record of which ids had a genuine content change —
+    // see the revision-check block below for how this drives the
+    // record-scoped bypass. Deliberately a SEPARATE structure from
+    // resolvedDeletedIdsBySection (deletions are never eligible for that
+    // bypass, see below).
+    const genuineUpdatesBySection: Record<string, Set<string>> = {};
     for (const key of PROTECTED_SECTIONS) {
       if (!Array.isArray(data[key])) continue; // section not part of this save — leave untouched
       const incoming = data[key];
@@ -827,6 +866,7 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
       const merged = mergeSectionById(key, incoming, existingList, deleted);
       if (merged.error) { mergeErrors.push(merged.error); continue; }
       if (merged.hasGenuineUpdate) anyGenuineUpdate = true;
+      if (merged.genuineUpdateIds.size > 0) genuineUpdatesBySection[key] = merged.genuineUpdateIds;
       data[key] = merged.finalList;
     }
 
@@ -879,21 +919,90 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
     //    modifies/deletes an existing record with NO `_baseRevision` at all
     //    is treated the same as a stale one — "no revision" can never prove
     //    freshness, and guessing is exactly what must not happen here.
+    //
+    // ── STAGE 3 FOLLOW-UP (2026-08-21) — RECORD-SCOPED BYPASS ───────────────
+    // The check above is deliberately global (one blob-wide `updated_at`),
+    // which is what produced the "overnight quote" problem: editing Quote A
+    // was refused merely because unrelated Job B (or anything else on the
+    // whole platform) changed in between, even though Quote A itself was
+    // never touched. Explicit deletions ALWAYS still use the global check
+    // above unchanged — a delete is high-consequence enough that it stays
+    // maximally conservative, no bypass.
+    //
+    // For a save with genuine updates but NO deletion, a caller MAY supply
+    // `_recordBase[section][id]` = the exact record it started editing from.
+    // For every id that genuinely changed in THIS save:
+    //   - a supplied base that still matches the record's CURRENT (pre-this-
+    //     save) server copy proves nothing else touched that specific record
+    //     since this editor opened it — safe to apply regardless of what
+    //     else changed platform-wide. This is exactly optimistic concurrency
+    //     scoped to one record, using deep content equality (the same
+    //     `stableStringify` the no-op/genuine-update decision above already
+    //     uses) as the "version", the same way row_version does relationally
+    //     with a counter.
+    //   - a supplied base that does NOT match is an unambiguous same-record
+    //     conflict — reported immediately and specifically, no need to also
+    //     consult the global revision.
+    //   - an id with NO base supplied at all falls back to the ordinary
+    //     global check below, unchanged — this is what keeps every existing
+    //     caller (nothing sends `_recordBase` yet outside the quote editor)
+    //     byte-for-byte identical to pre-2026-08-21 behavior.
+    // The whole save is only allowed to skip the global check when EVERY
+    // genuinely-updated id across every touched section resolved via a
+    // matching base — a single id needing (and failing) the fallback still
+    // blocks the entire save, exactly as before.
     if (anyExplicitDeletion || anyGenuineUpdate) {
-      const serverRevision = existingUpdatedAt ? new Date(existingUpdatedAt).toISOString() : null;
-      const clientRevision = baseRevision ? new Date(baseRevision).toISOString() : null;
-      if (!clientRevision || serverRevision !== clientRevision) {
+      let specificConflict: { section: string; id: string } | null = null;
+      let anyIdNeedsGlobalCheck = anyExplicitDeletion; // deletions always need it
+      if (!anyExplicitDeletion) {
+        for (const [key, ids] of Object.entries(genuineUpdatesBySection)) {
+          const existingList = arr(existingData && existingData[key]);
+          for (const id of ids) {
+            const base = recordBase[key] && recordBase[key][id];
+            if (base === undefined) { anyIdNeedsGlobalCheck = true; continue; }
+            const currentRecord = existingList.find((r) => r && String(r.id) === id);
+            if (currentRecord !== undefined && stableStringify(currentRecord) === stableStringify(base)) {
+              continue; // this id's server copy is exactly what the editor started from — verified safe
+            }
+            specificConflict = { section: key, id };
+            break;
+          }
+          if (specificConflict) break;
+        }
+      }
+
+      if (specificConflict) {
         await client.query('ROLLBACK');
-        console.warn(`[platform-state] BLOCKED (stale revision, ${totalDeleteCount} pending delete(s), genuineUpdate=${anyGenuineUpdate}) ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'} serverRevision=${serverRevision} yourRevision=${clientRevision}`);
+        console.warn(`[platform-state] BLOCKED (stale record, record-scoped check) ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'} section=${specificConflict.section} id=${specificConflict.id}`);
         res.status(409).json({
           conflict: true,
-          type: 'stale_revision',
-          error: 'Data changed elsewhere — refresh and retry.',
-          serverRevision,
-          yourRevision: clientRevision,
+          type: 'stale_record',
+          error: 'This record was changed elsewhere while you were editing it.',
+          section: specificConflict.section,
+          id: specificConflict.id,
         });
         return;
       }
+
+      if (anyIdNeedsGlobalCheck) {
+        const serverRevision = existingUpdatedAt ? new Date(existingUpdatedAt).toISOString() : null;
+        const clientRevision = baseRevision ? new Date(baseRevision).toISOString() : null;
+        if (!clientRevision || serverRevision !== clientRevision) {
+          await client.query('ROLLBACK');
+          console.warn(`[platform-state] BLOCKED (stale revision, ${totalDeleteCount} pending delete(s), genuineUpdate=${anyGenuineUpdate}) ts=${auditMeta.ts} user=${auditMeta.userId ?? '—'} serverRevision=${serverRevision} yourRevision=${clientRevision}`);
+          res.status(409).json({
+            conflict: true,
+            type: 'stale_revision',
+            error: 'Data changed elsewhere — refresh and retry.',
+            serverRevision,
+            yourRevision: clientRevision,
+          });
+          return;
+        }
+      }
+      // else: every genuinely-updated id across every touched section was
+      // verified record-scoped-safe above — proceed without the global
+      // revision check. This is the fix for the overnight-quote scenario.
     }
 
     // ── Backup-before-save: snapshot whatever is currently live BEFORE it is

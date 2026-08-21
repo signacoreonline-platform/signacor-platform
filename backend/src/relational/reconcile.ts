@@ -44,6 +44,50 @@
  * USAGE (run from backend/):
  *   npx ts-node --transpile-only src/relational/reconcile.ts
  *   npx ts-node --transpile-only src/relational/reconcile.ts --source-file=test/fixtures/sample-state.json
+ *   npx ts-node --transpile-only src/relational/reconcile.ts --mode=post-cutover
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * STAGE 3 (2026-08-20) — WHY THERE ARE NOW TWO MODES
+ * ══════════════════════════════════════════════════════════════════════
+ * Everything above this note (`runReconciliation`, the MATCH/DIFFERENT/...
+ * classification, `safeToCutOver`) is UNCHANGED and remains the PRE-CUTOVER
+ * check — it compares each rel_* row's `legacy_data` (the snapshot captured
+ * at backfill time) against the CURRENT live JSON. That comparison is
+ * exactly right before any relational writes have happened for a section:
+ * pre-cutover, the only way a rel_* row's modeled columns/legacy_data can
+ * exist at all is via backfill.ts, which is itself driven directly by the
+ * live JSON — so "does relational match JSON" and "is the backfill fresh"
+ * are the same question, and `runReconciliation` (still the function every
+ * existing test and `cutoverCli.ts enable` calls) keeps answering it
+ * unchanged, byte-for-byte, exactly as before.
+ *
+ * That comparison basis STOPS being meaningful the moment a section
+ * receives a REAL relational write through services.ts (Stage 3's
+ * updateJob/updateQuote/recordPayment/etc.) — those functions intentionally
+ * update the normalized rel_* columns but never rewrite `legacy_data` (by
+ * design: legacy_data stays as historical backfill provenance, not a
+ * running mirror of every edit). So once a section has live relational
+ * writes (which today only happens in local testing, or in production
+ * after a section is actually cut over), `runReconciliation` would report
+ * every edited record as DIFFERENT forever, with the message "relational
+ * copy is stale, re-run the backfill" — which is BACKWARDS: the relational
+ * copy is the fresher, authoritative one; the JSON is what's stale.
+ *
+ * `runPostCutoverIntegrityCheck` below is the answer for that situation. It
+ * NEVER compares against JSON/legacy_data at all — it verifies the
+ * relational data is internally consistent on its own terms: no duplicate
+ * document numbers (a belt-and-suspenders check; the DB's own UNIQUE
+ * constraints already prevent this), no dangling foreign-key references
+ * (a quote's converted_job_id/a job's quote_id/a PO's supplier_id-job_id-
+ * quote_id/a payment's owner_id all still point at a row that exists), and
+ * a small set of financial self-consistency invariants that must always
+ * hold regardless of what JSON says (a quote's stored subtotal/vat/total
+ * actually equal what its own current line items compute to; a credit
+ * note's used_amount never exceeds its amount). This is what Phase 22's
+ * "post-cutover verification... not falsely requiring stale JSON to equal
+ * current relational data" asks for.
+ *
+ * Neither function ever writes anything, on any table, in any mode.
  */
 import fs from 'fs';
 import path from 'path';
@@ -241,13 +285,181 @@ export async function runReconciliation(opts: { sourceFile?: string }): Promise<
   return { sections, overallSafe };
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// POST-CUTOVER MODE — relational-internal integrity only. NEVER reads
+// platform_state or any --source-file, and NEVER compares against
+// legacy_data. See the "WHY THERE ARE NOW TWO MODES" note at the top of
+// this file for the full rationale. Purely additive: does not change the
+// return type, behavior, or byte-for-byte output of `runReconciliation`
+// above, which every existing test and cutoverCli.ts's `enable` gate still
+// calls unchanged.
+// ═══════════════════════════════════════════════════════════════════════
+
+export interface PostCutoverIntegrityReport {
+  collection: string;
+  table: string;
+  cutOver: boolean;
+  relationalRowCount: number;
+  duplicateDocumentNumbers: Array<{ documentNumber: string; count: number }>;
+  orphanedReferences: Array<{ id: string; issue: string }>;
+  invariantViolations: Array<{ id: string; issue: string }>;
+  integrityOk: boolean;
+  reasons: string[];
+}
+
+export async function runPostCutoverIntegrityCheck(): Promise<{ sections: PostCutoverIntegrityReport[]; overallOk: boolean }> {
+  const cutoverRes = await pool.query('SELECT section, enabled FROM relational_cutover');
+  const cutoverBySection = new Map<string, boolean>();
+  for (const row of cutoverRes.rows) cutoverBySection.set(row.section, row.enabled);
+
+  // Document-number duplicate checks. Belt-and-suspenders: every table
+  // below already carries a DB-level UNIQUE constraint on this exact
+  // column (set), so a hit here means the constraint itself was somehow
+  // bypassed (e.g. a manual psql UPDATE) — treat any hit as an emergency,
+  // not routine drift.
+  async function checkDocNumbers(collection: string, table: string, numberCol: string, partitionCols: string[] = []): Promise<PostCutoverIntegrityReport> {
+    const countRes = await pool.query(`SELECT count(*)::int AS n FROM ${table}`);
+    const report: PostCutoverIntegrityReport = {
+      collection, table, cutOver: cutoverBySection.get(collection) === true,
+      relationalRowCount: countRes.rows[0].n,
+      duplicateDocumentNumbers: [], orphanedReferences: [], invariantViolations: [],
+      integrityOk: true, reasons: [],
+    };
+    const groupCols = [numberCol, ...partitionCols].join(', ');
+    const dupRes = await pool.query(
+      `SELECT ${numberCol} AS doc_number, count(*)::int AS n FROM ${table} GROUP BY ${groupCols} HAVING count(*) > 1`
+    );
+    for (const row of dupRes.rows) {
+      report.duplicateDocumentNumbers.push({ documentNumber: row.doc_number, count: row.n });
+    }
+    return report;
+  }
+
+  const sections: PostCutoverIntegrityReport[] = [];
+  sections.push(await checkDocNumbers('quotes', 'rel_quotes', 'quote_number', ['company_code']));
+  sections.push(await checkDocNumbers('jobs', 'rel_jobs', 'job_number'));
+  sections.push(await checkDocNumbers('accInvoices', 'rel_invoices', 'invoice_number', ['company_code']));
+  sections.push(await checkDocNumbers('purchaseOrders', 'rel_purchase_orders', 'po_number'));
+  sections.push(await checkDocNumbers('creditNotes', 'rel_credit_notes', 'credit_number'));
+
+  // Payments carry no document number of their own — still reported so the
+  // owner-orphan check below (the one reference NOT enforced by a DB FK,
+  // since owner_id is polymorphic across job/quote/invoice) has a home.
+  const paymentsCountRes = await pool.query('SELECT count(*)::int AS n FROM rel_payments');
+  const paymentsReport: PostCutoverIntegrityReport = {
+    collection: 'payments', table: 'rel_payments', cutOver: cutoverBySection.get('payments') === true,
+    relationalRowCount: paymentsCountRes.rows[0].n,
+    duplicateDocumentNumbers: [], orphanedReferences: [], invariantViolations: [], integrityOk: true, reasons: [],
+  };
+  sections.push(paymentsReport);
+
+  // ── Orphaned reference checks ──
+  // Almost every FK in schema 007/008 is a REAL Postgres FOREIGN KEY
+  // (rel_jobs.quote_id, rel_invoices.job_id/quote_id, rel_purchase_orders.
+  // supplier_id/job_id/quote_id, rel_credit_notes.customer_id/supplier_id,
+  // rel_quotes.converted_job_id, ...) — the database itself already makes
+  // a dangling reference impossible there, so re-checking them here would
+  // be pure theater. The ONE reference that is NOT a DB-level FK is
+  // rel_payments.owner_id, which is polymorphic (owner_type decides which
+  // table owner_id points into) and so cannot be declared as a real FK —
+  // this is the genuine, non-redundant integrity check for this section.
+  const orphanJobPayments = await pool.query(
+    `SELECT p.id, p.owner_id FROM rel_payments p WHERE p.owner_type = 'job' AND NOT EXISTS (SELECT 1 FROM rel_jobs j WHERE j.id = p.owner_id)`
+  );
+  const orphanQuotePayments = await pool.query(
+    `SELECT p.id, p.owner_id FROM rel_payments p WHERE p.owner_type = 'quote' AND NOT EXISTS (SELECT 1 FROM rel_quotes q WHERE q.id = p.owner_id)`
+  );
+  const orphanInvoicePayments = await pool.query(
+    `SELECT p.id, p.owner_id FROM rel_payments p WHERE p.owner_type = 'invoice' AND NOT EXISTS (SELECT 1 FROM rel_invoices i WHERE i.id = p.owner_id)`
+  );
+  for (const row of orphanJobPayments.rows) paymentsReport.orphanedReferences.push({ id: String(row.id), issue: `owner_type=job owner_id=${row.owner_id} has no matching rel_jobs row` });
+  for (const row of orphanQuotePayments.rows) paymentsReport.orphanedReferences.push({ id: String(row.id), issue: `owner_type=quote owner_id=${row.owner_id} has no matching rel_quotes row` });
+  for (const row of orphanInvoicePayments.rows) paymentsReport.orphanedReferences.push({ id: String(row.id), issue: `owner_type=invoice owner_id=${row.owner_id} has no matching rel_invoices row` });
+
+  // ── Financial self-consistency invariants ──
+  // Recomputed strictly from THIS row's own current relational data
+  // (its own rel_quote_line_items, right now) — never from JSON/legacy_data,
+  // and never from a value that could itself be stale. A quote edited
+  // relationally (line items changed via updateQuote/updateQuoteWithJobSync)
+  // must still have subtotal/vat_amount/total that agree with its OWN
+  // current lines — that's the whole point of this being a "post-cutover"
+  // check instead of a JSON comparison.
+  const quoteReport = sections.find((s) => s.collection === 'quotes')!;
+  const quotesRes = await pool.query('SELECT id, source_id, setup_fee, discount_pct, subtotal, vat_amount, total FROM rel_quotes');
+  for (const q of quotesRes.rows) {
+    const linesRes = await pool.query('SELECT subtotal FROM rel_quote_line_items WHERE quote_id = $1', [q.id]);
+    const subtotal = linesRes.rows.reduce((s: number, l: any) => s + num(l.subtotal), 0);
+    const discAmt = subtotal * (num(q.discount_pct) / 100);
+    const setupFee = num(q.setup_fee);
+    const afterDisc = subtotal - discAmt + setupFee;
+    const vat = afterDisc * 0.15;
+    const total = afterDisc + vat;
+    if (!approxEqual(subtotal, num(q.subtotal))) quoteReport.invariantViolations.push({ id: q.source_id, issue: `stored subtotal ${q.subtotal} != this quote's OWN current line items sum ${subtotal.toFixed(2)}` });
+    if (!approxEqual(vat, num(q.vat_amount))) quoteReport.invariantViolations.push({ id: q.source_id, issue: `stored vat_amount ${q.vat_amount} != recomputed ${vat.toFixed(2)} from this quote's OWN current line items` });
+    if (!approxEqual(total, num(q.total))) quoteReport.invariantViolations.push({ id: q.source_id, issue: `stored total ${q.total} != recomputed ${total.toFixed(2)} from this quote's OWN current line items` });
+  }
+
+  // Credit notes: used_amount can never exceed amount, regardless of what
+  // JSON ever said.
+  const creditReport = sections.find((s) => s.collection === 'creditNotes')!;
+  const creditRes = await pool.query('SELECT source_id, amount, used_amount FROM rel_credit_notes');
+  for (const cn of creditRes.rows) {
+    if (num(cn.used_amount) > num(cn.amount) + 0.01) {
+      creditReport.invariantViolations.push({ id: cn.source_id, issue: `used_amount ${cn.used_amount} exceeds amount ${cn.amount}` });
+    }
+  }
+
+  for (const s of sections) {
+    s.integrityOk = s.duplicateDocumentNumbers.length === 0 && s.orphanedReferences.length === 0 && s.invariantViolations.length === 0;
+    if (s.duplicateDocumentNumbers.length) s.reasons.push(`${s.duplicateDocumentNumbers.length} duplicate document number group(s) found — the DB UNIQUE constraint should already prevent this; treat as an emergency, not routine drift.`);
+    if (s.orphanedReferences.length) s.reasons.push(`${s.orphanedReferences.length} orphaned reference(s) found — a row points at an owner/parent that no longer exists.`);
+    if (s.invariantViolations.length) s.reasons.push(`${s.invariantViolations.length} financial self-consistency invariant violation(s) found — computed strictly from this row's own current relational data, never compared against JSON.`);
+    if (s.integrityOk) s.reasons.push('Relational data is internally consistent on its own terms — JSON/legacy_data was never consulted (see PRE-CUTOVER vs POST-CUTOVER note at top of file).');
+  }
+
+  const overallOk = sections.every((s) => s.integrityOk);
+  return { sections, overallOk };
+}
+
 if (require.main === module) {
   (async () => {
     const args = process.argv.slice(2);
+    const modeArg = args.find((a) => a.startsWith('--mode='));
+    const mode = modeArg ? modeArg.slice('--mode='.length) : 'pre-cutover';
+
+    if (mode === 'post-cutover') {
+      console.log(`[reconcile] READ ONLY. Mode: post-cutover (relational-internal integrity only — JSON/legacy_data is NOT consulted).\n`);
+      const { sections, overallOk } = await runPostCutoverIntegrityCheck();
+      for (const s of sections) {
+        console.log(`── ${s.collection} (${s.table}) ──────────────────────────`);
+        console.log(`  cut over: ${s.cutOver ? 'YES' : 'no'}  relational rows: ${s.relationalRowCount}`);
+        if (s.duplicateDocumentNumbers.length) {
+          console.log(`  duplicate document numbers: ${s.duplicateDocumentNumbers.length}`);
+          for (const d of s.duplicateDocumentNumbers) console.log(`    - ${d.documentNumber} (${d.count}x)`);
+        }
+        if (s.orphanedReferences.length) {
+          console.log(`  orphaned references: ${s.orphanedReferences.length}`);
+          for (const o of s.orphanedReferences) console.log(`    - id=${o.id}: ${o.issue}`);
+        }
+        if (s.invariantViolations.length) {
+          console.log(`  invariant violations: ${s.invariantViolations.length}`);
+          for (const v of s.invariantViolations) console.log(`    - id=${v.id}: ${v.issue}`);
+        }
+        console.log(`  INTEGRITY OK: ${s.integrityOk ? 'YES' : 'NO'}`);
+        for (const r of s.reasons) console.log(`    - ${r}`);
+        console.log('');
+      }
+      console.log(`════════════════════════════════════════`);
+      console.log(`OVERALL: ${overallOk ? 'ALL SECTIONS INTERNALLY CONSISTENT' : 'SOME SECTIONS HAVE INTEGRITY ISSUES'}`);
+      await pool.end();
+      process.exit(overallOk ? 0 : 0); // read-only report — never a hard CI failure by itself
+      return;
+    }
+
     const sourceFileArg = args.find((a) => a.startsWith('--source-file='));
     const sourceFile = sourceFileArg ? sourceFileArg.slice('--source-file='.length) : undefined;
 
-    console.log(`[reconcile] READ ONLY. Source: ${sourceFile || 'live platform_state'}\n`);
+    console.log(`[reconcile] READ ONLY. Mode: pre-cutover. Source: ${sourceFile || 'live platform_state'}\n`);
     const { sections, overallSafe } = await runReconciliation({ sourceFile });
     for (const s of sections) {
       console.log(`── ${s.collection} (${s.table}) ──────────────────────────`);

@@ -165,7 +165,20 @@ async function upsertRow(
   const id = existing.rows[0].id;
 
   if (!changed) {
-    return 'unchanged'; // derived columns are a pure function of legacyData — identical JSON means identical columns, nothing to write
+    // Derived columns are a pure function of legacyData — identical JSON
+    // means identical columns, nothing to write. CAVEAT (Stage 3, migration
+    // 008): this assumes the derivation logic itself hasn't changed since a
+    // row was last written. A row backfilled by an OLDER version of this
+    // file (e.g. before the unit/breakdown/address/vat_number columns
+    // existed) will keep this "unchanged" shortcut forever against
+    // unmodified JSON, even though re-running the (now newer) derivation
+    // would populate those columns for the first time. Never an issue for
+    // this repo's own tests (they always TRUNCATE the rel_* tables before
+    // backfilling) or for a genuine first-ever production backfill (there
+    // is no prior row to compare against, so the INSERT branch above runs
+    // instead) — only a local-dev nuance if backfill was run once under
+    // old code and once under new code against the same unchanged JSON.
+    return 'unchanged';
   }
 
   const vals = cols.map((c) => columns[c]);
@@ -295,8 +308,10 @@ export async function runBackfill(opts: { apply: boolean; sourceFile?: string; r
           contact_person: str(rec.contactPerson),
           phone: str(rec.phone),
           email: str(rec.email),
+          address: str(rec.address), // migration 008 — AddEditSupplierModal's real field
           city: str(rec.city),
           postal_code: str(rec.postalCode),
+          vat_number: str(rec.vatNumber), // migration 008 — AddEditSupplierModal's real field
           payment_terms: str(rec.paymentTerms),
           account_number: str(rec.accountNumber),
           notes: str(rec.notes),
@@ -453,6 +468,7 @@ export async function runBackfill(opts: { apply: boolean; sourceFile?: string; r
             {
               quote_id: relId, line_index: i, description: str(l.desc),
               qty: num(l.qty, 1), unit_price: num(l.unitPrice), subtotal: num(l.subtotal),
+              unit: str(l.unit), // migration 008 — quote line-item editor's real field
               inventory_item_id: invId, inventory_source_id: invSourceId,
             },
             l
@@ -522,6 +538,15 @@ export async function runBackfill(opts: { apply: boolean; sourceFile?: string; r
         const quoteNumRaw = str(rec.quoteNum);
         const quoteRelId = quoteNumRaw ? quoteNumberToId.get(`${co}::${quoteNumRaw.toUpperCase()}`) || null : null;
 
+        // migration 008 — JobDetail's saveCosts() always writes a fixed
+        // 9-key object (materials/labour/machine_time/design/delivery/
+        // franchise_royalty/subcontracting/printing/other) onto
+        // job.breakdown; the live fixture also shows plain `null` for jobs
+        // that have never had costs entered — normalize both cases to a
+        // real JSON object so rel_jobs.breakdown (NOT NULL DEFAULT '{}')
+        // always holds a valid, whole-object value, never a bare JSON null.
+        const breakdown = rec.breakdown && typeof rec.breakdown === 'object' ? rec.breakdown : {};
+
         const columns = {
           source_id: sourceId,
           job_number: num_,
@@ -551,6 +576,7 @@ export async function runBackfill(opts: { apply: boolean; sourceFile?: string; r
           po_ref: str(rec.poRef),
           reference: str(rec.reference),
           notes: str(rec.notes),
+          breakdown: JSON.stringify(breakdown), // migration 008 — jsonb column, same untyped-parameter convention already used for legacy_data
         };
         const outcome = await upsertRow(client, 'rel_jobs', ['source_id'], columns, rec);
         s[outcome]++;
@@ -569,6 +595,7 @@ export async function runBackfill(opts: { apply: boolean; sourceFile?: string; r
             {
               job_id: relId, line_index: i, description: str(l.desc),
               qty: num(l.qty, 1), unit_price: num(l.unitPrice), subtotal: num(l.subtotal),
+              unit: str(l.unit), // migration 008 — job line-item editor's real field
               inventory_item_id: invId, inventory_source_id: invSourceId,
             },
             l

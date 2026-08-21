@@ -67,23 +67,50 @@ import { authenticate } from '../middleware/auth';
  * Legacy quotes are never rewritten by this — their proformaNum keeps
  * whatever value it already had (see index.html resolveProformaInvoiceNumber
  * for the matching frontend-side derivation used at finalisation).
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * 2026-08-20 STAGE 3 — CREDIT NOTE NUMBERING MOVED TO THIS ARCHITECTURE
+ * ══════════════════════════════════════════════════════════════════════
+ * Credit notes (index.html AccountingPage/CreditNoteModal) previously had
+ * NO backend reservation at all — nextCnNum() was a pure FRONTEND
+ * `'CN-'+String(max(existing)+1)` scan over the FULL, unfiltered
+ * creditNotesAll array (both companies combined, not per-company), a real
+ * documented race-condition gap. Stage 3 adds 'creditNote' as a new
+ * doc_type here, reusing this file's existing atomic
+ * reserveDocumentNumberWithClient machinery unchanged rather than building
+ * a parallel counter. It is scoped as a GLOBAL doc type (GLOBAL_COMPANY,
+ * like job/po) rather than per-company, because that matches the REAL
+ * existing frontend behavior — nextCnNum() scans ALL credit notes
+ * regardless of company, so the counter must be global too or numbers
+ * issued for company 1 and company 2 could collide with each other the
+ * moment this became authoritative. No migration was needed for this:
+ * document_number_counters.doc_type is a free-text column with no CHECK
+ * constraint (see 003_document_number_counters.sql) — see migration 008's
+ * header comment for the explicit confirmation of that.
  */
 
 const router = Router();
 router.use(authenticate);
 
 const VALID_COMPANIES = ['1', '2', '4'];
-const VALID_DOC_TYPES = ['invoice', 'quote', 'job', 'po'] as const;
+const VALID_DOC_TYPES = ['invoice', 'quote', 'job', 'po', 'creditNote'] as const;
 type DocType = (typeof VALID_DOC_TYPES)[number];
 
-const GLOBAL_DOC_TYPES: ReadonlySet<DocType> = new Set(['job', 'po']);
+const GLOBAL_DOC_TYPES: ReadonlySet<DocType> = new Set(['job', 'po', 'creditNote']);
 const GLOBAL_COMPANY = 'ALL';
 
-const PREFIX: Record<DocType, string> = { invoice: 'INV-', quote: 'SQ-', job: 'SNS-', po: 'PO-' };
-const DOC_LABEL: Record<DocType, string> = { invoice: 'invoice', quote: 'quote', job: 'job', po: 'purchase order' };
+const PREFIX: Record<DocType, string> = { invoice: 'INV-', quote: 'SQ-', job: 'SNS-', po: 'PO-', creditNote: 'CN-' };
+const DOC_LABEL: Record<DocType, string> = { invoice: 'invoice', quote: 'quote', job: 'job', po: 'purchase order', creditNote: 'credit note' };
+
+// 2026-08-20: creditNote is deliberately 4 digits (CN-0001), NOT 5 like every
+// other doc type — this matches the EXACT format the old frontend nextCnNum()
+// already produced ('CN-' + String(n).padStart(4,'0')). Reproduced verbatim
+// rather than "fixed" to 5 digits, so existing CN-#### values already live
+// in JSON never look inconsistent with newly-reserved ones.
+const PAD_LEN: Record<DocType, number> = { invoice: 5, quote: 5, job: 5, po: 5, creditNote: 4 };
 
 function formatNumber(docType: DocType, n: number): string {
-  return PREFIX[docType] + String(n).padStart(5, '0');
+  return PREFIX[docType] + String(n).padStart(PAD_LEN[docType], '0');
 }
 
 function parseNumericValue(docType: DocType, formatted: string): number | null {
@@ -173,6 +200,14 @@ function scanExistingNumbers(data: Record<string, any> | null | undefined, compa
         found.add(p.num.trim().toUpperCase());
       }
     }
+  } else if (docType === 'creditNote') {
+    // Global (not per-company), matching nextCnNum()'s unfiltered scan.
+    const notes = Array.isArray(data.creditNotes) ? data.creditNotes : [];
+    for (const c of notes) {
+      if (c && typeof c.number === 'string' && c.number.trim()) {
+        found.add(c.number.trim().toUpperCase());
+      }
+    }
   }
 
   return found;
@@ -215,6 +250,10 @@ function findOwner(data: Record<string, any> | null | undefined, company: string
   } else if (docType === 'po') {
     const p = pos.find((pp: any) => pp && (pp.num || '').trim().toUpperCase() === up);
     if (p) return { documentType: 'purchase order', number: up, id: p.id, client: p.client ?? null };
+  } else if (docType === 'creditNote') {
+    const notes = Array.isArray(data.creditNotes) ? data.creditNotes : [];
+    const c = notes.find((cc: any) => cc && (cc.number || '').trim().toUpperCase() === up);
+    if (c) return { documentType: 'credit note', number: up, id: c.id, client: c.contactName ?? c.client ?? null };
   }
   return null;
 }

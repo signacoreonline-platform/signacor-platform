@@ -45,6 +45,38 @@
  * verbatim from legacy_data, or simply absent for a new record, matching
  * how a freshly-created JSON record would look before every optional field
  * had been filled in.
+ *
+ * ── STAGE 3 FIELD-NAMING FIX (2026-08-20) ─────────────────────────────────
+ * A Stage 3 audit (comparing this file's output shape against the ACTUAL
+ * frontend field names used in index.html's job/quote/inventory/credit-note/
+ * purchase-order code — AddEditSupplierModal, JobDetail, CreateQuoteModal,
+ * InventoryPage, CreditNoteModal, handleConvertToJob, CreateCustomPOModal —
+ * found several builders here were emitting a DIFFERENT key name than what
+ * the frontend actually reads, which would have silently broken every one of
+ * those sections the moment it was cut over, even though the backend/DB side
+ * was otherwise correct. Fixed here, matched 1:1 to the frontend's real
+ * field names (not invented/guessed):
+ *   - jobs/quotes:      contactPerson->contact, phone->tel, vatNumber->vatNum,
+ *                       discountPct->discount, description->desc (jobs only),
+ *                       the line-items array key items->lines, and within
+ *                       each line: description->desc, inventoryItemId->itemId,
+ *                       plus a real `unit` field (see migration 008).
+ *   - inventory/quickRates (mapItemRow): stockQty->stock, reorderLevel->reorder.
+ *   - creditNotes:      client->contactName, usedAmount->used.
+ *   - purchaseOrders items: inventoryItemId->inventoryId (per line item only;
+ *                       the PO record's own supplierId already matched).
+ *   - suppliers:        added address/vatNumber (migration 008 columns) —
+ *                       existing field names here already matched the
+ *                       frontend, no renames needed.
+ *   - jobs:             added `breakdown` (migration 008 column) for
+ *                       JobDetail's cost-breakdown editor.
+ * customers.phone vs the frontend's `tel` has the SAME mismatch but is
+ * deliberately NOT fixed here: customers is one of the two sections
+ * permanently hard-blocked from cutover (see cutover.ts HARD_BLOCKED_SECTIONS
+ * for customers/quickRates' historical id collisions), so this field can
+ * never actually reach the frontend under relational authority. Left as-is
+ * rather than touched, per the instruction not to spend effort on
+ * permanently out-of-scope sections.
  */
 import pool from '../db/pool';
 import { CutoverSection } from './cutover';
@@ -121,8 +153,10 @@ export async function buildSuppliersJson(): Promise<any[]> {
     contactPerson: r.contact_person ?? legacyBase(r).contactPerson ?? null,
     phone: r.phone ?? legacyBase(r).phone ?? null,
     email: r.email ?? legacyBase(r).email ?? null,
+    address: r.address ?? legacyBase(r).address ?? null,
     city: r.city ?? legacyBase(r).city ?? null,
     postalCode: r.postal_code ?? legacyBase(r).postalCode ?? null,
+    vatNumber: r.vat_number ?? legacyBase(r).vatNumber ?? null,
     paymentTerms: r.payment_terms ?? legacyBase(r).paymentTerms ?? null,
     accountNumber: r.account_number ?? legacyBase(r).accountNumber ?? null,
     notes: r.notes ?? legacyBase(r).notes ?? null,
@@ -142,13 +176,27 @@ function mapItemRow(r: any): any {
     unit: r.unit ?? legacyBase(r).unit ?? null,
     cost: num(r.cost),
     sell: num(r.sell),
-    stockQty: num(r.stock_qty),
-    reorderLevel: num(r.reorder_level),
+    stock: num(r.stock_qty),
+    reorder: num(r.reorder_level),
     supplierId: r.supplier_source_id != null ? restoreId(r.supplier_source_id) : (legacyBase(r).supplierId ?? null),
+    // MIGRATION CLOSURE Item 3: r.is_active only exists on rel_inventory_items
+    // (migration 009), not rel_quick_rate_items — `!== false` reads as
+    // "active" for both a real `true`/`false` value AND a plain `undefined`
+    // (quick-rate rows, which never get this column), so buildQuickRatesJson
+    // below is completely unaffected. Deliberately NOT filtered out here —
+    // see buildInventoryJson's note just below.
+    active: r.is_active !== false,
     _relId: r.id,
     _relRowVersion: r.row_version,
   };
 }
+// Deliberately returns EVERY row, active and inactive alike — full backups
+// (fullBackupV2 reads this via getAuthoritativeJson) and any future
+// historical audit must never silently lose a discontinued item just
+// because it was soft-deleted. The live-UI "vanishes from the list" effect
+// removeItem() used to have is reproduced entirely on the frontend
+// (InventoryPage filters `active !== false` for its own visible listing),
+// never by hiding data at this layer.
 export async function buildInventoryJson(): Promise<any[]> {
   const res = await pool.query('SELECT * FROM rel_inventory_items ORDER BY id');
   return res.rows.map(mapItemRow);
@@ -168,11 +216,12 @@ export async function buildQuotesJson(): Promise<any[]> {
     );
     const items = linesRes.rows.map((l) => ({
       ...legacyBase(l),
-      description: l.description,
+      desc: l.description,
       qty: num(l.qty),
       unitPrice: num(l.unit_price),
+      unit: l.unit ?? legacyBase(l).unit ?? null,
       subtotal: num(l.subtotal),
-      inventoryItemId: l.inventory_source_id != null ? restoreId(l.inventory_source_id) : (legacyBase(l).inventoryItemId ?? null),
+      itemId: l.inventory_source_id != null ? restoreId(l.inventory_source_id) : (legacyBase(l).itemId ?? null),
     }));
     const payments = await paymentsFor('quote', r.id);
     out.push({
@@ -181,11 +230,11 @@ export async function buildQuotesJson(): Promise<any[]> {
       num: r.quote_number,
       co: r.company_code,
       client: r.customer_name_raw ?? legacyBase(r).client ?? null,
-      contactPerson: r.contact_person ?? legacyBase(r).contactPerson ?? null,
+      contact: r.contact_person ?? legacyBase(r).contact ?? null,
       email: r.email ?? legacyBase(r).email ?? null,
-      phone: r.phone ?? legacyBase(r).phone ?? null,
+      tel: r.phone ?? legacyBase(r).tel ?? null,
       address: r.address ?? legacyBase(r).address ?? null,
-      vatNumber: r.vat_number ?? legacyBase(r).vatNumber ?? null,
+      vatNum: r.vat_number ?? legacyBase(r).vatNum ?? null,
       status: r.status ?? legacyBase(r).status ?? null,
       notes: r.notes ?? legacyBase(r).notes ?? null,
       terms: r.terms ?? legacyBase(r).terms ?? null,
@@ -194,13 +243,13 @@ export async function buildQuotesJson(): Promise<any[]> {
       poRef: r.po_ref ?? legacyBase(r).poRef ?? null,
       reference: r.reference ?? legacyBase(r).reference ?? null,
       setupFee: num(r.setup_fee),
-      discountPct: num(r.discount_pct),
+      discount: num(r.discount_pct),
       subtotal: num(r.subtotal),
       vat: num(r.vat_amount),
       total: num(r.total),
       proformaNum: r.proforma_num ?? legacyBase(r).proformaNum ?? null,
       convertedJobId: r.converted_job_source_id != null ? restoreId(r.converted_job_source_id) : (legacyBase(r).convertedJobId ?? null),
-      items: items.length ? items : (legacyBase(r).items ?? []),
+      lines: items.length ? items : (legacyBase(r).lines ?? []),
       payments,
       _relId: r.id,
       _relRowVersion: r.row_version,
@@ -219,11 +268,12 @@ export async function buildJobsJson(): Promise<any[]> {
     );
     const items = linesRes.rows.map((l) => ({
       ...legacyBase(l),
-      description: l.description,
+      desc: l.description,
       qty: num(l.qty),
       unitPrice: num(l.unit_price),
+      unit: l.unit ?? legacyBase(l).unit ?? null,
       subtotal: num(l.subtotal),
-      inventoryItemId: l.inventory_source_id != null ? restoreId(l.inventory_source_id) : (legacyBase(l).inventoryItemId ?? null),
+      itemId: l.inventory_source_id != null ? restoreId(l.inventory_source_id) : (legacyBase(l).itemId ?? null),
     }));
     const payments = await paymentsFor('job', r.id);
     out.push({
@@ -232,15 +282,18 @@ export async function buildJobsJson(): Promise<any[]> {
       num: r.job_number,
       co: r.company_code,
       client: r.customer_name_raw ?? legacyBase(r).client ?? null,
-      contactPerson: r.contact_person ?? legacyBase(r).contactPerson ?? null,
+      contact: r.contact_person ?? legacyBase(r).contact ?? null,
       email: r.email ?? legacyBase(r).email ?? null,
-      phone: r.phone ?? legacyBase(r).phone ?? null,
+      tel: r.phone ?? legacyBase(r).tel ?? null,
       address: r.address ?? legacyBase(r).address ?? null,
-      vatNumber: r.vat_number ?? legacyBase(r).vatNumber ?? null,
-      description: r.description ?? legacyBase(r).description ?? null,
+      vatNum: r.vat_number ?? legacyBase(r).vatNum ?? null,
+      desc: r.description ?? legacyBase(r).desc ?? null,
       status: r.status ?? legacyBase(r).status ?? null,
       stage: r.stage ?? legacyBase(r).stage ?? null,
       value: num(r.value),
+      breakdown: (r.breakdown && typeof r.breakdown === 'object' && Object.keys(r.breakdown).length)
+        ? r.breakdown
+        : (legacyBase(r).breakdown ?? {}),
       quoteNum: r.quote_number_raw ?? legacyBase(r).quoteNum ?? null,
       invoiceNum: r.invoice_num ?? legacyBase(r).invoiceNum ?? null,
       invoiceDate: dateStr(r.invoice_date) ?? legacyBase(r).invoiceDate ?? null,
@@ -248,13 +301,13 @@ export async function buildJobsJson(): Promise<any[]> {
       invoiceCreated: r.invoice_created ?? legacyBase(r).invoiceCreated ?? false,
       invoiceStatus: r.invoice_status ?? legacyBase(r).invoiceStatus ?? null,
       setupFee: num(r.setup_fee),
-      discountPct: num(r.discount_pct),
+      discount: num(r.discount_pct),
       salesperson: r.salesperson ?? legacyBase(r).salesperson ?? null,
       preparedBy: r.prepared_by ?? legacyBase(r).preparedBy ?? null,
       poRef: r.po_ref ?? legacyBase(r).poRef ?? null,
       reference: r.reference ?? legacyBase(r).reference ?? null,
       notes: r.notes ?? legacyBase(r).notes ?? null,
-      items: items.length ? items : (legacyBase(r).items ?? []),
+      lines: items.length ? items : (legacyBase(r).lines ?? []),
       payments,
       _relId: r.id,
       _relRowVersion: r.row_version,
@@ -311,10 +364,10 @@ export async function buildCreditNotesJson(): Promise<any[]> {
     id: restoreId(r.source_id),
     number: r.credit_number,
     type: r.note_type,
-    client: r.contact_name_raw,
+    contactName: r.contact_name_raw,
     date: dateStr(r.note_date) ?? legacyBase(r).date ?? null,
     amount: num(r.amount),
-    usedAmount: num(r.used_amount),
+    used: num(r.used_amount),
     reason: r.reason ?? legacyBase(r).reason ?? null,
     appliedTo: r.applied_to ?? legacyBase(r).appliedTo ?? null,
     notes: r.notes ?? legacyBase(r).notes ?? null,
@@ -336,7 +389,7 @@ export async function buildPurchaseOrdersJson(): Promise<any[]> {
       ...legacyBase(l),
       sku: l.sku, name: l.name, unit: l.unit,
       qtyNeeded: num(l.qty_needed), qtyOrdered: num(l.qty_ordered), unitCost: num(l.unit_cost),
-      inventoryItemId: l.inventory_source_id != null ? restoreId(l.inventory_source_id) : (legacyBase(l).inventoryItemId ?? null),
+      inventoryId: l.inventory_source_id != null ? restoreId(l.inventory_source_id) : (legacyBase(l).inventoryId ?? null),
     }));
     out.push({
       ...legacyBase(r),

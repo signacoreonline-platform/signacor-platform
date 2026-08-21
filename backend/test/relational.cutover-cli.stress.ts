@@ -74,27 +74,27 @@ async function main() {
   ok(qrRow.rows[0].enabled === false, '"quickRates" remains disabled — same hard block');
 
   console.log('\n[Cutover CLI] enable without BOTH --apply and correct --confirm is always a no-op dry run');
-  await runCli('enable', 'quotes'); // no flags at all
-  let quotesRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'quotes'`);
-  ok(quotesRow.rows[0].enabled === false, 'enable with no flags at all changes nothing');
+  await runCli('enable', 'suppliers'); // no flags at all
+  let suppliersRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'suppliers'`);
+  ok(suppliersRow.rows[0].enabled === false, 'enable with no flags at all changes nothing');
 
-  await runCli('enable', 'quotes', '--apply'); // apply but no confirm
-  quotesRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'quotes'`);
-  ok(quotesRow.rows[0].enabled === false, 'enable with --apply but no --confirm changes nothing');
+  await runCli('enable', 'suppliers', '--apply'); // apply but no confirm
+  suppliersRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'suppliers'`);
+  ok(suppliersRow.rows[0].enabled === false, 'enable with --apply but no --confirm changes nothing');
 
-  await runCli('enable', 'quotes', '--confirm=ENABLE_QUOTES'); // confirm but no apply
-  quotesRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'quotes'`);
-  ok(quotesRow.rows[0].enabled === false, 'enable with --confirm but no --apply changes nothing');
+  await runCli('enable', 'suppliers', '--confirm=ENABLE_SUPPLIERS'); // confirm but no apply
+  suppliersRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'suppliers'`);
+  ok(suppliersRow.rows[0].enabled === false, 'enable with --confirm but no --apply changes nothing');
 
-  await runCli('enable', 'quotes', '--apply', '--confirm=WRONG_PHRASE');
-  quotesRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'quotes'`);
-  ok(quotesRow.rows[0].enabled === false, 'enable with --apply but a WRONG --confirm phrase changes nothing');
+  await runCli('enable', 'suppliers', '--apply', '--confirm=WRONG_PHRASE');
+  suppliersRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'suppliers'`);
+  ok(suppliersRow.rows[0].enabled === false, 'enable with --apply but a WRONG --confirm phrase changes nothing');
 
   console.log('\n[Cutover CLI] enable is gated on a FRESH reconciliation showing safe-to-cutover');
-  // quotes has 0 discrepancies in the clean fixture — should be enable-able.
-  await runCli('enable', 'quotes', '--apply', '--confirm=ENABLE_QUOTES');
-  quotesRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'quotes'`);
-  ok(quotesRow.rows[0].enabled === true, 'enable with correct --apply + --confirm on a CLEAN section actually flips the DB row');
+  // suppliers has 0 discrepancies in the clean fixture and no Stage-3 dependency — should be enable-able.
+  await runCli('enable', 'suppliers', '--apply', '--confirm=ENABLE_SUPPLIERS');
+  suppliersRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'suppliers'`);
+  ok(suppliersRow.rows[0].enabled === true, 'enable with correct --apply + --confirm on a CLEAN section actually flips the DB row');
 
   // Dirty a job so jobs is no longer safe to cut over, then try to enable it.
   const fs = require('fs');
@@ -116,18 +116,39 @@ async function main() {
   ok(jobsRow.rows[0].enabled === false, 'enable is REFUSED for "jobs" once a fresh reconciliation shows a discrepancy, even with correct flags');
 
   console.log('\n[Cutover CLI] disable requires --apply + confirm too, and actually flips the row when given');
-  await runCli('disable', 'quotes'); // no flags
-  quotesRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'quotes'`);
-  ok(quotesRow.rows[0].enabled === true, 'disable with no flags changes nothing — quotes still enabled');
+  await runCli('disable', 'suppliers'); // no flags
+  suppliersRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'suppliers'`);
+  ok(suppliersRow.rows[0].enabled === true, 'disable with no flags changes nothing — suppliers still enabled');
 
-  await runCli('disable', 'quotes', '--apply', '--confirm=DISABLE_QUOTES_ACKNOWLEDGE_JSON_IS_STALE');
-  quotesRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'quotes'`);
-  ok(quotesRow.rows[0].enabled === false, 'disable with correct --apply + --confirm flips the row back off');
+  await runCli('disable', 'suppliers', '--apply', '--confirm=DISABLE_SUPPLIERS_ACKNOWLEDGE_JSON_IS_STALE');
+  suppliersRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'suppliers'`);
+  ok(suppliersRow.rows[0].enabled === false, 'disable with correct --apply + --confirm flips the row back off');
 
   console.log('\n[Cutover CLI] no enable-all exists — enable requires an exact, known section name');
   await runCli('enable', 'nonexistent-section', '--apply', '--confirm=ENABLE_NONEXISTENT-SECTION');
   const anyEnabled = await pool.query(`SELECT count(*)::int AS n FROM relational_cutover WHERE enabled = true`);
   ok(anyEnabled.rows[0].n === 0, 'an unknown section name is rejected outright, nothing is ever enabled by accident');
+
+  console.log('\n[Cutover CLI] STAGE 3 — dependency-aware cutover: "quotes" refuses until jobs/inventory/purchaseOrders are enabled');
+  // Fix up platform_state so jobs/inventory/purchaseOrders/quotes all
+  // reconcile cleanly again (the earlier "dirty job" scenario deliberately
+  // broke jobs' reconciliation; undo that here).
+  const cleanFixtureData = JSON.parse(require('fs').readFileSync(FIXTURE_PATH, 'utf8'));
+  await pool.query(`UPDATE platform_state SET data = $1::jsonb, updated_at = NOW() WHERE id = 1`, [JSON.stringify(cleanFixtureData)]);
+
+  await runCli('enable', 'quotes', '--apply', '--confirm=ENABLE_QUOTES');
+  let quotesDepRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'quotes'`);
+  ok(quotesDepRow.rows[0].enabled === false, '"quotes" is refused (even with correct flags + clean reconciliation) while jobs/inventory/purchaseOrders are not yet enabled');
+
+  await runCli('enable', 'jobs', '--apply', '--confirm=ENABLE_JOBS');
+  await runCli('enable', 'inventory', '--apply', '--confirm=ENABLE_INVENTORY');
+  await runCli('enable', 'purchaseOrders', '--apply', '--confirm=ENABLE_PURCHASEORDERS');
+  const depsRow = await pool.query(`SELECT section, enabled FROM relational_cutover WHERE section IN ('jobs','inventory','purchaseOrders')`);
+  ok(depsRow.rows.every((r) => r.enabled === true), 'jobs/inventory/purchaseOrders can each be enabled individually, one explicit --confirm at a time — no --enable-all exists', JSON.stringify(depsRow.rows));
+
+  await runCli('enable', 'quotes', '--apply', '--confirm=ENABLE_QUOTES');
+  quotesDepRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'quotes'`);
+  ok(quotesDepRow.rows[0].enabled === true, 'once ALL of quotes\' dependencies are enabled, enabling "quotes" itself now succeeds');
 
   process.argv = originalArgv;
   await resetRelationalTables();
