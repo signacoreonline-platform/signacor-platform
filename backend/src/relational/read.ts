@@ -63,8 +63,14 @@
  *                       plus a real `unit` field (see migration 008).
  *   - inventory/quickRates (mapItemRow): stockQty->stock, reorderLevel->reorder.
  *   - creditNotes:      client->contactName, usedAmount->used.
- *   - purchaseOrders items: inventoryItemId->inventoryId (per line item only;
- *                       the PO record's own supplierId already matched).
+ *   - purchaseOrders items: inventoryItemId->inventoryId (per line item).
+ *                       purchaseOrders' own supplierId, and each line item's
+ *                       inventoryId, are both resolved via a live join
+ *                       (rel_suppliers / rel_inventory_items respectively —
+ *                       see buildPurchaseOrdersJson's 2026-08-21 comment)
+ *                       rather than trusted from a backfill-only cache
+ *                       column, so both are correct for manually-created
+ *                       POs too, not just backfilled ones.
  *   - suppliers:        added address/vatNumber (migration 008 columns) —
  *                       existing field names here already matched the
  *                       frontend, no renames needed.
@@ -378,25 +384,55 @@ export async function buildCreditNotesJson(): Promise<any[]> {
 }
 
 // ── PURCHASE ORDERS (+ items) ──────────────────────────────────────────────
+// 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: supplierId used to be
+// derived ONLY from `supplier_source_id` — a denormalized cache column
+// populated exclusively by backfill.ts from the historical JSON supplier
+// id. That was fine when EVERY rel_purchase_orders row came from backfill,
+// but now that historical POs are never imported (see backfill.ts's
+// LEGACY_PURCHASE_ORDERS_SKIPPED_BY_POLICY) and manual creation (services.ts
+// createPurchaseOrder) is the ONLY way a PO row is ever created,
+// `supplier_source_id` is never populated at all for a real row — every
+// manually-created PO would render with supplierId always null/missing,
+// breaking supplier display everywhere the frontend reads it. Fixed by
+// LEFT JOINing rel_suppliers on the REAL FK (supplier_id) and deriving the
+// frontend-facing id from THAT supplier's own source_id (every rel_suppliers
+// row — backfilled or manually created — always has a non-null source_id;
+// see createSupplier's `id::text` convention), falling back to the old
+// supplier_source_id/legacy_data path only if the FK itself is null.
 export async function buildPurchaseOrdersJson(): Promise<any[]> {
-  const poRes = await pool.query('SELECT * FROM rel_purchase_orders ORDER BY id');
+  const poRes = await pool.query(
+    `SELECT po.*, sup.source_id AS resolved_supplier_source_id
+     FROM rel_purchase_orders po LEFT JOIN rel_suppliers sup ON sup.id = po.supplier_id
+     ORDER BY po.id`
+  );
   const out: any[] = [];
   for (const r of poRes.rows) {
+    // Same fix as the PO's own supplierId above, applied per line item: a
+    // manually-created PO item's `inventory_source_id` is never populated
+    // (only backfill.ts sets it), so derive inventoryId via a live join to
+    // rel_inventory_items on the real FK (inventory_item_id) instead.
     const linesRes = await pool.query(
-      'SELECT * FROM rel_purchase_order_items WHERE po_id = $1 ORDER BY line_index', [r.id]
+      `SELECT poi.*, inv.source_id AS resolved_inventory_source_id
+       FROM rel_purchase_order_items poi LEFT JOIN rel_inventory_items inv ON inv.id = poi.inventory_item_id
+       WHERE poi.po_id = $1 ORDER BY poi.line_index`,
+      [r.id]
     );
     const items = linesRes.rows.map((l) => ({
       ...legacyBase(l),
       sku: l.sku, name: l.name, unit: l.unit,
       qtyNeeded: num(l.qty_needed), qtyOrdered: num(l.qty_ordered), unitCost: num(l.unit_cost),
-      inventoryId: l.inventory_source_id != null ? restoreId(l.inventory_source_id) : (legacyBase(l).inventoryId ?? null),
+      inventoryId: l.inventory_item_id != null
+        ? restoreId(l.resolved_inventory_source_id ?? l.inventory_source_id)
+        : (l.inventory_source_id != null ? restoreId(l.inventory_source_id) : (legacyBase(l).inventoryId ?? null)),
     }));
     out.push({
       ...legacyBase(r),
       id: restoreId(r.source_id),
       num: r.po_number,
       co: r.company_code,
-      supplierId: r.supplier_source_id != null ? restoreId(r.supplier_source_id) : (legacyBase(r).supplierId ?? null),
+      supplierId: r.supplier_id != null
+        ? restoreId(r.resolved_supplier_source_id ?? r.supplier_source_id)
+        : (r.supplier_source_id != null ? restoreId(r.supplier_source_id) : (legacyBase(r).supplierId ?? null)),
       jobNum: r.job_number_raw ?? legacyBase(r).jobNum ?? null,
       quoteNum: r.quote_number_raw ?? legacyBase(r).quoteNum ?? null,
       date: dateStr(r.order_date) ?? legacyBase(r).date ?? null,

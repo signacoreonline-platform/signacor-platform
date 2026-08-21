@@ -110,14 +110,14 @@ async function main() {
   ok(quoteLine.rows[0].description === 'Vinyl banner 15sqm', 'the BUGFIX: quote line description landed correctly (was silently NULL before the fix)', quoteLine.rows[0]);
   ok(Number(quoteLine.rows[0].inventory_item_id) === Number(inv.id), 'the BUGFIX: the quote line\'s inventory_item_id landed correctly (was silently NULL before the fix, breaking dedup below entirely)', quoteLine.rows[0]);
 
-  console.log('\n[Full lifecycle] STEP 4 — convert the quote to a job (exactly what handleConvertToJob sends) — proves inventory dedup + auto-PO now actually fire, because inventory_item_id is set');
+  console.log('\n[Full lifecycle] STEP 4 — convert the quote to a job (exactly what handleConvertToJob sends) — proves inventory dedup still fires (inventory_item_id is set) AND that no automatic PO is created (policy change: PO creation is now manual-only)');
   const convertRes = await fetch(`${base}/api/relational/quotes/${quote.id}/convert-to-job`, { method: 'POST', headers: H });
   const conv: any = await convertRes.json();
   ok(convertRes.status === 201 && /^SNS-/i.test(conv.jobNumber || ''), 'job created with a real SNS-##### number', conv);
   const invAfterConvert = await pool.query(`SELECT stock_qty FROM rel_inventory_items WHERE id = $1`, [inv.id]);
   ok(Number(invAfterConvert.rows[0].stock_qty) === 5, 'inventory was correctly deducted (20 - 15 = 5) — this ONLY works because the quote line carried a real inventory_item_id', invAfterConvert.rows[0]);
-  const autoPO = await pool.query(`SELECT id, po_number FROM rel_purchase_orders WHERE supplier_id = $1`, [sup.id]);
-  ok(autoPO.rowCount === 1 && /^PO-/i.test(autoPO.rows[0].po_number || ''), 'an auto-PO was correctly generated for the now-low-stock item (5 <= reorder level 10)', autoPO.rows);
+  const noAutoPO = await pool.query(`SELECT id, po_number FROM rel_purchase_orders WHERE supplier_id = $1`, [sup.id]);
+  ok(noAutoPO.rowCount === 0, 'NO automatic PO was generated even though stock is now low (5 <= reorder level 10) — auto-PO generation was deliberately removed by migration policy; PO creation is manual-only going forward', noAutoPO.rows);
 
   console.log('\n[Full lifecycle] STEP 5 — edit the job (exactly what JobDetail.saveNotes sends)');
   const jobEditRes = await fetch(`${base}/api/relational/jobs/${conv.jobId}`, {
@@ -183,8 +183,18 @@ async function main() {
   const cnAfter = await pool.query(`SELECT used_amount FROM rel_credit_notes WHERE id = $1`, [cn.id]);
   ok(Number(cnAfter.rows[0].used_amount) === 0, 'the credit note\'s used_amount was correctly released back to 0');
 
-  console.log('\n[Full lifecycle] STEP 12 — approve the auto-generated PO (exactly what updatePO/handleApproveEmail sends)');
-  const poRow = await pool.query(`SELECT id, row_version FROM rel_purchase_orders WHERE id = $1`, [autoPO.rows[0].id]);
+  console.log('\n[Full lifecycle] STEP 12 — manually create a Purchase Order for this job (exactly what the new JobDetail "Create Purchase Order" action sends), then approve it (exactly what updatePO/handleApproveEmail sends)');
+  const manualPoRes = await fetch(`${base}/api/relational/purchase-orders`, {
+    method: 'POST', headers: H,
+    body: JSON.stringify({
+      companyCode: '2', supplierId: sup.id, jobId: conv.jobId, jobNumberRaw: conv.jobNumber,
+      items: [{ name: 'Restock Lifecycle Test Vinyl', qtyNeeded: 15, qtyOrdered: 15, unitCost: 15, inventoryItemId: inv.id }],
+      notes: 'Manual PO created via full-lifecycle test',
+    }),
+  });
+  const manualPo: any = await manualPoRes.json();
+  ok(manualPoRes.status === 201 && /^PO-\d{5}$/i.test(manualPo.poNumber || ''), 'manually-created PO has a real PO-##### number (manual workflow, not auto-generated)', manualPo);
+  const poRow = await pool.query(`SELECT id, row_version FROM rel_purchase_orders WHERE id = $1`, [manualPo.id]);
   const poApproveRes = await fetch(`${base}/api/relational/purchase-orders/${poRow.rows[0].id}`, {
     method: 'PUT', headers: H,
     body: JSON.stringify({ expectedVersion: poRow.rows[0].row_version, supplierId: sup.id, status: 'approved', notes: 'Approved via full-lifecycle test' }),

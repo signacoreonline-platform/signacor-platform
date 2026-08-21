@@ -13174,8 +13174,18 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
 /* ═══════════════════════════════════════════
    JOB DETAIL  (with editable cost breakdown)
 ═══════════════════════════════════════════ */
-function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack, user, logoDataUrl, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer }) {
+function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack, user, logoDataUrl, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer, purchaseOrders, setPurchaseOrders, suppliers }) {
   const [showInvoiceEmail, setShowInvoiceEmail] = useState(false);
+  // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: manual, OPTIONAL
+  // "Create Purchase Order" action lives here — the preferred placement per
+  // the migration policy, since operational purchasing decisions are made
+  // while working a job, not automatically during quote conversion (see
+  // services.ts's convertQuoteToJob, which no longer creates POs at all).
+  // A job may have any number of POs — reopening this modal creates another
+  // one against the SAME job, each with its own atomically-reserved
+  // PO-##### number (see createPurchaseOrderShared / services.ts's
+  // createPurchaseOrder).
+  const [showCreatePO, setShowCreatePO] = useState(false);
   const [invoiceCreatedInfo, setInvoiceCreatedInfo] = useState(null); // {invoiceNum} after creating an invoice here — replaces the old blocking alert()
   const job=jobs.find(j=>j.id===jobId);
   const [editingCosts, setEditingCosts]=useState(false);
@@ -13372,6 +13382,41 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 
       {/* Linked records — read-only navigation, never edits/relinks/deletes anything */}
       <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
+
+      {/* 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: manual, OPTIONAL
+          "Create Purchase Order" action — the new primary PO workflow.
+          A job may have any number of POs (each with its own PO-##### —
+          e.g. Job SNS-00130 -> PO-00086/Supplier A + PO-00087/Supplier B);
+          nothing here limits it to one. */}
+      {purchaseOrders!==undefined && setPurchaseOrders && (
+        <div className="bg-white rounded-2xl border border-gray-200 p-5">
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-xs font-black text-gray-400 uppercase tracking-widest">🛒 Purchase Orders for this Job</p>
+            <button onClick={()=>setShowCreatePO(true)}
+              className="text-xs font-bold bg-blue-800 hover:bg-blue-900 text-white rounded-xl px-3 py-1.5">
+              + Create Purchase Order
+            </button>
+          </div>
+          {(() => {
+            const jobPOs = (purchaseOrders||[]).filter(p => p.jobNum && job.num && String(p.jobNum).toUpperCase()===String(job.num).toUpperCase());
+            if (jobPOs.length===0) return <p className="text-xs text-gray-400">No purchase orders yet for this job — creating one is optional.</p>;
+            return (
+              <div className="space-y-1.5">
+                {jobPOs.map(po=>{
+                  const sup = (suppliers||[]).find(s=>s.id===parseInt(po.supplierId))||{name:'Unknown Supplier'};
+                  return (
+                    <div key={po.id} className="flex items-center justify-between text-xs bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+                      <span className="font-mono font-bold text-gray-700">{po.num}</span>
+                      <span className="text-gray-500">{sup.name}</span>
+                      <span className="text-gray-400">{(po.status||'draft').toUpperCase()}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
+        </div>
+      )}
 
       {/* Header */}
       <div className="bg-white rounded-2xl border border-gray-200 p-5 space-y-5">
@@ -13863,6 +13908,21 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
         />
       )}
 
+      {/* 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: manual PO
+          creation, linked cleanly to THIS job (and its source quote, if
+          any) via real relational ids when available — never a free-text
+          job reference here, since we already know exactly which job this
+          is. */}
+      {showCreatePO&&setPurchaseOrders&&(
+        <CreateCustomPOModal
+          job={job}
+          quote={_links.quote}
+          suppliers={suppliers||[]}
+          onClose={()=>setShowCreatePO(false)}
+          onSave={po=>createPurchaseOrderShared(po, user, setPurchaseOrders)}
+        />
+      )}
+
       {/* ── Invoice creation confirmation — replaces the old blocking alert() ── */}
       {invoiceCreatedInfo&&(
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&setInvoiceCreatedInfo(null)}>
@@ -13891,7 +13951,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 const DONE_STATUSES = ['completed','invoiced'];
 const WIP_STATUSES  = STAGE_STATUSES.filter(s=>!DONE_STATUSES.includes(s));
 
-function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared, proposedProjects=[], setProposedProjects, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer }) {
+function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared, proposedProjects=[], setProposedProjects, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer, purchaseOrders, setPurchaseOrders, suppliers }) {
   const [jobTab,       setJobTab]       = useState('active'); // 'active' | 'completed'
   const [statusFilter, setStatusFilter] = useState('all');
   const [search,       setSearch]       = useState('');
@@ -13974,7 +14034,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
   const completedCount = visibleJobs.filter(j=> DONE_STATUSES.includes(j.status)).length;
   const statusOpts     = jobTab==='active' ? WIP_STATUSES : DONE_STATUSES;
 
-  if(detail!==null) return <JobDetail jobId={detail} jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} onBack={()=>setDetail(null)} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices} customers={customers} onOpenQuote={onOpenQuote} onOpenInvoice={onOpenInvoice} onOpenJobPayments={onOpenJobPayments} onOpenCustomer={onOpenCustomer}/>;
+  if(detail!==null) return <JobDetail jobId={detail} jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} onBack={()=>setDetail(null)} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices} customers={customers} onOpenQuote={onOpenQuote} onOpenInvoice={onOpenInvoice} onOpenJobPayments={onOpenJobPayments} onOpenCustomer={onOpenCustomer} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>;
 
   return (
     <div className="p-4 space-y-4">
@@ -16133,16 +16193,77 @@ function PODetailModal({ po, suppliers, onClose, onUpdate, onEmail }) {
 }
 
 /* ═══════════════════════════════════════════
-   CREATE CUSTOM PO MODAL
+   CREATE PURCHASE ORDER — SHARED SAVE LOGIC
+   2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: extracted so BOTH PO
+   creation entry points (PurchaseOrdersPage's "+ New PO" and JobDetail's
+   "Create Purchase Order" action) share exactly one implementation of the
+   relational-vs-JSON branching — in particular the "never silently fall
+   back to JSON once purchaseOrders is cut over" rule lives in exactly one
+   place, not duplicated (and potentially drifting) across two components.
+   Returns `true` on success, or a string error message on failure — the
+   caller never needs its own error text, and CreateCustomPOModal's submit()
+   shows whatever string comes back verbatim.
 ═══════════════════════════════════════════ */
-function CreateCustomPOModal({ onClose, onSave, suppliers }) {
+async function createPurchaseOrderShared(po, user, setPurchaseOrders) {
+  const coTag = isHoldingsUser(user) ? HOLDINGS_CO_ID : (user && user.co !== undefined && user.co !== null ? user.co : (po.co ?? null));
+  if(isRelationalAuthoritative('purchaseOrders')){
+    // A custom/unsaved supplier (po.supplierId==null) has nowhere safe to
+    // go once purchaseOrders is relational-authoritative — refuse rather
+    // than silently writing JSON nobody reads any more. CreateCustomPOModal
+    // already prevents submitting this state when poAuthoritative is true,
+    // but this check stays here too since this function may in principle
+    // be called from anywhere.
+    if(po.supplierId==null){
+      return 'Please select a saved supplier. Once Purchase Orders is live in the new system, every PO needs a saved supplier — create the supplier first (Suppliers → + New Supplier), then create this PO.';
+    }
+    try {
+      const result = await relationalApi.createPurchaseOrder({
+        companyCode: coTag, supplierId: po.supplierId,
+        jobId: po.jobId ?? null, jobNumberRaw: po.jobNum || null,
+        quoteId: po.quoteId ?? null, quoteNumberRaw: po.quoteNumberRaw ?? null,
+        orderDate: po.date || null, notes: po.notes,
+        items: (po.items||[]).map(it=>({ inventoryItemId: it.inventoryId, name: it.name, unit: it.unit, qtyNeeded: it.qtyNeeded, qtyOrdered: it.qtyOrdered, unitCost: it.unitCost })),
+      });
+      setPurchaseOrders(prev=>[{...po, co:coTag, num:result.poNumber, id:result.id, _relId:result.id, _relRowVersion:result.rowVersion}, ...prev]);
+      return true;
+    } catch(e){
+      return 'Purchase Order could NOT be created.\n\n'+(e&&e.message?e.message:'unknown error');
+    }
+  }
+  const num = await reservePONumber();
+  if(!num) return false;
+  setPurchaseOrders(prev=>[{...po, co:coTag, num}, ...prev]);
+  return true;
+}
+
+/* ═══════════════════════════════════════════
+   CREATE CUSTOM PO MODAL
+   2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: this modal now serves
+   TWO entry points — the standalone Purchase Orders page ("+ New PO", no
+   `job` prop, free-text Job/Reference field, unchanged) and the new
+   Job-detail "Create Purchase Order" action (`job` prop supplied — the PO
+   is cleanly linked to a real job via `job._relId`, the Job/Reference field
+   is locked to that job's number instead of free text, and multiple POs may
+   be created against the same job by simply reopening this modal again —
+   nothing here limits a job to one PO).
+   It also now REFUSES a custom/unsaved-supplier PO once "purchaseOrders" is
+   relational-authoritative, instead of silently falling back to the legacy
+   JSON path (see createPurchaseOrderShared below) — rel_purchase_orders has
+   no raw/custom-supplier-name column, only a real FK to rel_suppliers (see
+   migration 007), so a PO with no saved supplier has nowhere safe to go
+   once relational is the only place that matters. The safe workflow in
+   that case is "Create Supplier first, then create the PO" — this modal
+   simply stops offering the custom-name tab at all when that's the state.
+═══════════════════════════════════════════ */
+function CreateCustomPOModal({ onClose, onSave, suppliers, job=null, quote=null }) {
   const today = new Date().toISOString().slice(0,10);
-  const [supplierMode, setSupplierMode] = useState('saved'); // 'saved' | 'custom'
+  const poAuthoritative = isRelationalAuthoritative('purchaseOrders');
+  const [supplierMode, setSupplierMode] = useState('saved'); // 'saved' | 'custom' — 'custom' is never offered once poAuthoritative
   const [supplierId, setSupplierId] = useState('');
   const [customSupplier, setCustomSupplier] = useState('');
   const [poDate, setPoDate] = useState(today);
   const [notes, setNotes] = useState('');
-  const [jobRef, setJobRef] = useState('');
+  const [jobRef, setJobRef] = useState(job ? job.num : '');
   const [lines, setLines] = useState([{id:1, desc:'', qty:1, unit:'unit', unitCost:0}]);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState('');
@@ -16160,13 +16281,20 @@ function CreateCustomPOModal({ onClose, onSave, suppliers }) {
     e.preventDefault();
     if(saving) return;
     const resolvedSuppId = supplierMode==='saved' ? (supplierId?parseInt(supplierId):null) : null;
-    const resolvedSupplierName = supplierMode==='custom' ? customSupplier.trim() : (suppliers.find(s=>s.id===resolvedSuppId)?.name||'Unknown');
+    if(poAuthoritative && resolvedSuppId==null){
+      setErr('Please select a saved supplier. Once Purchase Orders is live in the new system, every PO needs a saved supplier — create the supplier first (Suppliers → + New Supplier), then create this PO.');
+      return;
+    }
+    const jobNum = job ? job.num : jobRef;
     const po = {
       id: Date.now(),
-      num: '', // reserved atomically by onSave (handleCreateCustomPO) below
+      num: '', // reserved atomically by onSave (createPurchaseOrderShared) below
       supplierId: resolvedSuppId,
       customSupplierName: supplierMode==='custom' ? customSupplier.trim() : null,
-      jobNum: jobRef,
+      jobId: job ? (job._relId ?? null) : null,
+      jobNum,
+      quoteId: quote ? (quote._relId ?? null) : null,
+      quoteNumberRaw: quote ? (quote.num ?? null) : null,
       date: poDate,
       status: 'draft',
       isCustom: true,
@@ -16175,13 +16303,13 @@ function CreateCustomPOModal({ onClose, onSave, suppliers }) {
         qtyNeeded: parseFloat(l.qty)||1, qtyOrdered: parseFloat(l.qty)||1,
         unitCost: parseFloat(l.unitCost)||0,
       })),
-      notes: notes||('Custom PO'+(jobRef?' for Job '+jobRef:'')),
+      notes: notes||('Custom PO'+(jobNum?' for Job '+jobNum:'')),
     };
     setSaving(true); setErr('');
-    const ok = await onSave(po);
-    if(ok===false){
+    const result = await onSave(po);
+    if(result!==true){
       setSaving(false);
-      setErr('A PO number could not be reserved. The Purchase Order was not created. Please check your connection and try again.');
+      setErr(typeof result==='string' && result ? result : 'A PO number could not be reserved. The Purchase Order was not created. Please check your connection and try again.');
       return;
     }
     onClose();
@@ -16189,20 +16317,22 @@ function CreateCustomPOModal({ onClose, onSave, suppliers }) {
 
   return (
     <Modal onClose={onClose} wide>
-      <ModalHeader title="🛒 New Custom Purchase Order" onClose={onClose}/>
+      <ModalHeader title={job ? `🛒 New Purchase Order — Job ${job.num}` : '🛒 New Custom Purchase Order'} onClose={onClose}/>
       <form onSubmit={submit} className="px-6 py-5 space-y-4 overflow-y-auto max-h-[82vh]">
         {/* Supplier */}
         <div>
           <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-3">Supplier</p>
-          <div className="flex gap-2 mb-3">
-            {[{k:'saved',label:'📂 Saved Supplier'},{k:'custom',label:'✏️ Custom / Type Name'}].map(({k,label})=>(
-              <button type="button" key={k} onClick={()=>setSupplierMode(k)}
-                className={`text-xs font-bold px-3 py-1.5 rounded-xl border transition-all ${supplierMode===k?'bg-blue-800 text-white border-blue-800':'bg-white border-gray-200 text-gray-600'}`}>
-                {label}
-              </button>
-            ))}
-          </div>
-          {supplierMode==='saved'?(
+          {!poAuthoritative && (
+            <div className="flex gap-2 mb-3">
+              {[{k:'saved',label:'📂 Saved Supplier'},{k:'custom',label:'✏️ Custom / Type Name'}].map(({k,label})=>(
+                <button type="button" key={k} onClick={()=>setSupplierMode(k)}
+                  className={`text-xs font-bold px-3 py-1.5 rounded-xl border transition-all ${supplierMode===k?'bg-blue-800 text-white border-blue-800':'bg-white border-gray-200 text-gray-600'}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+          {supplierMode==='saved'||poAuthoritative?(
             <select value={supplierId} onChange={e=>setSupplierId(e.target.value)} className={iCls}>
               <option value="">— Select a supplier —</option>
               {suppliers.map(s=><option key={s.id} value={s.id}>{s.name}{s.city?` · ${s.city}`:''}</option>)}
@@ -16210,13 +16340,20 @@ function CreateCustomPOModal({ onClose, onSave, suppliers }) {
           ):(
             <input value={customSupplier} onChange={e=>setCustomSupplier(e.target.value)} required placeholder="Supplier / vendor name" className={iCls}/>
           )}
+          {poAuthoritative && (
+            <p className="text-xs text-gray-400 mt-1.5">Need a new supplier? <span className="font-semibold">Create Supplier</span> first, then create this PO.</p>
+          )}
         </div>
         {/* PO Meta */}
         <div className="grid grid-cols-2 gap-3">
           <div><label className="block text-xs font-semibold text-gray-500 mb-1">PO Date</label>
             <input type="date" value={poDate} onChange={e=>setPoDate(e.target.value)} className={iCls}/></div>
           <div><label className="block text-xs font-semibold text-gray-500 mb-1">Job / Reference</label>
-            <input value={jobRef} onChange={e=>setJobRef(e.target.value)} placeholder="Optional job or ref number" className={iCls}/></div>
+            {job ? (
+              <div className="w-full border border-gray-200 bg-gray-50 rounded-xl px-3 py-2 text-sm text-gray-600 font-semibold">{job.num}</div>
+            ) : (
+              <input value={jobRef} onChange={e=>setJobRef(e.target.value)} placeholder="Optional job or ref number" className={iCls}/>
+            )}</div>
         </div>
         {/* Line Items */}
         <div>
@@ -16334,34 +16471,13 @@ function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user
   //     company context" rather than an untagged/uncategorised PO.
   // Returns true/false so the modal can show an error instead of closing
   // on a failed reservation.
+  // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: the relational-vs-
+  // JSON branching (including the "refuse a custom/unsaved supplier once
+  // purchaseOrders is cut over" rule) now lives once, in
+  // createPurchaseOrderShared — shared with JobDetail's "Create Purchase
+  // Order" action — rather than duplicated here.
   async function handleCreateCustomPO(po) {
-    const coTag = isHoldingsUser(user) ? HOLDINGS_CO_ID : (user && user.co !== undefined && user.co !== null ? user.co : (po.co ?? null));
-    // Stage 3 Phase 9: routes through the relational REST API when
-    // "purchaseOrders" is cut over AND a real SAVED supplier was chosen
-    // (po.supplierId set). rel_purchase_orders has no raw/custom-supplier-
-    // name column (only a real FK to rel_suppliers — see migration 007), so
-    // a "custom" (not-yet-saved) supplier name has no home in the
-    // relational schema; that path is deliberately left JSON-only here. If
-    // purchaseOrders is ever cut over for real, the systemic safety guard
-    // (assertNoUnwiredRelationalSections) refuses that specific save loudly
-    // rather than silently losing the custom supplier name.
-    if(isRelationalAuthoritative('purchaseOrders') && po.supplierId!=null){
-      try {
-        const result = await relationalApi.createPurchaseOrder({
-          companyCode: coTag, supplierId: po.supplierId, jobNumberRaw: po.jobNum || null, notes: po.notes,
-          items: (po.items||[]).map(it=>({ inventoryItemId: it.inventoryId, name: it.name, unit: it.unit, qtyNeeded: it.qtyNeeded, qtyOrdered: it.qtyOrdered, unitCost: it.unitCost })),
-        });
-        setPurchaseOrders(prev=>[{...po, co:coTag, num:result.poNumber, id:result.id, _relId:result.id, _relRowVersion:result.rowVersion}, ...prev]);
-        return true;
-      } catch(e){
-        alert('Purchase Order could NOT be created.\n\n'+(e&&e.message?e.message:'unknown error'));
-        return false;
-      }
-    }
-    const num = await reservePONumber();
-    if(!num) return false;
-    setPurchaseOrders(prev=>[{...po, co:coTag, num}, ...prev]);
-    return true;
+    return await createPurchaseOrderShared(po, user, setPurchaseOrders);
   }
 
   return (
@@ -16369,7 +16485,7 @@ function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user
       <div className="flex items-center justify-between mb-5">
         <div>
           <h1 className="text-xl font-black text-gray-900">🛒 Purchase Orders</h1>
-          <p className="text-xs text-gray-400 mt-0.5">Auto-generated from inventory · or create custom orders</p>
+          <p className="text-xs text-gray-400 mt-0.5">Create purchase orders manually — from here, or from a job's detail view</p>
         </div>
         <div className="flex gap-2 items-center">
           {counts.draft>0&&<span className="text-xs font-bold bg-amber-100 text-amber-700 border border-amber-200 rounded-lg px-2 py-1">{counts.draft} pending action</span>}
@@ -16411,7 +16527,7 @@ function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user
           <div className="text-center py-16">
             <div className="text-5xl mb-4">🛒</div>
             <h3 className="text-lg font-bold text-gray-500 mb-2">{_poSearch?'No matching purchase orders':filter==='all'?'No purchase orders yet':'No '+filter+' orders'}</h3>
-            <p className="text-sm text-gray-400">{_poSearch?`Nothing matches "${search}". Try a PO number, supplier or job.`:<>Purchase orders are automatically created when inventory<br/>drops below reorder levels after job conversion.</>}</p>
+            <p className="text-sm text-gray-400">{_poSearch?`Nothing matches "${search}". Try a PO number, supplier or job.`:<>Purchase orders are created manually — use "+ New PO" above,<br/>or "Create Purchase Order" from a job's detail view.</>}</p>
           </div>
         )
         : (
@@ -23074,7 +23190,7 @@ function App() {
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} onOpenJob={openJobRecord} forceSaveSections={forceSaveSections}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets} forceSaveSections={forceSaveSections}/>,
-    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord}/>,
+    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,

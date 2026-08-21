@@ -94,6 +94,19 @@ async function testBackfill() {
   ok(apply1.summary.jobs.inserted === 2, 'jobs: both jobs inserted', JSON.stringify(apply1.summary.jobs));
   ok(apply1.conflicts.length === 2, 'exactly 2 conflicts reported (customers + quickRates duplicate groups)', String(apply1.conflicts.length));
 
+  // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: the fixture's one
+  // purchaseOrders record is deliberately never imported at all — skipped
+  // by policy, not a data-quality quarantine. Required test #1/#2/#4 below.
+  ok(apply1.summary.purchaseOrders.seen === 1, 'purchaseOrders: the fixture\'s 1 historical record was seen', JSON.stringify(apply1.summary.purchaseOrders));
+  ok(apply1.summary.purchaseOrders.legacySkippedByPolicy === 1, 'purchaseOrders: the fixture record is classified legacySkippedByPolicy (test #1)', JSON.stringify(apply1.summary.purchaseOrders));
+  ok(apply1.summary.purchaseOrders.policy === 'LEGACY_PURCHASE_ORDERS_SKIPPED_BY_POLICY', 'purchaseOrders: summary carries the deterministic policy classification string', JSON.stringify(apply1.summary.purchaseOrders));
+  ok(apply1.summary.purchaseOrders.inserted === 0 && apply1.summary.purchaseOrders.updated === 0 && apply1.summary.purchaseOrders.unchanged === 0, 'purchaseOrders: zero rows inserted/updated/unchanged — nothing is ever written', JSON.stringify(apply1.summary.purchaseOrders));
+  ok(apply1.summary.purchaseOrders.quarantined === 0 && apply1.summary.purchaseOrders.unexpectedConflicts === 0, 'purchaseOrders: zero quarantined-as-conflict, zero unexpected conflicts — this is a deliberate policy skip, not a data-quality failure', JSON.stringify(apply1.summary.purchaseOrders));
+  const poCountAfterApply1 = await pool.query('SELECT count(*)::int AS n FROM rel_purchase_orders');
+  ok(poCountAfterApply1.rows[0].n === 0, 'rel_purchase_orders has ZERO rows after backfill apply — no historical PO relational rows are created (test #2)', `got ${poCountAfterApply1.rows[0].n}`);
+  const fixtureAfterApply = JSON.parse(require('fs').readFileSync(FIXTURE_PATH, 'utf8'));
+  ok(Array.isArray(fixtureAfterApply.purchaseOrders) && fixtureAfterApply.purchaseOrders.length === 1 && fixtureAfterApply.purchaseOrders[0].num === 'PO-00001', 'source JSON purchaseOrders fixture is completely unchanged after backfill apply (test #3)', JSON.stringify(fixtureAfterApply.purchaseOrders));
+
   const jobRow = await pool.query(`SELECT quote_id FROM rel_jobs WHERE job_number = 'SNS-00001'`);
   ok(jobRow.rowCount === 1 && jobRow.rows[0].quote_id !== null, 'job SNS-00001 resolved its quote_id FK from quoteNum during backfill');
   const quoteRow = await pool.query(`SELECT converted_job_id FROM rel_quotes WHERE quote_number = 'SQ-00001'`);
@@ -108,6 +121,12 @@ async function testBackfill() {
   ok(apply2.summary.jobs.unchanged === 2, 'jobs: second run is all-unchanged', JSON.stringify(apply2.summary.jobs));
   const countAfter2 = await pool.query('SELECT count(*)::int AS n FROM rel_customers');
   ok(countAfter2.rows[0].n === 3, 'no duplicate rows created by the second run', String(countAfter2.rows[0].n));
+  // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE — idempotency (test #4):
+  // the SAME 1 historical record is reported skipped-by-policy again, never
+  // duplicated, never partially imported.
+  ok(apply2.summary.purchaseOrders.legacySkippedByPolicy === 1 && apply2.summary.purchaseOrders.inserted === 0, 'purchaseOrders: second backfill run reports the exact same policy decision deterministically (test #4)', JSON.stringify(apply2.summary.purchaseOrders));
+  const poCountAfter2 = await pool.query('SELECT count(*)::int AS n FROM rel_purchase_orders');
+  ok(poCountAfter2.rows[0].n === 0, 'rel_purchase_orders is still empty after a second backfill run — never duplicates, never creates legacy POs', `got ${poCountAfter2.rows[0].n}`);
 
   console.log('\n[Backfill] a run that throws mid-way rolls back completely; a retry afterward is safe');
   const fs = require('fs');
@@ -166,11 +185,19 @@ async function testReconciliation() {
   ok(quotes.safeToCutOver === true, 'quotes: no quarantine, no discrepancies -> safe to cut over', JSON.stringify(quotes));
   ok(quotes.financialMismatches.length === 0, 'quotes: financial recomputation agrees with what backfill stored');
 
+  // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE (test #5): purchaseOrders
+  // is a deliberate migration-policy exception — pre-cutover reconciliation
+  // must NOT fail merely because JSON has a record relational does not.
+  const posClean = clean.sections.find((s) => s.collection === 'purchaseOrders')!;
+  ok(posClean.legacyPolicyExcluded === true, 'purchaseOrders: reconcile report is explicitly marked as a legacy-policy exclusion', JSON.stringify(posClean));
+  ok(posClean.legacySkippedByPolicy === 1, 'purchaseOrders: reports the 1 historical fixture record as intentionally skipped by policy', JSON.stringify(posClean));
+  ok(posClean.safeToCutOver === true, 'purchaseOrders: SAFE TO CUT OVER despite JSON having a record relational does not — an explicit, user-approved migration policy, not a bug (test #5)', JSON.stringify(posClean));
+  ok(posClean.reasons.some((r) => r.includes('LEGACY SECTION EXCLUDED BY MIGRATION POLICY')), 'purchaseOrders: reasons explicitly state the legacy-exclusion policy', JSON.stringify(posClean.reasons));
+
   const fs = require('fs');
   const modified = JSON.parse(fs.readFileSync(FIXTURE_PATH, 'utf8'));
   modified.jobs[1].value = 999999; // stale relational copy
   modified.jobs.push({ id: 99999, num: 'SNS-99999', co: '2', client: 'ERESA', desc: 'not yet backfilled', status: 'lead', stage: 0, value: 1, lines: [], payments: [] });
-  modified.purchaseOrders = []; // relational still has one -> EXTRA
   const modPath = '/tmp/reconcile-modified-fixture.json';
   fs.writeFileSync(modPath, JSON.stringify(modified));
 
@@ -179,11 +206,28 @@ async function testReconciliation() {
   ok(jobs.different === 1, 'jobs: the changed job is correctly classified DIFFERENT', String(jobs.different));
   ok(jobs.missingInRelational === 1, 'jobs: the brand-new job is correctly classified MISSING_IN_RELATIONAL', String(jobs.missingInRelational));
   ok(jobs.safeToCutOver === false, 'jobs: no longer safe to cut over while DIFFERENT/MISSING exist');
-  const pos = dirty.sections.find((s) => s.collection === 'purchaseOrders')!;
-  ok(pos.extraInRelational === 1, 'purchaseOrders: the now-removed-from-JSON PO is correctly classified EXTRA_IN_RELATIONAL', String(pos.extraInRelational));
-  ok(pos.safeToCutOver === false, 'purchaseOrders: EXTRA blocks cutover');
-
   ok(dirty.overallSafe === false, 'overall gate correctly reports NOT safe while any section has discrepancies');
+
+  // purchaseOrders stays safe even in the "dirty" run above (JSON still has
+  // its 1 record, relational still has 0 — expected under policy, not a
+  // regression caused by the jobs-section dirtiness elsewhere).
+  const posDirty = dirty.sections.find((s) => s.collection === 'purchaseOrders')!;
+  ok(posDirty.safeToCutOver === true, 'purchaseOrders: still safe to cut over even while OTHER sections have discrepancies — the policy exclusion is independent of unrelated sections', JSON.stringify(posDirty));
+
+  // Genuine-violation detection: if a rel_purchase_orders row somehow DID
+  // carry a source_id matching a historical JSON record (which should never
+  // happen under the current no-import policy — e.g. a manual psql insert,
+  // or a future regression reintroducing the old import path), reconcile
+  // must catch it and refuse to call purchaseOrders safe.
+  await pool.query(
+    `INSERT INTO rel_purchase_orders (source_id, po_number, company_code, order_date, status, notes, legacy_data)
+     VALUES ('9001', 'PO-99999', '2', CURRENT_DATE, 'draft', 'simulated policy violation', '{}'::jsonb)`
+  );
+  const violated = await runReconciliation({ sourceFile: FIXTURE_PATH });
+  const posViolated = violated.sections.find((s) => s.collection === 'purchaseOrders')!;
+  ok(posViolated.safeToCutOver === false, 'purchaseOrders: a relational row whose source_id matches a historical JSON record is caught as an UNEXPECTED policy violation, not silently accepted', JSON.stringify(posViolated));
+  ok(posViolated.extraInRelational === 1, 'purchaseOrders: the unexpected legacy-sourced row is counted', String(posViolated.extraInRelational));
+  await pool.query(`DELETE FROM rel_purchase_orders WHERE source_id = '9001'`);
 }
 
 async function testServicesConcurrency() {

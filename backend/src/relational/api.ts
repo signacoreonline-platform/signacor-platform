@@ -346,11 +346,11 @@ router.delete('/credit-notes/:id', async (req: AuthRequest, res: Response): Prom
 router.post('/purchase-orders', async (req: AuthRequest, res: Response): Promise<void> => {
   if (!(await requireCutOver('purchaseOrders', res))) return;
   try {
-    const { companyCode, supplierId, jobId, jobNumberRaw, quoteId, quoteNumberRaw, notes, items } = req.body || {};
+    const { companyCode, supplierId, jobId, jobNumberRaw, quoteId, quoteNumberRaw, orderDate, notes, items } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) {
       res.status(400).json({ error: 'a non-empty "items" array is required' }); return;
     }
-    const result = await createPurchaseOrder({ companyCode, supplierId, jobId, jobNumberRaw, quoteId, quoteNumberRaw, notes, items });
+    const result = await createPurchaseOrder({ companyCode, supplierId, jobId, jobNumberRaw, quoteId, quoteNumberRaw, orderDate, notes, items });
     res.status(201).json({ success: true, id: result.id, poNumber: result.poNumber, rowVersion: result.rowVersion });
   } catch (err) { handleServiceError(err, res); }
 });

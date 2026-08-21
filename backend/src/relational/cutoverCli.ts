@@ -50,28 +50,37 @@ const HARD_BLOCKED_SECTIONS = new Set<string>(['customers', 'quickRates']);
 // Some sections cannot be safely enabled in isolation because a REAL
 // operation on them writes into OTHER sections' relational tables too.
 // The clearest example: services.ts's convertQuoteToJob (quote -> job)
-// creates a job, deducts inventory, and may auto-generate purchase orders,
-// all in ONE transaction, whenever a quote is converted — regardless of
-// which sections are cut over. If "quotes" is enabled but "jobs" is not,
-// that job still gets created in rel_jobs, but the live JSON-rendered app
-// (which reads jobs from platform_state, since "jobs" isn't cut over) would
-// never show it — a real record silently invisible to every normal user,
-// not corrupted, just unreachable. Same story for inventory (stock
-// deducted, but the JSON inventory view stays stale/wrong) and
-// purchaseOrders (an auto-PO created, never seen).
+// creates a job and deducts inventory, in ONE transaction, whenever a quote
+// is converted — regardless of which sections are cut over. If "quotes" is
+// enabled but "jobs" is not, that job still gets created in rel_jobs, but
+// the live JSON-rendered app (which reads jobs from platform_state, since
+// "jobs" isn't cut over) would never show it — a real record silently
+// invisible to every normal user, not corrupted, just unreachable. Same
+// story for inventory (stock deducted, but the JSON inventory view stays
+// stale/wrong).
+//
+// 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: convertQuoteToJob no
+// longer auto-generates purchase orders at all (see services.ts) — the
+// invisible-auto-PO risk this dependency group used to guard against for
+// "purchaseOrders" no longer exists, so "purchaseOrders" has been removed
+// from quotes' `requires` below. purchaseOrders can now be enabled fully
+// independently of quotes/jobs — it is an explicit, user-approved
+// migration-policy section (historical POs intentionally excluded, see
+// backfill.ts) whose own readiness is judged purely on its own manual-
+// workflow correctness, not on quote-conversion side effects.
 //
 // Rather than have the operator remember this, `enable <section>` REFUSES
 // if any of that section's required dependencies are not ALREADY enabled.
 // This is deliberately NOT an --enable-all: it forces the operator to run
-// enable for jobs, inventory, and purchaseOrders individually (each with
-// its own explicit --confirm=ENABLE_<SECTION> phrase and its own fresh
-// reconciliation check) BEFORE quotes can be enabled — one named,
-// explicit, auditable step per section, never a bundled/blanket action.
+// enable for jobs and inventory individually (each with its own explicit
+// --confirm=ENABLE_<SECTION> phrase and its own fresh reconciliation check)
+// BEFORE quotes can be enabled — one named, explicit, auditable step per
+// section, never a bundled/blanket action.
 const DEPENDENCY_GROUPS: Record<string, { requires: string[]; reason: string }> = {
   quotes: {
-    requires: ['jobs', 'inventory', 'purchaseOrders'],
+    requires: ['jobs', 'inventory'],
     reason:
-      'Quote -> Job conversion (services.ts convertQuoteToJob) creates a job, deducts inventory, and may auto-generate purchase orders in the SAME transaction as the conversion itself — regardless of which sections are cut over. If jobs/inventory/purchaseOrders are not ALSO relational-authoritative, those writes still happen but become invisible to the live JSON-rendered app (a real job/stock-adjustment/auto-PO existing in the database with no code path that ever surfaces it to a user). Enable jobs, inventory, and purchaseOrders individually FIRST (each with its own --confirm phrase), then enable quotes.',
+      'Quote -> Job conversion (services.ts convertQuoteToJob) creates a job and deducts inventory in the SAME transaction as the conversion itself — regardless of which sections are cut over. If jobs/inventory are not ALSO relational-authoritative, those writes still happen but become invisible to the live JSON-rendered app (a real job/stock-adjustment existing in the database with no code path that ever surfaces it to a user). Enable jobs and inventory individually FIRST (each with its own --confirm phrase), then enable quotes. (purchaseOrders is no longer part of this dependency group — convertQuoteToJob no longer creates purchase orders at all.)',
   },
 };
 

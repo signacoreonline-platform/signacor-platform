@@ -115,6 +115,52 @@ async function main() {
   ok(data2.jobs?.some((j: any) => j.num === relJob.jobNumber), 'the backup\'s jobs array includes the RELATIONALLY-created job (never written to platform_state at all)', `looked for ${relJob.jobNumber}`);
   ok(!data2.jobs?.some((j: any) => j.num === 'SNS-BKP-1'), 'the STALE frozen platform_state.data.jobs copy (SNS-BKP-1) is correctly NOT what\'s in the backup once jobs is relational-authoritative — it is superseded by the live relational rendering');
 
+  console.log('\n[Full Backup V2] PURCHASE ORDER MIGRATION POLICY CHANGE (2026-08-21) — active relational POs vs legacy JSON archive (tests #17/#18)');
+  await pool.query(`TRUNCATE rel_purchase_order_items, rel_purchase_orders, rel_suppliers RESTART IDENTITY CASCADE`).catch(() => undefined);
+  // Seed platform_state with a historical JSON purchaseOrders record — this
+  // must remain preserved and referenceable in the backup even after
+  // purchaseOrders is cut over, but must NOT be presented as active.
+  const psBefore = await pool.query('SELECT data FROM platform_state WHERE id = 1');
+  const psDataForPo = { ...(psBefore.rowCount ? psBefore.rows[0].data || {} : {}), purchaseOrders: [
+    { id: 8001, num: 'PO-00085', supplierId: '5001', jobNum: 'SNS-LEGACY-1', co: '2', date: '2020-01-01', status: 'sent', items: [{ inventoryId: null, name: 'Legacy Item', unit: 'ea', qtyNeeded: 1, qtyOrdered: 1, unitCost: 1 }], notes: 'historical, part of a duplicate-number group excluded by policy' },
+  ] };
+  await pool.query(`UPDATE platform_state SET data = $1::jsonb, updated_at = NOW() WHERE id = 1`, [JSON.stringify(psDataForPo)]);
+
+  process.env.RELATIONAL_AUTHORITY_ENABLED = 'true';
+  await pool.query(`UPDATE relational_cutover SET enabled = true, enabled_at = NOW(), enabled_by = 'backup-test' WHERE section = 'purchaseOrders'`);
+  const poSupplier = await services.createSupplier({ name: 'Full Backup V2 PO Supplier' });
+  const activePo = await services.createPurchaseOrder({
+    companyCode: '2', supplierId: poSupplier.id, notes: 'active relational PO',
+    items: [{ name: 'New Item', qtyNeeded: 5, qtyOrdered: 5, unitCost: 3 }],
+  });
+
+  const result3 = await buildFullBackupV2('admin');
+  ok(result3.manifest.perSectionAuthority.purchaseOrders === 'relational', 'after purchaseOrders cutover, manifest reports its authority as "relational"', result3.manifest.perSectionAuthority.purchaseOrders);
+  ok(!!result3.manifest.purchaseOrdersDataset, 'manifest carries a dedicated purchaseOrdersDataset field distinguishing active vs legacy');
+  ok(result3.manifest.purchaseOrdersDataset.activeDataset.label === 'ACTIVE RELATIONAL PURCHASE ORDERS', 'manifest labels the active dataset as ACTIVE RELATIONAL PURCHASE ORDERS once cut over', JSON.stringify(result3.manifest.purchaseOrdersDataset.activeDataset));
+  ok(result3.manifest.purchaseOrdersDataset.legacyJsonArchive.label === 'LEGACY JSON PURCHASE ORDER ARCHIVE', 'manifest labels the legacy dataset as LEGACY JSON PURCHASE ORDER ARCHIVE', JSON.stringify(result3.manifest.purchaseOrdersDataset.legacyJsonArchive));
+  ok(result3.manifest.purchaseOrdersDataset.legacyJsonArchive.recordCount === 1, 'manifest reports exactly 1 legacy archived PO record (the historical fixture)', String(result3.manifest.purchaseOrdersDataset.legacyJsonArchive.recordCount));
+
+  const data3 = JSON.parse(result3.buffer.length ? extractDataJson(result3) : '{}');
+  ok(Array.isArray(data3.purchaseOrders) && data3.purchaseOrders.length === 1 && data3.purchaseOrders[0].num === activePo.poNumber, 'test #17: data.json\'s "purchaseOrders" key contains ONLY the active relational PO, correctly rendered', JSON.stringify(data3.purchaseOrders));
+  ok(!data3.purchaseOrders.some((p: any) => p.num === 'PO-00085'), 'the legacy historical PO (PO-00085) is correctly NOT presented as active once purchaseOrders is cut over');
+  ok(Array.isArray(data3.purchaseOrdersLegacyArchive) && data3.purchaseOrdersLegacyArchive.length === 1 && data3.purchaseOrdersLegacyArchive[0].num === 'PO-00085', 'test #18: data.json\'s "purchaseOrdersLegacyArchive" key preserves the original historical JSON PO record, unfiltered', JSON.stringify(data3.purchaseOrdersLegacyArchive));
+
+  // Pre-cutover: purchaseOrdersLegacyArchive is still present (always
+  // captured regardless of cutover state) and mirrors the same historical
+  // data as the (still-JSON) active `purchaseOrders` key.
+  await pool.query(`UPDATE relational_cutover SET enabled = false, enabled_at = NULL, enabled_by = NULL WHERE section = 'purchaseOrders'`);
+  const result4 = await buildFullBackupV2('admin');
+  const data4 = JSON.parse(result4.buffer.length ? extractDataJson(result4) : '{}');
+  ok(result4.manifest.purchaseOrdersDataset.activeDataset.label.includes('not yet cut over'), 'pre-cutover: manifest labels the active dataset as not-yet-cut-over JSON', result4.manifest.purchaseOrdersDataset.activeDataset.label);
+  ok(Array.isArray(data4.purchaseOrdersLegacyArchive) && data4.purchaseOrdersLegacyArchive.length === 1, 'purchaseOrdersLegacyArchive is preserved even before cutover (always captured, independent of cutover state)', JSON.stringify(data4.purchaseOrdersLegacyArchive));
+
+  await pool.query(`TRUNCATE rel_purchase_order_items, rel_purchase_orders, rel_suppliers RESTART IDENTITY CASCADE`).catch(() => undefined);
+  // NOTE: intentionally leave RELATIONAL_AUTHORITY_ENABLED=true and the
+  // platform_state jobs seed alone here — the very next section (existing,
+  // unmodified below) still relies on the master switch being on and
+  // "jobs" still being cut over from the earlier step in this same test run.
+
   console.log('\n[Full Backup V2] verification catches a manufactured inconsistency (simulated partial-failure)');
   const { buildFullBackupV2: freshImport } = await import('../src/relational/fullBackupV2');
   // Monkeypatch a broken read builder briefly to prove the verification step

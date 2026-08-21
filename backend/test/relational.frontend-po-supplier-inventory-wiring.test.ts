@@ -12,14 +12,19 @@
  *      where a relational delete route exists) exactly as the wired
  *      frontend now calls it.
  *
- * Also documents, via a source-text assertion, the one remaining deliberate
- * gap: a "custom" (not-yet-saved) supplier name on a Purchase Order
- * (rel_purchase_orders has no raw-name column) stays JSON-only by design,
- * protected by the pre-existing systemic safety guard if the section is
- * ever cut over for real. Inventory item DELETE (formerly the same kind of
- * documented gap) was closed by MIGRATION CLOSURE Item 3 — see
- * relational.inventory-delete.stress.ts for full scenario coverage; this
- * file's own source-text checks below confirm removeItem() is wired.
+ * 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: the historical
+ * "custom (not-yet-saved) supplier name on a PO silently falls back to
+ * JSON once cut over" gap is now CLOSED, not merely documented — a PO with
+ * no saved supplier is explicitly REFUSED once purchaseOrders is
+ * relational-authoritative (rel_purchase_orders has no raw-name column,
+ * only a real FK to rel_suppliers). This file's source-text checks below
+ * confirm that refusal, plus JobDetail's new "Create Purchase Order" manual
+ * action (the preferred placement per the new migration policy) and the
+ * shared createPurchaseOrderShared implementation both entry points now use.
+ * Inventory item DELETE (formerly the same kind of documented gap) was
+ * closed by MIGRATION CLOSURE Item 3 — see relational.inventory-delete.stress.ts
+ * for full scenario coverage; this file's own source-text checks below
+ * confirm removeItem() is wired.
  *
  * Requires TEST_SERVER_URL_WITH_AUTHORITY for the end-to-end parts — skips
  * with a clear notice if unset, same convention as every other Stage 2/3
@@ -28,6 +33,7 @@
 import fs from 'fs';
 import path from 'path';
 import pool from '../src/db/pool';
+import * as services from '../src/relational/services';
 
 const INDEX_HTML_PATH = process.env.INDEX_HTML_PATH || path.resolve(__dirname, '..', '..', 'index.html');
 
@@ -63,19 +69,47 @@ function checkSourceWiring(src: string) {
   ok(src.includes(`await relationalApi.deleteSupplier(existing._relId, existing._relRowVersion);`),
     'delSup calls relationalApi.deleteSupplier with _relId/_relRowVersion');
 
-  // Purchase Orders (Phase 9)
-  ok(src.includes(`if(isRelationalAuthoritative('purchaseOrders') && po.supplierId!=null){`) && src.includes(`async function handleCreateCustomPO(po) {`),
-    'handleCreateCustomPO routes relationally only for a SAVED supplier (po.supplierId set)');
+  // Purchase Orders (Phase 9 / 2026-08-21 PURCHASE ORDER MIGRATION POLICY
+  // CHANGE). handleCreateCustomPO and JobDetail's own "Create Purchase
+  // Order" action now share ONE implementation — createPurchaseOrderShared
+  // — so the relational-vs-JSON branching (and the "never silently fall
+  // back to JSON once purchaseOrders is cut over" rule) is checked once,
+  // here, rather than duplicated per entry point.
+  ok(src.includes(`async function createPurchaseOrderShared(po, user, setPurchaseOrders) {`),
+    'createPurchaseOrderShared exists as the single shared PO-save implementation');
+  ok(src.includes(`if(isRelationalAuthoritative('purchaseOrders')){`) && src.includes(`async function createPurchaseOrderShared(po, user, setPurchaseOrders) {`),
+    'createPurchaseOrderShared checks isRelationalAuthoritative(\'purchaseOrders\')');
+  // The historical "custom supplier silently falls back to legacy JSON"
+  // gap is CLOSED: once purchaseOrders is relational-authoritative, a PO
+  // with no saved supplier (po.supplierId==null) is explicitly REFUSED —
+  // never written to JSON, never silently accepted. rel_purchase_orders has
+  // no raw/custom-supplier-name column, only a real FK to rel_suppliers
+  // (migration 007), so there is nowhere safe for that data to go.
+  ok(src.includes(`if(po.supplierId==null){`) && src.includes(`Please select a saved supplier.`),
+    'createPurchaseOrderShared REFUSES a custom/unsaved-supplier PO once purchaseOrders is relational-authoritative, instead of silently falling back to JSON (closes the historical JSON-fallback gap)');
+  ok(src.includes(`return 'Purchase Order could NOT be created.`),
+    'a failed relational PO create returns an error string rather than silently succeeding or writing JSON');
+  ok(src.includes(`async function handleCreateCustomPO(po) {`) && src.includes(`return await createPurchaseOrderShared(po, user, setPurchaseOrders);`),
+    'PurchaseOrdersPage.handleCreateCustomPO delegates to the shared implementation, not its own duplicate branching');
   ok(src.includes(`const result = await relationalApi.createPurchaseOrder({`),
-    'handleCreateCustomPO create branch calls relationalApi.createPurchaseOrder');
+    'createPurchaseOrderShared\'s relational branch calls relationalApi.createPurchaseOrder');
   ok(src.includes(`_relId:result.id, _relRowVersion:result.rowVersion}, ...prev]);`),
-    'handleCreateCustomPO sets _relId/_relRowVersion immediately on the new PO stub');
+    'createPurchaseOrderShared sets _relId/_relRowVersion immediately on the new PO stub');
   ok(src.includes(`if(isRelationalAuthoritative('purchaseOrders') && updated._relId!=null){`) && src.includes(`async function updatePO(updated) {`),
     'updatePO routes relationally only for a genuine relational row (updated._relId set)');
   ok(src.includes(`const result = await relationalApi.updatePurchaseOrder(updated._relId, updated._relRowVersion,`),
     'updatePO calls relationalApi.updatePurchaseOrder with updated._relId/._relRowVersion');
-  ok(src.includes(`rel_purchase_orders has no raw/custom-supplier-`),
-    'the custom-supplier-name limitation for POs is explicitly documented in source, not silently handled');
+
+  // JobDetail's manual "Create Purchase Order" action (the new preferred
+  // placement per the migration policy) — links cleanly to the real job via
+  // job._relId, never a free-text-only reference, and supports creating
+  // more than one PO against the same job.
+  ok(src.includes(`function JobDetail({`) && src.includes(`const [showCreatePO, setShowCreatePO] = useState(false);`),
+    'JobDetail carries its own "Create Purchase Order" modal state');
+  ok(src.includes(`jobId: job ? (job._relId ?? null) : null,`),
+    'CreateCustomPOModal links a job-originated PO to the real relational job id, not just a free-text job number');
+  ok(src.includes(`onSave={po=>createPurchaseOrderShared(po, user, setPurchaseOrders)}`),
+    'JobDetail\'s Create Purchase Order action reuses the SAME shared save logic as the Purchase Orders page — no separate, potentially-drifting implementation');
 
   // Inventory (Phase 10)
   ok(src.includes(`if(isRelationalAuthoritative('inventory')){`) && src.includes(`async function saveItem(item) {`),
@@ -166,7 +200,39 @@ async function runEndToEndProof() {
   const poAfter = await pool.query(`SELECT status, notes FROM rel_purchase_orders WHERE id = $1`, [createPoBody.id]);
   ok(poAfter.rows[0].status === 'approved' && poAfter.rows[0].notes === 'Approved via wired frontend', 'the DB row reflects the PO status/notes edit');
 
+  // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: exactly what
+  // JobDetail's new "Create Purchase Order" action sends — a real jobId
+  // link (not just a free-text job number), proving the manual-PO-from-job
+  // workflow end to end over real HTTP (test #9/#13).
+  console.log('\n[Frontend PO/supplier/inventory wiring] PO: JobDetail\'s "Create Purchase Order" action links a real job via jobId');
+  // Defensive reset before creating THIS file's first quote/job: this suite
+  // shares one disposable local Postgres with every other stress suite in
+  // this directory, run back-to-back without a reset in between within one
+  // full-regression pass — a previous suite (e.g. fullBackupV2.stress.ts)
+  // may have truncated rel_quotes (restarting its id sequence back to 1)
+  // without also clearing its now-orphaned quote_conversions bookkeeping
+  // row for 'rel:1', which would otherwise collide with the very first
+  // quote conversion this file performs.
+  await pool.query(`TRUNCATE rel_jobs, rel_job_line_items, rel_quotes, rel_quote_line_items, rel_customers RESTART IDENTITY CASCADE`).catch(() => undefined);
+  await pool.query(`DELETE FROM quote_conversions WHERE quote_id LIKE 'rel:%'`);
+  const wiringQuote = await services.createQuote({ companyCode: '2', customerNameRaw: 'PO Wiring Job Co', lines: [{ description: 'x', qty: 1, unitPrice: 10 }] });
+  const wiringConv = await services.convertQuoteToJob(wiringQuote.id);
+  ok(!('autoPurchaseOrders' in wiringConv), 'converting this quote created no auto-PO (feature removed) — confirms the manual PO created next is the ONLY PO for this job');
+  const createJobPoRes = await fetch(`${base}/api/relational/purchase-orders`, {
+    method: 'POST', headers: authHeaders,
+    body: JSON.stringify({
+      companyCode: '2', supplierId: createSupBody.id, jobId: wiringConv.jobId, jobNumberRaw: wiringConv.jobNumber, notes: 'Created from Job detail',
+      items: [{ inventoryItemId: null, name: 'Job-linked Item', unit: 'ea', qtyNeeded: 2, qtyOrdered: 2, unitCost: 5 }],
+    }),
+  });
+  const createJobPoBody: any = await createJobPoRes.json();
+  ok(createJobPoRes.status === 201 && /^PO-\d{5}$/.test(createJobPoBody.poNumber || ''), 'job-linked PO created with a real PO-##### number', createJobPoBody);
+  const jobPoRow = await pool.query(`SELECT job_id, job_number_raw FROM rel_purchase_orders WHERE id = $1`, [createJobPoBody.id]);
+  ok(Number(jobPoRow.rows[0].job_id) === Number(wiringConv.jobId), 'the created PO is linked to the REAL relational job via job_id, not just a free-text job number', jobPoRow.rows[0]);
+
   await resetRelationalTables();
+  await pool.query(`TRUNCATE rel_jobs, rel_job_line_items, rel_quotes, rel_quote_line_items, rel_customers RESTART IDENTITY CASCADE`).catch(() => undefined);
+  await pool.query(`DELETE FROM quote_conversions WHERE quote_id LIKE 'rel:%'`);
   await pool.query(`UPDATE platform_state SET data = '{}'::jsonb, updated_at = NOW() WHERE id = 1`);
 }
 

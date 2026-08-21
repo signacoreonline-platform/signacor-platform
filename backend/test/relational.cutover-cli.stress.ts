@@ -129,7 +129,7 @@ async function main() {
   const anyEnabled = await pool.query(`SELECT count(*)::int AS n FROM relational_cutover WHERE enabled = true`);
   ok(anyEnabled.rows[0].n === 0, 'an unknown section name is rejected outright, nothing is ever enabled by accident');
 
-  console.log('\n[Cutover CLI] STAGE 3 — dependency-aware cutover: "quotes" refuses until jobs/inventory/purchaseOrders are enabled');
+  console.log('\n[Cutover CLI] STAGE 3 — dependency-aware cutover: "quotes" refuses until jobs/inventory are enabled');
   // Fix up platform_state so jobs/inventory/purchaseOrders/quotes all
   // reconcile cleanly again (the earlier "dirty job" scenario deliberately
   // broke jobs' reconciliation; undo that here).
@@ -138,17 +138,30 @@ async function main() {
 
   await runCli('enable', 'quotes', '--apply', '--confirm=ENABLE_QUOTES');
   let quotesDepRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'quotes'`);
-  ok(quotesDepRow.rows[0].enabled === false, '"quotes" is refused (even with correct flags + clean reconciliation) while jobs/inventory/purchaseOrders are not yet enabled');
+  ok(quotesDepRow.rows[0].enabled === false, '"quotes" is refused (even with correct flags + clean reconciliation) while jobs/inventory are not yet enabled');
+
+  // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: convertQuoteToJob no
+  // longer creates purchase orders at all, so "purchaseOrders" is no longer
+  // part of quotes' dependency group — it can be enabled fully
+  // independently, before, after, or without ever enabling quotes/jobs. It
+  // succeeds here even though the JSON purchaseOrders collection (1 fixture
+  // record) has nothing relational to match — the new
+  // reconcileLegacyPolicySkippedCollection reports that as an intentional,
+  // approved policy exclusion (legacyPolicyExcluded=true), not a
+  // discrepancy, so the normal "enable REFUSES unless safeToCutOver" gate
+  // does not block it.
+  await runCli('enable', 'purchaseOrders', '--apply', '--confirm=ENABLE_PURCHASEORDERS');
+  const poRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'purchaseOrders'`);
+  ok(poRow.rows[0].enabled === true, 'purchaseOrders can be enabled on its own — no longer gated behind jobs/inventory/quotes — because historical POs are excluded by an explicit, approved migration policy, not a data problem', JSON.stringify(poRow.rows));
 
   await runCli('enable', 'jobs', '--apply', '--confirm=ENABLE_JOBS');
   await runCli('enable', 'inventory', '--apply', '--confirm=ENABLE_INVENTORY');
-  await runCli('enable', 'purchaseOrders', '--apply', '--confirm=ENABLE_PURCHASEORDERS');
-  const depsRow = await pool.query(`SELECT section, enabled FROM relational_cutover WHERE section IN ('jobs','inventory','purchaseOrders')`);
-  ok(depsRow.rows.every((r) => r.enabled === true), 'jobs/inventory/purchaseOrders can each be enabled individually, one explicit --confirm at a time — no --enable-all exists', JSON.stringify(depsRow.rows));
+  const depsRow = await pool.query(`SELECT section, enabled FROM relational_cutover WHERE section IN ('jobs','inventory')`);
+  ok(depsRow.rows.every((r) => r.enabled === true), 'jobs/inventory can each be enabled individually, one explicit --confirm at a time — no --enable-all exists', JSON.stringify(depsRow.rows));
 
   await runCli('enable', 'quotes', '--apply', '--confirm=ENABLE_QUOTES');
   quotesDepRow = await pool.query(`SELECT enabled FROM relational_cutover WHERE section = 'quotes'`);
-  ok(quotesDepRow.rows[0].enabled === true, 'once ALL of quotes\' dependencies are enabled, enabling "quotes" itself now succeeds');
+  ok(quotesDepRow.rows[0].enabled === true, 'once jobs+inventory are enabled (purchaseOrders is no longer required), enabling "quotes" itself now succeeds');
 
   process.argv = originalArgv;
   await resetRelationalTables();

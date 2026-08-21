@@ -103,6 +103,15 @@ export async function buildFullBackupV2(exportedByRole: string): Promise<FullBac
     );
     for (const row of qRes.rows) quarantineCounts[row.collection] = Number(row.n);
 
+    // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: capture the RAW
+    // historical JSON purchaseOrders array exactly as it stands in
+    // platform_state, BEFORE any relational overlay below can replace
+    // `effectiveData.purchaseOrders`. This is the permanent legacy archive —
+    // independent of purchaseOrders' cutover state, never deleted, never
+    // merged with the active dataset. See the archive-key handling further
+    // down for how this is actually preserved in the exported ZIP.
+    const legacyPurchaseOrdersArchive = arr(platformStateRow.data.purchaseOrders);
+
     // Build the effective, authority-correct `data` blob: platform_state as
     // the base, overlaid with a fresh relational-authoritative rendering for
     // every section that is ACTUALLY cut over right now (env master switch
@@ -125,12 +134,35 @@ export async function buildFullBackupV2(exportedByRole: string): Promise<FullBac
       }
     }
 
+    // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: once purchaseOrders
+    // is cut over, `effectiveData.purchaseOrders` above has just been
+    // REPLACED by the fresh relational rendering (ACTIVE RELATIONAL PURCHASE
+    // ORDERS — correctly reflecting that the 640 historical JSON records are
+    // no longer the active dataset). Without the line below, the original
+    // historical JSON purchaseOrders array would simply be gone from this
+    // backup the moment cutover happens — never physically deleted from
+    // platform_state itself, but absent from THIS archive, which would
+    // violate "do not erase the historical PO source data from recovery
+    // material". `purchaseOrdersLegacyArchive` always carries that original
+    // historical array, unfiltered, regardless of purchaseOrders' cutover
+    // state — so the ZIP always contains both an unambiguous ACTIVE dataset
+    // (`purchaseOrders`) and the LEGACY JSON PURCHASE ORDER ARCHIVE
+    // (`purchaseOrdersLegacyArchive`), never merged into one list. See the
+    // manifest's `purchaseOrdersDataset` field for the human-readable
+    // distinction.
+    effectiveData.purchaseOrdersLegacyArchive = legacyPurchaseOrdersArchive;
+
     await client.query('COMMIT');
 
     // ── Assemble manifest + payload ──────────────────────────────────────
     const now = new Date();
     const recordCounts: Record<string, number> = {};
     for (const key of ALL_JSON_SECTIONS) recordCounts[key] = arr(effectiveData[key]).length;
+    // purchaseOrdersLegacyArchive is NOT one of the normal ALL_JSON_SECTIONS
+    // authority-bearing sections (it has no "active/relational" concept of
+    // its own — it is always the raw historical snapshot) but it still gets
+    // the same record-count + verification treatment as everything else.
+    recordCounts.purchaseOrdersLegacyArchive = arr(effectiveData.purchaseOrdersLegacyArchive).length;
 
     const dataJson = JSON.stringify(effectiveData, null, 2);
     const checksum = crypto.createHash('sha256').update(dataJson, 'utf8').digest('hex');
@@ -149,6 +181,13 @@ export async function buildFullBackupV2(exportedByRole: string): Promise<FullBac
         throw new Error(`Full Backup V2 verification FAILED: section "${key}" expected ${expected} record(s) but the serialized archive would contain ${actual} — aborting export, nothing was written.`);
       }
     }
+    {
+      const expected = recordCounts.purchaseOrdersLegacyArchive;
+      const actual = arr(reparsed.purchaseOrdersLegacyArchive).length;
+      if (actual !== expected) {
+        throw new Error(`Full Backup V2 verification FAILED: purchaseOrdersLegacyArchive expected ${expected} record(s) but the serialized archive would contain ${actual} — aborting export, nothing was written.`);
+      }
+    }
 
     const fileStamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
     const filename = `signacore-platform-full-backup-v2-${fileStamp}.zip`;
@@ -165,12 +204,32 @@ export async function buildFullBackupV2(exportedByRole: string): Promise<FullBac
       quarantinedGroupCounts: quarantineCounts,
       dataJsonSha256: checksum,
       dataJsonBytes: Buffer.byteLength(dataJson, 'utf8'),
+      // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: an explicit,
+      // human-readable field distinguishing the ACTIVE purchase-order
+      // dataset from the LEGACY JSON PURCHASE ORDER ARCHIVE, so nobody
+      // reading this manifest (or a future restore tool) mistakes the 640
+      // historical records for current active data once purchaseOrders is
+      // cut over — see the archive-key handling above for the mechanics.
+      purchaseOrdersDataset: {
+        activeDataset: {
+          key: 'data.json -> purchaseOrders',
+          label: sectionAuthority.purchaseOrders === 'relational' ? 'ACTIVE RELATIONAL PURCHASE ORDERS' : 'ACTIVE (JSON, not yet cut over)',
+          source: sectionAuthority.purchaseOrders,
+          recordCount: recordCounts.purchaseOrders,
+        },
+        legacyJsonArchive: {
+          key: 'data.json -> purchaseOrdersLegacyArchive',
+          label: 'LEGACY JSON PURCHASE ORDER ARCHIVE',
+          recordCount: recordCounts.purchaseOrdersLegacyArchive,
+          note: 'The original historical purchaseOrders records exactly as they existed in platform_state, preserved unfiltered for forensic/recovery reference regardless of purchaseOrders\' cutover state. These are intentionally excluded from the relational migration by explicit migration policy (see backfill.ts\'s LEGACY_PURCHASE_ORDERS_SKIPPED_BY_POLICY classification) and are never presented as the active dataset, never merged with it, and never deleted.',
+        },
+      },
       contents: {
         'manifest.json': 'this file',
-        'data.json': 'the full, unfiltered, both-companies business-data blob — same shape platform_state.data has always had, with relational-authoritative sections (see perSectionAuthority) rendered fresh from the relational tables instead of read from the (possibly frozen) platform_state row',
+        'data.json': 'the full, unfiltered, both-companies business-data blob — same shape platform_state.data has always had, with relational-authoritative sections (see perSectionAuthority) rendered fresh from the relational tables instead of read from the (possibly frozen) platform_state row. See purchaseOrdersDataset above for the one section with a distinct active-vs-archive split.',
       },
       excludes: 'app_users (accounts, password hashes), JWT secrets, and any other authentication material are never read or included by this export — same policy as the pre-V2 export.',
-      notes: 'A section with perSectionAuthority="relational" is the live source of truth for that section; the JSON copy inside data.json for that section is a fresh rendering, not platform_state\'s own (possibly stale, frozen-at-cutover) copy.',
+      notes: 'A section with perSectionAuthority="relational" is the live source of truth for that section; the JSON copy inside data.json for that section is a fresh rendering, not platform_state\'s own (possibly stale, frozen-at-cutover) copy. purchaseOrders is the one exception with its own permanent archive copy — see purchaseOrdersDataset.',
     };
 
     // ── Build the ZIP in memory ───────────────────────────────────────────

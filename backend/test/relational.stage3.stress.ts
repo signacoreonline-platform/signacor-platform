@@ -155,8 +155,16 @@ async function testQuoteEditingAndSync() {
   ok(quoteStaleBlocked, 'a stale quote row_version on the sync path is rejected before touching the job at all');
 }
 
-async function testConversionInventoryAndAutoPO() {
-  console.log('\n[Quote->Job conversion] inventory deduction (floor at 0) + automatic low-stock PO generation, one transaction');
+// 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: this test used to also
+// prove automatic low-stock PO generation during quote->job conversion —
+// that business rule has been REMOVED (see services.ts's convertQuoteToJob
+// header comment). Rewritten (not deleted) to prove the NEW rule instead:
+// inventory deduction still works exactly as before, but conversion NEVER
+// creates a PO under any circumstance, including when stock ends up low —
+// purchasing is now always a separate, manual, optional decision (tests
+// #6/#7/#8 from the migration policy brief).
+async function testConversionInventoryNoAutoPO() {
+  console.log('\n[Quote->Job conversion] inventory deduction (floor at 0) still works — automatic PO generation has been REMOVED');
   const supplierResult = await services.createSupplier({ name: 'Acme Supplies', email: 'sales@acme.test' });
   const invResult = await pool.query(
     `WITH new_id AS (SELECT nextval('rel_inventory_items_id_seq') AS id)
@@ -173,28 +181,26 @@ async function testConversionInventoryAndAutoPO() {
     lines: [{ description: 'Vinyl Roll', qty: 5, unitPrice: 40, inventoryItemId: invItemId }],
   });
 
+  const poCountBefore = (await pool.query('SELECT count(*)::int AS n FROM rel_purchase_orders')).rows[0].n;
+
   const conv = await services.convertQuoteToJob(quote.id);
-  ok(conv.inventoryAdjustments.length === 1, 'exactly one inventory item was adjusted');
+  ok(conv.inventoryAdjustments.length === 1, 'exactly one inventory item was adjusted (test #7)');
   ok(conv.inventoryAdjustments[0].consumed === 5, 'consumed quantity matches the quote line qty');
   ok(conv.inventoryAdjustments[0].newStock === 7, 'stock correctly deducted (12 - 5 = 7)');
+  ok(!('autoPurchaseOrders' in conv) && !('poReservationFailures' in conv), 'convertQuoteToJob\'s return value no longer carries autoPurchaseOrders/poReservationFailures at all — the feature is fully removed, not just empty', JSON.stringify(conv));
 
   const invAfter = await buildInventoryJson();
   const itemAfter = invAfter.find((i) => i._relId === invItemId);
   ok(itemAfter.stock === 7, 'read.ts renders inventory stock under the key "stock" (not "stockQty")', itemAfter.stock);
   ok(itemAfter.reorder === 10, 'read.ts renders reorder level under the key "reorder" (not "reorderLevel")', itemAfter.reorder);
 
-  // 7 <= reorder(10) -> still low -> auto-PO should have been generated.
-  ok(conv.autoPurchaseOrders.length === 1, 'exactly one auto-PO was generated for the low-stock item\'s supplier group');
-  ok(String(conv.autoPurchaseOrders[0].supplierId) === String(supplierResult.id), 'auto-PO is grouped under the correct supplier', { got: conv.autoPurchaseOrders[0].supplierId, expected: supplierResult.id });
+  // 7 <= reorder(10) -> stock IS low -> under the OLD rule this would have
+  // auto-generated a PO. Under the new rule, it must NOT (tests #6/#8).
+  const poCountAfter = (await pool.query('SELECT count(*)::int AS n FROM rel_purchase_orders')).rows[0].n;
+  ok(poCountAfter === poCountBefore, 'stock ended up low (7 <= reorder 10) but ZERO purchase orders were created — automatic PO generation is gone (test #6/#8)', `before=${poCountBefore} after=${poCountAfter}`);
 
-  const posAfter = await buildPurchaseOrdersJson();
-  const poAfter = posAfter.find((p) => p._relId === conv.autoPurchaseOrders[0].poId);
-  ok(!!poAfter, 'auto-generated PO renders via read.ts');
-  ok(/^PO-/.test(poAfter.num), 'auto-PO got a real atomically-reserved PO-##### number', poAfter.num);
-  ok(poAfter.items.length === 1 && String(poAfter.items[0].inventoryId) === String(invItemId), 'PO item uses the key "inventoryId" (not "inventoryItemId")', poAfter.items[0]);
-  ok(poAfter.items[0].qtyNeeded === Math.max(1, 10 * 2 - 7), 'qtyNeeded computed as max(1, reorder*2 - stock)', poAfter.items[0].qtyNeeded);
-
-  // Floor-at-zero: deduct more than available stock.
+  // Floor-at-zero: deduct more than available stock — also still low, also
+  // still must not auto-create a PO.
   const invResult2 = await pool.query(
     `WITH new_id AS (SELECT nextval('rel_inventory_items_id_seq') AS id)
      INSERT INTO rel_inventory_items (id, source_id, name, unit, cost, sell, stock_qty, reorder_level, legacy_data)
@@ -208,6 +214,24 @@ async function testConversionInventoryAndAutoPO() {
   });
   const conv2 = await services.convertQuoteToJob(quote2.id);
   ok(conv2.inventoryAdjustments[0].newStock === 0, 'stock is floored at 0, never goes negative, when consumption exceeds available stock', conv2.inventoryAdjustments[0]);
+  const poCountAfter2 = (await pool.query('SELECT count(*)::int AS n FROM rel_purchase_orders')).rows[0].n;
+  ok(poCountAfter2 === poCountBefore, 'even a severely-understocked item (floored at 0) does not auto-create a PO — low stock is informational only now, purchasing is manual', `before=${poCountBefore} after=${poCountAfter2}`);
+
+  // The manual workflow remains fully available: a user CAN create a PO
+  // for the resulting job afterward, referencing the exact job that was
+  // just converted, with a real atomically-reserved PO-##### number.
+  const jobRes = await pool.query('SELECT job_number FROM rel_jobs WHERE id = $1', [conv.jobId]);
+  const manualPo = await services.createPurchaseOrder({
+    companyCode: '2', supplierId: supplierResult.id, jobId: conv.jobId, jobNumberRaw: jobRes.rows[0].job_number,
+    notes: 'user-initiated manual PO after conversion',
+    items: [{ inventoryItemId: invItemId, name: 'Vinyl Roll', unit: 'm', qtyNeeded: 20, qtyOrdered: 20, unitCost: 20 }],
+  });
+  ok(/^PO-\d{5}$/.test(manualPo.poNumber), 'a manual PO can still be created for the job afterward, with a real PO-##### number (test #9)', manualPo.poNumber);
+  const posAfter = await buildPurchaseOrdersJson();
+  const poAfter = posAfter.find((p) => p._relId === manualPo.id);
+  ok(!!poAfter, 'the manually-created PO renders via read.ts');
+  ok(String(poAfter.supplierId) === String(supplierResult.id), 'the manual PO\'s supplierId resolves correctly via the live rel_suppliers join (not just backfill-only supplier_source_id)', { got: poAfter.supplierId, expected: supplierResult.id });
+  ok(poAfter.items.length === 1 && String(poAfter.items[0].inventoryId) === String(invItemId), 'PO item uses the key "inventoryId" (not "inventoryItemId")', poAfter.items[0]);
 }
 
 async function testPaymentLifecycle() {
@@ -301,7 +325,7 @@ async function main() {
   await resetStage3Tables();
   await testJobEditing();
   await testQuoteEditingAndSync();
-  await testConversionInventoryAndAutoPO();
+  await testConversionInventoryNoAutoPO();
   await testPaymentLifecycle();
   await testCreditNoteAndPOAndSupplierCrud();
 

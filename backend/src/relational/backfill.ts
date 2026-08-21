@@ -97,6 +97,21 @@ interface Summary {
     quarantined: number;
     unresolvedCustomer?: number;
     unresolvedSupplier?: number;
+    // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: purchaseOrders is
+    // the one collection that is deliberately NEVER imported at all (see
+    // PASS 6 below) — these three fields make that an explicit, reported
+    // migration decision rather than a silent zero. `legacySkippedByPolicy`
+    // is the count of historical JSON purchaseOrders records intentionally
+    // left out of rel_purchase_orders. `unexpectedConflicts` stays 0 under
+    // normal operation (nothing is ever attempted against
+    // rel_purchase_orders for legacy rows, so there is nothing left to
+    // conflict) — it exists so a genuine future bug that DID attempt an
+    // import would show up as non-zero instead of being masked by this
+    // field's absence. `policy` names the deterministic classification for
+    // any tooling/report that reads this summary programmatically.
+    legacySkippedByPolicy?: number;
+    unexpectedConflicts?: number;
+    policy?: string;
   };
 }
 
@@ -772,87 +787,59 @@ export async function runBackfill(opts: { apply: boolean; sourceFile?: string; r
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // PASS 6 — purchase orders + items
+    // PASS 6 — purchase orders: LEGACY_PURCHASE_ORDERS_SKIPPED_BY_POLICY
     // ══════════════════════════════════════════════════════════════════
+    // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: this pass used to
+    // attempt a real upsert of every historical JSON purchaseOrders record
+    // into rel_purchase_orders/rel_purchase_order_items, quarantining any
+    // record sharing a duplicate source id or document number (the old JSON
+    // purchaseOrders collection has large groups of 7-8 records sharing the
+    // SAME po number — e.g. PO-00085/PO-00084/PO-00083 — a genuine
+    // historical data-quality problem, not something this tool invented).
+    // That produced hundreds of unexplained-looking "quarantined" entries
+    // (637 of 640 on the real production dataset) for data nobody actually
+    // needs relationally.
+    //
+    // A deliberate BUSINESS/MIGRATION POLICY DECISION has been made: the
+    // historical purchaseOrders collection is NOT migrated into the
+    // relational purchase-order system at all. Purchase orders going
+    // forward are created exclusively through the new manual PO workflow
+    // (services.ts's createPurchaseOrder, called from the frontend's
+    // "Create Purchase Order" action) — never backfilled from JSON. This is
+    // NOT a cleanup hack for the duplicate-number problem; even a single
+    // clean historical PO record would still be excluded under this policy,
+    // because the decision is "start the relational PO system from a clean
+    // future-facing baseline", not "repair what backfill can't cleanly
+    // import".
+    //
+    // What this pass does NOT do:
+    //   - it never calls upsertRow against rel_purchase_orders or
+    //     rel_purchase_order_items for ANY historical record — zero writes,
+    //     every single run, deterministically;
+    //   - it never reads/modifies platform_state.purchaseOrders (the source
+    //     JSON array is left completely untouched — see runBackfill's
+    //     header comment: this tool is one-directional JSON -> relational
+    //     and NEVER writes back to platform_state regardless);
+    //   - it never reports these 640 records as "quarantined" (a
+    //     conflict/failure classification) — they are reported as
+    //     `legacySkippedByPolicy`, a deliberate, expected, and fully
+    //     explained classification, distinct from a genuine data problem.
+    //
+    // Idempotent by construction: since nothing is ever written, running
+    // this twice (or a thousand times) always reports the exact same
+    // seen/legacySkippedByPolicy/unexpectedConflicts numbers and creates
+    // zero relational rows every time — there is no state to converge.
     {
       const s = bump(summary, 'purchaseOrders');
       const list = arr(data.purchaseOrders);
       s.seen = list.length;
-      const { clean, duplicateGroups } = splitDuplicateIds(list);
-      for (const [id, recs] of duplicateGroups) {
-        s.quarantined += recs.length;
-        recordConflict({ collection: 'purchaseOrders', source_id: id, document_number: null, conflict_type: 'duplicate_source_id', detail: { count: recs.length } });
-      }
-      const byNum = new Map<string, any[]>();
-      for (const rec of clean) {
-        const num_ = str(rec.num);
-        if (!num_) continue;
-        const k = num_.toUpperCase();
-        if (!byNum.has(k)) byNum.set(k, []);
-        byNum.get(k)!.push(rec);
-      }
-      const skipIds = new Set<string>();
-      for (const [k, recs] of byNum) {
-        if (recs.length > 1) {
-          for (const r of recs) skipIds.add(String(r.id));
-          s.quarantined += recs.length;
-          recordConflict({ collection: 'purchaseOrders', source_id: null, document_number: k, conflict_type: 'duplicate_document_number', detail: { count: recs.length, ids: recs.map((r) => r.id) } });
-        }
-      }
-
-      for (const rec of clean) {
-        const sourceId = String(rec.id);
-        if (skipIds.has(sourceId)) continue;
-        const num_ = str(rec.num);
-        if (!num_) {
-          s.quarantined++;
-          recordConflict({ collection: 'purchaseOrders', source_id: sourceId, document_number: null, conflict_type: 'missing_required_field', detail: { num: num_ } });
-          continue;
-        }
-        const supplierSourceId = rec.supplierId !== undefined && rec.supplierId !== null ? String(rec.supplierId) : null;
-        const supplierRelId = supplierSourceId ? supplierIdBySourceId.get(supplierSourceId) || null : null;
-        if (supplierSourceId && !supplierRelId) s.unresolvedSupplier = (s.unresolvedSupplier || 0) + 1;
-        const jobNumRaw = str(rec.jobNum);
-        const jobRelId = jobNumRaw ? jobNumberToId.get(jobNumRaw.toUpperCase()) || null : null;
-        const quoteNumRaw = str(rec.quoteNum);
-        const co = str(rec.co);
-        const quoteRelId = quoteNumRaw && co ? quoteNumberToId.get(`${co}::${quoteNumRaw.toUpperCase()}`) || null : null;
-
-        const columns = {
-          source_id: sourceId,
-          po_number: num_,
-          company_code: co,
-          supplier_id: supplierRelId,
-          supplier_source_id: supplierSourceId,
-          job_id: jobRelId,
-          job_number_raw: jobNumRaw,
-          quote_id: quoteRelId,
-          quote_number_raw: quoteNumRaw,
-          order_date: dateOrNull(rec.date),
-          status: str(rec.status),
-          notes: str(rec.notes),
-        };
-        const outcome = await upsertRow(client, 'rel_purchase_orders', ['source_id'], columns, rec);
-        s[outcome]++;
-        const row = await client.query('SELECT id FROM rel_purchase_orders WHERE source_id = $1', [sourceId]);
-        const relId = row.rows[0].id;
-
-        const items = arr(rec.items);
-        for (let i = 0; i < items.length; i++) {
-          const it = items[i];
-          const invSourceId = it.inventoryId !== undefined && it.inventoryId !== null ? String(it.inventoryId) : null;
-          const invId = invSourceId ? inventoryIdBySourceId.get(invSourceId) || null : null;
-          await upsertRow(
-            client, 'rel_purchase_order_items', ['po_id', 'line_index'],
-            {
-              po_id: relId, line_index: i, inventory_item_id: invId, inventory_source_id: invSourceId,
-              sku: str(it.sku), name: str(it.name), unit: str(it.unit),
-              qty_needed: num(it.qtyNeeded), qty_ordered: num(it.qtyOrdered), unit_cost: num(it.unitCost),
-            },
-            it
-          );
-        }
-      }
+      s.legacySkippedByPolicy = list.length;
+      s.unexpectedConflicts = 0;
+      s.policy = 'LEGACY_PURCHASE_ORDERS_SKIPPED_BY_POLICY';
+      // inserted/updated/unchanged/quarantined intentionally stay at their
+      // bump()-initialized 0 — nothing is inserted, updated, left unchanged,
+      // or quarantined-as-a-conflict; every historical record is skipped by
+      // policy, reported via legacySkippedByPolicy above instead.
     }
 
     // ══════════════════════════════════════════════════════════════════
