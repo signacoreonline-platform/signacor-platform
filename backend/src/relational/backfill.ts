@@ -50,6 +50,7 @@ import fs from 'fs';
 import path from 'path';
 import pool from '../db/pool';
 import { PoolClient } from 'pg';
+import { describeConnectionError } from '../db/ssl';
 
 const CONFIRM_PHRASE = 'I UNDERSTAND THIS WRITES TO THE RELATIONAL DATABASE';
 
@@ -993,5 +994,15 @@ if (require.main === module) {
     console.log(`\n[backfill] ${result.ok ? 'OK' : 'FAILED'}${apply ? (result.ok ? ' — committed.' : ' — rolled back, nothing written.') : ' — dry run, nothing written.'}`);
     await pool.end();
     process.exit(result.ok ? 0 : 1);
-  })();
+  })().catch(async (err) => {
+    // EXTERNAL RENDER SSL FIX (2026-08-21): a connection failure here means
+    // runBackfill() never started (DRY RUN) or its own transaction never
+    // committed (APPLY — runBackfill's internal BEGIN/COMMIT/ROLLBACK means
+    // a failed connection or a failed query rolls back everything in that
+    // one transaction; nothing here retries the connection or the write).
+    console.error(describeConnectionError(err));
+    console.error('[backfill] Fatal error — nothing was written.', err);
+    await pool.end().catch(() => undefined);
+    process.exit(1);
+  });
 }

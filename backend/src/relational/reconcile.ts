@@ -92,6 +92,7 @@
 import fs from 'fs';
 import path from 'path';
 import pool from '../db/pool';
+import { describeConnectionError } from '../db/ssl';
 
 function arr(v: unknown): any[] {
   return Array.isArray(v) ? v : [];
@@ -477,5 +478,12 @@ if (require.main === module) {
     console.log(`OVERALL: ${overallSafe ? 'ALL SECTIONS SAFE TO CUT OVER' : 'NOT ALL SECTIONS ARE SAFE TO CUT OVER YET'}`);
     await pool.end();
     process.exit(0);
-  })();
+  })().catch(async (err) => {
+    // reconcile.ts never writes anything in any mode — a connection
+    // failure here just means the report never ran; nothing to roll back.
+    console.error(describeConnectionError(err));
+    console.error('[reconcile] Fatal error.', err);
+    await pool.end().catch(() => undefined);
+    process.exit(1);
+  });
 }

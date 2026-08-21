@@ -40,6 +40,7 @@
 import pool from '../db/pool';
 import { ALL_SECTIONS, CutoverSection } from './cutover';
 import { runReconciliation } from './reconcile';
+import { describeConnectionError } from '../db/ssl';
 
 const HARD_BLOCKED_SECTIONS = new Set<string>(['customers', 'quickRates']);
 
@@ -226,5 +227,15 @@ export async function main(): Promise<void> {
 }
 
 if (require.main === module) {
-  main().finally(() => pool.end());
+  main()
+    .catch((err) => {
+      // enable/disable already require --apply + an exact --confirm phrase
+      // and only ever flip one boolean row per section (no multi-step
+      // write to roll back) — a connection failure here means that flip
+      // never happened; nothing here retries it.
+      console.error(describeConnectionError(err));
+      console.error('[cutoverCli] Fatal error.', err);
+      process.exitCode = 1;
+    })
+    .finally(() => pool.end());
 }

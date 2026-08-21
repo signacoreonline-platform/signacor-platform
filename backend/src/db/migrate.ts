@@ -20,6 +20,7 @@ import { Client } from 'pg';
 import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
+import { resolveSsl, describeConnectionError } from './ssl';
 
 dotenv.config();
 
@@ -66,12 +67,14 @@ async function main(): Promise<void> {
     return;
   }
 
-  // pg's SSL requirements differ between local Postgres and Render Postgres.
-  // Render's external connection strings work with rejectUnauthorized:false.
-  const useSsl = /render\.com|\.com\/|sslmode=require/i.test(databaseUrl);
+  // EXTERNAL RENDER SSL FIX (2026-08-21): this was the ORIGINAL, proven SSL
+  // detection in this project — now moved to db/ssl.ts's resolveSsl() so
+  // db/pool.ts (the shared pool used by the server and every relational
+  // CLI tool) reuses the exact same logic instead of a second, potentially
+  // diverging copy. Behavior here is unchanged.
   const client = new Client({
     connectionString: databaseUrl,
-    ssl: useSsl ? { rejectUnauthorized: false } : undefined,
+    ssl: resolveSsl(databaseUrl),
   });
 
   await client.connect();
@@ -127,6 +130,7 @@ async function main(): Promise<void> {
 main()
   .then(() => process.exit(0))
   .catch((err) => {
+    console.error(describeConnectionError(err));
     console.error('[migrate] Fatal error:', err);
     process.exit(1);
   });
