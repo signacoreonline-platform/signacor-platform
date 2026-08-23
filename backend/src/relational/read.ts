@@ -396,6 +396,18 @@ export async function buildCreditNotesJson(): Promise<any[]> {
     ...legacyBase(r),
     id: restoreId(r.source_id),
     number: r.credit_number,
+    // 2026-08-23 (credit note company-isolation repair, migration 011):
+    // company_code now exists on rel_credit_notes and is hydrated through
+    // the SAME coNum() helper used for quotes/jobs/accInvoices/
+    // purchaseOrders, so `co` is always a real number here too — never a
+    // raw string, closing the exact bug class the Holdings fix closed for
+    // the other four sections. Falls back to whatever `co` legacy_data
+    // itself carried (a real number too, from pre-cutover parseInt(co))
+    // ONLY for a historical row backfilled before this column existed and
+    // not yet re-backfilled by the extended backfill.ts pass — once that
+    // pass runs, company_code is populated directly and this fallback is
+    // never reached for that row again.
+    co: coNum(r.company_code) ?? legacyBase(r).co ?? null,
     type: r.note_type,
     contactName: r.contact_name_raw,
     date: dateStr(r.note_date) ?? legacyBase(r).date ?? null,

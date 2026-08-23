@@ -249,7 +249,7 @@ async function testPaymentLifecycle() {
   const editRes = await services.updatePayment(eft.paymentId, 1, { amount: 120, notes: 'corrected amount' });
   ok(editRes.rowVersion === 2, 'editing a non-Credit payment succeeds and bumps row_version');
 
-  const cn = await services.createCreditNote({ type: 'customer', contactName: 'Credit Test Co', amount: 300, reason: 'Overpayment refund credit' });
+  const cn = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Credit Test Co', amount: 300, reason: 'Overpayment refund credit' });
   ok(/^CN-\d{4}$/.test(cn.creditNumber), 'credit note gets an atomically-reserved CN-#### number (4 digits, matching nextCnNum\'s real format)', cn.creditNumber);
 
   const creditPay = await services.recordPayment({ type: 'job', id: jobId }, 200, { method: 'Credit' });
@@ -284,7 +284,7 @@ async function testPaymentLifecycle() {
 
 async function testCreditNoteAndPOAndSupplierCrud() {
   console.log('\n[Credit notes / purchase orders / suppliers / inventory] CRUD, concurrency, atomic numbering');
-  const cn = await services.createCreditNote({ type: 'customer', contactName: 'CRUD Test Co', amount: 100, reason: 'test' });
+  const cn = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'CRUD Test Co', amount: 100, reason: 'test' });
   const cnPatch = await services.updateCreditNote(cn.id, cn.rowVersion, { reason: 'updated reason' });
   ok(cnPatch.rowVersion === cn.rowVersion + 1, 'credit note edit bumps row_version');
   let deleteUsedBlocked = false;

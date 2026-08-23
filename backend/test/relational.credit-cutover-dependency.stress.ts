@@ -70,7 +70,7 @@ async function main() {
   });
   const conv = await services.convertQuoteToJob(quote.id);
   const jobId = conv.jobId;
-  await services.createCreditNote({ type: 'customer', contactName: 'Credit Dependency Test Co', amount: 500 });
+  await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Credit Dependency Test Co', amount: 500 });
 
   console.log('\n[Credit cutover dependency] "jobs" cut over, "creditNotes" NOT cut over — a Credit payment is BLOCKED');
   const blockedRes = await fetch(`${base}/api/relational/payments`, {

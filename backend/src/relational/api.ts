@@ -414,11 +414,18 @@ router.delete('/payments/:id', async (req: AuthRequest, res: Response): Promise<
 router.post('/credit-notes', async (req: AuthRequest, res: Response): Promise<void> => {
   if (!(await requireCutOver('creditNotes', res))) return;
   try {
-    const { type, contactName, date, amount, reason, appliedTo, notes, status } = req.body || {};
+    const { companyCode, type, contactName, date, amount, reason, appliedTo, notes, status } = req.body || {};
+    // 2026-08-23 (credit note company-isolation repair): companyCode is now
+    // required, matching createManualInvoice's own validation ("companyCode"
+    // is required) — the same convention already used elsewhere, not a new
+    // stricter rule invented for this one section.
+    if (!companyCode || typeof companyCode !== 'string') {
+      res.status(400).json({ error: '"companyCode" is required' }); return;
+    }
     if (!['customer', 'supplier'].includes(type) || !contactName || !Number.isFinite(Number(amount))) {
       res.status(400).json({ error: '"type" (customer/supplier), "contactName" and a numeric "amount" are required' }); return;
     }
-    const result = await createCreditNote({ type, contactName, date, amount: Number(amount), reason, appliedTo, notes, status });
+    const result = await createCreditNote({ companyCode, type, contactName, date, amount: Number(amount), reason, appliedTo, notes, status });
     res.status(201).json({ success: true, id: result.id, creditNumber: result.creditNumber, rowVersion: result.rowVersion });
   } catch (err) { handleServiceError(err, res); }
 });

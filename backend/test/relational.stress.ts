@@ -92,7 +92,21 @@ async function testBackfill() {
   ok(apply1.summary.customers.quarantined === 2, 'customers: exactly 2 quarantined (the duplicate-id pair)', JSON.stringify(apply1.summary.customers));
   ok(apply1.summary.quickRates.quarantined === 2, 'quickRates: exactly 2 quarantined (the duplicate-id pair)', JSON.stringify(apply1.summary.quickRates));
   ok(apply1.summary.jobs.inserted === 2, 'jobs: both jobs inserted', JSON.stringify(apply1.summary.jobs));
-  ok(apply1.conflicts.length === 2, 'exactly 2 conflicts reported (customers + quickRates duplicate groups)', String(apply1.conflicts.length));
+  // 2026-08-23 (credit note company-isolation repair): the fixture's one
+  // creditNotes record (CN-0001) has no `co` field at all — a realistic
+  // stand-in for the actual production historical credit note this repair
+  // was written for. backfill.ts's extended credit-notes pass now reports
+  // this honestly as a 'missing_company_identity' conflict rather than
+  // guessing/defaulting it to Original — company_code stays NULL for that
+  // row, exactly per the "fail/quarantine/report, don't guess" instruction.
+  // This is a THIRD, intentional, correct conflict alongside the
+  // pre-existing customers/quickRates duplicate-id groups, not a
+  // regression — the count below moved from 2 to 3 for that reason.
+  ok(apply1.conflicts.length === 3, 'exactly 3 conflicts reported (customers + quickRates duplicate groups, plus creditNotes missing_company_identity for CN-0001)', String(apply1.conflicts.length));
+  const cnConflict = apply1.conflicts.find((c) => c.collection === 'creditNotes' && c.conflict_type === 'missing_company_identity');
+  ok(!!cnConflict && cnConflict.source_id === '8001', 'the creditNotes conflict correctly identifies CN-0001 (source_id 8001) as missing company identity', JSON.stringify(cnConflict));
+  const cnRow = await pool.query(`SELECT company_code FROM rel_credit_notes WHERE source_id = '8001'`);
+  ok(cnRow.rows[0]?.company_code === null, 'CN-0001 was still inserted (nothing else about it was blocked) but company_code was left NULL rather than guessed', JSON.stringify(cnRow.rows[0]));
 
   // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: the fixture's one
   // purchaseOrders record is deliberately never imported at all — skipped

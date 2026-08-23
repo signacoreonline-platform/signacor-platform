@@ -150,7 +150,7 @@ async function main() {
   const cnAmount = jobValue - halfAmount + 50; // more than enough to cover the remainder
   const cnRes = await fetch(`${base}/api/relational/credit-notes`, {
     method: 'POST', headers: H,
-    body: JSON.stringify({ type: 'customer', contactName: 'Lifecycle Test Customer', date: '2026-08-21', amount: cnAmount, reason: 'Overpayment', appliedTo: '', notes: '', status: 'open' }),
+    body: JSON.stringify({ companyCode: '2', type: 'customer', contactName: 'Lifecycle Test Customer', date: '2026-08-21', amount: cnAmount, reason: 'Overpayment', appliedTo: '', notes: '', status: 'open' }),
   });
   const cn: any = await cnRes.json();
   ok(cnRes.status === 201 && /^CN-/i.test(cn.creditNumber || ''), 'credit note created with a real CN-##### number', cn);

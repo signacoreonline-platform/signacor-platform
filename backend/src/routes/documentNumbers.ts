@@ -92,7 +92,11 @@ import { authenticate } from '../middleware/auth';
 const router = Router();
 router.use(authenticate);
 
-const VALID_COMPANIES = ['1', '2', '4'];
+// 2026-08-23 (credit note company-isolation repair): exported so
+// services.ts's createCreditNote can validate an incoming companyCode
+// against the SAME known-valid-company list this route already enforces,
+// rather than inventing a second, possibly-drifting copy of it.
+export const VALID_COMPANIES = ['1', '2', '4'];
 const VALID_DOC_TYPES = ['invoice', 'quote', 'job', 'po', 'creditNote'] as const;
 type DocType = (typeof VALID_DOC_TYPES)[number];
 

@@ -93,6 +93,7 @@ import fs from 'fs';
 import path from 'path';
 import pool from '../db/pool';
 import { describeConnectionError } from '../db/ssl';
+import { VALID_COMPANIES } from '../routes/documentNumbers';
 
 function arr(v: unknown): any[] {
   return Array.isArray(v) ? v : [];
@@ -477,10 +478,26 @@ export async function runPostCutoverIntegrityCheck(): Promise<{ sections: PostCu
   // Credit notes: used_amount can never exceed amount, regardless of what
   // JSON ever said.
   const creditReport = sections.find((s) => s.collection === 'creditNotes')!;
-  const creditRes = await pool.query('SELECT source_id, amount, used_amount FROM rel_credit_notes');
+  const creditRes = await pool.query('SELECT source_id, amount, used_amount, company_code FROM rel_credit_notes');
   for (const cn of creditRes.rows) {
     if (num(cn.used_amount) > num(cn.amount) + 0.01) {
       creditReport.invariantViolations.push({ id: cn.source_id, issue: `used_amount ${cn.used_amount} exceeds amount ${cn.amount}` });
+    }
+  }
+  // 2026-08-23 (credit note company-isolation repair, migration 011):
+  // company_code is now a real column here too (was missing entirely
+  // before this repair). Once creditNotes is cut over, every row SHOULD
+  // carry a valid, known company identity — same three values ('1','2','4')
+  // documentNumbers.ts's VALID_COMPANIES already enforces for every other
+  // section's document-number reservation. This never GUESSES or WRITES a
+  // fix — purely reports missing/unrecognized company identity so a human
+  // can decide (see backfill.ts's own "fail/quarantine/report, don't
+  // guess" extension for how such a row is actually resolved).
+  for (const cn of creditRes.rows) {
+    if (cn.company_code === null || cn.company_code === undefined || cn.company_code === '') {
+      creditReport.invariantViolations.push({ id: cn.source_id, issue: `company_code is missing — company identity not yet established for this row (see backfill.ts's supplemental credit-note pass, or the note's own preserved legacy_data.co)` });
+    } else if (!VALID_COMPANIES.includes(String(cn.company_code))) {
+      creditReport.invariantViolations.push({ id: cn.source_id, issue: `company_code ${JSON.stringify(cn.company_code)} is not one of the known valid companies (${VALID_COMPANIES.join(', ')})` });
     }
   }
 

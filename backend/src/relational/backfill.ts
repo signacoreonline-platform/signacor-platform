@@ -51,6 +51,10 @@ import path from 'path';
 import pool from '../db/pool';
 import { PoolClient } from 'pg';
 import { describeConnectionError } from '../db/ssl';
+// 2026-08-23 (credit note company-isolation repair): the SAME known-valid-
+// company list documentNumbers.ts's own reservation route already enforces
+// — reused here rather than re-inventing a second copy that could drift.
+import { VALID_COMPANIES } from '../routes/documentNumbers';
 
 const CONFIRM_PHRASE = 'I UNDERSTAND THIS WRITES TO THE RELATIONAL DATABASE';
 
@@ -768,6 +772,22 @@ export async function runBackfill(opts: { apply: boolean; sourceFile?: string; r
         // keyed by id not name in this app's own contactName datalist, so
         // best-effort supplier match is skipped here rather than guessed —
         // supplier_id stays null, contact_name_raw always preserved.
+        // 2026-08-23 (credit note company-isolation repair): populate the
+        // new company_code column (migration 011) straight from this
+        // record's own `co`, exactly like quotes/jobs/invoices/purchase
+        // orders already do — NEVER defaulted to Original when missing or
+        // unrecognized. A record with no valid company identity is
+        // reported via recordConflict (company_code left NULL, everything
+        // else about the note still backfills normally) rather than
+        // guessed, per the explicit "fail/quarantine/report, don't guess"
+        // instruction for this repair.
+        const coStr = rec.co === undefined || rec.co === null ? null : String(rec.co).trim();
+        const validCompanyCode = coStr && VALID_COMPANIES.includes(coStr) ? coStr : null;
+        if (coStr && !validCompanyCode) {
+          recordConflict({ collection: 'creditNotes', source_id: sourceId, document_number: str(rec.number), conflict_type: 'invalid_company_identity', detail: { co: rec.co, validCompanies: VALID_COMPANIES } });
+        } else if (!coStr) {
+          recordConflict({ collection: 'creditNotes', source_id: sourceId, document_number: str(rec.number), conflict_type: 'missing_company_identity', detail: {} });
+        }
         const columns = {
           source_id: sourceId,
           credit_number: str(rec.number) || `(no-number-${sourceId})`,
@@ -782,9 +802,39 @@ export async function runBackfill(opts: { apply: boolean; sourceFile?: string; r
           applied_to: str(rec.appliedTo),
           notes: str(rec.notes),
           status: str(rec.status),
+          company_code: validCompanyCode,
         };
         const outcome = await upsertRow(client, 'rel_credit_notes', ['source_id'], columns, rec);
         s[outcome]++;
+      }
+
+      // Supplemental, ALWAYS-RUN pass (independent of upsertRow's
+      // legacy_data-unchanged shortcut — see upsertRow's own 2026-08-20
+      // CAVEAT comment): a credit note backfilled by an OLDER version of
+      // this file (before migration 011/this column existed) has
+      // unchanged legacy_data on every subsequent run, so the ordinary
+      // upsert above would never revisit it. This targeted UPDATE finds
+      // exactly the rows still missing company_code, re-derives it from
+      // that SAME row's own already-stored legacy_data.co (never from
+      // JSON again, never guessed), and writes ONLY company_code — no
+      // other column, no row_version bump, no legacy_data change — so a
+      // normal re-run of backfill (not just a first-ever run) closes this
+      // gap for any already-migrated note too.
+      const stillMissingRes = await client.query(
+        `SELECT id, source_id, credit_number, legacy_data FROM rel_credit_notes WHERE company_code IS NULL`
+      );
+      for (const row of stillMissingRes.rows) {
+        const legacyCo = row.legacy_data && typeof row.legacy_data === 'object' ? row.legacy_data.co : undefined;
+        const legacyCoStr = legacyCo === undefined || legacyCo === null ? null : String(legacyCo).trim();
+        if (legacyCoStr && VALID_COMPANIES.includes(legacyCoStr)) {
+          await client.query(`UPDATE rel_credit_notes SET company_code = $1 WHERE id = $2`, [legacyCoStr, row.id]);
+          s.updated = (s.updated || 0) + 1;
+        }
+        // else: already reported above (this run) or on a prior run —
+        // recordConflict is intentionally not duplicated here to avoid
+        // double-reporting the same still-unresolved row every re-run;
+        // the row simply stays company_code=NULL, visible to anyone
+        // querying `SELECT * FROM rel_credit_notes WHERE company_code IS NULL`.
       }
     }
 

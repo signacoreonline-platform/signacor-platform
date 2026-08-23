@@ -199,7 +199,7 @@ async function main() {
       companyCode: '2', customerId: custC.id, customerNameRaw: 'Quote Credit Payment Co',
       lines: [{ description: 'Credit test', qty: 1, unitPrice: 1000 }],
     });
-    const cn = await services.createCreditNote({ type: 'customer', contactName: 'Quote Credit Payment Co', amount: 600 });
+    const cn = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Quote Credit Payment Co', amount: 600 });
     const creditPayRes = await fetch(`${base}/api/relational/payments`, {
       method: 'POST', headers: H, body: JSON.stringify({ ownerType: 'quote', ownerId: quoteC.id, amount: 400, method: 'Credit' }),
     });

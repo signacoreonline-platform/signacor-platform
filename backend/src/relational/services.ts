@@ -1355,6 +1355,16 @@ export async function updateQuoteWithJobSync(
 // recordPayment/deletePayment above (there is no separate "apply" table —
 // used_amount on this one row IS the application state, exactly like JSON).
 export interface CreditNoteInput {
+  // 2026-08-23 (credit note company-isolation repair): companyCode is
+  // REQUIRED, matching createManualInvoice's own companyCode requirement
+  // — see the API route's validation, which mirrors that same convention
+  // rather than inventing a stricter (or looser) rule for this one
+  // section. Persisted into rel_credit_notes.company_code (migration 011)
+  // and read back as a real number via read.ts's coNum(), exactly like
+  // quotes/jobs/accInvoices/purchaseOrders. Never re-derivable from
+  // legacy_data on a brand-new note (there is none yet), so it must be
+  // supplied here, not defaulted.
+  companyCode: string;
   type: 'customer' | 'supplier';
   contactName: string;
   date?: string | null;
@@ -1371,10 +1381,10 @@ export async function createCreditNote(input: CreditNoteInput): Promise<{ id: nu
     const creditNumber = await reserveDocumentNumberWithClient(client, 'ALL', 'creditNote' as any);
     const res = await client.query(
       `WITH new_id AS (SELECT nextval('rel_credit_notes_id_seq') AS id)
-       INSERT INTO rel_credit_notes (id, source_id, credit_number, note_type, contact_name_raw, note_date, amount, used_amount, reason, applied_to, notes, status, legacy_data)
-       SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, 0, $6, $7, $8, $9, '{}'::jsonb FROM new_id
+       INSERT INTO rel_credit_notes (id, source_id, credit_number, note_type, contact_name_raw, note_date, amount, used_amount, reason, applied_to, notes, status, company_code, legacy_data)
+       SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $10, '{}'::jsonb FROM new_id
        RETURNING id, row_version`,
-      [creditNumber, input.type, input.contactName, input.date || null, input.amount, input.reason ?? null, input.appliedTo ?? null, input.notes ?? null, input.status ?? 'active']
+      [creditNumber, input.type, input.contactName, input.date || null, input.amount, input.reason ?? null, input.appliedTo ?? null, input.notes ?? null, input.status ?? 'active', input.companyCode]
     );
     await client.query('COMMIT');
     return { id: res.rows[0].id, creditNumber, rowVersion: res.rows[0].row_version };
@@ -1391,6 +1401,16 @@ export interface CreditNotePatchInput {
   appliedTo?: string | null; notes?: string | null; status?: string | null;
 }
 export async function updateCreditNote(id: number, expectedVersion: number, patch: Partial<CreditNotePatchInput>): Promise<{ rowVersion: number }> {
+  // 2026-08-23 (credit note company-isolation repair): companyCode is
+  // deliberately NOT in colMap and CreditNotePatchInput has no companyCode
+  // field at all — company ownership is set once at creation and is
+  // immutable thereafter, matching how no other section's update path
+  // (updateQuote/updateJob/updateInvoice/updatePurchaseOrder) ever accepts
+  // a companyCode patch either. Even if a caller's req.body included a
+  // stray companyCode/company_code key, the colMap-driven SET list below
+  // only ever includes keys present in colMap, so it is silently ignored,
+  // never applied — a Holdings credit note can never be silently
+  // reassigned to Original (or vice versa) through an edit.
   const colMap: Record<string, string> = {
     contactName: 'contact_name_raw', date: 'note_date', amount: 'amount', reason: 'reason',
     appliedTo: 'applied_to', notes: 'notes', status: 'status',

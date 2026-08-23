@@ -191,11 +191,11 @@ async function main() {
   ok(!!freshRead && typeof freshRead.co === 'number' && freshRead.co === 1, 'the freshly-created Holdings quote reads back with a real numeric co=1 immediately (this WAS the exact failure mode reported: correct on optimistic create, hidden on the next GET)', freshRead && freshRead.co);
   ok(belongsToUserCompany(freshRead, HOLDINGS_USER) && !belongsToUserCompany(freshRead, ORIGINAL_USER), 'the fresh Holdings quote is visible to a Holdings user and correctly hidden from an Original-company user on the very next read');
 
-  console.log('\n[Holdings scoping repair] KNOWN, SEPARATE, NOT-YET-FIXED GAP — new credit notes have no company_code column at all and lose co on refresh');
-  const cnHoldings = await services.createCreditNote({ type: 'customer', contactName: 'Holdings Credit Note Contact', amount: 100 });
+  console.log('\n[Holdings scoping repair] FOLLOW-UP CLOSED (2026-08-23 credit note company-isolation repair) — the credit-notes gap documented here is now fixed; see relational.credit-note-company-isolation-repair.stress.ts for full coverage');
+  const cnHoldings = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Holdings Credit Note Contact', amount: 100 });
   const creditNotesAfter = await read.buildCreditNotesJson();
   const cnRead = creditNotesAfter.find((c: any) => c._relId === cnHoldings.id);
-  ok(!!cnRead && cnRead.co === undefined, 'CONFIRMS the documented gap: a brand-new credit note has NO co field at all after a read-refresh (rel_credit_notes has no company_code column; legacy_data is stored as {} on create) — this is a DIFFERENT bug from the one this suite fixes, tracked separately, not touched in this pass', cnRead && cnRead.co);
+  ok(!!cnRead && typeof cnRead.co === 'number' && cnRead.co === 1, 'a brand-new credit note now hydrates co as a real number (1) after a read-refresh — migration 011 added company_code, services.ts/index.html now thread it through, closing the gap this suite previously only documented', cnRead && cnRead.co);
 
   await resetRelationalTables();
 

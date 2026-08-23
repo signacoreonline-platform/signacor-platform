@@ -43,8 +43,13 @@ function checkSourceWiring(src: string) {
   console.log('\n[Frontend credit note wiring] source-text checks — AccountingPage saveCreditNote/deleteCreditNote');
   ok(src.includes(`if(isRelationalAuthoritative('creditNotes')){`) && src.includes(`async function saveCreditNote(cn){`),
     'saveCreditNote checks isRelationalAuthoritative(\'creditNotes\') before deciding how to persist');
-  ok(src.includes(`const result = await relationalApi.createCreditNote({ type: tagged.type, contactName: tagged.contactName, date: tagged.date, amount: tagged.amount, reason: tagged.reason, appliedTo: tagged.appliedTo, notes: tagged.notes, status: tagged.status });`),
-    'the create branch calls relationalApi.createCreditNote with the full CreditNoteModal field set');
+  ok(src.includes(`const result = await relationalApi.createCreditNote({ companyCode: String(tagged.co), type: tagged.type, contactName: tagged.contactName, date: tagged.date, amount: tagged.amount, reason: tagged.reason, appliedTo: tagged.appliedTo, notes: tagged.notes, status: tagged.status });`),
+    // 2026-08-23 (credit note company-isolation repair): companyCode is now
+    // sent alongside the pre-existing CreditNoteModal field set — see
+    // saveCreditNote's own tagged.co computation just above this call.
+    'the create branch calls relationalApi.createCreditNote with companyCode plus the full CreditNoteModal field set');
+  ok(src.includes(`const fallbackCo = (user && user.co !== undefined && user.co !== null) ? user.co : 2;`),
+    'saveCreditNote\'s fallbackCo now defaults to 2 (Original Signacore), not null, matching saveManualInvoice\'s currentUserCo convention');
   ok(src.includes(`_relId: result.id, _relRowVersion: result.rowVersion }, ...prev]);`),
     'the create branch sets _relId/_relRowVersion on the new local stub immediately');
   ok(src.includes(`const result = await relationalApi.updateCreditNote(existing && existing._relId, existing && existing._relRowVersion,`),
@@ -81,10 +86,12 @@ async function runEndToEndProof() {
   console.log('\n[Frontend credit note wiring] end-to-end: exactly what saveCreditNote() now sends for a NEW credit note');
   const createRes = await fetch(`${base}/api/relational/credit-notes`, {
     method: 'POST', headers: authHeaders,
-    body: JSON.stringify({ type: 'customer', contactName: 'Frontend CN Wiring Co', date: '2026-08-21', amount: 250, reason: 'Overpayment', appliedTo: '', notes: '', status: 'open' }),
+    body: JSON.stringify({ companyCode: '1', type: 'customer', contactName: 'Frontend CN Wiring Co', date: '2026-08-21', amount: 250, reason: 'Overpayment', appliedTo: '', notes: '', status: 'open' }),
   });
   const createBody: any = await createRes.json();
   ok(createRes.status === 201 && /^CN-/i.test(createBody.creditNumber || ''), 'credit note created with a real CN-##### number', createBody);
+  const createdRow = await pool.query(`SELECT company_code FROM rel_credit_notes WHERE id = $1`, [createBody.id]);
+  ok(createdRow.rows[0]?.company_code === '1', 'the new credit note persisted company_code="1" exactly as sent', createdRow.rows[0]);
 
   console.log('\n[Frontend credit note wiring] end-to-end: exactly what saveCreditNote() now sends for an EDIT');
   const editRes = await fetch(`${base}/api/relational/credit-notes/${createBody.id}`, {
@@ -93,8 +100,9 @@ async function runEndToEndProof() {
   });
   const editBody: any = await editRes.json();
   ok(editRes.status === 200, 'edit succeeded and bumped rowVersion', editBody);
-  const afterEdit = await pool.query(`SELECT amount, notes FROM rel_credit_notes WHERE id = $1`, [createBody.id]);
+  const afterEdit = await pool.query(`SELECT amount, notes, company_code FROM rel_credit_notes WHERE id = $1`, [createBody.id]);
   ok(Number(afterEdit.rows[0].amount) === 300 && afterEdit.rows[0].notes === 'edited via wired frontend', 'the DB row reflects the edit');
+  ok(afterEdit.rows[0].company_code === '1', 'company_code is untouched by the edit — still "1" — even though the edit request carried no companyCode field at all (it is not in CreditNotePatchInput/colMap)', afterEdit.rows[0]);
 
   console.log('\n[Frontend credit note wiring] a note with used_amount > 0 correctly REFUSES delete (services.ts business rule, unchanged)');
   await pool.query(`UPDATE rel_credit_notes SET used_amount = 50 WHERE id = $1`, [createBody.id]);

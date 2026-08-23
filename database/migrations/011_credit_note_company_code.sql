@@ -1,0 +1,43 @@
+-- 011_credit_note_company_code.sql
+--
+-- CREDIT NOTE COMPANY-ISOLATION REPAIR (2026-08-23) — follow-up to the
+-- Holdings zero-data / company-scoping repair. rel_credit_notes was the
+-- ONE relationally-authoritative, company-specific section (per the
+-- COMPANY CONTEXT block in index.html — quotes/jobs/accInvoices/
+-- purchaseOrders/creditNotes are all company-specific, not shared) that
+-- never got a company_code column in 007_relational_core.sql at all.
+--
+-- Effect before this migration: every historical credit note's company
+-- identity survives only inside legacy_data (the raw JSON blob captured at
+-- backfill time — untouched, still there). But services.ts's
+-- createCreditNote has no companyCode field to store, and inserts
+-- legacy_data as '{}' for a brand-new note — so a credit note created
+-- AFTER creditNotes went relational-authoritative loses its company
+-- identity entirely, the moment it round-trips through a read. This
+-- migration only adds the column; backfill.ts, services.ts, read.ts and
+-- index.html are updated separately to populate/consume it.
+--
+-- Same "loose reference, not a hard FK" convention already documented for
+-- company_code on rel_quotes/rel_jobs/rel_invoices/rel_purchase_orders
+-- (see 007_relational_core.sql's own company_code comment): the live
+-- app's co values are opaque small integers-as-strings ('1','2','4' are
+-- the currently real, in-use companies — see documentNumbers.ts's
+-- VALID_COMPANIES; '3' is a retired/excluded placeholder never assigned
+-- to a live company). A hard FK would risk rejecting legitimate
+-- historical data over a mapping this migration does not re-derive.
+--
+-- Idempotent and additive only:
+--   - ADD COLUMN IF NOT EXISTS / CREATE INDEX IF NOT EXISTS
+--   - the column is NULLable with no default — every pre-existing row
+--     stays exactly as it is (company identity still recoverable from its
+--     own legacy_data) until a targeted backfill run explicitly populates
+--     it (see backfill.ts's extended credit-notes pass)
+--   - never drops, renames, or retypes an existing column
+--   - never touches existing row data (amounts, lines, status, payments,
+--     notes, document numbers) — this migration touches ONLY the new
+--     column's own (all-NULL) values
+--   - safe to re-run: re-running finds the column and index already
+--     present and does nothing further
+
+ALTER TABLE rel_credit_notes ADD COLUMN IF NOT EXISTS company_code TEXT;
+CREATE INDEX IF NOT EXISTS idx_rel_credit_notes_company ON rel_credit_notes (company_code);
