@@ -112,6 +112,30 @@ function num(v: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+// 2026-08-23 (production cutover repair — HOLDINGS ZERO-DATA / COMPANY-
+// SCOPING REPAIR): `company_code` is stored as TEXT in every rel_* table
+// (it has always doubled as a free-form code, not strictly a company id),
+// but every pre-cutover legacy-JSON creation path stored the frontend's
+// `co` field as a genuine JS number (`parseInt(co)` — see index.html's
+// job/quote creation). The frontend's company-scoping predicates
+// (isHoldingsRecord/isHoldingsUser in index.html) compare `rec.co` with
+// strict `===` against the numeric HOLDINGS_CO_ID. Hydrating `co` as the
+// raw TEXT column value (a string) made that strict comparison silently
+// and permanently false for every relationally-authoritative record,
+// regardless of which company it actually belonged to — hiding Holdings
+// company-specific records from Holdings users entirely, and (since the
+// non-Holdings branch is simply the negation) incorrectly exposing BOTH
+// companies' relationally-hydrated records to non-Holdings users. This
+// helper restores the original "co is always a real number when numeric"
+// invariant at the single point where relational rows re-enter the JSON
+// shape the rest of the app already assumes, rather than patching each
+// downstream `.co===`/`.co==` comparison site individually.
+function coNum(v: any): number | string | null {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : v;
+}
+
 // ── payments (embedded sub-array on job / quote / accInvoices records) ────
 async function paymentsFor(ownerType: 'job' | 'quote' | 'invoice', ownerId: number): Promise<any[]> {
   const res = await pool.query(
@@ -234,7 +258,7 @@ export async function buildQuotesJson(): Promise<any[]> {
       ...legacyBase(r),
       id: restoreId(r.source_id),
       num: r.quote_number,
-      co: r.company_code,
+      co: coNum(r.company_code),
       client: r.customer_name_raw ?? legacyBase(r).client ?? null,
       contact: r.contact_person ?? legacyBase(r).contact ?? null,
       email: r.email ?? legacyBase(r).email ?? null,
@@ -286,7 +310,7 @@ export async function buildJobsJson(): Promise<any[]> {
       ...legacyBase(r),
       id: restoreId(r.source_id),
       num: r.job_number,
-      co: r.company_code,
+      co: coNum(r.company_code),
       client: r.customer_name_raw ?? legacyBase(r).client ?? null,
       contact: r.contact_person ?? legacyBase(r).contact ?? null,
       email: r.email ?? legacyBase(r).email ?? null,
@@ -346,7 +370,7 @@ export async function buildInvoicesJson(): Promise<any[]> {
       ...legacyBase(r),
       id: restoreId(r.source_id),
       number: r.invoice_number,
-      co: r.company_code,
+      co: coNum(r.company_code),
       contactName: r.contact_name ?? legacyBase(r).contactName ?? null,
       contactEmail: r.contact_email ?? legacyBase(r).contactEmail ?? null,
       contactAddress: r.contact_address ?? legacyBase(r).contactAddress ?? null,
@@ -432,7 +456,7 @@ export async function buildPurchaseOrdersJson(): Promise<any[]> {
       ...legacyBase(r),
       id: restoreId(r.source_id),
       num: r.po_number,
-      co: r.company_code,
+      co: coNum(r.company_code),
       supplierId: r.supplier_id != null
         ? restoreId(r.resolved_supplier_source_id ?? r.supplier_source_id)
         : (r.supplier_source_id != null ? restoreId(r.supplier_source_id) : (legacyBase(r).supplierId ?? null)),
@@ -456,7 +480,7 @@ export async function buildEmployeesJson(): Promise<any[]> {
     ...legacyBase(r), id: restoreId(r.source_id),
     name: r.full_name ?? legacyBase(r).name ?? null,
     role: r.role ?? legacyBase(r).role ?? null,
-    co: r.company_code ?? legacyBase(r).co ?? null,
+    co: coNum(r.company_code) ?? legacyBase(r).co ?? null,
     _relId: r.id, _relRowVersion: r.row_version,
   }));
 }

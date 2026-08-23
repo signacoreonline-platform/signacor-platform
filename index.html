@@ -22251,7 +22251,14 @@ function ReportsPage({ jobs, companies, user, logoDataUrl, customers }) {
   const daysInMonth = new Date(calYear,calMonth+1,0).getDate();
 
   const data=useMemo(()=>{
-    const j=active===0?visibleJobs:visibleJobs.filter(x=>x.co===active);
+    // 2026-08-23 (production cutover repair — HOLDINGS ZERO-DATA / COMPANY-
+    // SCOPING REPAIR): read.ts now hydrates a relationally-authoritative
+    // job's `co` back as a real number (see backend/src/relational/read.ts's
+    // coNum() helper), so this comparison is defensive/belt-and-braces —
+    // Number(...) normalizes in case a still-JSON-sourced job's `co` is ever
+    // a numeric string, matching the same fix already applied at HOLDINGS_CO_ID
+    // comparisons.
+    const j=active===0?visibleJobs:visibleJobs.filter(x=>Number(x.co)===Number(active));
     const rev=j.reduce((s,x)=>s+x.value,0),cost=j.reduce((s,x)=>s+breakdownTotal(x.breakdown),0),prof=rev-cost;
     return {jobs:j,rev,cost,prof,marg:rev>0?(prof/rev*100).toFixed(1):'0.0'};
   },[active,visibleJobs]);
@@ -22260,7 +22267,7 @@ function ReportsPage({ jobs, companies, user, logoDataUrl, customers }) {
     if(reportTab!=='overview') return;
     if(instRef.current){instRef.current.destroy();instRef.current=null;}
     if(!chartRef.current) return;
-    const cd=visibleCompanies.map(c=>{const j=visibleJobs.filter(x=>x.co===c.id);return{name:c.short,rev:j.reduce((s,x)=>s+x.value,0),cost:j.reduce((s,x)=>s+breakdownTotal(x.breakdown),0),color:c.color};});
+    const cd=visibleCompanies.map(c=>{const j=visibleJobs.filter(x=>Number(x.co)===Number(c.id));return{name:c.short,rev:j.reduce((s,x)=>s+x.value,0),cost:j.reduce((s,x)=>s+breakdownTotal(x.breakdown),0),color:c.color};});
     instRef.current=new Chart(chartRef.current,{type:'bar',data:{labels:cd.map(d=>d.name),datasets:[{label:'Revenue',data:cd.map(d=>d.rev),backgroundColor:cd.map(d=>d.color+'bb'),borderRadius:4},{label:'Costs',data:cd.map(d=>d.cost),backgroundColor:'#94a3b8aa',borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{font:{size:10},boxWidth:10}}},scales:{y:{ticks:{callback:v=>`R${(v/1000).toFixed(0)}k`,font:{size:10}},grid:{color:'#f1f5f9'}},x:{ticks:{font:{size:10}},grid:{display:false}}}}});
     return ()=>{if(instRef.current)instRef.current.destroy();};
   },[visibleJobs,visibleCompanies,reportTab]);
