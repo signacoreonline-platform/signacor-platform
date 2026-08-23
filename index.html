@@ -198,6 +198,59 @@ function isRelationalAuthoritative(section) {
   return relationalAuthoritativeSectionsRef.current.indexOf(section) !== -1;
 }
 
+// 2026-08-23 SAVE-AUTHORITY AUDIT FIX — shared autosave/baseline desync.
+//
+// `serverBaselineRef` is the single App instance's "last full state
+// received from server" — the ONLY thing the generic 800ms-debounced
+// autosave effect (see the App component, main autosave useEffect) diffs
+// local state against to decide what changed and therefore what the
+// systemic relational-authority guard (assertNoUnwiredRelationalSections,
+// above) needs to check. It was previously declared with `useRef(null)`
+// INSIDE the App component (only one instance is ever mounted — see the
+// single `ReactDOM.createRoot(...).render(<App/>)` call at the bottom of
+// this file — so lifting it to module scope, exactly like
+// relationalAuthoritativeSectionsRef above, is behaviourally identical:
+// same single object, same lifetime, but now also directly reachable from
+// every sibling page/detail component (QuotesPage, JobDetail,
+// SuppliersPage, InventoryPage, AccountingPage, ...) which are declared as
+// top-level functions BEFORE App and therefore cannot see one of App's own
+// hooks/refs without prop-drilling.
+//
+// ROOT CAUSE this closes: every dedicated relational action (e.g.
+// JobDetail.saveNotes) persists its change directly via a relationalApi
+// call, then calls its own optimistic setJobs/setQuotes/setSuppliers/
+// setInventory/setAccInvoices/setCreditNotes/setPurchaseOrders for
+// immediate UI feedback — it never touches serverBaselineRef. The generic
+// autosave effect watches ALL of those top-level arrays unconditionally,
+// so 800ms after that optimistic update it sees the section as "locally
+// changed" against a now-stale baseline and attempts an illegitimate JSON
+// PUT for an already relational-authoritative section — which
+// assertNoUnwiredRelationalSections correctly (and loudly) rejects. That
+// guard must NOT be weakened — it is doing exactly its job. The fix is to
+// keep the guard's OWN input honest: whenever a change was already safely
+// persisted through the relational API, mirror the exact same resulting
+// value into serverBaselineRef.current so the next autosave diff correctly
+// reports "nothing pending here — already saved." A mutation that changes
+// local state WITHOUT ever going through this helper (e.g. a genuinely
+// still-unwired JSON-only path) is completely unaffected — it still shows
+// up as "changed" against baseline and still correctly throws, exactly as
+// before this fix.
+//
+// `updater` mirrors the same shape callers already pass to their
+// setState call — either a `prev => nextArray` function (the common case,
+// reused verbatim from the paired setJobs/setQuotes/etc call so the exact
+// same transform is proven, not re-derived) or a `() => nextArray` thunk
+// for the handful of call sites that computed a concrete next-array value
+// directly (e.g. from a live prop) rather than via a `prev =>` updater. A
+// no-op (nothing to sync yet, e.g. before this session's first successful
+// load) is always safe and never throws.
+const serverBaselineRef = { current: null };
+function syncRelationalBaseline(sectionKey, updater) {
+  if (serverBaselineRef.current && Array.isArray(serverBaselineRef.current[sectionKey])) {
+    serverBaselineRef.current = { ...serverBaselineRef.current, [sectionKey]: updater(serverBaselineRef.current[sectionKey]) };
+  }
+}
+
 // Mirrors saveToServer's auth/error conventions (401 -> forced logout,
 // non-2xx -> thrown Error). The parsed body (when present) is attached as
 // `.body` so callers can inspect `.body.type` for 'stale_record' /
@@ -8005,7 +8058,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // job can already reference a quote number that didn't exist a moment
     // ago.
     if(!isEdit && isRelationalAuthoritative('quotes')){
-      setQuotes(prev=>[q,...prev]);
+      const quotesUpdater = prev=>[q,...prev];
+      setQuotes(quotesUpdater);
+      syncRelationalBaseline('quotes', quotesUpdater);
       setEditQuote(null);
       return;
     }
@@ -8064,9 +8119,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // touches this call at all, so it can never be blocked by that.
       if(linkedJob && linkedJob._relRowVersion !== undefined) patch.expectedJobVersion = linkedJob._relRowVersion;
       const result = await relationalApi.updateQuote(q._relId, q._relRowVersion, patch);
-      setQuotes(prev=>prev.map(x=>x.id===q.id
+      const quotesUpdater = prev=>prev.map(x=>x.id===q.id
         ? {...q, status: live?live.status:x.status, convertedJobId: live?live.convertedJobId:x.convertedJobId, _relId: x._relId, _relRowVersion: result.rowVersion}
-        : x));
+        : x);
+      setQuotes(quotesUpdater);
+      syncRelationalBaseline('quotes', quotesUpdater);
       if(result.jobId && linkedJob){
         // Same value/discount/setupFee formula the JSON path below uses —
         // kept in sync purely for immediate display; the next GET's
@@ -8075,12 +8132,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         const _discPct = parseFloat(q.discount)||0;
         const _setupFee = parseFloat(q.setupFee)||0;
         const _afterDisc = _sub - _sub*(_discPct/100) + _setupFee;
-        setJobs(prev=>prev.map(j=>j.id===linkedJob.id
+        const jobsUpdater = prev=>prev.map(j=>j.id===linkedJob.id
           ? {...j, lines:q.lines, discount:q.discount||'', setupFee:q.setupFee||'', value:_afterDisc*1.15,
              client:q.client, contact:q.contact||'', email:q.email||'', tel:q.tel||'',
              address:q.address||'', vatNum:q.vatNum||'', notes:q.notes||j.notes||'',
              _relRowVersion: result.jobRowVersion}
-          : j));
+          : j);
+        setJobs(jobsUpdater);
+        syncRelationalBaseline('jobs', jobsUpdater);
       }
       setEditQuote(null);
       return;
@@ -8179,7 +8238,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       try {
         const result = await relationalApi.updateQuoteStatus(updated._relId, updated._relRowVersion, updated.status);
         const applied = {...updated, _relRowVersion: result.rowVersion};
-        setQuotes(prev=>prev.map(q=>q.id===applied.id?applied:q));
+        const quotesUpdater = prev=>prev.map(q=>q.id===applied.id?applied:q);
+        setQuotes(quotesUpdater);
+        syncRelationalBaseline('quotes', quotesUpdater);
         setViewQuote(applied);
       } catch(e){
         alert(describeSaveConflictError(e, 'quote')+'\n\nThe status change was NOT saved.');
@@ -8425,8 +8486,12 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           stage: STATUS_TO_STAGE['quote_approved']||4, payments: [],
           _relId: result.jobId, _relRowVersion: result.jobRowVersion,
         };
-        setJobs(prev=>[stubJob, ...prev]);
-        setQuotes(prev=>prev.map(qx=>qx.id===q.id?{...qx,status:'converted',convertedJobId:result.jobId}:qx));
+        const jobsUpdater = prev=>[stubJob, ...prev];
+        const quotesUpdater = prev=>prev.map(qx=>qx.id===q.id?{...qx,status:'converted',convertedJobId:result.jobId}:qx);
+        setJobs(jobsUpdater);
+        syncRelationalBaseline('jobs', jobsUpdater);
+        setQuotes(quotesUpdater);
+        syncRelationalBaseline('quotes', quotesUpdater);
         setViewQuote(null);
         setConvertedInfo({jobId: result.jobId, jobNum: result.jobNumber, linkedInvoiceNum: null});
       } catch(saveErr){
@@ -8746,6 +8811,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         // stale_record conflict.
         const nextJobs = jobs.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:result.invoiceNumber, invoiceDate:new Date().toISOString().slice(0,10), stage:9, status:'invoiced', _relRowVersion:result.jobRowVersion}:j);
         setJobs(nextJobs);
+        syncRelationalBaseline('jobs', () => nextJobs);
         setInvoiceCreatedInfo({ job, invoiceNum: result.invoiceNumber });
       } catch(saveErr){
         alert('Invoice could NOT be created.\n\n'+(saveErr&&saveErr.message?saveErr.message:'unknown error')+'\n\nNothing was changed. Please check your connection and try again.');
@@ -8866,7 +8932,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           quoteId: quote.id, quoteNum: quote.num,
           status:'sent', lineItems: [], payments: (quote.payments||[]).map(p=>({...p})),
         };
-        setAccInvoices(prev=>[stubInvoice, ...prev]);
+        const accInvoicesUpdater = prev=>[stubInvoice, ...prev];
+        setAccInvoices(accInvoicesUpdater);
+        syncRelationalBaseline('accInvoices', accInvoicesUpdater);
         setViewQuote(null);
         revealJobInvoice({id: result.invoiceId});
       } catch(saveErr){
@@ -13314,7 +13382,9 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     if(isRelationalAuthoritative('jobs')){
       try {
         const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { stage: ns, status: nextStatus });
-        setJobs(prev=>prev.map(j=>j.id===job.id?{...j,stage:ns,status:nextStatus,_relRowVersion:result.rowVersion}:j));
+        const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j,stage:ns,status:nextStatus,_relRowVersion:result.rowVersion}:j);
+        setJobs(jobsUpdater);
+        syncRelationalBaseline('jobs', jobsUpdater);
       } catch(e){
         alert(describeSaveConflictError(e, 'job')+'\n\nThe job stage was NOT advanced.');
       }
@@ -13350,7 +13420,9 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
         alert(describeSaveConflictError(e, 'job')+'\n\nThe job was NOT deleted.');
         return;
       }
-      setJobs(prev=>prev.filter(j=>j.id!==job.id));
+      const jobsUpdater = prev=>prev.filter(j=>j.id!==job.id);
+      setJobs(jobsUpdater);
+      syncRelationalBaseline('jobs', jobsUpdater);
       onBack();
       return;
     }
@@ -13375,7 +13447,9 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     if(isRelationalAuthoritative('jobs')){
       try {
         const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { breakdown: bd });
-        setJobs(prev=>prev.map(j=>j.id===job.id?{...j,breakdown:{...bd},_relRowVersion:result.rowVersion}:j));
+        const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j,breakdown:{...bd},_relRowVersion:result.rowVersion}:j);
+        setJobs(jobsUpdater);
+        syncRelationalBaseline('jobs', jobsUpdater);
         setEditingCosts(false);
       } catch(e){
         alert(describeSaveConflictError(e, 'job')+'\n\nYour cost breakdown was NOT saved.');
@@ -13395,7 +13469,9 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     if(isRelationalAuthoritative('jobs')){
       try {
         const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { notes: nextNotes });
-        setJobs(prev=>prev.map(j=>j.id===job.id?{...j,notes:nextNotes,_relRowVersion:result.rowVersion}:j));
+        const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j,notes:nextNotes,_relRowVersion:result.rowVersion}:j);
+        setJobs(jobsUpdater);
+        syncRelationalBaseline('jobs', jobsUpdater);
         setEditingNotes(false);
       } catch(e){
         alert(describeSaveConflictError(e, 'job')+'\n\nYour note was NOT saved.');
@@ -13419,7 +13495,9 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
         // from qty*unitPrice (never trusted from the client).
         const patchLines = cleanLines.map(l=>({ desc: l.desc, qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId }));
         const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { lines: patchLines });
-        setJobs(prev=>prev.map(j=>j.id===job.id?{...j,lines:cleanLines,_relRowVersion:result.rowVersion}:j));
+        const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j,lines:cleanLines,_relRowVersion:result.rowVersion}:j);
+        setJobs(jobsUpdater);
+        syncRelationalBaseline('jobs', jobsUpdater);
         setEditingLines(false);
       } catch(e){
         alert(describeSaveConflictError(e, 'job')+'\n\nYour line items were NOT saved.');
@@ -13431,6 +13509,45 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   }
   function cancelLines(){ setEditingLines(false); }
   function addSowLine(){ setLinesDraft(prev=>[...prev,{id:Date.now()+Math.random(),desc:'',qty:1,unit:'',unitPrice:0,subtotal:0}]); }
+
+  // 2026-08-23 SAVE-AUTHORITY AUDIT FIX — genuine LIVE CUTOVER GAP closed.
+  // Both the write-off toggle and the due-date inline editor used to call
+  // setJobs(...) directly with NO isRelationalAuthoritative check and NO
+  // relationalApi call at all — the ONLY two Job mutations in this file
+  // that were completely unwired, not merely affected by the shared
+  // autosave/baseline-desync bug fixed elsewhere in this pass. rel_jobs had
+  // no column for either field until migration
+  // 010_job_writeoff_duedate.sql; relationalApi.updateJob now accepts
+  // {writeOff} / {dueDate} exactly like {notes}/{lines}/{breakdown} above.
+  async function toggleWriteOff(k){
+    const nextVal = job.writeOff===k?null:k;
+    if(isRelationalAuthoritative('jobs')){
+      try {
+        const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { writeOff: nextVal });
+        const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j,writeOff:nextVal,_relRowVersion:result.rowVersion}:j);
+        setJobs(jobsUpdater);
+        syncRelationalBaseline('jobs', jobsUpdater);
+      } catch(e){
+        alert(describeSaveConflictError(e, 'job')+'\n\nThe write-off status was NOT saved.');
+      }
+      return;
+    }
+    setJobs(prev=>prev.map(j=>j.id===job.id?{...j,writeOff:nextVal}:j));
+  }
+  async function updateJobDueDate(val){
+    if(isRelationalAuthoritative('jobs')){
+      try {
+        const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { dueDate: val });
+        const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j,dueDate:val,_relRowVersion:result.rowVersion}:j);
+        setJobs(jobsUpdater);
+        syncRelationalBaseline('jobs', jobsUpdater);
+      } catch(e){
+        alert(describeSaveConflictError(e, 'job')+'\n\nThe due date was NOT saved.');
+      }
+      return;
+    }
+    setJobs(prev=>prev.map(j=>j.id===job.id?{...j,dueDate:val}:j));
+  }
   function removeSowLine(id){ setLinesDraft(prev=>prev.filter(l=>l.id!==id)); }
   function updateSowLine(id,key,val){ setLinesDraft(prev=>prev.map(l=>l.id===id?{...l,[key]:val}:l)); }
 
@@ -13949,7 +14066,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
               <div className="flex items-center gap-2 flex-wrap bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5">
                 <span className="text-gray-400 text-xs">Write-off:</span>
                 {[{k:'warranty',icon:'🛡️',cls:'bg-purple-100 text-purple-700 border-purple-300'},{k:'maintenance',icon:'🔧',cls:'bg-orange-100 text-orange-700 border-orange-300'}].map(({k,icon,cls})=>(
-                  <button key={k} onClick={()=>setJobs(prev=>prev.map(j=>j.id===job.id?{...j,writeOff:j.writeOff===k?null:k}:j))}
+                  <button key={k} onClick={()=>toggleWriteOff(k)}
                     className={`text-xs font-bold px-2.5 py-1 rounded-lg border transition-all ${job.writeOff===k?cls:'bg-white text-gray-500 border-gray-200 hover:border-gray-400'}`}>
                     {icon} {k.charAt(0).toUpperCase()+k.slice(1)}
                   </button>
@@ -14268,7 +14385,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
                   <div onClick={e=>e.stopPropagation()} className="mt-1.5 flex justify-end">
                     <input type="date" value={job.dueDate||''}
                       onClick={e=>e.stopPropagation()}
-                      onChange={e=>setJobs(prev=>prev.map(j=>j.id===job.id?{...j,dueDate:e.target.value}:j))}
+                      onChange={e=>updateJobDueDate(e.target.value)}
                       title="Due date"
                       className={`text-[11px] font-semibold rounded-full px-2.5 py-1 border cursor-pointer focus:ring-2 focus:ring-emerald-400 focus:outline-none
                         ${job.dueDate
@@ -15057,7 +15174,7 @@ function SaveAsProductModal({ calcData, completeProducts, setCompleteProducts, o
 }
 
 // ── Modal: Edit a Complete Product (full calc embedded) ──
-function EditCompleteProductModal({ cp, completeProducts, setCompleteProducts, setQuotes, onClose }) {
+function EditCompleteProductModal({ cp, completeProducts, setCompleteProducts, quotes, setQuotes, onClose }) {
   const [name,    setName]    = useState(cp.name);
   const [desc,    setDesc]    = useState(cp.description||'');
   const [markup,  setMarkup]  = useState(cp.markup||35);
@@ -15081,7 +15198,29 @@ function EditCompleteProductModal({ cp, completeProducts, setCompleteProducts, s
   const sellIncVat = sellExVat+vatAmt;
   const fmt = n => 'R '+Number(n).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,',');
 
-  function handleSave(){
+  // 2026-08-23 SAVE-AUTHORITY AUDIT FIX — genuine LIVE CUTOVER GAP closed.
+  // This function previously always called setQuotes(...) unconditionally
+  // to cascade a Complete Product's price/name change into every linked
+  // quote's line items, with NO relational awareness and NO persistence
+  // call at all — a pure local-state rewrite. That was harmless while
+  // "quotes" was JSON-authoritative (the generic autosave would pick it up
+  // normally), but the instant "quotes" becomes relational-authoritative,
+  // that same optimistic setQuotes(...) makes the generic autosave effect
+  // see `quotes` as "locally changed" against a baseline nothing ever kept
+  // in sync — 800ms later the systemic guard (correctly) refuses the
+  // resulting illegitimate JSON save, so editing an UNRELATED Complete
+  // Product silently failed to persist its cascade into linked quotes (and
+  // surfaced a confusing "Save failed" for a page the user never touched).
+  // Fixed by routing each linked quote's line-item patch through the SAME
+  // relational endpoint QuotesPage.saveLines/handleSave already uses
+  // (relationalApi.updateQuote — no new endpoint needed, this is additive
+  // reuse) when "quotes" is relational-authoritative, then syncing the
+  // baseline exactly like every other relational action in this file. A
+  // linked quote this modal has no real relational identity for
+  // (q._relId == null — should not happen for a genuinely cut-over quote,
+  // but never assumed) is skipped with a clear warning rather than guessed
+  // at. The non-relational JSON path below is completely unchanged.
+  async function handleSave(){
     if(!name.trim()){alert('Product name is required.');return;}
     const now = new Date().toISOString();
     const updated = {...cp, name:name.trim(), description:desc.trim(), markup, items:items.map(it=>({...it})),
@@ -15089,14 +15228,39 @@ function EditCompleteProductModal({ cp, completeProducts, setCompleteProducts, s
     setCompleteProducts(prev=>prev.map(p=>p.id===cp.id?updated:p));
     // Auto-update any quote lines linked to this product
     if(setQuotes){
-      setQuotes(prev=>prev.map(q=>({
-        ...q,
-        lines:(q.lines||[]).map(l=>
-          l.cpId===cp.id && l.cpLinked
-            ? {...l, desc:updated.name, unitPrice:updated.sellExVat, subtotal:(l.qty||1)*updated.sellExVat}
-            : l
-        )
-      })));
+      if(isRelationalAuthoritative('quotes')){
+        const linkedQuotes = (quotes||[]).filter(q=>(q.lines||[]).some(l=>l.cpId===cp.id && l.cpLinked));
+        const failures = [];
+        for(const q of linkedQuotes){
+          const nextLines = (q.lines||[]).map(l=>
+            l.cpId===cp.id && l.cpLinked
+              ? {...l, desc:updated.name, unitPrice:updated.sellExVat, subtotal:(l.qty||1)*updated.sellExVat}
+              : l
+          );
+          if(q._relId==null){ failures.push(q.num||q.id); continue; }
+          try {
+            const patchLines = nextLines.map(l=>({ desc: l.desc, qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId }));
+            const result = await relationalApi.updateQuote(q._relId, q._relRowVersion, { lines: patchLines });
+            const quotesUpdater = prev=>prev.map(x=>x.id===q.id?{...x, lines:nextLines, _relRowVersion:result.rowVersion}:x);
+            setQuotes(quotesUpdater);
+            syncRelationalBaseline('quotes', quotesUpdater);
+          } catch(e){
+            failures.push(q.num||q.id);
+          }
+        }
+        if(failures.length){
+          alert('Product saved, but these linked quotes could NOT be updated automatically: '+failures.join(', ')+'.\n\nOpen and re-save them manually to apply the new price.');
+        }
+      } else {
+        setQuotes(prev=>prev.map(q=>({
+          ...q,
+          lines:(q.lines||[]).map(l=>
+            l.cpId===cp.id && l.cpLinked
+              ? {...l, desc:updated.name, unitPrice:updated.sellExVat, subtotal:(l.qty||1)*updated.sellExVat}
+              : l
+          )
+        })));
+      }
     }
     onClose();
   }
@@ -15898,11 +16062,15 @@ function SuppliersPage({ suppliers, setSuppliers }) {
           // BUGFIX (Stage 3 follow-on): _relId/_relRowVersion set immediately
           // from the response — same class of fix as customer/quote/credit
           // note creation, closing the "edit immediately after create" race.
-          setSuppliers(prev => [{ ...s, id: result.id, _relId: result.id, _relRowVersion: result.rowVersion }, ...prev]);
+          const suppliersUpdater = prev => [{ ...s, id: result.id, _relId: result.id, _relRowVersion: result.rowVersion }, ...prev];
+          setSuppliers(suppliersUpdater);
+          syncRelationalBaseline('suppliers', suppliersUpdater);
         } else {
           const existing = suppliers.find(x=>x.id===s.id);
           const result = await relationalApi.updateSupplier(existing && existing._relId, existing && existing._relRowVersion, patch);
-          setSuppliers(prev => prev.map(x=>x.id===s.id ? { ...s, _relRowVersion: result.rowVersion } : x));
+          const suppliersUpdater = prev => prev.map(x=>x.id===s.id ? { ...s, _relRowVersion: result.rowVersion } : x);
+          setSuppliers(suppliersUpdater);
+          syncRelationalBaseline('suppliers', suppliersUpdater);
         }
       } catch(e){
         alert(describeSaveConflictError(e, 'supplier'));
@@ -15924,7 +16092,9 @@ function SuppliersPage({ suppliers, setSuppliers }) {
     if(isRelationalAuthoritative('suppliers') && existing && existing._relId!=null){
       try {
         await relationalApi.deleteSupplier(existing._relId, existing._relRowVersion);
-        setSuppliers(prev=>prev.filter(s=>s.id!==id));
+        const suppliersUpdater = prev=>prev.filter(s=>s.id!==id);
+        setSuppliers(suppliersUpdater);
+        syncRelationalBaseline('suppliers', suppliersUpdater);
       } catch(e){
         alert(describeSaveConflictError(e, 'supplier'));
       }
@@ -16287,7 +16457,9 @@ async function createPurchaseOrderShared(po, user, setPurchaseOrders) {
         orderDate: po.date || null, notes: po.notes,
         items: (po.items||[]).map(it=>({ inventoryItemId: it.inventoryId, name: it.name, unit: it.unit, qtyNeeded: it.qtyNeeded, qtyOrdered: it.qtyOrdered, unitCost: it.unitCost })),
       });
-      setPurchaseOrders(prev=>[{...po, co:coTag, num:result.poNumber, id:result.id, _relId:result.id, _relRowVersion:result.rowVersion}, ...prev]);
+      const poUpdater = prev=>[{...po, co:coTag, num:result.poNumber, id:result.id, _relId:result.id, _relRowVersion:result.rowVersion}, ...prev];
+      setPurchaseOrders(poUpdater);
+      syncRelationalBaseline('purchaseOrders', poUpdater);
       return true;
     } catch(e){
       return 'Purchase Order could NOT be created.\n\n'+(e&&e.message?e.message:'unknown error');
@@ -16509,7 +16681,9 @@ function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user
     if(isRelationalAuthoritative('purchaseOrders') && updated._relId!=null){
       try {
         const result = await relationalApi.updatePurchaseOrder(updated._relId, updated._relRowVersion, { supplierId: updated.supplierId, status: updated.status, notes: updated.notes });
-        setPurchaseOrders(prev=>prev.map(p=>p.id===updated.id?{...updated, _relRowVersion:result.rowVersion}:p));
+        const poUpdater = prev=>prev.map(p=>p.id===updated.id?{...updated, _relRowVersion:result.rowVersion}:p);
+        setPurchaseOrders(poUpdater);
+        syncRelationalBaseline('purchaseOrders', poUpdater);
       } catch(e){
         alert(describeSaveConflictError(e, 'purchase order'));
         return;
@@ -17050,7 +17224,9 @@ function QuickRatesModal({ quickRates, setQuickRates, suppliers, inventory, setI
       try {
         const patch = { sku: item.sku, name: item.name, category: item.cat, unit: item.unit, cost: item.cost, sell: item.sell, stock: item.stock, reorder: item.reorder, supplierId: item.supplierId||null };
         const result = await relationalApi.createInventoryItem(patch);
-        setInventory(prev=>[...prev, { ...item, id: result.id, supplierId: item.supplierId||null, _relId: result.id, _relRowVersion: result.rowVersion }]);
+        const inventoryUpdater = prev=>[...prev, { ...item, id: result.id, supplierId: item.supplierId||null, _relId: result.id, _relRowVersion: result.rowVersion }];
+        setInventory(inventoryUpdater);
+        syncRelationalBaseline('inventory', inventoryUpdater);
       } catch(e) {
         alert(describeSaveConflictError(e, 'inventory item'));
         return;
@@ -17072,7 +17248,9 @@ function QuickRatesModal({ quickRates, setQuickRates, suppliers, inventory, setI
         try {
           const delta = Number(qrItem.stock)||0;
           const result = await relationalApi.adjustInventoryStock(target._relId, target._relRowVersion, delta);
-          setInventory(prev=>prev.map(i=>i.id!==invTargetId?i:{ ...i, stock: result.newStock, _relRowVersion: result.rowVersion }));
+          const inventoryUpdater = prev=>prev.map(i=>i.id!==invTargetId?i:{ ...i, stock: result.newStock, _relRowVersion: result.rowVersion });
+          setInventory(inventoryUpdater);
+          syncRelationalBaseline('inventory', inventoryUpdater);
         } catch(e) {
           alert(describeSaveConflictError(e, 'inventory item'));
           return;
@@ -17366,7 +17544,9 @@ function QuickRatesPanel({ quickRates, setQuickRates, suppliers, inventory, setI
       try {
         const patch = { sku: item.sku, name: item.name, category: item.cat, unit: item.unit, cost: item.cost, sell: item.sell, stock: item.stock, reorder: item.reorder, supplierId: item.supplierId||null };
         const result = await relationalApi.createInventoryItem(patch);
-        setInventory(prev=>[...prev, { ...item, id: result.id, supplierId: item.supplierId||null, _relId: result.id, _relRowVersion: result.rowVersion }]);
+        const inventoryUpdater = prev=>[...prev, { ...item, id: result.id, supplierId: item.supplierId||null, _relId: result.id, _relRowVersion: result.rowVersion }];
+        setInventory(inventoryUpdater);
+        syncRelationalBaseline('inventory', inventoryUpdater);
       } catch(e) {
         alert(describeSaveConflictError(e, 'inventory item'));
         return;
@@ -17386,7 +17566,9 @@ function QuickRatesPanel({ quickRates, setQuickRates, suppliers, inventory, setI
         try {
           const delta = Number(qrItem.stock)||0;
           const result = await relationalApi.adjustInventoryStock(target._relId, target._relRowVersion, delta);
-          setInventory(prev=>prev.map(i=>i.id!==invTargetId?i:{ ...i, stock: result.newStock, _relRowVersion: result.rowVersion }));
+          const inventoryUpdater = prev=>prev.map(i=>i.id!==invTargetId?i:{ ...i, stock: result.newStock, _relRowVersion: result.rowVersion });
+          setInventory(inventoryUpdater);
+          syncRelationalBaseline('inventory', inventoryUpdater);
         } catch(e) {
           alert(describeSaveConflictError(e, 'inventory item'));
           return;
@@ -17590,7 +17772,7 @@ function QuickRatesPanel({ quickRates, setQuickRates, suppliers, inventory, setI
   );
 }
 
-function InventoryPage({ inventory, setInventory, suppliers, user, completeProducts, setCompleteProducts, setQuotes, companies, logoDataUrl, quickRates, setQuickRates }) {
+function InventoryPage({ inventory, setInventory, suppliers, user, completeProducts, setCompleteProducts, quotes, setQuotes, companies, logoDataUrl, quickRates, setQuickRates }) {
   const isAdmin = true; // Assistant has full view + edit access to Inventory, same as admin
   const [invSubTab,     setInvSubTab]     = useState('stock'); // 'stock' | 'products'
   const [showImport,    setShowImport]    = useState(false);
@@ -17657,7 +17839,9 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
     if(item && item._relId!=null && isRelationalAuthoritative('inventory')){
       try {
         await relationalApi.deleteInventoryItem(item._relId, item._relRowVersion);
-        setInventory(prev=>prev.filter(i=>i.id!==id));
+        const inventoryUpdater = prev=>prev.filter(i=>i.id!==id);
+        setInventory(inventoryUpdater);
+        syncRelationalBaseline('inventory', inventoryUpdater);
       } catch(e){
         alert(describeSaveConflictError(e, 'inventory item'));
       }
@@ -17675,11 +17859,15 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
         const patch = { sku: item.sku, name: item.name, category: item.cat, unit: item.unit, cost: item.cost, sell: item.sell, stock: item.stock, reorder: item.reorder, supplierId: item.supplierId };
         if(isNew){
           const result = await relationalApi.createInventoryItem(patch);
-          setInventory(prev => [...prev, { ...item, id: result.id, _relId: result.id, _relRowVersion: result.rowVersion }]);
+          const inventoryUpdater = prev => [...prev, { ...item, id: result.id, _relId: result.id, _relRowVersion: result.rowVersion }];
+          setInventory(inventoryUpdater);
+          syncRelationalBaseline('inventory', inventoryUpdater);
         } else {
           const existing = inventory.find(x=>x.id===item.id);
           const result = await relationalApi.updateInventoryItem(existing && existing._relId, existing && existing._relRowVersion, patch);
-          setInventory(prev => prev.map(x=>x.id===item.id ? { ...item, _relRowVersion: result.rowVersion } : x));
+          const inventoryUpdater = prev => prev.map(x=>x.id===item.id ? { ...item, _relRowVersion: result.rowVersion } : x);
+          setInventory(inventoryUpdater);
+          syncRelationalBaseline('inventory', inventoryUpdater);
         }
       } catch(e){
         alert(describeSaveConflictError(e, 'inventory item'));
@@ -18030,7 +18218,7 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
     <div className="p-4 space-y-4">
       {showImport&&<BulkImportModal inventory={inventory} onClose={()=>setShowImport(false)} onImport={setInventory}/>}
       {(showAddItem||editItem||copyItem)&&<AddEditInventoryItemModal item={copyItem||editItem} suppliers={suppliers||[]} allCats={cats} onClose={()=>{setShowAddItem(false);setEditItem(null);setCopyItem(null);}} onSave={it=>{saveItem(it);setCopyItem(null);}}/>}
-      {editCP&&<EditCompleteProductModal cp={editCP} completeProducts={completeProducts||[]} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} onClose={()=>setEditCP(null)}/>}
+      {editCP&&<EditCompleteProductModal cp={editCP} completeProducts={completeProducts||[]} setCompleteProducts={setCompleteProducts} quotes={quotes||[]} setQuotes={setQuotes} onClose={()=>setEditCP(null)}/>}
       {showQuickRates&&<QuickRatesModal quickRates={quickRates||[]} setQuickRates={setQuickRates} suppliers={suppliers||[]} inventory={inventory} setInventory={setInventory} inventoryCats={cats} onClose={()=>setShowQuickRates(false)}/>}
 
       {/* Sub-tab toggle */}
@@ -19504,6 +19692,7 @@ async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll
         const tagged = { ...inv, co: relCo, _relRowVersion: result.rowVersion };
         const nextAccInvoices = (accInvoicesAll||[]).map(i=>i.id===tagged.id?tagged:i);
         setAccInvoices(nextAccInvoices);
+        syncRelationalBaseline('accInvoices', () => nextAccInvoices);
         return true;
       } else {
         const result = await relationalApi.createInvoice({
@@ -19514,6 +19703,7 @@ async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll
         const tagged = { ...inv, id: result.id, number: result.invoiceNumber, co: relCo, _relId: result.id, _relRowVersion: result.rowVersion };
         const nextAccInvoices = [tagged, ...(accInvoicesAll||[])];
         setAccInvoices(nextAccInvoices);
+        syncRelationalBaseline('accInvoices', () => nextAccInvoices);
         return true;
       }
     } catch(e){
@@ -19924,7 +20114,9 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
         alert(describeSaveConflictError(e, 'invoice')+'\n\nThe invoice was NOT deleted.');
         return;
       }
-      setAccInvoices(prev=>prev.filter(i=>i.id!==id));
+      const accInvoicesUpdater = prev=>prev.filter(i=>i.id!==id);
+      setAccInvoices(accInvoicesUpdater);
+      syncRelationalBaseline('accInvoices', accInvoicesUpdater);
       return;
     }
     setAccInvoices(prev=>prev.filter(i=>i.id!==id));
@@ -19949,7 +20141,9 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
       try {
         const result = await relationalApi.recordPayment('invoice', inv._relId, remaining, { date:today, method:'EFT', notes:'Quick mark paid' });
         const newP = {id:Date.now(), date:today, method:'EFT', amount:remaining, notes:'Quick mark paid', _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion};
-        setAccInvoices(prev=>prev.map(i=>i.id===inv.id?{...i, status:'paid', paidDate:today, payments:[...(i.payments||[]),newP]}:i));
+        const accInvoicesUpdater = prev=>prev.map(i=>i.id===inv.id?{...i, status:'paid', paidDate:today, payments:[...(i.payments||[]),newP]}:i);
+        setAccInvoices(accInvoicesUpdater);
+        syncRelationalBaseline('accInvoices', accInvoicesUpdater);
       } catch(e){
         alert(describeSaveConflictError(e, 'invoice')+'\n\nThe payment was NOT recorded.');
       }
@@ -19994,11 +20188,15 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
           // conversion creation stubs): _relId/_relRowVersion must be set
           // explicitly here so an immediately-following edit/delete never
           // calls updateCreditNote/deleteCreditNote with an undefined id.
-          setCreditNotes(prev => [{ ...tagged, id: result.id, number: result.creditNumber, used: 0, _relId: result.id, _relRowVersion: result.rowVersion }, ...prev]);
+          const creditNotesUpdater = prev => [{ ...tagged, id: result.id, number: result.creditNumber, used: 0, _relId: result.id, _relRowVersion: result.rowVersion }, ...prev];
+          setCreditNotes(creditNotesUpdater);
+          syncRelationalBaseline('creditNotes', creditNotesUpdater);
         } else {
           const existing = cnotes.find(c=>c.id===tagged.id);
           const result = await relationalApi.updateCreditNote(existing && existing._relId, existing && existing._relRowVersion, { contactName: tagged.contactName, date: tagged.date, amount: tagged.amount, reason: tagged.reason, appliedTo: tagged.appliedTo, notes: tagged.notes, status: tagged.status });
-          setCreditNotes(prev => prev.map(c=>c.id===tagged.id ? { ...tagged, _relRowVersion: result.rowVersion } : c));
+          const creditNotesUpdater = prev => prev.map(c=>c.id===tagged.id ? { ...tagged, _relRowVersion: result.rowVersion } : c);
+          setCreditNotes(creditNotesUpdater);
+          syncRelationalBaseline('creditNotes', creditNotesUpdater);
         }
       } catch(e){
         alert(describeSaveConflictError(e, 'credit note'));
@@ -20022,7 +20220,9 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     if(isRelationalAuthoritative('creditNotes') && existing && existing._relId!=null){
       try {
         await relationalApi.deleteCreditNote(existing._relId, existing._relRowVersion);
-        setCreditNotes(prev=>prev.filter(c=>c.id!==id));
+        const creditNotesUpdater = prev=>prev.filter(c=>c.id!==id);
+        setCreditNotes(creditNotesUpdater);
+        syncRelationalBaseline('creditNotes', creditNotesUpdater);
       } catch(e){
         alert(describeSaveConflictError(e, 'credit note'));
       }
@@ -22284,7 +22484,13 @@ function App() {
   // overwrite each other's work.  A 30-second poll keeps all open browsers in sync.
   const apiReadyRef      = useRef(false);  // true once initial GET succeeded
   const apiSaveTimerRef  = useRef(null);
-  const serverBaselineRef = useRef(null);  // last full state received from server
+  // serverBaselineRef itself now lives at module scope (see its
+  // declaration and full doc comment near isRelationalAuthoritative,
+  // above `relationalAuthoritativeSectionsRef`) — 2026-08-23 save-authority
+  // audit fix, so every sibling page/detail component's relational action
+  // functions can also keep it in sync via syncRelationalBaseline, not
+  // just this component. Behaviourally identical to the previous
+  // useRef(null): only one App instance is ever mounted.
   const currentSnapshotRef = useRef(null); // always-current local snapshot (avoids stale closures in poll)
   // True only once THIS session's own initial GET directly confirmed the
   // database is genuinely empty (a brand-new install). Used as the sole
@@ -23466,7 +23672,7 @@ function App() {
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
-    inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
+    inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quotes={quotes} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
     reports:     <ReportsPage     jobs={jobs} companies={companies} user={user} logoDataUrl={brandingLogo} customers={customers}/>,
     accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user} onOpenJob={openJobRecord} onOpenQuote={openQuoteRecord} onOpenCustomer={openCustomerRecord} onOpenJobPayments={openJobPaymentsRecord} initialStatementContact={accountingOpen&&accountingOpen.contact} onInitialStatementHandled={()=>setAccountingOpen(null)} forceSaveSections={forceSaveSections}/>,

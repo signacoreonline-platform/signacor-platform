@@ -1,0 +1,38 @@
+-- 010_job_writeoff_duedate.sql
+--
+-- SAVE-AUTHORITY AUDIT (2026-08-23) — schema gap closed for two ACTIVE
+-- Job features that had NO relational column at all: JobDetail's
+-- write-off toggle (job.writeOff, values 'warranty'/'maintenance'/null)
+-- and JobDetail's inline due-date editor (job.dueDate, a plain date
+-- string used for the Jobs calendar/overdue-highlight view — distinct
+-- from invoice_date/invoice_due, which are the job's INVOICE dates, not
+-- the job's own scheduling due date).
+--
+-- Both controls are still live and clickable in index.html regardless of
+-- whether "jobs" is relational-authoritative — before this fix, editing
+-- either one called setJobs(...) directly with NO isRelationalAuthoritative
+-- check and NO relationalApi call at all (a genuine LIVE CUTOVER GAP, not
+-- merely the shared autosave/baseline-desync bug fixed elsewhere in this
+-- same audit pass). Once "jobs" is cut over, that unconditional setJobs(...)
+-- made the generic autosave effect see `jobs` as locally changed against a
+-- baseline it could never reconcile relationally, so 800ms later the
+-- systemic safety guard (correctly) refused to save it as JSON — meaning
+-- these two edits silently failed to persist at all while jobs is cut over.
+--
+-- Same additive pattern as 008_stage3_workflow_columns.sql's `breakdown`
+-- column: a small, low-cardinality/simple-scalar field with no relational
+-- structure of its own, added directly to rel_jobs rather than a separate
+-- table.
+--
+-- Idempotent and additive only:
+--   - ADD COLUMN IF NOT EXISTS
+--   - both columns are NULLable with no default other than NULL, so every
+--     pre-existing (backfilled) row is simply "no write-off / no due date
+--     set yet" until explicitly edited — matching the JSON behaviour where
+--     an absent field just reads as falsy/undefined
+--   - never drops, renames, or retypes an existing column
+--   - never touches historical row data
+--   - safe to re-run
+
+ALTER TABLE rel_jobs ADD COLUMN IF NOT EXISTS write_off TEXT;
+ALTER TABLE rel_jobs ADD COLUMN IF NOT EXISTS due_date  DATE;

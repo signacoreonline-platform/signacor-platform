@@ -1072,6 +1072,13 @@ export interface JobPatchInput {
   setupFee?: number; discountPct?: number; salesperson?: string | null;
   preparedBy?: string | null; poRef?: string | null; reference?: string | null;
   notes?: string | null; value?: number;
+  // 010_job_writeoff_duedate.sql (2026-08-23 save-authority audit) — two
+  // previously JSON-only-and-unwired active Job features, now given a real
+  // relational column each. writeOff is 'warranty' | 'maintenance' | null;
+  // dueDate is a plain YYYY-MM-DD string (the job's own scheduling due
+  // date, distinct from invoiceDate/invoiceDue).
+  writeOff?: string | null;
+  dueDate?: string | null;
   breakdown?: Record<string, number>;
   lines?: LineItemPatch[];
 }
@@ -1089,6 +1096,8 @@ export async function updateJob(id: number, expectedVersion: number, patch: Part
       status: 'status', stage: 'stage', setupFee: 'setup_fee', discountPct: 'discount_pct',
       salesperson: 'salesperson', preparedBy: 'prepared_by', poRef: 'po_ref',
       reference: 'reference', notes: 'notes', value: 'value',
+      // 010_job_writeoff_duedate.sql (2026-08-23 save-authority audit)
+      writeOff: 'write_off', dueDate: 'due_date',
     };
     const sets: string[] = []; const vals: any[] = [];
     for (const [k, col] of Object.entries(colMap)) {

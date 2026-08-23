@@ -60,7 +60,16 @@ function checkSourceWiring(src: string) {
     'SuppliersPage.saveSup checks isRelationalAuthoritative(\'suppliers\')');
   ok(src.includes(`const result = await relationalApi.createSupplier(patch);`),
     'saveSup create branch calls relationalApi.createSupplier');
-  ok(src.includes(`setSuppliers(prev => [{ ...s, id: result.id, _relId: result.id, _relRowVersion: result.rowVersion }, ...prev]);`),
+  // 2026-08-23 save-authority audit: the inline setSuppliers(prev=>...)
+  // updater was split into a named const so the SAME updater can also be
+  // passed to syncRelationalBaseline (keeps the generic autosave's "what
+  // changed" diff honest against this already-confirmed relational save —
+  // see that helper's doc comment near isRelationalAuthoritative). The
+  // _relId/_relRowVersion values are still set immediately, just assigned
+  // to a variable one line before the setSuppliers call instead of inline.
+  ok(src.includes(`const suppliersUpdater = prev => [{ ...s, id: result.id, _relId: result.id, _relRowVersion: result.rowVersion }, ...prev];`)
+    && src.includes(`setSuppliers(suppliersUpdater);`)
+    && src.includes(`syncRelationalBaseline('suppliers', suppliersUpdater);`),
     'saveSup create branch sets _relId/_relRowVersion immediately');
   ok(src.includes(`const result = await relationalApi.updateSupplier(existing && existing._relId, existing && existing._relRowVersion, patch);`),
     'saveSup edit branch uses existing._relId, never a bare .id');
@@ -93,7 +102,10 @@ function checkSourceWiring(src: string) {
     'PurchaseOrdersPage.handleCreateCustomPO delegates to the shared implementation, not its own duplicate branching');
   ok(src.includes(`const result = await relationalApi.createPurchaseOrder({`),
     'createPurchaseOrderShared\'s relational branch calls relationalApi.createPurchaseOrder');
-  ok(src.includes(`_relId:result.id, _relRowVersion:result.rowVersion}, ...prev]);`),
+  // 2026-08-23 save-authority audit: same setter/updater split as
+  // saveSup above, paired with syncRelationalBaseline('purchaseOrders', ...).
+  ok(src.includes(`_relId:result.id, _relRowVersion:result.rowVersion}, ...prev];`)
+    && src.includes(`syncRelationalBaseline('purchaseOrders', poUpdater);`),
     'createPurchaseOrderShared sets _relId/_relRowVersion immediately on the new PO stub');
   ok(src.includes(`if(isRelationalAuthoritative('purchaseOrders') && updated._relId!=null){`) && src.includes(`async function updatePO(updated) {`),
     'updatePO routes relationally only for a genuine relational row (updated._relId set)');
@@ -116,7 +128,11 @@ function checkSourceWiring(src: string) {
     'InventoryPage.saveItem checks isRelationalAuthoritative(\'inventory\')');
   ok(src.includes(`const result = await relationalApi.createInventoryItem(patch);`),
     'saveItem create branch calls relationalApi.createInventoryItem');
-  ok(src.includes(`setInventory(prev => [...prev, { ...item, id: result.id, _relId: result.id, _relRowVersion: result.rowVersion }]);`),
+  // 2026-08-23 save-authority audit: same setter/updater split as saveSup
+  // above, paired with syncRelationalBaseline('inventory', ...).
+  ok(src.includes(`const inventoryUpdater = prev => [...prev, { ...item, id: result.id, _relId: result.id, _relRowVersion: result.rowVersion }];`)
+    && src.includes(`setInventory(inventoryUpdater);`)
+    && src.includes(`syncRelationalBaseline('inventory', inventoryUpdater);`),
     'saveItem create branch sets _relId/_relRowVersion immediately');
   ok(src.includes(`const result = await relationalApi.updateInventoryItem(existing && existing._relId, existing && existing._relRowVersion, patch);`),
     'saveItem edit branch uses existing._relId, never a bare .id');

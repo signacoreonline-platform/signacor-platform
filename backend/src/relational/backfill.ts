@@ -593,6 +593,8 @@ export async function runBackfill(opts: { apply: boolean; sourceFile?: string; r
           reference: str(rec.reference),
           notes: str(rec.notes),
           breakdown: JSON.stringify(breakdown), // migration 008 — jsonb column, same untyped-parameter convention already used for legacy_data
+          write_off: str(rec.writeOff), // migration 010 (2026-08-23 save-authority audit)
+          due_date: dateOrNull(rec.dueDate), // migration 010 (2026-08-23 save-authority audit)
         };
         const outcome = await upsertRow(client, 'rel_jobs', ['source_id'], columns, rec);
         s[outcome]++;

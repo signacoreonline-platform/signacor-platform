@@ -300,6 +300,9 @@ export async function buildJobsJson(): Promise<any[]> {
       breakdown: (r.breakdown && typeof r.breakdown === 'object' && Object.keys(r.breakdown).length)
         ? r.breakdown
         : (legacyBase(r).breakdown ?? {}),
+      // 010_job_writeoff_duedate.sql (2026-08-23 save-authority audit)
+      writeOff: r.write_off ?? legacyBase(r).writeOff ?? null,
+      dueDate: dateStr(r.due_date) ?? legacyBase(r).dueDate ?? null,
       quoteNum: r.quote_number_raw ?? legacyBase(r).quoteNum ?? null,
       invoiceNum: r.invoice_num ?? legacyBase(r).invoiceNum ?? null,
       invoiceDate: dateStr(r.invoice_date) ?? legacyBase(r).invoiceDate ?? null,
