@@ -43,11 +43,12 @@ import {
   createCustomer, updateCustomer,
   createQuote, convertQuoteToJob, updateQuote, updateQuoteWithJobSync,
   createInvoiceForJob, finalizeProformaToInvoice,
-  recordPayment, updateJob, updatePayment, deletePayment, getPaymentMethod,
+  recordPayment, updateJob, deleteJob, updatePayment, deletePayment, getPaymentMethod,
   createCreditNote, updateCreditNote, deleteCreditNote,
   createPurchaseOrder, updatePurchaseOrder,
   createSupplier, updateSupplier, deleteSupplier,
   createInventoryItem, updateInventoryItem, adjustInventoryStock, deleteInventoryItem,
+  createManualInvoice, updateInvoice, deleteInvoice,
 } from './services';
 
 const router = Router();
@@ -159,6 +160,32 @@ router.put('/quotes/:id', async (req: AuthRequest, res: Response): Promise<void>
   } catch (err) { handleServiceError(err, res); }
 });
 
+// CUTOVER BLOCKER COMPLETION — "quote status actions" named blocker
+// (mark sent / approve / decline / admin reinstate). Deliberately its OWN
+// route rather than folded into PUT /quotes/:id above: that route calls
+// updateQuoteWithJobSync, whose colMap intentionally EXCLUDES status (see
+// services.ts's comment on updateQuoteWithJobSync — a plain field/lines edit
+// must never be able to smuggle in a status change, and a status change must
+// never re-cascade quote display fields onto the linked job). This route
+// calls the plain updateQuote() instead (services.ts), whose own colMap DOES
+// include status, and touches nothing else.
+router.patch('/quotes/:id/status', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireCutOver('quotes', res))) return;
+  try {
+    const id = Number(req.params.id);
+    const expectedVersion = Number(req.body?.expectedVersion);
+    const { status } = req.body || {};
+    if (!Number.isFinite(id) || !Number.isFinite(expectedVersion)) {
+      res.status(400).json({ error: '"id" (path) and "expectedVersion" (body) must be numbers' }); return;
+    }
+    if (!status || typeof status !== 'string') {
+      res.status(400).json({ error: '"status" is required' }); return;
+    }
+    const result = await updateQuote(id, expectedVersion, { status });
+    res.json({ success: true, rowVersion: result.rowVersion });
+  } catch (err) { handleServiceError(err, res); }
+});
+
 router.post('/quotes/:id/convert-to-job', async (req: AuthRequest, res: Response): Promise<void> => {
   if (!(await requireCutOver('quotes', res)) || !(await requireCutOver('jobs', res))) return;
   try {
@@ -201,6 +228,79 @@ router.post('/jobs/:id/create-invoice', async (req: AuthRequest, res: Response):
     if (!Number.isFinite(jobId)) { res.status(400).json({ error: '"id" must be a number' }); return; }
     const result = await createInvoiceForJob(jobId);
     res.status(201).json({ success: true, invoiceId: result.invoiceId, invoiceNumber: result.invoiceNumber, jobRowVersion: result.jobRowVersion });
+  } catch (err) { handleServiceError(err, res); }
+});
+
+// CUTOVER BLOCKER COMPLETION — "job deletion" named blocker. Mirrors every
+// other DELETE route's expectedVersion-in-body / handleServiceError pattern.
+// services.ts's deleteJob() itself refuses (BusinessRuleError -> 409
+// business_rule) when an invoice or PO still FK-references this job, and
+// reverts a converted-from quote back to 'approved' in the same transaction
+// — see services.ts for the full rationale.
+router.delete('/jobs/:id', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireCutOver('jobs', res))) return;
+  try {
+    const id = Number(req.params.id);
+    const expectedVersion = Number(req.body?.expectedVersion);
+    if (!Number.isFinite(id) || !Number.isFinite(expectedVersion)) {
+      res.status(400).json({ error: '"id" (path) and "expectedVersion" (body) must be numbers' }); return;
+    }
+    const result = await deleteJob(id, expectedVersion);
+    res.json({ success: true, deleted: result.deleted });
+  } catch (err) { handleServiceError(err, res); }
+});
+
+// ── ACC INVOICES ─────────────────────────────────────────────────────────
+// CUTOVER BLOCKER COMPLETION — "manual invoicing" / "invoice deletion" named
+// blockers. Distinct from POST /jobs/:id/create-invoice above (which derives
+// an invoice FROM a job's own lines) — these three routes are for a
+// standalone/manual invoice (AccountingPage's "new invoice" flow) and for
+// editing/deleting any accInvoices row regardless of how it was created.
+router.post('/invoices', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireCutOver('accInvoices', res))) return;
+  try {
+    const {
+      companyCode, customerId, contactName, contactEmail, contactAddress,
+      reference, status, issueDate, dueDate, lines,
+    } = req.body || {};
+    if (!companyCode || typeof companyCode !== 'string') {
+      res.status(400).json({ error: '"companyCode" is required' }); return;
+    }
+    if (!Array.isArray(lines) || lines.length === 0) {
+      res.status(400).json({ error: 'a non-empty "lines" array is required' }); return;
+    }
+    const result = await createManualInvoice({
+      companyCode, customerId, contactName, contactEmail, contactAddress,
+      reference, status, issueDate, dueDate, lines,
+    });
+    res.status(201).json({ success: true, id: result.id, invoiceNumber: result.invoiceNumber, rowVersion: result.rowVersion });
+  } catch (err) { handleServiceError(err, res); }
+});
+
+router.put('/invoices/:id', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireCutOver('accInvoices', res))) return;
+  try {
+    const id = Number(req.params.id);
+    const expectedVersion = Number(req.body?.expectedVersion);
+    if (!Number.isFinite(id) || !Number.isFinite(expectedVersion)) {
+      res.status(400).json({ error: '"id" (path) and "expectedVersion" (body) must be numbers' }); return;
+    }
+    const { expectedVersion: _ev, ...patch } = req.body || {};
+    const result = await updateInvoice(id, expectedVersion, patch);
+    res.json({ success: true, rowVersion: result.rowVersion });
+  } catch (err) { handleServiceError(err, res); }
+});
+
+router.delete('/invoices/:id', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireCutOver('accInvoices', res))) return;
+  try {
+    const id = Number(req.params.id);
+    const expectedVersion = Number(req.body?.expectedVersion);
+    if (!Number.isFinite(id) || !Number.isFinite(expectedVersion)) {
+      res.status(400).json({ error: '"id" (path) and "expectedVersion" (body) must be numbers' }); return;
+    }
+    const result = await deleteInvoice(id, expectedVersion);
+    res.json({ success: true, deleted: result.deleted });
   } catch (err) { handleServiceError(err, res); }
 });
 

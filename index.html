@@ -266,10 +266,24 @@ const relationalApi = {
   updateCustomer(id, expectedVersion, patch) { return relationalFetch('/customers/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
   createQuote(data) { return relationalFetch('/quotes', { method: 'POST', body: JSON.stringify(data) }); },
   updateQuote(id, expectedVersion, patch) { return relationalFetch('/quotes/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
+  // CUTOVER BLOCKER COMPLETION — "quote status actions" named blocker. A
+  // deliberately SEPARATE endpoint from updateQuote above (see api.ts's
+  // comment on PATCH /quotes/:id/status) — status transitions never go
+  // through the job-cascading PUT /quotes/:id route.
+  updateQuoteStatus(id, expectedVersion, status) { return relationalFetch('/quotes/' + id + '/status', { method: 'PATCH', body: JSON.stringify({ expectedVersion: expectedVersion, status: status }) }); },
   convertQuoteToJob(quoteId) { return relationalFetch('/quotes/' + quoteId + '/convert-to-job', { method: 'POST' }); },
   finalizeProforma(quoteId) { return relationalFetch('/quotes/' + quoteId + '/finalize-proforma', { method: 'POST' }); },
   updateJob(id, expectedVersion, patch) { return relationalFetch('/jobs/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
+  // CUTOVER BLOCKER COMPLETION — "job deletion" named blocker.
+  deleteJob(id, expectedVersion) { return relationalFetch('/jobs/' + id, { method: 'DELETE', body: JSON.stringify({ expectedVersion: expectedVersion }) }); },
   createInvoiceForJob(jobId) { return relationalFetch('/jobs/' + jobId + '/create-invoice', { method: 'POST' }); },
+  // CUTOVER BLOCKER COMPLETION — "manual invoicing" / "invoice deletion"
+  // named blockers. Distinct from createInvoiceForJob above (derives an
+  // invoice FROM a job); these are for a standalone/manual invoice and for
+  // editing/deleting any accInvoices row regardless of how it was created.
+  createInvoice(data) { return relationalFetch('/invoices', { method: 'POST', body: JSON.stringify(data) }); },
+  updateInvoice(id, expectedVersion, patch) { return relationalFetch('/invoices/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
+  deleteInvoice(id, expectedVersion) { return relationalFetch('/invoices/' + id, { method: 'DELETE', body: JSON.stringify({ expectedVersion: expectedVersion }) }); },
   recordPayment(ownerType, ownerId, amount, extra) { return relationalFetch('/payments', { method: 'POST', body: JSON.stringify(Object.assign({ ownerType: ownerType, ownerId: ownerId, amount: amount }, extra || {})) }); },
   // ownerSection ('jobs'/'accInvoices'/'quotes') is required by the server —
   // a payment has no independent JSON section of its own (read.ts's
@@ -8142,7 +8156,36 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     editQuoteBaseRef.current = null;
     setEditQuote(null);
   }
-  function handleUpdate(updated){
+  // CUTOVER BLOCKER COMPLETION — "quote status actions" named blocker
+  // (mark sent / approve / decline / admin reinstate — this is the ONE
+  // choke point all of those route through, via onUpdate={q=>{handleUpdate(q);...}}
+  // above). When "quotes" is relational-authoritative this now persists the
+  // status through relationalApi.updateQuoteStatus (PATCH /quotes/:id/status
+  // -> services.ts's plain updateQuote) instead of silently only updating
+  // local React state. The JSON-specific side effects below it (removing a
+  // declined quote's linked job from the `jobs` array; syncing job.payments/
+  // invoiceStatus from the quote) are deliberately SKIPPED in the relational
+  // branch — they were JSON-only sync mechanisms with no relational
+  // equivalent needed: relational jobs already manage their own status/
+  // payments independently (deleteJob/updateJob/recordPayment), and a job
+  // whose source quote gets declined is not auto-deleted relationally (that
+  // would be a surprising, undocumented cascade this task was not asked to
+  // introduce — an admin can still delete the job explicitly via deleteJob
+  // if that's genuinely intended). On failure the optimistic status change
+  // is NOT applied — the quote's on-screen status stays whatever it actually
+  // is server-side, per the "rejected saves preserve the user's draft" rule.
+  async function handleUpdate(updated){
+    if(isRelationalAuthoritative('quotes') && updated._relId!=null){
+      try {
+        const result = await relationalApi.updateQuoteStatus(updated._relId, updated._relRowVersion, updated.status);
+        const applied = {...updated, _relRowVersion: result.rowVersion};
+        setQuotes(prev=>prev.map(q=>q.id===applied.id?applied:q));
+        setViewQuote(applied);
+      } catch(e){
+        alert(describeSaveConflictError(e, 'quote')+'\n\nThe status change was NOT saved.');
+      }
+      return;
+    }
     setQuotes(prev=>prev.map(q=>q.id===updated.id?updated:q));
     // If the quote is declined, remove any job it was converted into so it no
     // longer shows up in Jobs / Accounting / Dashboard.
@@ -13279,7 +13322,17 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     }
     setJobs(prev=>prev.map(j=>j.id===job.id?{...j,stage:ns,status:nextStatus}:j));
   }
-  function deleteJob(){
+  // CUTOVER BLOCKER COMPLETION — "job deletion" named blocker. When "jobs"
+  // is relational-authoritative this now goes through relationalApi.deleteJob
+  // (services.ts's deleteJob: locks the row, reverts a converted-from quote
+  // back to 'approved' and clears its link, deletes the job's own rel_payments
+  // rows, then deletes the job — all in one transaction, refusing with a
+  // clear error if an invoice or PO still references this job) instead of
+  // the JSON-only filter+quote-unlink below. On failure we deliberately do
+  // NOT call onBack() — the user stays on the job so the failure (e.g. a
+  // linked invoice/PO blocking the delete, or a stale row) is visible rather
+  // than silently navigating away from an un-deleted record.
+  async function deleteJob(){
     // Warn clearly if this job has an invoice number and/or recorded
     // payments — deleting the job discards that history too. Delete logic
     // itself (below) is unchanged.
@@ -13289,18 +13342,28 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     const deleteWarning = linkBits.length>0
       ? `Delete job ${job.num} — ${job.client}?\n\nThis job has ${linkBits.join(' and ')} linked to it — deleting the job will permanently remove that history too, and may affect statements and accounting totals.\n\nThis cannot be undone.`
       : `Delete job ${job.num} — ${job.client}? This cannot be undone.`;
-    if(window.confirm(deleteWarning)){
-      setJobs(prev=>prev.filter(j=>j.id!==job.id));
-      // Unlink the source quote so it no longer points at a deleted job
-      if(setQuotes && (job.quoteNum || job.id)){
-        setQuotes(prev=>prev.map(q=>{
-          const linked = (q.convertedJobId===job.id) || (job.quoteNum && q.num===job.quoteNum);
-          if(!linked) return q;
-          return {...q, convertedJobId:null, status: q.status==='converted' ? 'approved' : q.status};
-        }));
+    if(!window.confirm(deleteWarning)) return;
+    if(isRelationalAuthoritative('jobs') && job._relId!=null){
+      try {
+        await relationalApi.deleteJob(job._relId, job._relRowVersion);
+      } catch(e){
+        alert(describeSaveConflictError(e, 'job')+'\n\nThe job was NOT deleted.');
+        return;
       }
+      setJobs(prev=>prev.filter(j=>j.id!==job.id));
       onBack();
+      return;
     }
+    setJobs(prev=>prev.filter(j=>j.id!==job.id));
+    // Unlink the source quote so it no longer points at a deleted job
+    if(setQuotes && (job.quoteNum || job.id)){
+      setQuotes(prev=>prev.map(q=>{
+        const linked = (q.convertedJobId===job.id) || (job.quoteNum && q.num===job.quoteNum);
+        if(!linked) return q;
+        return {...q, convertedJobId:null, status: q.status==='converted' ? 'approved' : q.status};
+      }));
+    }
+    onBack();
   }
   function updateBd(key,val){
     setBd(prev=>({...prev,[key]:parseFloat(val)||0}));
@@ -16559,13 +16622,20 @@ function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user
         )
       }
 
+      {/* CUTOVER BLOCKER COMPLETION — 2nd named PO gap: onEmail's "sent"
+          status transition (fired after Approve+Email succeeds — see
+          PODetailModal.handleApproveEmail) used to write purchaseOrders JSON
+          state directly, bypassing updatePO's already-correct relational-vs-
+          JSON branch entirely. Now reuses updatePO itself so the "sent"
+          transition gets the exact same relational handling as every other
+          PO status change. */}
       {viewPO&&(
         <PODetailModal
           po={viewPO}
           suppliers={suppliers}
           onClose={()=>setViewPO(null)}
           onUpdate={updatePO}
-          onEmail={updated=>setPurchaseOrders(prev=>prev.map(p=>p.id===updated.id?{...updated,status:'sent'}:p))}
+          onEmail={updated=>updatePO({...updated, status:'sent'})}
         />
       )}
       {showCreate&&(
@@ -16968,14 +17038,50 @@ function QuickRatesModal({ quickRates, setQuickRates, suppliers, inventory, setI
     setQuickRates(prev=>prev.find(x=>x.id===item.id) ? prev.map(x=>x.id===item.id?item:x) : [...prev,item]);
   }
 
-  function moveToInventory(item) {
+  // CUTOVER BLOCKER COMPLETION — Quick Rates -> Inventory "promote" actions
+  // were unconditionally JSON-only even after "inventory" became relational-
+  // authoritative (a confirmed audit gap: create is relational everywhere
+  // else in Inventory, but this sibling action silently wrote JSON). quickRates
+  // itself STAYS JSON permanently (established decision) — only the resulting
+  // Inventory row needs to go through the relational API when "inventory" is
+  // cut over, mirroring InventoryPage's own saveItem/adjustInventoryStock use.
+  async function moveToInventory(item) {
+    if (isRelationalAuthoritative('inventory')) {
+      try {
+        const patch = { sku: item.sku, name: item.name, category: item.cat, unit: item.unit, cost: item.cost, sell: item.sell, stock: item.stock, reorder: item.reorder, supplierId: item.supplierId||null };
+        const result = await relationalApi.createInventoryItem(patch);
+        setInventory(prev=>[...prev, { ...item, id: result.id, supplierId: item.supplierId||null, _relId: result.id, _relRowVersion: result.rowVersion }]);
+      } catch(e) {
+        alert(describeSaveConflictError(e, 'inventory item'));
+        return;
+      }
+      setQuickRates(prev=>prev.filter(x=>x.id!==item.id));
+      setPendingMove(null);
+      return;
+    }
     const newItem = { ...item, id: Date.now(), supplierId: item.supplierId||null };
     setInventory(prev=>[...prev, newItem]);
     setQuickRates(prev=>prev.filter(x=>x.id!==item.id));
     setPendingMove(null);
   }
 
-  function mergeIntoInventory(qrItem, invTargetId) {
+  async function mergeIntoInventory(qrItem, invTargetId) {
+    if (isRelationalAuthoritative('inventory')) {
+      const target = (inventory||[]).find(i=>i.id===invTargetId);
+      if (target && target._relId!=null) {
+        try {
+          const delta = Number(qrItem.stock)||0;
+          const result = await relationalApi.adjustInventoryStock(target._relId, target._relRowVersion, delta);
+          setInventory(prev=>prev.map(i=>i.id!==invTargetId?i:{ ...i, stock: result.newStock, _relRowVersion: result.rowVersion }));
+        } catch(e) {
+          alert(describeSaveConflictError(e, 'inventory item'));
+          return;
+        }
+        setQuickRates(prev=>prev.filter(x=>x.id!==qrItem.id));
+        setPendingMove(null);
+        return;
+      }
+    }
     setInventory(prev=>prev.map(i=>{
       if(i.id!==invTargetId) return i;
       return { ...i, stock: (Number(i.stock)||0)+(Number(qrItem.stock)||0) };
@@ -17251,12 +17357,45 @@ function QuickRatesPanel({ quickRates, setQuickRates, suppliers, inventory, setI
     }
     setQuickRates(prev=>prev.find(x=>x.id===item.id)?prev.map(x=>x.id===item.id?item:x):[...prev,item]);
   }
-  function moveToInventory(item) {
+  // CUTOVER BLOCKER COMPLETION — same fix as QuickRatesModal's identical
+  // pair of functions above: quickRates stays JSON permanently, but the
+  // Inventory row this promotes/merges into must go through the relational
+  // API once "inventory" is cut over.
+  async function moveToInventory(item) {
+    if (isRelationalAuthoritative('inventory')) {
+      try {
+        const patch = { sku: item.sku, name: item.name, category: item.cat, unit: item.unit, cost: item.cost, sell: item.sell, stock: item.stock, reorder: item.reorder, supplierId: item.supplierId||null };
+        const result = await relationalApi.createInventoryItem(patch);
+        setInventory(prev=>[...prev, { ...item, id: result.id, supplierId: item.supplierId||null, _relId: result.id, _relRowVersion: result.rowVersion }]);
+      } catch(e) {
+        alert(describeSaveConflictError(e, 'inventory item'));
+        return;
+      }
+      setQuickRates(prev=>prev.filter(x=>x.id!==item.id));
+      setPendingMove(null);
+      return;
+    }
     setInventory(prev=>[...prev,{...item,id:Date.now(),supplierId:item.supplierId||null}]);
     setQuickRates(prev=>prev.filter(x=>x.id!==item.id));
     setPendingMove(null);
   }
-  function mergeIntoInventory(qrItem, invTargetId) {
+  async function mergeIntoInventory(qrItem, invTargetId) {
+    if (isRelationalAuthoritative('inventory')) {
+      const target = (inventory||[]).find(i=>i.id===invTargetId);
+      if (target && target._relId!=null) {
+        try {
+          const delta = Number(qrItem.stock)||0;
+          const result = await relationalApi.adjustInventoryStock(target._relId, target._relRowVersion, delta);
+          setInventory(prev=>prev.map(i=>i.id!==invTargetId?i:{ ...i, stock: result.newStock, _relRowVersion: result.rowVersion }));
+        } catch(e) {
+          alert(describeSaveConflictError(e, 'inventory item'));
+          return;
+        }
+        setQuickRates(prev=>prev.filter(x=>x.id!==qrItem.id));
+        setPendingMove(null);
+        return;
+      }
+    }
     setInventory(prev=>prev.map(i=>i.id!==invTargetId?i:{...i,stock:(Number(i.stock)||0)+(Number(qrItem.stock)||0)}));
     setQuickRates(prev=>prev.filter(x=>x.id!==qrItem.id));
     setPendingMove(null);
@@ -19070,10 +19209,40 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
         setSaving(false);
       }
     }
+    // CUTOVER BLOCKER COMPLETION — "Accounting-view payments" named blocker.
+    // This modal (invoked from AccountingPage's own Invoice view) duplicated
+    // QuotePaymentsModal's add/edit/delete-payment functionality but was
+    // unconditionally JSON — a confirmed audit gap (one payments UI relational,
+    // another silently writing JSON). Fixed identically to QuotePaymentsModal's
+    // own resolvePaymentOwner/relationalApi pattern, simplified here since the
+    // owner is always unambiguous: this invoice (`inv`), never polymorphic
+    // across job/quote. Credit-method cross-authority safety (creditNotes must
+    // also be cut over) is enforced SERVER-SIDE (api.ts's POST/DELETE
+    // /payments already check this) — errors surface via describeSaveConflictError.
     async function addPayment() {
       if(saving) return;
       if(!amount||parseFloat(amount)<=0){alert('Enter a valid amount');return;}
       const amt = parseFloat(amount);
+      if(isRelationalAuthoritative('accInvoices') && inv._relId!=null){
+        if(method==='Credit' && amt > availableCredit + 0.005){
+          alert(`${inv.contactName} only has ${fmtAmt(availableCredit)} of available credit. Reduce the amount, issue another credit note first, or choose a different payment method.`);
+          return;
+        }
+        setSaveErr('');
+        setSaving(true);
+        try {
+          const result = await relationalApi.recordPayment('invoice', inv._relId, amt, { date, method, notes: notes.trim() });
+          const newP = {id:Date.now(),date,method,amount:amt,notes:notes.trim(), _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion};
+          setPayments(prev=>[...prev,newP]);
+          setAmount(''); setNotes('');
+          onSaved && onSaved({...inv, payments:[...payments,newP]});
+        } catch(e){
+          setSaveErr(describeSaveConflictError(e, 'payment'));
+        } finally {
+          setSaving(false);
+        }
+        return;
+      }
       let creditNotesOverride = null;
       if(method==='Credit'){
         if(amt > availableCredit + 0.005){
@@ -19098,6 +19267,19 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
       if(!isAdmin){alert('Only admins can delete payments.');return;}
       if(!window.confirm('Delete this payment? This may change the invoice status.'))return;
       const removed = payments.find(p=>p.id===pid);
+      if(isRelationalAuthoritative('accInvoices') && removed && removed._relPaymentId!=null){
+        setSaveErr('');
+        setSaving(true);
+        try {
+          await relationalApi.deletePayment(removed._relPaymentId, removed._relRowVersion, 'accInvoices');
+          setPayments(prev=>prev.filter(p=>p.id!==pid));
+        } catch(e){
+          setSaveErr(describeSaveConflictError(e, 'payment'));
+        } finally {
+          setSaving(false);
+        }
+        return;
+      }
       let creditNotesOverride = null;
       if(removed && removed.method==='Credit'){
         creditNotesOverride = releaseCreditNoteUsage(creditNotes, inv.contactName, parseFloat(removed.amount)||0);
@@ -19116,6 +19298,19 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
       const p = payments.find(x=>x.id===pid);
       const patch = promptEditPayment(p);
       if(!patch) return;
+      if(isRelationalAuthoritative('accInvoices') && p && p._relPaymentId!=null){
+        setSaveErr('');
+        setSaving(true);
+        try {
+          const result = await relationalApi.updatePayment(p._relPaymentId, p._relRowVersion, 'accInvoices', patch);
+          setPayments(prev=>prev.map(x=>x.id===pid?{...x, ...patch, _relRowVersion:result.rowVersion}:x));
+        } catch(e){
+          setSaveErr(describeSaveConflictError(e, 'payment'));
+        } finally {
+          setSaving(false);
+        }
+        return;
+      }
       const updated = updatePaymentInSource(payments, pid, patch);
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':inv.status;
@@ -19285,6 +19480,47 @@ async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll
   // has no `co` at all (should not happen in practice, but never worse than
   // the prior behaviour).
   const currentUserCo = (user && user.co !== undefined && user.co !== null) ? user.co : 2;
+  // CUTOVER BLOCKER COMPLETION — "manual invoicing" / "invoice deletion"
+  // named blockers. When "accInvoices" is relational-authoritative, create
+  // and edit both go straight through the relational REST API instead of the
+  // JSON number-reservation/duplicate-recovery machinery below — relational
+  // numbering (services.ts's reserveDocumentNumberWithClient, company-scoped
+  // exactly like createInvoiceForJob's own reservation) is atomic/collision-
+  // free by construction, so the "suggest a free number and retry" recovery
+  // flow that follows has no relational equivalent needed.
+  if(isRelationalAuthoritative('accInvoices')){
+    const relCo = isHoldingsUser(user) ? HOLDINGS_CO_ID : currentUserCo;
+    const lines = (inv.lineItems||[]).map(l=>({
+      description: l.description||'', qty: parseFloat(l.qty)||0, unitAmount: parseFloat(l.unitAmount)||0,
+      accountCode: l.accountCode||null, taxType: l.taxType||null,
+    }));
+    try {
+      if(inv._relId!=null){
+        const result = await relationalApi.updateInvoice(inv._relId, inv._relRowVersion, {
+          contactName: inv.contactName, contactEmail: inv.contactEmail||null, contactAddress: inv.contactAddress||null,
+          reference: inv.reference||null, status: inv.status||null,
+          issueDate: inv.date||null, dueDate: inv.dueDate||null, lines,
+        });
+        const tagged = { ...inv, co: relCo, _relRowVersion: result.rowVersion };
+        const nextAccInvoices = (accInvoicesAll||[]).map(i=>i.id===tagged.id?tagged:i);
+        setAccInvoices(nextAccInvoices);
+        return true;
+      } else {
+        const result = await relationalApi.createInvoice({
+          companyCode: relCo, contactName: inv.contactName, contactEmail: inv.contactEmail||null, contactAddress: inv.contactAddress||null,
+          reference: inv.reference||null, status: inv.status||null,
+          issueDate: inv.date||null, dueDate: inv.dueDate||null, lines,
+        });
+        const tagged = { ...inv, id: result.id, number: result.invoiceNumber, co: relCo, _relId: result.id, _relRowVersion: result.rowVersion };
+        const nextAccInvoices = [tagged, ...(accInvoicesAll||[])];
+        setAccInvoices(nextAccInvoices);
+        return true;
+      }
+    } catch(e){
+      alert(describeSaveConflictError(e, 'invoice')+'\n\nThe invoice was NOT saved.');
+      return false;
+    }
+  }
   let working = inv;
   if(!working.number){
     const co = isHoldingsUser(user) ? HOLDINGS_CO_ID : currentUserCo;
@@ -19667,7 +19903,12 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     setAccBills(prev => prev.find(b=>b.id===tagged.id) ? prev.map(b=>b.id===tagged.id?tagged:b) : [tagged,...prev]);
     setShowBillModal(false); setEditBill(null);
   }
-  function deleteInvoice(id){
+  // CUTOVER BLOCKER COMPLETION — "invoice deletion" named blocker. Previously
+  // unconditionally JSON with no relational gate at all — a confirmed audit
+  // gap (create/read relational, delete silently JSON-only). Now routes
+  // through relationalApi.deleteInvoice (services.ts's deleteInvoice) when
+  // "accInvoices" is relational-authoritative.
+  async function deleteInvoice(id){
     // Warn clearly if this invoice has payment history attached — deleting
     // it discards that history too. Delete logic itself is unchanged.
     const inv = accInvoices.find(i=>i.id===id);
@@ -19675,14 +19916,45 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     const warn = payCount>0
       ? `This invoice has ${payCount} recorded payment${payCount>1?'s':''} against it. Deleting the invoice will permanently remove that payment history too, and may affect statements and accounting totals.\n\nDelete anyway?`
       : 'Delete this invoice? This cannot be undone.';
-    if(window.confirm(warn)) setAccInvoices(prev=>prev.filter(i=>i.id!==id));
+    if(!window.confirm(warn)) return;
+    if(isRelationalAuthoritative('accInvoices') && inv && inv._relId!=null){
+      try {
+        await relationalApi.deleteInvoice(inv._relId, inv._relRowVersion);
+      } catch(e){
+        alert(describeSaveConflictError(e, 'invoice')+'\n\nThe invoice was NOT deleted.');
+        return;
+      }
+      setAccInvoices(prev=>prev.filter(i=>i.id!==id));
+      return;
+    }
+    setAccInvoices(prev=>prev.filter(i=>i.id!==id));
   }
   function deleteBill(id){ if(window.confirm('Delete this bill?')) setAccBills(prev=>prev.filter(b=>b.id!==id)); }
-  function markInvPaid(inv){
+  // CUTOVER BLOCKER COMPLETION — relational payments are separate rel_payments
+  // rows, not an embedded array on the invoice, so this can't just route
+  // through saveInvoice/saveManualInvoice (whose relational branch doesn't
+  // touch payments at all). Special-cased: records the remaining balance
+  // directly via relationalApi.recordPayment, which ALSO recomputes the
+  // invoice's own paid/partial/outstanding status server-side
+  // (services.ts's recomputeOwnerPaymentStatus) — the local state update
+  // below is a best-effort mirror only, matching the pattern already used
+  // elsewhere in this file; the next platform-state read is authoritative.
+  async function markInvPaid(inv){
     const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
     const alreadyPaid=(inv.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
     const remaining=Math.max(0,invTotal-alreadyPaid);
     const today=new Date().toISOString().slice(0,10);
+    if(isRelationalAuthoritative('accInvoices') && inv._relId!=null){
+      if(remaining<=0){ return; } // already fully paid — nothing to record
+      try {
+        const result = await relationalApi.recordPayment('invoice', inv._relId, remaining, { date:today, method:'EFT', notes:'Quick mark paid' });
+        const newP = {id:Date.now(), date:today, method:'EFT', amount:remaining, notes:'Quick mark paid', _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion};
+        setAccInvoices(prev=>prev.map(i=>i.id===inv.id?{...i, status:'paid', paidDate:today, payments:[...(i.payments||[]),newP]}:i));
+      } catch(e){
+        alert(describeSaveConflictError(e, 'invoice')+'\n\nThe payment was NOT recorded.');
+      }
+      return;
+    }
     const newPayments=remaining>0?[...(inv.payments||[]),{id:Date.now(),date:today,method:'EFT',amount:remaining,notes:'Quick mark paid'}]:(inv.payments||[]);
     saveInvoice({...inv, status:'paid', paidDate:today, payments:newPayments});
   }

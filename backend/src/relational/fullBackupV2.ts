@@ -69,6 +69,29 @@ const ALL_JSON_SECTIONS = [
   'completeProducts', 'payrollRecords', 'quickRates', 'proposedProjects', 'creditNotes',
 ];
 
+// CUTOVER BLOCKER COMPLETION — closes Full Backup V2 gap #1 (no raw rel_*
+// table dump — only a JSON-shaped rendering of currently-cut-over sections)
+// and gap #2 (document_number_counters entirely absent). Every rel_* table
+// from migration 007 (business data) PLUS the two supporting tables that are
+// genuinely recovery-critical once relational authority begins: without
+// document_number_counters, restoring only rel_jobs/rel_quotes/etc but not the
+// atomic counters they were numbered from risks a future document reusing an
+// already-issued number after a restore; without quote_conversions, a
+// restored database loses the quote<->job conversion history the JSON-side
+// read overlay depends on (see services.ts's convertQuoteToJob/deleteJob).
+// This is read UNCONDITIONALLY — every table, every row — regardless of
+// which sections are currently cut over, because a genuinely full recovery
+// must be possible even for a section that gets cut over AFTER this backup
+// was taken but before the next one.
+const RAW_REL_TABLES = [
+  'rel_companies', 'rel_customers', 'rel_suppliers', 'rel_inventory_items',
+  'rel_quick_rate_items', 'rel_quotes', 'rel_quote_line_items', 'rel_jobs',
+  'rel_job_line_items', 'rel_invoices', 'rel_invoice_line_items', 'rel_payments',
+  'rel_credit_notes', 'rel_purchase_orders', 'rel_purchase_order_items',
+  'rel_employees', 'rel_leave_requests', 'rel_disciplinary_records',
+];
+const RAW_SUPPORTING_TABLES = ['document_number_counters', 'quote_conversions'];
+
 function arr(v: unknown): any[] { return Array.isArray(v) ? v : []; }
 
 export interface FullBackupV2Result {
@@ -97,11 +120,34 @@ export async function buildFullBackupV2(exportedByRole: string): Promise<FullBac
     const cutRes = await client.query('SELECT section, enabled FROM relational_cutover ORDER BY section');
     cutOverRows = cutRes.rows;
 
-    // Quarantine info (informational only — never resolved/guessed here).
+    // Quarantine info — aggregate counts (kept exactly as before, for the
+    // existing manifest.quarantinedGroupCounts field / backward compat).
     const qRes = await client.query(
       `SELECT collection, COUNT(DISTINCT source_id) AS n FROM relational_legacy_conflicts WHERE conflict_type = 'duplicate_source_id' GROUP BY collection`
     );
     for (const row of qRes.rows) quarantineCounts[row.collection] = Number(row.n);
+
+    // CUTOVER BLOCKER COMPLETION — closes Full Backup V2 gap #4: the actual
+    // quarantined records (not just aggregate counts above) are now captured
+    // too, so a recovery/reconciliation pass after a restore can see exactly
+    // WHICH source records were quarantined and why, not just how many.
+    const quarantineRecordsRes = await client.query(
+      `SELECT id, backfill_run_id, collection, source_id, document_number, conflict_type, detail, detected_at FROM relational_legacy_conflicts ORDER BY collection, source_id, id`
+    );
+    const quarantineRecords = quarantineRecordsRes.rows;
+
+    // CUTOVER BLOCKER COMPLETION — closes gap #1 (raw rel_* table dump) and
+    // gap #2 (document_number_counters absent). Read every table raw, inside
+    // this same REPEATABLE READ snapshot, regardless of cutover state.
+    const rawTables: Record<string, any[]> = {};
+    for (const table of RAW_REL_TABLES) {
+      const res = await client.query(`SELECT * FROM ${table}`);
+      rawTables[table] = res.rows;
+    }
+    for (const table of RAW_SUPPORTING_TABLES) {
+      const res = await client.query(`SELECT * FROM ${table}`);
+      rawTables[table] = res.rows;
+    }
 
     // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: capture the RAW
     // historical JSON purchaseOrders array exactly as it stands in
@@ -152,6 +198,29 @@ export async function buildFullBackupV2(exportedByRole: string): Promise<FullBac
     // distinction.
     effectiveData.purchaseOrdersLegacyArchive = legacyPurchaseOrdersArchive;
 
+    // CUTOVER BLOCKER COMPLETION — closes gap #3: relational_cutover's RAW
+    // per-section state, captured unconditionally (regardless of the env
+    // master switch), covering EVERY section in ALL_SECTIONS including
+    // "payments" (which sectionAuthority/perSectionAuthority above can never
+    // represent — it has no standalone JSON key, see SECTION_JSON_KEY). This
+    // is the ground truth a restore/reconciliation tool should trust instead
+    // of the derived perSectionAuthority summary, which — by design, for its
+    // OWN documented purpose of describing "what does data.json currently
+    // contain" — collapses to 'json' for every section whenever the master
+    // switch happens to be off at backup time, even if the DB rows say
+    // enabled=true underneath.
+    const cutoverStateRaw = cutOverRows.map(r => ({ section: r.section, enabled: r.enabled }));
+
+    // A single new file (relational-raw.json), additive alongside the
+    // existing data.json/manifest.json — nothing already in the archive is
+    // removed, restructured, or reinterpreted.
+    const relationalRaw = {
+      relTables: rawTables,
+      cutoverStateRaw,
+      relationalAuthorityMasterSwitchEnabled: masterSwitch,
+      quarantineRecords,
+    };
+
     await client.query('COMMIT');
 
     // ── Assemble manifest + payload ──────────────────────────────────────
@@ -166,6 +235,12 @@ export async function buildFullBackupV2(exportedByRole: string): Promise<FullBac
 
     const dataJson = JSON.stringify(effectiveData, null, 2);
     const checksum = crypto.createHash('sha256').update(dataJson, 'utf8').digest('hex');
+
+    const rawRecordCounts: Record<string, number> = {};
+    for (const table of [...RAW_REL_TABLES, ...RAW_SUPPORTING_TABLES]) rawRecordCounts[table] = arr(rawTables[table]).length;
+    rawRecordCounts.quarantineRecords = arr(quarantineRecords).length;
+    const relationalRawJson = JSON.stringify(relationalRaw, null, 2);
+    const relationalRawChecksum = crypto.createHash('sha256').update(relationalRawJson, 'utf8').digest('hex');
 
     // ── Verification against silent partial failure ──────────────────────
     // Recompute counts from the EXACT bytes about to be archived (parse
@@ -188,6 +263,22 @@ export async function buildFullBackupV2(exportedByRole: string): Promise<FullBac
         throw new Error(`Full Backup V2 verification FAILED: purchaseOrdersLegacyArchive expected ${expected} record(s) but the serialized archive would contain ${actual} — aborting export, nothing was written.`);
       }
     }
+    // Same silent-partial-failure verification, applied to relational-raw.json.
+    const reparsedRaw = JSON.parse(relationalRawJson);
+    for (const table of [...RAW_REL_TABLES, ...RAW_SUPPORTING_TABLES]) {
+      const expected = rawRecordCounts[table];
+      const actual = arr(reparsedRaw.relTables && reparsedRaw.relTables[table]).length;
+      if (actual !== expected) {
+        throw new Error(`Full Backup V2 verification FAILED: raw table "${table}" expected ${expected} record(s) but the serialized archive would contain ${actual} — aborting export, nothing was written.`);
+      }
+    }
+    {
+      const expected = rawRecordCounts.quarantineRecords;
+      const actual = arr(reparsedRaw.quarantineRecords).length;
+      if (actual !== expected) {
+        throw new Error(`Full Backup V2 verification FAILED: quarantineRecords expected ${expected} record(s) but the serialized archive would contain ${actual} — aborting export, nothing was written.`);
+      }
+    }
 
     const fileStamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
     const filename = `signacore-platform-full-backup-v2-${fileStamp}.zip`;
@@ -204,6 +295,17 @@ export async function buildFullBackupV2(exportedByRole: string): Promise<FullBac
       quarantinedGroupCounts: quarantineCounts,
       dataJsonSha256: checksum,
       dataJsonBytes: Buffer.byteLength(dataJson, 'utf8'),
+      // CUTOVER BLOCKER COMPLETION — closes Full Backup V2 gaps #1-#4 (see
+      // relational-raw.json below): raw rel_* tables + document_number_
+      // counters + quote_conversions (gaps #1/#2), the raw per-section
+      // relational_cutover state including "payments" (gap #3, ground truth
+      // — see cutoverStateRaw's own comment above for why this differs from
+      // perSectionAuthority), and full quarantined records, not just counts
+      // (gap #4).
+      relationalRawSha256: relationalRawChecksum,
+      relationalRawBytes: Buffer.byteLength(relationalRawJson, 'utf8'),
+      relationalRawRecordCounts: rawRecordCounts,
+      cutoverStateRaw,
       // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: an explicit,
       // human-readable field distinguishing the ACTIVE purchase-order
       // dataset from the LEGACY JSON PURCHASE ORDER ARCHIVE, so nobody
@@ -227,9 +329,10 @@ export async function buildFullBackupV2(exportedByRole: string): Promise<FullBac
       contents: {
         'manifest.json': 'this file',
         'data.json': 'the full, unfiltered, both-companies business-data blob — same shape platform_state.data has always had, with relational-authoritative sections (see perSectionAuthority) rendered fresh from the relational tables instead of read from the (possibly frozen) platform_state row. See purchaseOrdersDataset above for the one section with a distinct active-vs-archive split.',
+        'relational-raw.json': 'RAW relational recovery data, additive alongside data.json: every rel_* table (business rows AND child line items) exactly as stored, document_number_counters, quote_conversions, the raw relational_cutover per-section rows (cutoverStateRaw — includes "payments", which has no JSON-section equivalent), and the full quarantined-record list (relational_legacy_conflicts), not just aggregate counts. Read this file to reconstruct actual relational-authoritative state after a restore; data.json alone is a JSON-shaped RENDERING, not sufficient on its own to restore relational child records or document-number counters.',
       },
       excludes: 'app_users (accounts, password hashes), JWT secrets, and any other authentication material are never read or included by this export — same policy as the pre-V2 export.',
-      notes: 'A section with perSectionAuthority="relational" is the live source of truth for that section; the JSON copy inside data.json for that section is a fresh rendering, not platform_state\'s own (possibly stale, frozen-at-cutover) copy. purchaseOrders is the one exception with its own permanent archive copy — see purchaseOrdersDataset.',
+      notes: 'A section with perSectionAuthority="relational" is the live source of truth for that section; the JSON copy inside data.json for that section is a fresh rendering, not platform_state\'s own (possibly stale, frozen-at-cutover) copy. purchaseOrders is the one exception with its own permanent archive copy — see purchaseOrdersDataset. cutoverStateRaw is the ground truth for per-section relational authority — unlike perSectionAuthority (derived only for describing data.json\'s own JSON-key sections), it reflects the DB rows exactly as they stand, covers every section including "payments", and is not silently collapsed to "json" when relationalAuthorityMasterSwitchEnabled happens to be false at backup time.',
     };
 
     // ── Build the ZIP in memory ───────────────────────────────────────────
@@ -244,6 +347,7 @@ export async function buildFullBackupV2(exportedByRole: string): Promise<FullBac
     archive.pipe(passthrough);
     archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
     archive.append(dataJson, { name: 'data.json' });
+    archive.append(relationalRawJson, { name: 'relational-raw.json' });
     await archive.finalize();
     await done;
     const buffer = Buffer.concat(chunks);

@@ -81,7 +81,14 @@ async function main() {
     console.log('  (unzip CLI not available — skipping structural unzip check, relying on programmatic checks below)');
   }
   if (entries.length) {
-    ok(entries.some((l) => l.includes('manifest.json')) && entries.some((l) => l.includes('data.json')), 'ZIP contains exactly manifest.json and data.json', entries.join(' | '));
+    // CUTOVER BLOCKER COMPLETION: the ZIP now ALSO contains relational-raw.json
+    // (see fullBackupV2.ts's four Full Backup V2 gap fixes) — updated from
+    // "exactly manifest.json and data.json" to include the new file.
+    ok(
+      entries.some((l) => l.includes('manifest.json')) && entries.some((l) => l.includes('data.json')) && entries.some((l) => l.includes('relational-raw.json')),
+      'ZIP contains manifest.json, data.json AND relational-raw.json',
+      entries.join(' | ')
+    );
   }
 
   let dataJsonExtracted = '';
@@ -114,6 +121,29 @@ async function main() {
   const data2 = JSON.parse(result2.buffer.length ? extractDataJson(result2) : '{}');
   ok(data2.jobs?.some((j: any) => j.num === relJob.jobNumber), 'the backup\'s jobs array includes the RELATIONALLY-created job (never written to platform_state at all)', `looked for ${relJob.jobNumber}`);
   ok(!data2.jobs?.some((j: any) => j.num === 'SNS-BKP-1'), 'the STALE frozen platform_state.data.jobs copy (SNS-BKP-1) is correctly NOT what\'s in the backup once jobs is relational-authoritative — it is superseded by the live relational rendering');
+
+  console.log('\n[Full Backup V2] CUTOVER BLOCKER COMPLETION — the four Full Backup V2 gaps are closed (relational-raw.json)');
+  const raw2 = JSON.parse(result2.buffer.length ? extractNamedJson(result2, 'relational-raw.json') : '{}');
+  // Gap #1: a raw rel_* table dump (not just a JSON-shaped rendering) —
+  // rel_jobs should carry the actual DB row for relJob, with its real
+  // row_version/id/company_code columns, independent of read.ts's rendering.
+  ok(Array.isArray(raw2.relTables?.rel_jobs) && raw2.relTables.rel_jobs.some((r: any) => r.job_number === relJob.jobNumber), 'relational-raw.json.relTables.rel_jobs contains the raw DB row for the relationally-created job', JSON.stringify(raw2.relTables?.rel_jobs?.map((r: any) => r.job_number)));
+  ok(Array.isArray(raw2.relTables?.rel_quotes) && raw2.relTables.rel_quotes.some((r: any) => r.id === relQuote.id), 'relational-raw.json.relTables.rel_quotes contains the raw DB row for the source quote');
+  // Gap #2: document_number_counters was completely absent before — now present.
+  ok(Array.isArray(raw2.relTables?.document_number_counters) && raw2.relTables.document_number_counters.some((r: any) => r.doc_type === 'quote'), 'relational-raw.json.relTables.document_number_counters contains a "quote" counter row (previously entirely absent from Full Backup V2)', JSON.stringify(raw2.relTables?.document_number_counters));
+  ok(Array.isArray(raw2.relTables?.quote_conversions), 'relational-raw.json.relTables.quote_conversions is present (supports reconstructing quote<->job conversion history after a restore)');
+  // Gap #3: raw per-section relational_cutover state, including "payments"
+  // (which perSectionAuthority can never represent — no standalone JSON key),
+  // and NOT silently collapsed just because it happens to mirror the
+  // env-derived summary — this is the ground truth straight from the DB rows.
+  ok(Array.isArray(raw2.cutoverStateRaw) && raw2.cutoverStateRaw.some((r: any) => r.section === 'payments'), 'relational-raw.json.cutoverStateRaw includes a "payments" row (perSectionAuthority has no equivalent for this section at all)', JSON.stringify(raw2.cutoverStateRaw));
+  ok(raw2.cutoverStateRaw?.find((r: any) => r.section === 'jobs')?.enabled === true, 'relational-raw.json.cutoverStateRaw reports jobs.enabled=true, matching the DB row directly (ground truth, not a derived label)');
+  ok(raw2.relationalAuthorityMasterSwitchEnabled === true, 'relational-raw.json also carries the master switch state alongside the raw per-section rows');
+  // Gap #4: full quarantined records (not just aggregate counts) — array
+  // present and correctly shaped even when there happen to be zero right now.
+  ok(Array.isArray(raw2.quarantineRecords), 'relational-raw.json.quarantineRecords is a real array of full quarantine records (not just the pre-existing manifest.quarantinedGroupCounts aggregate)', JSON.stringify(raw2.quarantineRecords));
+  ok(typeof result2.manifest.relationalRawSha256 === 'string' && result2.manifest.relationalRawSha256.length === 64, 'manifest declares a sha256 checksum for relational-raw.json, same integrity guarantee as data.json');
+  ok(!!result2.manifest.relationalRawRecordCounts && typeof result2.manifest.relationalRawRecordCounts.rel_jobs === 'number', 'manifest.relationalRawRecordCounts covers the raw rel_* tables too, verified against the archived bytes exactly like recordCounts is for data.json');
 
   console.log('\n[Full Backup V2] PURCHASE ORDER MIGRATION POLICY CHANGE (2026-08-21) — active relational POs vs legacy JSON archive (tests #17/#18)');
   await pool.query(`TRUNCATE rel_purchase_order_items, rel_purchase_orders, rel_suppliers RESTART IDENTITY CASCADE`).catch(() => undefined);
@@ -190,17 +220,20 @@ async function main() {
 }
 
 function extractDataJson(result: { buffer: Buffer }): string {
-  // Minimal local re-extraction used only for the in-process assertion
-  // above (avoids depending on the `unzip` CLI being present in every test
-  // environment). archiver produces standard ZIP files; for a robust
-  // programmatic read, shell out to `unzip -p` via a temp file.
+  return extractNamedJson(result, 'data.json');
+}
+
+// CUTOVER BLOCKER COMPLETION: generalized from extractDataJson so the new
+// relational-raw.json file can be verified with the same in-process,
+// no-unzip-CLI-required approach.
+function extractNamedJson(result: { buffer: Buffer }, entryName: string): string {
   const os = require('os'); const fsx = require('fs'); const pathx = require('path');
   const { execFileSync } = require('child_process');
   const tmp = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'fbv2-extract-'));
   const zipPath = pathx.join(tmp, 'b.zip');
   fsx.writeFileSync(zipPath, result.buffer);
   try {
-    const out = execFileSync('unzip', ['-p', zipPath, 'data.json'], { encoding: 'utf8' });
+    const out = execFileSync('unzip', ['-p', zipPath, entryName], { encoding: 'utf8' });
     return out;
   } catch {
     return '{}';

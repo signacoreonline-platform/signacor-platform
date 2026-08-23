@@ -462,6 +462,136 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
   }
 }
 
+// FINAL CUTOVER BLOCKER COMPLETION (2026-08-22): until now the ONLY ways an
+// invoice could ever be created relationally were createInvoiceForJob and
+// finalizeProformaToInvoice below — a standalone "manual invoice" (no job,
+// no quote — Sales/Accounting's own New Invoice action) had no relational
+// path at all, and there was no PUT/DELETE for an invoice of any kind. That
+// meant once "accInvoices" cut over, manual invoicing, invoice editing, and
+// invoice deletion would all fail loud with no working replacement. These
+// three functions close that gap, reusing the exact same
+// reserve/lock/row_version/replace-lines conventions already established by
+// createQuote/updateQuote/createInvoiceForJob above — no new architecture.
+async function replaceInvoiceLinesTx(client: PoolClient, invoiceId: number, lines: InvoiceLineItemPatch[]): Promise<void> {
+  await client.query('DELETE FROM rel_invoice_line_items WHERE invoice_id = $1', [invoiceId]);
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    const qty = Number(l.qty) || 0;
+    const unitAmount = Number(l.unitAmount) || 0;
+    await client.query(
+      `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'{}'::jsonb)`,
+      [invoiceId, i, l.description ?? null, qty, unitAmount, l.accountCode ?? '4000', l.taxType ?? '15%']
+    );
+  }
+}
+
+export interface InvoiceLineItemPatch { description?: string | null; qty: number; unitAmount: number; accountCode?: string | null; taxType?: string | null }
+export interface CreateManualInvoiceInput {
+  companyCode: string; customerId?: number | null; contactName: string; contactEmail?: string | null;
+  contactAddress?: string | null; reference?: string | null; status?: string | null;
+  issueDate?: string | null; dueDate?: string | null; lines: InvoiceLineItemPatch[];
+}
+// A standalone invoice not tied to any job/quote — company-scoped
+// reservation (matches createInvoiceForJob's own reservation), never the
+// global counter used by job/po/creditNote.
+export async function createManualInvoice(input: CreateManualInvoiceInput): Promise<{ id: number; invoiceNumber: string; rowVersion: number }> {
+  if (!input.contactName || !input.contactName.trim()) throw new BusinessRuleError('"contactName" is required to create an invoice');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const invoiceNumber = await reserveDocumentNumberWithClient(client, input.companyCode, 'invoice');
+    const invRes = await client.query(
+      `WITH new_id AS (SELECT nextval('rel_invoices_id_seq') AS id)
+       INSERT INTO rel_invoices (id, source_id, invoice_number, company_code, customer_id, contact_name, contact_email, contact_address, reference, status, issue_date, due_date, legacy_data)
+       SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9::date, CURRENT_DATE), $10::date, '{}'::jsonb FROM new_id
+       RETURNING id, row_version`,
+      [invoiceNumber, input.companyCode, input.customerId ?? null, input.contactName.trim(), input.contactEmail ?? null,
+       input.contactAddress ?? null, input.reference ?? null, input.status ?? 'sent', input.issueDate ?? null, input.dueDate ?? null]
+    );
+    const invoiceId = invRes.rows[0].id;
+    await replaceInvoiceLinesTx(client, invoiceId, input.lines || []);
+    await client.query('COMMIT');
+    return { id: invoiceId, invoiceNumber, rowVersion: invRes.rows[0].row_version };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export interface InvoicePatchInput {
+  contactName?: string; contactEmail?: string | null; contactAddress?: string | null;
+  reference?: string | null; status?: string | null; issueDate?: string | null; dueDate?: string | null;
+  lines?: InvoiceLineItemPatch[];
+}
+export async function updateInvoice(id: number, expectedVersion: number, patch: Partial<InvoicePatchInput>): Promise<{ rowVersion: number }> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const curRes = await client.query('SELECT row_version FROM rel_invoices WHERE id = $1 FOR UPDATE', [id]);
+    if (curRes.rowCount === 0) throw new BusinessRuleError(`invoice ${id} not found`);
+    if (curRes.rows[0].row_version !== expectedVersion) throw new ConcurrencyConflictError('rel_invoices', id);
+
+    const colMap: Record<string, string> = {
+      contactName: 'contact_name', contactEmail: 'contact_email', contactAddress: 'contact_address',
+      reference: 'reference', status: 'status', issueDate: 'issue_date', dueDate: 'due_date',
+    };
+    const sets: string[] = []; const vals: any[] = [];
+    for (const [k, col] of Object.entries(colMap)) {
+      if ((patch as any)[k] !== undefined) { vals.push((patch as any)[k]); sets.push(`${col} = $${vals.length}`); }
+    }
+    const linesChanged = Array.isArray(patch.lines);
+    if (linesChanged) {
+      await replaceInvoiceLinesTx(client, id, patch.lines!);
+    }
+    if (sets.length === 0 && !linesChanged) {
+      await client.query('COMMIT');
+      return { rowVersion: curRes.rows[0].row_version };
+    }
+    vals.push(id); const idIdx = vals.length;
+    const setClause = sets.length ? sets.join(', ') + ', ' : '';
+    const res = await client.query(
+      `UPDATE rel_invoices SET ${setClause}row_version = row_version + 1, updated_at = NOW() WHERE id = $${idIdx} RETURNING row_version`,
+      vals
+    );
+    await client.query('COMMIT');
+    return { rowVersion: res.rows[0].row_version };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Mirrors the JSON path's deleteInvoice exactly (no job-side reversion —
+// the JSON path never had any either): drops this invoice's own payment
+// history (rel_payments.owner_id is polymorphic, not an FK, so it is never
+// touched by a cascade) and the invoice row itself. rel_invoice_line_items
+// is ON DELETE CASCADE. Does not touch the linked job (if any) — matches
+// existing JSON parity; job.invoice_created is a pre-existing, unrelated
+// simplification, not something introduced here.
+export async function deleteInvoice(id: number, expectedVersion: number): Promise<{ deleted: true }> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const curRes = await client.query('SELECT row_version FROM rel_invoices WHERE id = $1 FOR UPDATE', [id]);
+    if (curRes.rowCount === 0) throw new BusinessRuleError(`invoice ${id} not found`);
+    if (curRes.rows[0].row_version !== expectedVersion) throw new ConcurrencyConflictError('rel_invoices', id);
+    await client.query(`DELETE FROM rel_payments WHERE owner_type = 'invoice' AND owner_id = $1`, [id]);
+    await client.query('DELETE FROM rel_invoices WHERE id = $1', [id]);
+    await client.query('COMMIT');
+    return { deleted: true };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 // ── PRO -> INV finalisation ──────────────────────────────────────────────
 // Verifies the PRO reservation belongs to this quote, verifies the matching
 // INV reservation (same derivation rule as documentNumbers.ts
@@ -996,6 +1126,63 @@ export async function updateJob(id: number, expectedVersion: number, patch: Part
   }
 }
 
+// FINAL CUTOVER BLOCKER COMPLETION (2026-08-22): jobs had no relational
+// delete at all — index.html's deleteJob() was unconditionally JSON-only,
+// so once "jobs" cut over the delete button would silently fail to persist
+// (the job reappears on reload). Mirrors the JSON path's behavior exactly:
+// unlink any quote that was converted into this job (revert 'converted'
+// back to 'approved', clear the FK, free the quote_conversions guard row so
+// the quote could be converted again) and drop the job's own payment
+// history (rel_payments.owner_id is deliberately NOT an FK — polymorphic —
+// so it is never touched by ON DELETE CASCADE and must be cleared
+// explicitly, matching the JSON path's own warning that deleting a job
+// discards its payment history too). A job that already has an invoice or
+// purchase order referencing it (rel_invoices.job_id / rel_purchase_orders.job_id,
+// both real FKs, no cascade) is refused with a clear business-rule message —
+// a deliberate tightening vs. the JSON path (which allowed this silently),
+// consistent with how deleteSupplier/deleteInventoryItem already refuse
+// deletes that would orphan a real FK elsewhere in this codebase.
+export async function deleteJob(id: number, expectedVersion: number): Promise<{ deleted: true }> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const curRes = await client.query('SELECT row_version FROM rel_jobs WHERE id = $1 FOR UPDATE', [id]);
+    if (curRes.rowCount === 0) throw new BusinessRuleError(`job ${id} not found`);
+    if (curRes.rows[0].row_version !== expectedVersion) throw new ConcurrencyConflictError('rel_jobs', id);
+
+    const linkedQuoteRes = await client.query(`SELECT id FROM rel_quotes WHERE converted_job_id = $1 FOR UPDATE`, [id]);
+    for (const q of linkedQuoteRes.rows) {
+      await client.query(
+        `UPDATE rel_quotes SET converted_job_id = NULL, converted_job_source_id = NULL,
+           status = CASE WHEN status = 'converted' THEN 'approved' ELSE status END,
+           row_version = row_version + 1, updated_at = NOW()
+         WHERE id = $1`,
+        [q.id]
+      );
+      await client.query(`DELETE FROM quote_conversions WHERE quote_id = $1`, [`rel:${q.id}`]);
+    }
+
+    await client.query(`DELETE FROM rel_payments WHERE owner_type = 'job' AND owner_id = $1`, [id]);
+
+    try {
+      await client.query('DELETE FROM rel_jobs WHERE id = $1', [id]);
+    } catch (err: any) {
+      if (err && err.code === '23503') {
+        throw new BusinessRuleError('This job cannot be deleted — an invoice or purchase order is still linked to it. Remove those first.');
+      }
+      throw err;
+    }
+
+    await client.query('COMMIT');
+    return { deleted: true };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 // ── QUOTE EDIT WITH LINKED-JOB SYNC — Stage 3 Phase 3 ───────────────────────
 // Reproduces index.html QuotesPage.handleSave's cascade EXACTLY: when a
 // quote linked to a job (quote.converted_job_id) is edited, the job's
@@ -1242,6 +1429,16 @@ export interface CreatePOInput {
   notes?: string | null; items: POItemInput[];
 }
 export async function createPurchaseOrder(input: CreatePOInput): Promise<{ id: number; poNumber: string; rowVersion: number }> {
+  // FINAL CUTOVER BLOCKER COMPLETION (2026-08-22): this function only ever
+  // runs once purchaseOrders is relational-authoritative (it is reached
+  // exclusively via POST /purchase-orders, gated by requireCutOver), so a
+  // saved supplier is unconditionally required here — this was previously
+  // enforced ONLY in index.html's createPurchaseOrderShared/CreateCustomPOModal,
+  // meaning a direct API call could create a supplier-less PO. Enforcing it
+  // here closes that gap without weakening the frontend's own check.
+  if (input.supplierId == null) {
+    throw new BusinessRuleError('A saved supplier is required to create a purchase order — create the supplier first, then create this PO.');
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
