@@ -361,7 +361,35 @@ export async function convertQuoteToJob(quoteId: number): Promise<{
 // LegacyInvoiceConflictError (-> HTTP 409 `legacy_conflict`) rather than
 // silently reassigned — the same "never auto-resolve a historical
 // collision" posture backfill.ts uses for duplicate source ids.
-export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: number; invoiceNumber: string; legacyMapped?: boolean; jobRowVersion: number }> {
+// 2026-08-23 (production cutover repair — JOB FINANCIAL + LIFECYCLE REPAIR):
+// this function used to unconditionally set `status = 'invoiced', stage = 9`
+// on EVERY call, regardless of the job's actual current stage. That is only
+// correct when the job has already organically reached the invoice-ready
+// point of its own workflow (Installation, stage 7, or later — the SAME
+// threshold index.html's JobDetail "Create Invoice" button and
+// getPendingJobInvoices() already use to decide a job is "invoice-ready").
+// index.html deliberately ALSO offers an earlier "Create Invoice Now —
+// without waiting for the job to reach the Installation stage" action
+// (QuotesPage, for a quote's linked job) for genuine early-invoicing needs.
+// Calling that intentional feature on a job still at, say, Quote Approved
+// (stage 4) used to jump `stage` straight to 9 (Invoiced) as a side effect —
+// fabricating Deposit Received / In Production / Installation / Completed
+// as already done, none of which had actually happened. Those are
+// event-driven facts (a real payment for Deposit Received; a real
+// user-driven advanceStage click for the rest) and must never be implied
+// merely by an invoice existing. INVOICE LINKAGE (invoice_num/invoice_date/
+// invoice_created/invoice_status, and the rel_invoices row itself, plus its
+// job_id foreign key) is UNCONDITIONAL and unchanged below — only the
+// stage/status bump is now conditional on the job already being at or past
+// INSTALL_STAGE. A job invoiced early keeps its true current stage and
+// continues its normal lifecycle from there; a job invoiced once it has
+// genuinely reached Installation/Completed still gets the SAME one-step
+// jump straight to Invoiced this function always intentionally provided
+// (skipping a separate manual "Completed" click was already, and remains,
+// the deliberate design — see BASE_LOCKED_STAGES in index.html, which locks
+// stage 9 from ever being reached via the manual "Advance" button at all).
+const INSTALL_STAGE = 7;
+export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: number; invoiceNumber: string; legacyMapped?: boolean; jobRowVersion: number; jobStage: number; jobStatus: string }> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -391,11 +419,14 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
           await client.query(`UPDATE rel_invoices SET job_id = $1, job_number_raw = $2 WHERE id = $3`, [jobId, job.job_number, existingInv.id]);
         }
         const jobUpdRes1 = await client.query(
-          `UPDATE rel_jobs SET invoice_created = true, invoice_date = COALESCE(invoice_date, CURRENT_DATE), invoice_status = COALESCE(invoice_status, 'pending'), status = 'invoiced', stage = 9, row_version = row_version + 1, updated_at = NOW() WHERE id = $1 RETURNING row_version`,
-          [jobId]
+          `UPDATE rel_jobs SET invoice_created = true, invoice_date = COALESCE(invoice_date, CURRENT_DATE), invoice_status = COALESCE(invoice_status, 'pending'),
+             status = CASE WHEN stage >= $2 THEN 'invoiced' ELSE status END,
+             stage  = CASE WHEN stage >= $2 THEN 9 ELSE stage END,
+             row_version = row_version + 1, updated_at = NOW() WHERE id = $1 RETURNING row_version, stage, status`,
+          [jobId, INSTALL_STAGE]
         );
         await client.query('COMMIT');
-        return { invoiceId: existingInv.id, invoiceNumber: job.invoice_num, legacyMapped: true, jobRowVersion: jobUpdRes1.rows[0].row_version };
+        return { invoiceId: existingInv.id, invoiceNumber: job.invoice_num, legacyMapped: true, jobRowVersion: jobUpdRes1.rows[0].row_version, jobStage: jobUpdRes1.rows[0].stage, jobStatus: jobUpdRes1.rows[0].status };
       }
 
       // No rel_invoices row exists for this number yet at all — create
@@ -419,11 +450,14 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
         );
       }
       const jobUpdRes2 = await client.query(
-        `UPDATE rel_jobs SET invoice_created = true, invoice_date = COALESCE(invoice_date, CURRENT_DATE), invoice_status = COALESCE(invoice_status, 'pending'), status = 'invoiced', stage = 9, row_version = row_version + 1, updated_at = NOW() WHERE id = $1 RETURNING row_version`,
-        [jobId]
+        `UPDATE rel_jobs SET invoice_created = true, invoice_date = COALESCE(invoice_date, CURRENT_DATE), invoice_status = COALESCE(invoice_status, 'pending'),
+           status = CASE WHEN stage >= $2 THEN 'invoiced' ELSE status END,
+           stage  = CASE WHEN stage >= $2 THEN 9 ELSE stage END,
+           row_version = row_version + 1, updated_at = NOW() WHERE id = $1 RETURNING row_version, stage, status`,
+        [jobId, INSTALL_STAGE]
       );
       await client.query('COMMIT');
-      return { invoiceId: legacyInvoiceId, invoiceNumber: job.invoice_num, legacyMapped: true, jobRowVersion: jobUpdRes2.rows[0].row_version };
+      return { invoiceId: legacyInvoiceId, invoiceNumber: job.invoice_num, legacyMapped: true, jobRowVersion: jobUpdRes2.rows[0].row_version, jobStage: jobUpdRes2.rows[0].stage, jobStatus: jobUpdRes2.rows[0].status };
     }
 
     const invoiceNumber = await reserveDocumentNumberWithClient(client, job.company_code, 'invoice');
@@ -448,12 +482,15 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
     }
 
     const jobUpdRes3 = await client.query(
-      `UPDATE rel_jobs SET invoice_num = $1, invoice_date = CURRENT_DATE, invoice_created = true, invoice_status = 'pending', status = 'invoiced', stage = 9, row_version = row_version + 1, updated_at = NOW() WHERE id = $2 RETURNING row_version`,
-      [invoiceNumber, jobId]
+      `UPDATE rel_jobs SET invoice_num = $1, invoice_date = CURRENT_DATE, invoice_created = true, invoice_status = 'pending',
+         status = CASE WHEN stage >= $3 THEN 'invoiced' ELSE status END,
+         stage  = CASE WHEN stage >= $3 THEN 9 ELSE stage END,
+         row_version = row_version + 1, updated_at = NOW() WHERE id = $2 RETURNING row_version, stage, status`,
+      [invoiceNumber, jobId, INSTALL_STAGE]
     );
 
     await client.query('COMMIT');
-    return { invoiceId, invoiceNumber, jobRowVersion: jobUpdRes3.rows[0].row_version };
+    return { invoiceId, invoiceNumber, jobRowVersion: jobUpdRes3.rows[0].row_version, jobStage: jobUpdRes3.rows[0].stage, jobStatus: jobUpdRes3.rows[0].status };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw err;

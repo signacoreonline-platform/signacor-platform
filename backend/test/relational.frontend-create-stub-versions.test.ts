@@ -66,8 +66,15 @@ function checkSourceWiring(src: string) {
   ok(src.includes(`_relId: result.jobId, _relRowVersion: result.jobRowVersion,`) && src.includes(`const result = await relationalApi.convertQuoteToJob(q._relId);`),
     'handleConvertToJob\'s stubJob sets _relId/_relRowVersion from convertQuoteToJob()\'s response');
 
-  ok(src.includes(`stage:9, status:'invoiced', _relRowVersion:result.jobRowVersion}:j`),
-    'createInvoiceNow refreshes the job\'s _relRowVersion from createInvoiceForJob()\'s response');
+  // 2026-08-23 (production cutover repair — JOB FINANCIAL + LIFECYCLE
+  // REPAIR): stage/status are no longer hardcoded to 9/'invoiced' here —
+  // createInvoiceForJob only bumps them server-side once the job has
+  // already reached INSTALL_STAGE, and the frontend must reflect whatever
+  // the backend actually did (result.jobStage/result.jobStatus) rather
+  // than assuming the terminal values unconditionally. _relRowVersion is
+  // still refreshed from the response exactly as before.
+  ok(src.includes(`stage:result.jobStage, status:result.jobStatus, _relRowVersion:result.jobRowVersion}:j`),
+    'createInvoiceNow refreshes the job\'s stage/status/_relRowVersion from createInvoiceForJob()\'s response (not hardcoded)');
 }
 
 async function resetRelationalTables() {

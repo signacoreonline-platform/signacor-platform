@@ -227,7 +227,15 @@ router.post('/jobs/:id/create-invoice', async (req: AuthRequest, res: Response):
     const jobId = Number(req.params.id);
     if (!Number.isFinite(jobId)) { res.status(400).json({ error: '"id" must be a number' }); return; }
     const result = await createInvoiceForJob(jobId);
-    res.status(201).json({ success: true, invoiceId: result.invoiceId, invoiceNumber: result.invoiceNumber, jobRowVersion: result.jobRowVersion });
+    // 2026-08-23 (production cutover repair): jobStage/jobStatus reflect
+    // what createInvoiceForJob ACTUALLY did to the job (see its own
+    // comment) — the stage/status bump to Invoiced(9) only happens when the
+    // job had already reached INSTALL_STAGE; otherwise these come back
+    // unchanged from the job's stage/status before this call. The frontend
+    // must reflect these exact values rather than assuming stage 9 —
+    // duplicating that assumption client-side is exactly the kind of
+    // same-root-cause drift this repair closes.
+    res.status(201).json({ success: true, invoiceId: result.invoiceId, invoiceNumber: result.invoiceNumber, jobRowVersion: result.jobRowVersion, jobStage: result.jobStage, jobStatus: result.jobStatus });
   } catch (err) { handleServiceError(err, res); }
 });
 

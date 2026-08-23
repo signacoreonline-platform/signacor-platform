@@ -726,7 +726,24 @@ const STATUS_META = {
   completed:{ label:'Completed', cls:'bg-green-100 text-green-700' }, invoiced:{ label:'Invoiced', cls:'bg-teal-100 text-teal-700' },
 };
 
-const zar  = n => 'R\u00a0' + Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+// 2026-08-23 (production cutover repair): Number(n) on an undefined/null/
+// empty/non-numeric input silently produces NaN, and NaN.toLocaleString()
+// literally returns the string "NaN" -- this is the exact mechanism behind
+// the "R NaN" seen in production (root cause was a missing `value` field on
+// a freshly-converted job's optimistic stub -- see handleConvertToJob and
+// isZeroValueJob below, both fixed at their source). This guard is
+// deliberately NOT "mask it as R0.00" (Number(n)||0) -- a value that failed
+// to compute is not the same fact as a value that is genuinely zero, and
+// silently showing R0.00 would misrepresent a broken calculation as a real
+// currency amount. "R --" makes a failed calculation visibly distinct from
+// both a real amount and a genuine zero, for ANY current or future caller
+// of this shared helper (quotes, jobs, invoices, margins, etc.).
+const zar  = n => {
+  const isBlank = (n === null || n === undefined || n === '');
+  const num = isBlank ? NaN : Number(n);
+  if (!Number.isFinite(num)) return 'R \u2014';
+  return 'R\u00a0' + num.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+};
 const zarK = n => 'R ' + (Number(n)/1000).toFixed(0) + 'k';
 
 /* ═══════════════════════════════════════════
@@ -8483,6 +8500,21 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           desc: 'From Quote '+q.num, status: 'quote_approved', co: q.co,
           lines: q.lines, quoteNum: q.num, notes: q.notes||'',
           setupFee: q.setupFee||'', discount: q.discount||'',
+          // 2026-08-23 (production cutover repair): this stub previously had
+          // NO `value` field at all. services.ts's convertQuoteToJob sets
+          // rel_jobs.value directly from the source quote's own total --
+          // this mirrors that EXACT source so the optimistic stub matches
+          // what the next relational read-overlay will return, instead of
+          // leaving job.value undefined until that later refresh happens
+          // (which, per the 30s poll's locally-changed-section skip plus
+          // stateStamp gating on the unrelated JSON platform_state
+          // savedAt/_autoSavedAt, can be delayed far longer than 30s for a
+          // purely-relational mutation like this one). An undefined value
+          // rendered as the literal "R NaN" via zar() and, worse, was
+          // misclassified as a genuine zero-value job by isZeroValueJob's
+          // old NaN-via-truthiness bug (both hardened separately above, but
+          // the real defect for THIS symptom was this missing field).
+          value: q.total,
           stage: STATUS_TO_STAGE['quote_approved']||4, payments: [],
           _relId: result.jobId, _relRowVersion: result.jobRowVersion,
         };
@@ -8765,6 +8797,17 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   }
   async function createInvoiceNow(job){
     if(!job) return;
+    // 2026-08-23 (production cutover repair): same threshold used by
+    // JobDetail's own "Create Invoice" button / getPendingJobInvoices() to
+    // decide a job has organically reached the invoice-ready point of its
+    // own workflow. This button intentionally allows invoicing EARLIER too
+    // (see its "without waiting for the job to reach the Installation
+    // stage" tooltip below) — for a job invoiced before this stage, the
+    // stage/status must NOT be bumped to Invoiced(9)/'invoiced' as a side
+    // effect; only a job already at or past this stage may have that
+    // shortcut applied (mirrors createInvoiceForJob's own INSTALL_STAGE
+    // guard in backend/src/relational/services.ts).
+    const INSTALL_STAGE = 7;
     // This job may already have inherited an invoice created directly from
     // its source quote (see createInvoiceFromQuote/handleConvertToJob) —
     // that record IS this job's real invoice. Never reserve/create a second
@@ -8809,7 +8852,16 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         // immediately-following edit (job costs/notes/lines/stage, all wired via
         // Phase 1) doesn't send a stale expectedVersion and hit a false 409
         // stale_record conflict.
-        const nextJobs = jobs.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:result.invoiceNumber, invoiceDate:new Date().toISOString().slice(0,10), stage:9, status:'invoiced', _relRowVersion:result.jobRowVersion}:j);
+        // 2026-08-23 (production cutover repair): stage/status now come
+        // straight from the backend's response (createInvoiceForJob only
+        // bumps them to 9/'invoiced' when the job had already reached
+        // INSTALL_STAGE server-side) instead of being hardcoded here --
+        // hardcoding stage:9/status:'invoiced' unconditionally is exactly
+        // what used to fabricate Deposit Received/In Production/
+        // Installation/Completed as already done for a job invoiced early
+        // via "Create Invoice Now -- without waiting for the job to reach
+        // the Installation stage" below.
+        const nextJobs = jobs.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:result.invoiceNumber, invoiceDate:new Date().toISOString().slice(0,10), stage:result.jobStage, status:result.jobStatus, _relRowVersion:result.jobRowVersion}:j);
         setJobs(nextJobs);
         syncRelationalBaseline('jobs', () => nextJobs);
         setInvoiceCreatedInfo({ job, invoiceNum: result.invoiceNumber });
@@ -8826,7 +8878,12 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     if(job.invoiceNum){
       const cur = jobs.find(j=>j.id===job.id);
       if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return;
-      const nextJobs = jobs.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
+      // 2026-08-23 (production cutover repair): only bump stage/status to
+      // Invoiced when this job has already organically reached
+      // INSTALL_STAGE -- an invoice created earlier (deliberately, via this
+      // "without waiting" action) links to the job but must NOT fabricate
+      // Deposit Received/In Production/Installation/Completed as done.
+      const nextJobs = jobs.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), ...(j.stage>=INSTALL_STAGE ? {stage:9, status:'invoiced'} : {})}:j);
       // Confirmed-save-before-success (2026-08-06): wait for the backend to
       // actually accept this before flipping local state / showing the
       // "Invoice created" success screen — see forceSaveSections above.
@@ -8873,7 +8930,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // never preserved from an earlier value pre-seeded at quote→job
     // conversion time (that used to make the invoice date silently equal
     // the job-creation date instead of the real invoice-creation date).
-    const nextJobs = jobs.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:today, invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
+    // 2026-08-23 (production cutover repair): see the matching note above --
+    // only bump stage/status once this job has already reached INSTALL_STAGE.
+    const nextJobs = jobs.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:today, invoiceDue:(j.invoiceDue||due), ...(j.stage>=INSTALL_STAGE ? {stage:9, status:'invoiced'} : {})}:j);
     // Confirmed-save-before-success (2026-08-06): save FIRST — only touch
     // local state / show "created" once the backend has actually confirmed
     // this write, same as handleConvertToJob. If this fails, the reserved
@@ -13352,7 +13411,23 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   // Received (5) / Invoiced (9) stages would never auto-activate. For these jobs
   // we unlock those stages so the operator can advance the job manually and
   // bypass the deposit / payment requirement.
-  const isZeroValueJob = (parseFloat(job.value)||0) <= 0;
+  //
+  // 2026-08-23 (production cutover repair): the previous
+  // `(parseFloat(job.value)||0) <= 0` treated a FAILED parse (NaN --
+  // job.value undefined/null/'' /non-numeric, e.g. a job whose value never
+  // hydrated correctly) exactly the same as a genuine zero, via `||0`'s
+  // falsy-NaN fallback -- silently misclassifying a job with a BROKEN value
+  // as a legitimate sponsored/warranty/no-charge job and incorrectly
+  // unlocking the deposit/invoice stage locks for a job that is not
+  // actually zero-value. A failed calculation must NEVER qualify as
+  // zero-value -- only a genuinely valid finite number that is <= 0 may.
+  // Empty string is treated as invalid (not zero) for the same reason --
+  // Number('') is 0 in JS, which would otherwise silently accept missing
+  // data as "genuinely zero".
+  const rawJobValue = job.value;
+  const numericJobValue = (rawJobValue === null || rawJobValue === undefined || rawJobValue === '') ? NaN : Number(rawJobValue);
+  const hasValidJobValue = Number.isFinite(numericJobValue);
+  const isZeroValueJob = hasValidJobValue && numericJobValue <= 0;
   const LOCKED_STAGES = isZeroValueJob ? [] : BASE_LOCKED_STAGES;
   const nextStage=job.stage+1;
   const nextLocked=LOCKED_STAGES.includes(nextStage);
@@ -13984,16 +14059,50 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                 <button onClick={async ()=>{
                     const today=new Date().toISOString().slice(0,10);
                     const due=new Date(Date.now()+30*864e5).toISOString().slice(0,10);
-                    // Creating the tax invoice advances the job to its final
-                    // lifecycle stage, Invoiced (9). Final payment is recorded
-                    // afterwards via Payments / Payment History.
+                    // Creating the tax invoice LINKS it to this job. It does
+                    // NOT by itself fabricate any earlier lifecycle stage --
+                    // Deposit Received/In Production/Installation/Completed
+                    // remain governed by their own event-driven rules. Only
+                    // once the job has ALREADY reached INSTALL_STAGE (which
+                    // this button requires anyway, per canCreateInvoice
+                    // above) does creating the invoice also advance
+                    // stage/status straight to Invoiced (9) -- the same
+                    // one-step shortcut this action has always intentionally
+                    // provided for a job at Installation or Completed.
+                    //
+                    // 2026-08-23 (production cutover repair): this handler
+                    // previously had NO isRelationalAuthoritative branch at
+                    // all -- unlike its sibling createInvoiceNow
+                    // (QuotesPage), it never called relationalApi and never
+                    // called syncRelationalBaseline, so in production (jobs
+                    // + accInvoices both relational-authoritative) clicking
+                    // this button optimistically flipped the job to
+                    // "Invoiced" locally but NEVER actually persisted --
+                    // the change was silently rejected ~800ms later by the
+                    // generic autosave's systemic relational-authority guard
+                    // (assertNoUnwiredRelationalSections), surfacing only a
+                    // brief "Save failed" toast that auto-clears in 2.5s.
+                    // This branch closes that gap using the exact same
+                    // relational path createInvoiceNow already uses.
+                    if(isRelationalAuthoritative('jobs') && isRelationalAuthoritative('accInvoices')){
+                      try {
+                        const result = await relationalApi.createInvoiceForJob(job._relId);
+                        const nextJobs = jobs.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:result.invoiceNumber, invoiceDate:(j.invoiceDate||today), stage:result.jobStage, status:result.jobStatus, _relRowVersion:result.jobRowVersion}:j);
+                        setJobs(nextJobs);
+                        syncRelationalBaseline('jobs', () => nextJobs);
+                        setInvoiceCreatedInfo({ invoiceNum: result.invoiceNumber });
+                      } catch(saveErr){
+                        alert('Invoice could NOT be created.\n\n'+(saveErr&&saveErr.message?saveErr.message:'unknown error')+'\n\nNothing was changed. Please check your connection and try again.');
+                      }
+                      return;
+                    }
                     if(job.invoiceNum){
                       // Already carries a number (e.g. a historical job
                       // invoiced before this fix) — just flip the flags.
                       setJobs(prev=>{
                         const cur = prev.find(j=>j.id===job.id);
                         if(!cur || cur.invoiceCreated || (cur.invoiceNum && cur.stage>=9)) return prev;
-                        return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
+                        return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceDate:(j.invoiceDate||today), invoiceDue:(j.invoiceDue||due), ...(j.stage>=INSTALL_STAGE ? {stage:9, status:'invoiced'} : {})}:j);
                       });
                       setInvoiceCreatedInfo({ invoiceNum: job.invoiceNum });
                       return;
@@ -14031,7 +14140,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                       // invoiceDate is set to the actual moment of invoice creation
                       // here — never preserved from an earlier value pre-seeded at
                       // quote→job conversion time.
-                      return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:today, invoiceDue:(j.invoiceDue||due), stage:9, status:'invoiced'}:j);
+                      return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:today, invoiceDue:(j.invoiceDue||due), ...(j.stage>=INSTALL_STAGE ? {stage:9, status:'invoiced'} : {})}:j);
                     });
                     setInvoiceCreatedInfo({ invoiceNum: reserved });
                   }}
@@ -22545,18 +22654,63 @@ function App() {
   //  Invoiced (stage 9): activates automatically once a completed job (stage 8)
   //  carries a tax-invoice number (i.e. the quote was converted to an invoice).
   //  Both rules are idempotent, so this never loops.
+  //
+  // 2026-08-23 (production cutover repair): two defects fixed here.
+  // (1) This effect previously only ever called setJobs() — a pure local
+  //     React state update with NO relationalApi call and no
+  //     syncRelationalBaseline call. For a relational-authoritative job
+  //     (production today), that change never actually reached the
+  //     backend — the generic debounced autosave's systemic guard
+  //     (assertNoUnwiredRelationalSections) silently rejected it ~800ms
+  //     later, so BOTH auto-advances only looked like they worked for the
+  //     rest of this browser session but reverted on the next full
+  //     reload/refetch. Each stage bump is now persisted through the SAME
+  //     relationalApi.updateJob path advanceStage already uses,
+  //     best-effort (a conflicting/stale row_version here just means
+  //     another concurrent edit already changed this job — the next
+  //     poll/refresh reconciles to the authoritative state either way).
+  // (2) The Invoiced condition checked `j.invoiceNum` (a job merely
+  //     CARRYING an invoice number — which can be set by a reservation/
+  //     proforma step before an invoice is actually, successfully created)
+  //     instead of `j.invoiceCreated` (the confirmed "this job really has
+  //     a created, linked invoice" flag already used as the canonical
+  //     definition everywhere else in this file, e.g. JobDetail's own
+  //     `invoiceCreated` derivation). Invoice existence must never be
+  //     inferred from a bare number.
   useEffect(()=>{
     let changed=false;
+    const relationalJobs = isRelationalAuthoritative('jobs');
+    const toPersist=[];
     const next=(jobs||[]).map(j=>{
       const st=j.stage||0;
       if(st===4){
         const rec=reconcileJobInvoice(j,quotes);
-        if(rec.totalPaid>0){ changed=true; return {...j,stage:5,status:STAGE_STATUSES[5]}; }
+        if(rec.totalPaid>0){
+          changed=true;
+          if(relationalJobs && j._relId!=null) toPersist.push({id:j.id, relId:j._relId, relRowVersion:j._relRowVersion, stage:5, status:STAGE_STATUSES[5]});
+          return {...j,stage:5,status:STAGE_STATUSES[5]};
+        }
       }
-      if(st===8 && j.invoiceNum){ changed=true; return {...j,stage:9,status:STAGE_STATUSES[9]}; }
+      if(st===8 && j.invoiceCreated){
+        changed=true;
+        if(relationalJobs && j._relId!=null) toPersist.push({id:j.id, relId:j._relId, relRowVersion:j._relRowVersion, stage:9, status:STAGE_STATUSES[9]});
+        return {...j,stage:9,status:STAGE_STATUSES[9]};
+      }
       return j;
     });
-    if(changed) setJobs(next);
+    if(changed){
+      setJobs(next);
+      syncRelationalBaseline('jobs', () => next);
+      toPersist.forEach(p=>{
+        relationalApi.updateJob(p.relId, p.relRowVersion, { stage:p.stage, status:p.status }).then(result=>{
+          setJobs(prev=>prev.map(j=>j.id===p.id?{...j,_relRowVersion:result.rowVersion}:j));
+        }).catch(()=>{ /* best-effort background reconciliation — silent,
+          same convention as the 30s poll's network-error handling; a
+          stale/conflicting row_version here just means someone else
+          already changed this job, and the next poll/refresh reconciles
+          to the authoritative state. */ });
+      });
+    }
   },[jobs,quotes]);
 
   // All array/object sections stored in platform_state

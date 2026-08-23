@@ -83,8 +83,20 @@ async function main() {
   ok(beforeCounters.rows[0].n === afterCounters.rows[0].n, 'no atomic document-number counter row was consumed for this legacy adoption', { before: beforeCounters.rows[0].n, after: afterCounters.rows[0].n });
   const invRow2 = await pool.query(`SELECT invoice_number, job_id FROM rel_invoices WHERE id = $1`, [result2.invoiceId]);
   ok(invRow2.rows[0]?.invoice_number === 'INV-LEGACY-777' && String(invRow2.rows[0]?.job_id) === String(job2), 'exactly one rel_invoices row was created, linked to this job, using the legacy number', invRow2.rows[0]);
+  // 2026-08-23 (production cutover repair — JOB FINANCIAL + LIFECYCLE
+  // REPAIR): createInvoiceForJob no longer bumps stage/status to
+  // Invoiced(9) unconditionally — only once the job has already reached
+  // INSTALL_STAGE (7) organically. makeJob() creates job2 via
+  // convertQuoteToJob, which always leaves a fresh job at stage 4
+  // (quote_approved) — well before Installation — so adopting this job's
+  // legacy invoice number here must link the invoice (invoice_created
+  // flips true) WITHOUT fabricating Deposit Received/In Production/
+  // Installation/Completed by jumping stage straight to 9. This assertion
+  // previously expected stage:9/status:'invoiced' unconditionally — that
+  // was the exact bug (invoice existence used as proof of lifecycle
+  // position) this repair fixes; see services.ts's createInvoiceForJob.
   const jobRow2 = await pool.query(`SELECT invoice_created, status, stage FROM rel_jobs WHERE id = $1`, [job2]);
-  ok(jobRow2.rows[0]?.invoice_created === true && jobRow2.rows[0]?.status === 'invoiced' && jobRow2.rows[0]?.stage === 9, 'job flags flip correctly (invoice_created/status/stage) exactly as the normal path does', jobRow2.rows[0]);
+  ok(jobRow2.rows[0]?.invoice_created === true && jobRow2.rows[0]?.status === 'quote_approved' && jobRow2.rows[0]?.stage === 4, 'job invoice flag flips true, but stage/status are NOT fabricated forward since this job has not reached INSTALL_STAGE', jobRow2.rows[0]);
 
   console.log('\n[Legacy invoice branch] calling it again on the SAME job now correctly refuses as already-invoiced (not re-triggering legacy adoption)');
   try {
