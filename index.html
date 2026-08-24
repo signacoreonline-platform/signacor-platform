@@ -20874,7 +20874,7 @@ async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll
   return true;
 }
 
-function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices:accInvoicesAll, setAccInvoices, accBills:accBillsAll, setAccBills, creditNotes:creditNotesAll, setCreditNotes, suppliers, customers, companies, logoDataUrl, user, onOpenJob, onOpenQuote, onOpenCustomer, onOpenJobPayments, initialStatementContact, onInitialStatementHandled, forceSaveSections }) {
+function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices:accInvoicesAll, setAccInvoices, accBills:accBillsAll, setAccBills, creditNotes:creditNotesAll, setCreditNotes, suppliers, customers, companies, logoDataUrl, user, onOpenJob, onOpenQuote, onOpenCustomer, onOpenJobPayments, initialStatementContact, onInitialStatementHandled, forceSaveSections }) {
   // Company-context filter for DISPLAY, applied by shadowing the prop names
   // — every plain read of jobs/bankTxns/accInvoices/accBills/creditNotes
   // below this line is already company-scoped throughout this component.
@@ -21208,13 +21208,28 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     // it discards that history too. Delete logic itself is unchanged.
     const inv = accInvoices.find(i=>i.id===id);
     const payCount = inv ? (inv.payments||[]).length : 0;
-    const warn = payCount>0
-      ? `This invoice has ${payCount} recorded payment${payCount>1?'s':''} against it. Deleting the invoice will permanently remove that payment history too, and may affect statements and accounting totals.\n\nDelete anyway?`
+    // An invoice raised against a job is ALSO represented as invoice linkage
+    // on that job (invoiceNum/invoiceDate/invoiceDue/invoiceCreated/
+    // invoiceStatus) — that is the second representation this delete now
+    // reverses server-side. The person confirming has to be told, because
+    // after this the job goes back to "ready to invoice, not yet invoiced"
+    // and re-invoicing it will mint a NEW number, not this one.
+    const linkedJobNum = inv ? (inv.reference || inv.jobNum || '') : '';
+    const warnParts = [];
+    if(payCount>0){
+      warnParts.push(`This invoice has ${payCount} recorded payment${payCount>1?'s':''} against it. Deleting the invoice will permanently remove that payment history too, and may affect statements and accounting totals.`);
+    }
+    if(linkedJobNum){
+      warnParts.push(`This invoice belongs to Job ${linkedJobNum}. Deleting it also removes the invoice number from that job, which will go back to "ready to invoice but not yet invoiced". Re-invoicing it later will use a NEW invoice number — ${inv&&inv.number?inv.number:'this number'} is not reused. The job itself, its stage and any payments recorded against the JOB are not affected.`);
+    }
+    const warn = warnParts.length
+      ? warnParts.join('\n\n')+'\n\nDelete anyway?'
       : 'Delete this invoice? This cannot be undone.';
     if(!window.confirm(warn)) return;
     if(isRelationalAuthoritative('accInvoices') && inv && inv._relId!=null){
+      let delResult = null;
       try {
-        await relationalApi.deleteInvoice(inv._relId, inv._relRowVersion);
+        delResult = await relationalApi.deleteInvoice(inv._relId, inv._relRowVersion);
       } catch(e){
         alert(describeSaveConflictError(e, 'invoice')+'\n\nThe invoice was NOT deleted.');
         return;
@@ -21222,6 +21237,55 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
       const accInvoicesUpdater = prev=>prev.filter(i=>i.id!==id);
       setAccInvoices(accInvoicesUpdater);
       syncRelationalBaseline('accInvoices', accInvoicesUpdater);
+      // INVOICE-DELETE REPAIR (2026-08-24). An invoice that belongs to a job
+      // is represented twice: as this accInvoices record AND as the invoice
+      // linkage stamped on the job itself (invoiceNum/invoiceDate/invoiceDue/
+      // invoiceCreated/invoiceStatus), out of which Sales, Accounting,
+      // getAllInvoicesUnified, the Payments tab and the dashboard revenue
+      // tile all synthesise a job-derived invoice row. The backend now
+      // reverses BOTH halves in one transaction (services.ts deleteInvoice)
+      // and reports the jobs it cleared; this mirrors that locally — the
+      // exact inverse of what createInvoiceNow already does after
+      // createInvoiceForJob — so the job-side twin goes at the same instant
+      // the record does, instead of surfacing for as long as it takes the
+      // coalesced authoritative re-read to land (or indefinitely, if that
+      // re-read fails). Purely a local mirror of a server fact: it filters
+      // nothing and hides nothing that the server still holds.
+      const clearedJobs = (delResult && delResult.clearedJobs) || [];
+      if(clearedJobs.length && setJobs){
+        const clearedByRelId = {};
+        clearedJobs.forEach(c=>{ if(c && c.id!=null) clearedByRelId[c.id] = c; });
+        const jobsUpdater = prev => (prev||[]).map(j=>{
+          const c = (j && j._relId!=null) ? clearedByRelId[j._relId] : null;
+          if(!c) return j;
+          return {...j, invoiceNum:null, invoiceDate:null, invoiceDue:null,
+                  invoiceCreated:false, invoiceStatus:null, _relRowVersion:c.rowVersion};
+        });
+        setJobs(jobsUpdater);
+        syncRelationalBaseline('jobs', jobsUpdater);
+      }
+      // A historical numbering collision (more than one job carrying this
+      // invoice number, on an invoice with no job link to disambiguate them)
+      // is deliberately NOT auto-resolved server-side — see
+      // LegacyInvoiceConflictError. Say so plainly instead of leaving what
+      // remains looking like this delete having failed.
+      // A Credit payment against this invoice had consumed part of a customer
+      // credit note; deleting it gives that amount back (services.ts's shared
+      // releaseCreditForPaymentTx). Say so — the credit note's Remaining has
+      // just changed and the person needs to know it was not lost.
+      const creditReleased = (delResult && delResult.creditReleased) || 0;
+      if(creditReleased > 0){
+        alert('The invoice was deleted.\n\n'+zar(creditReleased)+' of customer credit that had been applied to it has been released back to the customer\'s credit note(s).');
+      }
+      const ambiguousJobs = (delResult && delResult.ambiguousJobs) || [];
+      if(ambiguousJobs.length){
+        alert('The invoice was deleted.\n\nHowever '+ambiguousJobs.length+' jobs ('
+          +ambiguousJobs.map(a=>a.jobNumber).join(', ')
+          +') all carry this same invoice number, which is a historical numbering'
+          +' collision. Their invoice numbers were deliberately left untouched —'
+          +' clearing them automatically could remove the wrong job\'s invoice.'
+          +' Please review those jobs and decide which is correct.');
+      }
       return;
     }
     setAccInvoices(prev=>prev.filter(i=>i.id!==id));
@@ -25190,7 +25254,7 @@ function App() {
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quotes={quotes} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
     reports:     <ReportsPage     jobs={jobs} companies={companies} user={user} logoDataUrl={brandingLogo} customers={customers}/>,
-    accounting:  <AccountingPage jobs={jobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user} onOpenJob={openJobRecord} onOpenQuote={openQuoteRecord} onOpenCustomer={openCustomerRecord} onOpenJobPayments={openJobPaymentsRecord} initialStatementContact={accountingOpen&&accountingOpen.contact} onInitialStatementHandled={()=>setAccountingOpen(null)} forceSaveSections={forceSaveSections}/>,
+    accounting:  <AccountingPage jobs={jobs} setJobs={setJobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user} onOpenJob={openJobRecord} onOpenQuote={openQuoteRecord} onOpenCustomer={openCustomerRecord} onOpenJobPayments={openJobPaymentsRecord} initialStatementContact={accountingOpen&&accountingOpen.contact} onInitialStatementHandled={()=>setAccountingOpen(null)} forceSaveSections={forceSaveSections}/>,
     hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={brandingLogo} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
     // Admin-only (main Admin, never Holdings Admin) — guarded again here in
     // addition to the Sidebar link and safePage above, so this can never

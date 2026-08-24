@@ -77,8 +77,20 @@ function checkFrontendWiring(src: string) {
     'saveManualInvoice() calls relationalApi.updateInvoice(inv._relId, inv._relRowVersion, ...) when editing an existing relational invoice');
 
   console.log('\n  -- invoice deletion --');
-  ok(/async function deleteInvoice\(id\)\{[\s\S]{0,700}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,300}relationalApi\.deleteInvoice\(inv\._relId, inv\._relRowVersion\)/.test(src),
+  // 2026-08-24 (invoice-delete / Sales-vs-Accounting repair): the distance
+  // bound was 700 and is now 2500 — NOT to make this assertion easier to
+  // satisfy, but because the handler legitimately grew a longer confirmation
+  // message (it must now tell the user the linked job loses its invoice
+  // number). The assertion is simultaneously STRENGTHENED: the two follow-up
+  // checks below pin the second half of the delete, which did not exist when
+  // the original bound was written and which a purely distance-bounded regex
+  // would happily have let regress.
+  ok(/async function deleteInvoice\(id\)\{[\s\S]{0,2500}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,300}relationalApi\.deleteInvoice\(inv\._relId, inv\._relRowVersion\)/.test(src),
     'AccountingPage.deleteInvoice() checks isRelationalAuthoritative(\'accInvoices\') and calls relationalApi.deleteInvoice(inv._relId, inv._relRowVersion)');
+  ok(/relationalApi\.deleteInvoice\(inv\._relId, inv\._relRowVersion\)[\s\S]{0,2500}delResult\.clearedJobs[\s\S]{0,1500}syncRelationalBaseline\('jobs',/.test(src),
+    'AccountingPage.deleteInvoice() also reverses the JOB-side half locally (clearedJobs -> setJobs + jobs baseline), so the job-derived invoice twin cannot survive the delete');
+  ok(/delResult\.ambiguousJobs/.test(src),
+    'AccountingPage.deleteInvoice() surfaces a quarantined invoice-number collision instead of leaving it looking like a failed delete');
 
   console.log('\n  -- Accounting-view payments (PaymentHistoryModal) --');
   ok(/async function addPayment\(\) \{[\s\S]{0,300}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,900}relationalApi\.recordPayment\('invoice', inv\._relId,/.test(src),

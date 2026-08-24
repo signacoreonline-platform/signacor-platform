@@ -354,8 +354,17 @@ router.put('/invoices/:id', async (req: AuthRequest, res: Response): Promise<voi
   } catch (err) { handleServiceError(err, res); }
 });
 
+// Gated on BOTH sections, exactly like POST /jobs/:id/create-invoice above —
+// the operation this one reverses. Deleting an invoice now also reverses the
+// invoice linkage the create stamped onto rel_jobs (see services.ts
+// deleteInvoice), so it is a two-section write. With "jobs" still on JSON
+// authority that write would land in a table nothing reads, leaving the
+// reported leftover unfixed while silently diverging rel_jobs from the JSON
+// the reconciliation gate compares against before cutover. Refusing with the
+// standard not_cut_over conflict is the honest answer; the frontend surfaces
+// it through the existing catch as "The invoice was NOT deleted."
 router.delete('/invoices/:id', async (req: AuthRequest, res: Response): Promise<void> => {
-  if (!(await requireCutOver('accInvoices', res))) return;
+  if (!(await requireCutOver('jobs', res)) || !(await requireCutOver('accInvoices', res))) return;
   try {
     const id = Number(req.params.id);
     const expectedVersion = Number(req.body?.expectedVersion);
@@ -363,7 +372,21 @@ router.delete('/invoices/:id', async (req: AuthRequest, res: Response): Promise<
       res.status(400).json({ error: '"id" (path) and "expectedVersion" (body) must be numbers' }); return;
     }
     const result = await deleteInvoice(id, expectedVersion);
-    res.json({ success: true, deleted: result.deleted });
+    // `clearedJobs` reports the jobs whose own invoice linkage this delete
+    // reversed (see services.ts deleteInvoice) — id + rowVersion so the client
+    // can drop the job-derived invoice row it synthesises from job.invoiceNum
+    // immediately, and keep its optimistic-concurrency baseline for that job
+    // honest, instead of waiting on the coalesced authoritative re-read.
+    // `ambiguousJobs` names the jobs a historical numbering collision left
+    // sharing this invoice number when the invoice carried no job_id to
+    // disambiguate them. Nothing was cleared for them on purpose — that is a
+    // human decision (see LegacyInvoiceConflictError) — so the client must
+    // say so rather than let the leftover look like a bug.
+    res.json({
+      success: true, deleted: result.deleted,
+      clearedJobs: result.clearedJobs, ambiguousJobs: result.ambiguousJobs,
+      creditReleased: result.creditReleased,
+    });
   } catch (err) { handleServiceError(err, res); }
 });
 

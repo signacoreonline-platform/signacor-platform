@@ -940,24 +940,178 @@ export async function updateInvoice(id: number, expectedVersion: number, patch: 
   }
 }
 
-// Mirrors the JSON path's deleteInvoice exactly (no job-side reversion —
-// the JSON path never had any either): drops this invoice's own payment
-// history (rel_payments.owner_id is polymorphic, not an FK, so it is never
-// touched by a cascade) and the invoice row itself. rel_invoice_line_items
-// is ON DELETE CASCADE. Does not touch the linked job (if any) — matches
-// existing JSON parity; job.invoice_created is a pre-existing, unrelated
-// simplification, not something introduced here.
-export async function deleteInvoice(id: number, expectedVersion: number): Promise<{ deleted: true }> {
+// ── INVOICE-DELETE / SALES-vs-ACCOUNTING REPAIR (2026-08-24) — ROOT CAUSE ──
+// An invoice is represented in this system TWO ways at once, by design (see
+// the header comment above CREATE TABLE rel_invoices in
+// database/migrations/007_relational_core.sql): as a freestanding
+// rel_invoices row, AND — when it belongs to a job — as invoice linkage
+// fields stamped onto that job (invoice_num / invoice_date / invoice_due /
+// invoice_created / invoice_status). createInvoiceForJob above writes BOTH,
+// in one transaction, on every one of its three branches.
+//
+// This function used to reverse only the first. Every invoice list in the
+// frontend — Sales -> Invoices (jobInvItems), Accounting -> Invoices
+// (getJobInvoices), getAllInvoicesUnified (dashboard counts + consistency
+// audit), the Payments tab, and the dashboard revenue tile — SYNTHESISES a
+// job-derived invoice row out of job.invoiceNum, and suppresses it only
+// while a live accInvoices record still references that job. So deleting a
+// job's invoice removed the very record that was suppressing the job-side
+// twin: the invoice did not disappear, it silently changed source from
+// 'manual' to 'job' and carried on being listed under the SAME invoice
+// number and the same amount. Worse, the job was then permanently stuck —
+// createInvoiceForJob refuses a job whose invoice_created is already true,
+// and Accounting renders no delete control at all for a source==='job' row,
+// so the leftover could neither be re-invoiced nor removed.
+//
+// The fix is to make the delete reverse the same two-part write the create
+// performed, atomically: the invoice row (plus its own payments and, by
+// cascade, its line items) AND the job-side linkage that represents it.
+//
+// SCOPE — this is the part that has to be exactly right, because getting it
+// wrong destroys another job's financial data. rel_invoices has UNIQUE
+// (company_code, invoice_number); rel_jobs has NO such constraint, so two
+// jobs CAN legitimately carry the same invoice_num — that is precisely the
+// historical numbering collision LegacyInvoiceConflictError quarantines
+// above, and which the codebase says must never be auto-resolved. So the
+// reversal is scoped to the job this invoice is actually LINKED to:
+//   * rel_invoices.job_id is set on every branch of createInvoiceForJob and
+//     by convertQuoteToJob's relink, so when it is present it names the one
+//     job, unambiguously, and nothing else is touched.
+//   * job_id can be NULL on a BACKFILLED invoice whose JSON record carried
+//     no jobId (backfill.ts only sets it from rec.jobId) while the job's own
+//     JSON still carried the invoice number. There, and only there, the job
+//     is resolved by (company_code, invoice_num) — case- and whitespace-
+//     insensitively, because backfill stores both sides verbatim from JSON.
+//     If that resolves to MORE THAN ONE job it is the quarantined collision:
+//     nothing is cleared, and the candidates are returned as `ambiguousJobs`
+//     so a person can decide, exactly as LegacyInvoiceConflictError intends.
+// A job is also only cleared if it actually has linkage to clear, and never
+// when it carries a DIFFERENT invoice number — so no job's row_version is
+// bumped (and no editor is given a spurious 409) for a no-op.
+//
+// Nothing else about the job is touched: its stage/status stay where the
+// business actually is (an invoice being deleted does not un-install a
+// sign), and its own job-owned payments (rel_payments owner_type='job') are
+// its own, not the invoice's — which is why invoice_status is RECOMPUTED
+// from those surviving payments rather than simply nulled: a job that has
+// been paid directly must not be reported as unpaid because its invoice
+// record was removed. The consumed INV number is deliberately NOT returned
+// to the counter — re-invoicing mints the next number, which is the normal
+// accounting treatment of a deleted document.
+//
+// LOCK ORDER: createInvoiceForJob takes rel_jobs FOR UPDATE and then
+// rel_invoices. This function must take them in the SAME order or a
+// concurrent create/delete pair can deadlock, so it reads the invoice's
+// identity unlocked first, locks the job rows, and only then locks and
+// version-checks the invoice. company_code/invoice_number are immutable
+// (updateInvoice's colMap contains neither), so that unlocked read cannot go
+// stale — but job_id is NOT immutable (createInvoiceForJob's adoption branch
+// and convertQuoteToJob both assign it, neither bumping row_version), so it
+// is re-read under the invoice's own lock and any change aborts the delete
+// as a conflict rather than clearing a job that was never locked. For the
+// same reason the final UPDATE is restricted to the ids locked earlier
+// (`id = ANY($1)`) instead of re-evaluating the predicate against a fresh
+// READ COMMITTED snapshot.
+export async function deleteInvoice(id: number, expectedVersion: number): Promise<{
+  deleted: true;
+  clearedJobs: Array<{ id: number; sourceId: string; jobNumber: string; rowVersion: number }>;
+  ambiguousJobs: Array<{ id: number; jobNumber: string }>;
+  creditReleased: number;
+}> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const curRes = await client.query('SELECT row_version FROM rel_invoices WHERE id = $1 FOR UPDATE', [id]);
+    const identRes = await client.query(
+      'SELECT company_code, invoice_number, job_id FROM rel_invoices WHERE id = $1', [id]
+    );
+    if (identRes.rowCount === 0) throw new BusinessRuleError(`invoice ${id} not found`);
+    const companyCode: string = identRes.rows[0].company_code;
+    const invoiceNumber: string = identRes.rows[0].invoice_number;
+    const identJobId: number | null = identRes.rows[0].job_id === null ? null : Number(identRes.rows[0].job_id);
+
+    let targetJobIds: number[] = [];
+    let ambiguousJobs: Array<{ id: number; jobNumber: string }> = [];
+    if (identJobId !== null) {
+      targetJobIds = [identJobId];
+    } else {
+      const matchRes = await client.query(
+        `SELECT id, job_number FROM rel_jobs
+          WHERE company_code = $1 AND UPPER(BTRIM(invoice_num)) = UPPER(BTRIM($2)) ORDER BY id`,
+        [companyCode, invoiceNumber]
+      );
+      if (matchRes.rowCount === 1) targetJobIds = [Number(matchRes.rows[0].id)];
+      else if ((matchRes.rowCount ?? 0) > 1) {
+        ambiguousJobs = matchRes.rows.map((r) => ({ id: Number(r.id), jobNumber: r.job_number }));
+      }
+    }
+    if (targetJobIds.length > 0) {
+      await client.query('SELECT id FROM rel_jobs WHERE id = ANY($1::bigint[]) ORDER BY id FOR UPDATE', [targetJobIds]);
+    }
+
+    const curRes = await client.query('SELECT row_version, job_id FROM rel_invoices WHERE id = $1 FOR UPDATE', [id]);
     if (curRes.rowCount === 0) throw new BusinessRuleError(`invoice ${id} not found`);
     if (curRes.rows[0].row_version !== expectedVersion) throw new ConcurrencyConflictError('rel_invoices', id);
+    const lockedJobId: number | null = curRes.rows[0].job_id === null ? null : Number(curRes.rows[0].job_id);
+    if (lockedJobId !== identJobId) throw new ConcurrencyConflictError('rel_invoices', id);
+
+    // FINANCIAL SAFETY (2026-08-24). The invoice's own payment history goes
+    // with it — the existing, explicit business rule, which the confirmation
+    // dialog states in full before anything is deleted. But a 'Credit'
+    // payment is not just history: it CONSUMED a customer credit note, and
+    // deleting it without releasing that consumption silently burns the
+    // customer's credit. deletePayment has always released it; this path
+    // never did, because it deleted the rows with raw SQL. Both now go
+    // through the same releaseCreditForPaymentTx, so credit notes stay
+    // internally correct whichever way a payment is removed.
+    const invPaysRes = await client.query(
+      `SELECT id, method, owner_type, owner_id, amount FROM rel_payments
+        WHERE owner_type = 'invoice' AND owner_id = $1 ORDER BY id FOR UPDATE`,
+      [id]
+    );
+    let creditReleased = 0;
+    for (const p of invPaysRes.rows) creditReleased += await releaseCreditForPaymentTx(client, p);
     await client.query(`DELETE FROM rel_payments WHERE owner_type = 'invoice' AND owner_id = $1`, [id]);
     await client.query('DELETE FROM rel_invoices WHERE id = $1', [id]);
+    // The second half of the same reversal. row_version is bumped so any
+    // editor holding this job open gets the normal 409 stale_record instead
+    // of silently writing the cleared linkage back; the new version is
+    // returned so the client that performed the delete stays current.
+    const clearedRes = targetJobIds.length > 0
+      ? await client.query(
+          `UPDATE rel_jobs
+              SET invoice_num = NULL, invoice_date = NULL, invoice_due = NULL,
+                  invoice_created = false, invoice_status = NULL,
+                  row_version = row_version + 1, updated_at = NOW()
+            WHERE id = ANY($1::bigint[])
+              AND (invoice_num IS NULL OR UPPER(BTRIM(invoice_num)) = UPPER(BTRIM($2)))
+              AND (invoice_num IS NOT NULL OR invoice_created OR invoice_status IS NOT NULL
+                   OR invoice_date IS NOT NULL OR invoice_due IS NOT NULL)
+            RETURNING id, source_id, job_number, row_version`,
+          [targetJobIds, invoiceNumber]
+        )
+      : { rows: [] as any[] };
+    // A cleared job may still hold payments of its OWN (owner_type='job'),
+    // which this delete does not touch and must not misreport. invoice_status
+    // is the column those payments' status lives in, so where any survive it
+    // is recomputed from them (recomputeOwnerPaymentStatus does not bump
+    // row_version, so the version returned above stays correct); where none
+    // do, NULL is the true reversal of createInvoiceForJob's stamp.
+    for (const r of clearedRes.rows) {
+      const paidRes = await client.query(
+        `SELECT COALESCE(SUM(amount), 0) AS total FROM rel_payments WHERE owner_type = 'job' AND owner_id = $1`,
+        [Number(r.id)]
+      );
+      if (Number(paidRes.rows[0].total) > 0) await recomputeOwnerPaymentStatus(client, 'job', Number(r.id));
+    }
     await client.query('COMMIT');
-    return { deleted: true };
+    return {
+      deleted: true,
+      clearedJobs: clearedRes.rows.map((r) => ({
+        id: Number(r.id), sourceId: String(r.source_id), jobNumber: r.job_number, rowVersion: r.row_version,
+      })),
+      ambiguousJobs,
+      creditReleased,
+    };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw err;
@@ -1249,6 +1403,49 @@ export async function getPaymentMethod(id: number): Promise<string | null> {
 // before — so "reject stale delete" and "release credit + delete
 // atomically" now both hold together, without duplicating any of the
 // existing credit-release/recompute logic.
+// ── SHARED CREDIT RELEASE (extracted 2026-08-24, invoice-delete repair) ────
+// Removing a payment whose method is 'Credit' must give the consumed amount
+// back to the customer's credit note(s) — otherwise the credit is silently
+// burnt. This was the body of deletePayment and was reachable ONLY through
+// deletePayment, which meant deleteInvoice's own
+// `DELETE FROM rel_payments WHERE owner_type='invoice'` destroyed Credit
+// payments without ever releasing what they had consumed. Extracted verbatim
+// (same oldest-releasable-first selection, same FOR UPDATE, same row_version
+// bump) so both callers apply one identical rule and cannot drift.
+async function releaseCreditForPaymentTx(
+  client: PoolClient,
+  payment: { method?: string | null; owner_type: 'job' | 'invoice' | 'quote'; owner_id: number; amount: number | string }
+): Promise<number> {
+  if (payment.method !== 'Credit') return 0;
+  let creditReleased = 0;
+  const table = payment.owner_type === 'job' ? 'rel_jobs' : payment.owner_type === 'invoice' ? 'rel_invoices' : 'rel_quotes';
+  const nameCol = payment.owner_type === 'invoice' ? 'contact_name' : 'customer_name_raw';
+  const ownerRes = await client.query(`SELECT ${nameCol} AS contact_name FROM ${table} WHERE id = $1`, [payment.owner_id]);
+  const contactName = ownerRes.rowCount ? (ownerRes.rows[0].contact_name || '') : '';
+  const norm = contactName.trim().toLowerCase();
+  if (!norm) return 0;
+  const notesRes = await client.query(
+    `SELECT id, used_amount FROM rel_credit_notes
+     WHERE note_type = 'customer' AND LOWER(TRIM(contact_name_raw)) = $1 AND used_amount > 0
+     ORDER BY note_date DESC NULLS LAST, id DESC
+     FOR UPDATE`,
+    [norm]
+  );
+  let remaining = Number(payment.amount);
+  for (const note of notesRes.rows) {
+    if (remaining <= 0) break;
+    const releasable = Math.min(remaining, Number(note.used_amount));
+    if (releasable <= 0) continue;
+    await client.query(
+      `UPDATE rel_credit_notes SET used_amount = used_amount - $1, row_version = row_version + 1, updated_at = NOW() WHERE id = $2`,
+      [releasable, note.id]
+    );
+    remaining -= releasable;
+    creditReleased += releasable;
+  }
+  return creditReleased;
+}
+
 export async function deletePayment(id: number, expectedVersion: number): Promise<{ deleted: true; creditReleased: number }> {
   const client = await pool.connect();
   try {
@@ -1257,35 +1454,7 @@ export async function deletePayment(id: number, expectedVersion: number): Promis
     if (curRes.rowCount === 0) throw new BusinessRuleError(`payment ${id} not found`);
     const payment = curRes.rows[0];
     if (payment.row_version !== expectedVersion) throw new ConcurrencyConflictError('rel_payments', id);
-    let creditReleased = 0;
-    if (payment.method === 'Credit') {
-      const table = payment.owner_type === 'job' ? 'rel_jobs' : payment.owner_type === 'invoice' ? 'rel_invoices' : 'rel_quotes';
-      const nameCol = payment.owner_type === 'invoice' ? 'contact_name' : 'customer_name_raw';
-      const ownerRes = await client.query(`SELECT ${nameCol} AS contact_name FROM ${table} WHERE id = $1`, [payment.owner_id]);
-      const contactName = ownerRes.rowCount ? (ownerRes.rows[0].contact_name || '') : '';
-      const norm = contactName.trim().toLowerCase();
-      if (norm) {
-        const notesRes = await client.query(
-          `SELECT id, used_amount FROM rel_credit_notes
-           WHERE note_type = 'customer' AND LOWER(TRIM(contact_name_raw)) = $1 AND used_amount > 0
-           ORDER BY note_date DESC NULLS LAST, id DESC
-           FOR UPDATE`,
-          [norm]
-        );
-        let remaining = Number(payment.amount);
-        for (const note of notesRes.rows) {
-          if (remaining <= 0) break;
-          const releasable = Math.min(remaining, Number(note.used_amount));
-          if (releasable <= 0) continue;
-          await client.query(
-            `UPDATE rel_credit_notes SET used_amount = used_amount - $1, row_version = row_version + 1, updated_at = NOW() WHERE id = $2`,
-            [releasable, note.id]
-          );
-          remaining -= releasable;
-          creditReleased += releasable;
-        }
-      }
-    }
+    const creditReleased = await releaseCreditForPaymentTx(client, payment);
     await client.query('DELETE FROM rel_payments WHERE id = $1', [id]);
     await recomputeOwnerPaymentStatus(client, payment.owner_type, payment.owner_id);
     await client.query('COMMIT');

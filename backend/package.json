@@ -24,6 +24,8 @@
     "test:save-path-jobs-persistence": "ts-node --transpile-only test/relational.save-path-jobs-persistence.stress.ts",
     "test:save-path-jobs-persistence:compiled": "node dist/test/relational.save-path-jobs-persistence.stress.js",
     "test:post-migration-stabilization:compiled": "node dist/test/relational.post-migration-stabilization.stress.js",
+    "test:invoice-delete-representation": "ts-node --transpile-only test/relational.invoice-delete-representation.stress.ts",
+    "test:invoice-delete-representation:compiled": "node dist/test/relational.invoice-delete-representation.stress.js",
     "test:relational:stage3:compiled": "node dist/test/relational.stage3.stress.js",
     "test:relational:mixed-mode": "node dist/test/relational.mixed-mode.stress.js",
     "test:relational:rest-api": "node dist/test/relational.rest-api.stress.js",
