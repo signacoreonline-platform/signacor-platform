@@ -165,7 +165,14 @@ router.put('/quotes/:id', async (req: AuthRequest, res: Response): Promise<void>
     if (!Number.isFinite(id) || !Number.isFinite(expectedVersion)) {
       res.status(400).json({ error: '"id" (path) and "expectedVersion" (body) must be numbers' }); return;
     }
-    const { expectedVersion: _ev, expectedJobVersion, ...patch } = req.body || {};
+    // ── BLOCKER 2 (2026-08-24) — `resyncJobLines` is stripped here and is
+    // deliberately NOT forwarded. A quote edit over HTTP can never rewrite the
+    // linked job's production line items, no matter what the client sends.
+    // The service still supports an explicit resync (services.ts opts), but no
+    // HTTP surface exposes it, because no UI workflow asks for one; the shipped
+    // edit patch resends `lines` unconditionally, so an exposed flag would be
+    // one stray field away from deleting production lines again.
+    const { expectedVersion: _ev, expectedJobVersion, resyncJobLines: _rsjl, ...patch } = req.body || {};
     const result = await updateQuoteWithJobSync(id, expectedVersion, patch, {
       expectedJobVersion: expectedJobVersion !== undefined ? Number(expectedJobVersion) : undefined,
     });

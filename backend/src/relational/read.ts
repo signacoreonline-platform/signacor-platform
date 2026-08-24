@@ -130,6 +130,16 @@ function num(v: any): number {
 // invariant at the single point where relational rows re-enter the JSON
 // shape the rest of the app already assumes, rather than patching each
 // downstream `.co===`/`.co==` comparison site individually.
+// migration 013 — a nullable numeric column: null stays null (meaning "never
+// recorded"), so the pricing formula's "absent pieces reads as 1" rule and the
+// UI's `l.sqmL && ...` truthiness checks both behave exactly as before for
+// every historical line.
+function numOrNull(v: any): number | null {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 function coNum(v: any): number | string | null {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
@@ -272,6 +282,20 @@ export async function buildQuotesJson(): Promise<any[]> {
       unit: l.unit ?? legacyBase(l).unit ?? null,
       subtotal: num(l.subtotal),
       itemId: l.inventory_source_id != null ? restoreId(l.inventory_source_id) : (legacyBase(l).itemId ?? null),
+      // ── migration 013 ────────────────────────────────────────────────────
+      // Dimensions, piece count and the complete-product link now have real
+      // columns. The legacy fallbacks keep BACKFILLED lines (whose values live
+      // only in legacy_data, and which 013 does not retro-populate) rendering
+      // exactly as they do today — and because the column is checked first, a
+      // line that has been saved since 013 reads from the column, so clearing
+      // a dimension actually clears it instead of falling back to the old one.
+      sqmL: numOrNull(l.sqm_l) ?? legacyBase(l).sqmL ?? null,
+      sqmW: numOrNull(l.sqm_w) ?? legacyBase(l).sqmW ?? null,
+      pQty: numOrNull(l.pieces) ?? legacyBase(l).pQty ?? null,
+      cpId: l.complete_product_source_id != null
+        ? restoreId(l.complete_product_source_id) : (legacyBase(l).cpId ?? null),
+      cpLinked: l.complete_product_linked !== null && l.complete_product_linked !== undefined
+        ? l.complete_product_linked : (legacyBase(l).cpLinked ?? null),
     }));
     const payments = await paymentsFor('quote', r.id);
     out.push({
@@ -407,6 +431,20 @@ export async function buildJobsJson(): Promise<any[]> {
       unit: l.unit ?? legacyBase(l).unit ?? null,
       subtotal: num(l.subtotal),
       itemId: l.inventory_source_id != null ? restoreId(l.inventory_source_id) : (legacyBase(l).itemId ?? null),
+      // ── migration 013 ────────────────────────────────────────────────────
+      // Dimensions, piece count and the complete-product link now have real
+      // columns. The legacy fallbacks keep BACKFILLED lines (whose values live
+      // only in legacy_data, and which 013 does not retro-populate) rendering
+      // exactly as they do today — and because the column is checked first, a
+      // line that has been saved since 013 reads from the column, so clearing
+      // a dimension actually clears it instead of falling back to the old one.
+      sqmL: numOrNull(l.sqm_l) ?? legacyBase(l).sqmL ?? null,
+      sqmW: numOrNull(l.sqm_w) ?? legacyBase(l).sqmW ?? null,
+      pQty: numOrNull(l.pieces) ?? legacyBase(l).pQty ?? null,
+      cpId: l.complete_product_source_id != null
+        ? restoreId(l.complete_product_source_id) : (legacyBase(l).cpId ?? null),
+      cpLinked: l.complete_product_linked !== null && l.complete_product_linked !== undefined
+        ? l.complete_product_linked : (legacyBase(l).cpLinked ?? null),
     }));
     const payments = await paymentsFor('job', r.id);
     out.push({

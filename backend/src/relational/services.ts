@@ -170,7 +170,12 @@ export async function updateCustomer(
 // ── CREATE QUOTE ───────────────────────────────────────────────────────────
 // BEGIN; reserve/validate document number; insert quote; insert quote
 // items; COMMIT — exactly the shape described in the migration brief.
-export interface QuoteLineInput { description: string; qty: number; unitPrice: number; unit?: string | null; inventoryItemId?: number | null }
+export interface QuoteLineInput {
+  description: string; qty: number; unitPrice: number; unit?: string | null; inventoryItemId?: number | null;
+  // migration 013 — see LINE_EXTRAS below.
+  sqmL?: number | string | null; sqmW?: number | string | null; pieces?: number | string | null;
+  cpId?: number | string | null; cpLinked?: boolean | null;
+}
 export interface CreateQuoteInput {
   companyCode: string;
   customerId?: number | null;
@@ -207,12 +212,24 @@ export interface CreateQuoteInput {
 }
 
 export async function createQuote(input: CreateQuoteInput): Promise<{ id: number; quoteNumber: string; rowVersion: number }> {
+  // Everything the caller can get wrong is checked BEFORE a transaction opens,
+  // so a bad value is a readable refusal instead of a raw Postgres error the
+  // client renders as "Internal error" — and no document number is burnt.
+  if (!input.companyCode || !String(input.companyCode).trim()) {
+    throw new BusinessRuleError('A company is required to create a quote.');
+  }
+  if (!input.customerNameRaw || !String(input.customerNameRaw).trim()) {
+    throw new BusinessRuleError('A client name is required to create a quote.');
+  }
+  validateQuoteHeader(input);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    await assertCustomerExists(client, input.customerId);
     const quoteNumber = await reserveDocumentNumberWithClient(client, input.companyCode, 'quote');
 
-    const subtotal = input.lines.reduce((s, l) => s + (Number(l.qty) || 0) * (Number(l.unitPrice) || 0), 0);
+    // migration 013: pieces x qty x unitPrice — the SAME formula the form uses.
+    const subtotal = input.lines.reduce((s, l) => s + lineSubtotal(l.pieces, l.qty, l.unitPrice), 0);
     const discountPct = input.discountPct || 0;
     const discAmt = subtotal * (discountPct / 100);
     const setupFee = input.setupFee || 0;
@@ -246,10 +263,14 @@ export async function createQuote(input: CreateQuoteInput): Promise<{ id: number
       // Same resolveInventoryRef() fix as replaceQuoteLinesTx — createQuote had
       // the identical raw-itemId-into-a-FK-column defect (BUG 3 root cause #1).
       const inv = await resolveInventoryRef(client, l.inventoryItemId);
+      const ex = lineExtras(l as any);
       await client.query(
-        `INSERT INTO rel_quote_line_items (quote_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, inventory_source_id, legacy_data)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{}'::jsonb)`,
-        [quoteId, i, l.description ?? null, qty, unitPrice, l.unit ?? null, qty * unitPrice, inv.fk, inv.sourceId]
+        `INSERT INTO rel_quote_line_items (quote_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, inventory_source_id,
+           sqm_l, sqm_w, pieces, complete_product_source_id, complete_product_linked, legacy_data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, '{}'::jsonb)`,
+        [quoteId, i, sanitizeText(l.description) ?? null, qty, unitPrice, sanitizeText(l.unit) ?? null,
+         lineSubtotal(l.pieces, qty, unitPrice), inv.fk, inv.sourceId,
+         ex.sqmL, ex.sqmW, ex.pieces, ex.cpId, ex.cpLinked]
       );
     }
 
@@ -383,10 +404,15 @@ export async function convertQuoteToJob(quoteId: number): Promise<{
 
     for (const l of lineItemsRes.rows) {
       await client.query(
-        `INSERT INTO rel_job_line_items (job_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, inventory_source_id, legacy_data)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        `INSERT INTO rel_job_line_items (job_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, inventory_source_id,
+           sqm_l, sqm_w, pieces, complete_product_source_id, complete_product_linked, legacy_data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
         [jobId, l.line_index, l.description, l.qty, l.unit_price, l.unit, l.subtotal,
          l.inventory_item_id, l.inventory_source_id,
+         // migration 013: the quote line's dimensions, piece count and
+         // complete-product link are the Job Card's specification — carried
+         // across as real columns now, not smuggled through legacy_data.
+         l.sqm_l, l.sqm_w, l.pieces, l.complete_product_source_id, l.complete_product_linked,
          // Carry the QUOTE line's legacy_data across verbatim so per-line
          // extras the relational schema does not model (sqmL/sqmW/pQty/
          // sizeText/cpLinked — the sizing fields the printed Job Card reads via
@@ -1492,6 +1518,12 @@ export interface LineItemPatch {
   unitPrice: number;
   unit?: string | null;
   itemId?: number | null;
+  // migration 013 — see LINE_EXTRAS below.
+  sqmL?: number | string | null;
+  sqmW?: number | string | null;
+  pieces?: number | string | null;
+  cpId?: number | string | null;
+  cpLinked?: boolean | null;
 }
 
 // ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 3 ROOT CAUSE #1 ──────────
@@ -1529,6 +1561,196 @@ export interface LineItemPatch {
 // inventory item was deleted still saves, exactly like convertQuoteToJob's own
 // forgiving "referenced item no longer exists" skip, instead of 500ing the whole
 // quote.
+/* ═══════════════════════════════════════════
+   QUOTE / JOB LINE EXTRAS + INPUT VALIDATION (2026-08-24, migration 013)
+
+   LINE_EXTRAS — the five per-line fields migration 013 gives real columns.
+   `pieces` is the only FINANCIAL one: the Quote form has always priced a line
+   as `pQty x qty x unitPrice` (index.html ~6753) while the server recomputed
+   `qty x unitPrice`, so every multi-piece quote was persisted under-priced by
+   a factor of pQty. lineSubtotal() below is now the ONE formula, used by every
+   writer, and it defaults pieces to 1 so historical lines price exactly as
+   they always have.
+
+   VALIDATION — the Quote form can hand the server values Postgres cannot
+   parse, and until now they reached `$::date` / NUMERIC raw and surfaced to
+   the user as a generic "Internal error". The worst case needs no bad typing
+   at all: migration 012 never retro-populated quote_date, so a BACKFILLED
+   quote hydrates its date from legacy_data as whatever string the old JSON
+   held (e.g. "14/03/2025"); <input type="date"> renders blank but keeps that
+   string in form state, and the next save posts it verbatim. Everything below
+   is checked BEFORE any SQL runs, and fails as a BusinessRuleError the client
+   already knows how to display without losing the draft.
+═══════════════════════════════════════════ */
+
+/** Number | null, tolerant of the strings the form actually sends. */
+function optionalNumber(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  const t = String(v).trim();
+  if (t === '') return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
+/** Boolean | null — only an explicit boolean-ish value sets it. */
+function optionalBoolean(v: unknown): boolean | null {
+  if (v === null || v === undefined || v === '') return null;
+  if (typeof v === 'boolean') return v;
+  const t = String(v).trim().toLowerCase();
+  if (t === 'true' || t === '1') return true;
+  if (t === 'false' || t === '0') return false;
+  return null;
+}
+/** The originating Complete Product id, kept verbatim as a breadcrumb. */
+function optionalSourceId(v: unknown): string | null {
+  if (v === null || v === undefined) return null;
+  const t = String(v).trim();
+  return t === '' ? null : t;
+}
+
+/**
+ * THE line subtotal formula. `pieces` and `qty` are separate commercial
+ * concepts and are NEVER folded together — qty stays the per-piece quantity,
+ * which is what inventory consumption and the printed "N items x X m² each"
+ * spec line both depend on.
+ */
+export function lineSubtotal(pieces: unknown, qty: unknown, unitPrice: unknown): number {
+  const p = optionalNumber(pieces);
+  const q = Number(qty) || 0;
+  const u = Number(unitPrice) || 0;
+  const effectivePieces = p === null || p <= 0 ? 1 : p;
+  return effectivePieces * q * u;
+}
+
+/** Normalised LINE_EXTRAS for one line, ready to bind. */
+function lineExtras(l: { sqmL?: unknown; sqmW?: unknown; pieces?: unknown; cpId?: unknown; cpLinked?: unknown }) {
+  return {
+    sqmL: optionalNumber(l.sqmL),
+    sqmW: optionalNumber(l.sqmW),
+    pieces: optionalNumber(l.pieces),
+    cpId: optionalSourceId(l.cpId),
+    cpLinked: optionalBoolean(l.cpLinked),
+  };
+}
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+/**
+ * A date the caller may set. Returns undefined when the caller did not supply
+ * the field at all, null for "clear it", and the ISO string otherwise.
+ * A non-ISO value is REFUSED — never reinterpreted. "14/03/2025" could equally
+ * be 14 March or (in another DateStyle) an invalid month, and silently guessing
+ * would put a wrong date on a customer-facing document.
+ */
+function validateOptionalDate(value: unknown, label: string): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const t = String(value).trim();
+  if (t === '') return null;
+  if (!ISO_DATE.test(t)) {
+    throw new BusinessRuleError(
+      `${label} is not a valid date ("${String(value).slice(0, 40)}"). Please select the date again before saving.`
+    );
+  }
+  const [y, m, d] = t.split('-').map(Number);
+  const probe = new Date(Date.UTC(y, m - 1, d));
+  if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== m - 1 || probe.getUTCDate() !== d) {
+    throw new BusinessRuleError(
+      `${label} is not a real calendar date ("${t}"). Please select the date again before saving.`
+    );
+  }
+  return t;
+}
+
+/**
+ * A number the caller may set, checked against the COLUMN's real range so an
+ * out-of-range value is a readable refusal rather than a raw 22003.
+ */
+function validateOptionalNumber(
+  value: unknown, label: string, opts: { min: number; max: number; allowBlank?: boolean }
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || String(value).trim() === '') {
+    if (opts.allowBlank) return 0;
+    return undefined;
+  }
+  const n = Number(String(value).trim());
+  if (!Number.isFinite(n)) {
+    throw new BusinessRuleError(`${label} must be a number ("${String(value).slice(0, 40)}").`);
+  }
+  if (n < opts.min || n > opts.max) {
+    throw new BusinessRuleError(
+      `${label} must be between ${opts.min} and ${opts.max} — got ${n}. Please correct it before saving.`
+    );
+  }
+  return n;
+}
+
+// Column ranges, from 007_relational_core.sql / 013_quote_line_dimensions.sql.
+const RANGE_MONEY = { min: -99999999.99, max: 99999999.99 };        // NUMERIC(14,2)
+const RANGE_RATE = { min: -9999999999.9999, max: 9999999999.9999 }; // NUMERIC(14,4)
+const RANGE_DISCOUNT = { min: -999.999, max: 999.999 };             // NUMERIC(6,3)
+const RANGE_PIECES = { min: 0, max: 9999999999.9999 };
+
+/** Strips NUL bytes, which Postgres rejects outright (22021) in any text column. */
+function sanitizeText(v: unknown): any {
+  if (typeof v !== 'string') return v;
+  return v.indexOf('\u0000') === -1 ? v : v.replace(/\u0000/g, '');
+}
+
+/**
+ * Validates every quote line BEFORE any SQL runs, so a bad line can never
+ * half-write a quote and can never reach the user as "Internal error".
+ */
+function validateLines(lines: any[] | undefined, label: string): void {
+  if (lines === undefined) return;
+  if (!Array.isArray(lines)) throw new BusinessRuleError(`${label} must be a list of lines.`);
+  lines.forEach((l, i) => {
+    if (!l || typeof l !== 'object') throw new BusinessRuleError(`${label}: line ${i + 1} is empty or malformed.`);
+    validateOptionalNumber(l.qty, `${label}: line ${i + 1} quantity`, RANGE_RATE);
+    validateOptionalNumber(l.unitPrice, `${label}: line ${i + 1} unit price`, RANGE_RATE);
+    validateOptionalNumber(l.sqmL, `${label}: line ${i + 1} length`, RANGE_RATE);
+    validateOptionalNumber(l.sqmW, `${label}: line ${i + 1} width`, RANGE_RATE);
+    validateOptionalNumber(l.pieces, `${label}: line ${i + 1} pieces`, RANGE_PIECES);
+    const sub = lineSubtotal(l.pieces, l.qty, l.unitPrice);
+    if (!Number.isFinite(sub) || sub < RANGE_MONEY.min || sub > RANGE_MONEY.max) {
+      throw new BusinessRuleError(
+        `${label}: line ${i + 1} totals ${sub} — that is outside the range this system can store. Please check the quantity, pieces and unit price.`
+      );
+    }
+  });
+}
+
+/**
+ * Header-level validation shared by create and both update paths. It also
+ * NORMALISES in place — validating without normalising was not enough: a
+ * whitespace-only date passes the check (it means "clear it") but the caller
+ * would then still bind the original "   " into a DATE column and get a raw
+ * 22007. The value that was validated must be the value that gets written.
+ */
+function validateQuoteHeader(input: any, label = 'Quote'): void {
+  if (!input || typeof input !== 'object') return;
+  const d = validateOptionalDate(input.quoteDate, 'Quote date');
+  if (d !== undefined) input.quoteDate = d;
+  const v = validateOptionalDate(input.validUntil, 'Valid until');
+  if (v !== undefined) input.validUntil = v;
+  validateOptionalNumber(input.discountPct, 'Discount %', RANGE_DISCOUNT);
+  validateOptionalNumber(input.setupFee, 'Setup fee', RANGE_MONEY);
+  if (typeof input.notes === 'string') input.notes = sanitizeText(input.notes);
+  if (typeof input.reference === 'string') input.reference = sanitizeText(input.reference);
+  if (typeof input.poRef === 'string') input.poRef = sanitizeText(input.poRef);
+  validateLines(input.lines, label);
+}
+
+/** Refuses a customerId that does not exist, instead of letting FK 23503 500. */
+async function assertCustomerExists(client: PoolClient, customerId: unknown): Promise<void> {
+  if (customerId === null || customerId === undefined || customerId === '') return;
+  const n = Number(customerId);
+  if (!Number.isFinite(n)) throw new BusinessRuleError(`Customer reference "${String(customerId).slice(0, 40)}" is not valid.`);
+  const res = await client.query('SELECT 1 FROM rel_customers WHERE id = $1', [n]);
+  if (res.rowCount === 0) {
+    throw new BusinessRuleError(`The selected customer (id ${n}) no longer exists. Please re-select the customer before saving.`);
+  }
+}
+
 async function resolveInventoryRef(
   client: PoolClient,
   itemId: unknown
@@ -1570,13 +1792,16 @@ async function replaceQuoteLinesTx(client: PoolClient, quoteId: number, lines: L
     const l = lines[i];
     const qty = Number(l.qty) || 0;
     const unitPrice = Number(l.unitPrice) || 0;
-    const lineSubtotal = qty * unitPrice;
-    subtotal += lineSubtotal;
+    const thisLineSubtotal = lineSubtotal(l.pieces, qty, unitPrice);
+    subtotal += thisLineSubtotal;
     const inv = await resolveInventoryRef(client, l.itemId);
+    const ex = lineExtras(l as any);
     await client.query(
-      `INSERT INTO rel_quote_line_items (quote_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, inventory_source_id, legacy_data)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'{}'::jsonb)`,
-      [quoteId, i, l.desc ?? null, qty, unitPrice, l.unit ?? null, lineSubtotal, inv.fk, inv.sourceId]
+      `INSERT INTO rel_quote_line_items (quote_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, inventory_source_id,
+         sqm_l, sqm_w, pieces, complete_product_source_id, complete_product_linked, legacy_data)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'{}'::jsonb)`,
+      [quoteId, i, sanitizeText(l.desc) ?? null, qty, unitPrice, sanitizeText(l.unit) ?? null, thisLineSubtotal, inv.fk, inv.sourceId,
+       ex.sqmL, ex.sqmW, ex.pieces, ex.cpId, ex.cpLinked]
     );
   }
   return subtotal;
@@ -1589,10 +1814,14 @@ async function replaceJobLinesTx(client: PoolClient, jobId: number, lines: LineI
     const qty = Number(l.qty) || 0;
     const unitPrice = Number(l.unitPrice) || 0;
     const inv = await resolveInventoryRef(client, l.itemId);
+    const ex = lineExtras(l as any);
     await client.query(
-      `INSERT INTO rel_job_line_items (job_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, inventory_source_id, legacy_data)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'{}'::jsonb)`,
-      [jobId, i, l.desc ?? null, qty, unitPrice, l.unit ?? null, qty * unitPrice, inv.fk, inv.sourceId]
+      `INSERT INTO rel_job_line_items (job_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, inventory_source_id,
+         sqm_l, sqm_w, pieces, complete_product_source_id, complete_product_linked, legacy_data)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'{}'::jsonb)`,
+      [jobId, i, sanitizeText(l.desc) ?? null, qty, unitPrice, sanitizeText(l.unit) ?? null,
+       lineSubtotal(l.pieces, qty, unitPrice), inv.fk, inv.sourceId,
+       ex.sqmL, ex.sqmW, ex.pieces, ex.cpId, ex.cpLinked]
     );
   }
 }
@@ -1642,6 +1871,7 @@ export interface QuotePatchInput {
   lines?: LineItemPatch[];
 }
 export async function updateQuote(id: number, expectedVersion: number, patch: Partial<QuotePatchInput>): Promise<{ rowVersion: number }> {
+  validateQuoteHeader(patch, 'Quote');
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1737,6 +1967,11 @@ export interface JobPatchInput {
   depositWaivedBy?: string | null;
 }
 export async function updateJob(id: number, expectedVersion: number, patch: Partial<JobPatchInput>): Promise<{ rowVersion: number }> {
+  // 2026-08-24 — job lines carry the same dimensions/pieces columns quote
+  // lines do (migration 013), so they need the same before-any-SQL validation:
+  // an out-of-range piece count or price must reach the user as a sentence,
+  // never as a raw NUMERIC overflow surfacing as "Internal error".
+  validateLines(patch.lines as any[] | undefined, 'Job');
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1902,8 +2137,9 @@ export async function updateQuoteWithJobSync(
   quoteId: number,
   expectedQuoteVersion: number,
   patch: Partial<QuotePatchInput>,
-  opts: { expectedJobVersion?: number } = {}
+  opts: { expectedJobVersion?: number; resyncJobLines?: boolean } = {}
 ): Promise<QuoteJobSyncResult> {
+  validateQuoteHeader(patch, 'Quote');
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1960,7 +2196,22 @@ export async function updateQuoteWithJobSync(
         throw new ConcurrencyConflictError('rel_jobs', linkedJobId);
       }
 
-      if (finalLines) await replaceJobLinesTx(client, linkedJobId, finalLines);
+      // ── BLOCKER 2 (2026-08-24) — a quote edit must NOT rewrite the job's
+      // own line items. Quote lines INITIALISE the job at conversion; after
+      // that, production owns them: the Job page has its own line editor
+      // writing this same table. This cascade used to fire whenever the patch
+      // carried `lines` — and the shipped edit patch ALWAYS carries lines
+      // (index.html ~8996 is unconditional), so changing a phone number on the
+      // quote silently deleted every production line added since conversion.
+      // Reproduced before this fix: 3 job lines -> 1.
+      //
+      // The cascade is now an EXPLICIT action only. Nothing infers a resync
+      // from the mere fact that a quote was saved. `opts.resyncJobLines` is the
+      // one way to ask for it, and the job's row_version is still asserted
+      // exactly as before, so an explicit resync remains concurrency-safe.
+      if (finalLines && opts.resyncJobLines === true) {
+        await replaceJobLinesTx(client, linkedJobId, finalLines);
+      }
 
       // Resulting (post-this-save) quote field values — whether from THIS
       // patch or preserved unchanged — mirrors `q.contact||''` etc. in the

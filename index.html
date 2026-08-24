@@ -6760,7 +6760,31 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   const afterDiscount=subtotal-discountAmt+setupFeeAmt;
   const vat=afterDiscount*0.15; const total=afterDiscount+vat;
 
+  /* ── QUOTE ATTACHMENTS (2026-08-24) — TEMPORARILY READ-ONLY ────────────────
+     Quote attachments are whole files held as base64 data URLs
+     (reader.readAsDataURL below). rel_quotes has no column for them and the
+     relational quote services neither accept nor return them, so while
+     "quotes" is relational-authoritative an attachment change is silently
+     lossy in BOTH directions: a newly attached file is dropped on save, and —
+     because a backfilled quote's attachments hydrate from legacy_data — a file
+     the user removed comes back on the next authoritative read.
+
+     Persisting them properly means a real document-storage design (a blob
+     column or a file service), which is a much larger piece of work than the
+     Quote reliability repair this change is part of. Until that exists, the
+     honest behaviour is to REFUSE the mutation and say so, rather than accept
+     it and quietly not save it. Existing attachments stay fully viewable and
+     downloadable; only add/remove is blocked, and only while quotes are
+     relational-authoritative — the legacy JSON path is unchanged. */
+  const quoteAttachmentsReadOnly = isRelationalAuthoritative('quotes');
+  const QUOTE_ATTACHMENTS_BLOCKED_REASON =
+    'Quote attachments cannot be added or removed at the moment. Quotes are now stored in the accounting database, which does not yet hold attachment files, so a change here would not actually be saved. Existing attachments below still open and download normally. Everything else on this quote saves as usual.';
   function handleAttach(e) {
+    if(quoteAttachmentsReadOnly){
+      e.target.value='';
+      window.alert(QUOTE_ATTACHMENTS_BLOCKED_REASON);
+      return;
+    }
     const files = Array.from(e.target.files);
     files.forEach(file=>{
       const reader = new FileReader();
@@ -6771,7 +6795,10 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
     });
     e.target.value='';
   }
-  function removeAttachment(id){ setAttachments(prev=>prev.filter(a=>a.id!==id)); }
+  function removeAttachment(id){
+    if(quoteAttachmentsReadOnly){ window.alert(QUOTE_ATTACHMENTS_BLOCKED_REASON); return; }
+    setAttachments(prev=>prev.filter(a=>a.id!==id));
+  }
 
   async function submit(e){
     e.preventDefault();
@@ -6889,7 +6916,14 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
             salesperson: salesperson||null, preparedBy: preparedBy||null,
             poRef: poRef||null, reference: reference||null,
             quoteDate: date||null, validUntil: valid||null,
-            lines: lines.map(l=>({ description: l.desc||'', qty: parseFloat(l.qty)||0, unitPrice: parseFloat(l.unitPrice)||0, unit: l.unit||null, inventoryItemId: l.itemId||null })),
+            // migration 013 — dimensions, PIECE COUNT and the complete-product
+            // link are real relational fields now. `pieces` is the financial
+            // one: the form prices every line as pQty x qty x unitPrice, and
+            // until it was sent the server recomputed qty x unitPrice and
+            // persisted every multi-piece quote under-priced.
+            lines: lines.map(l=>({ description: l.desc||'', qty: parseFloat(l.qty)||0, unitPrice: parseFloat(l.unitPrice)||0, unit: l.unit||null, inventoryItemId: l.itemId||null,
+              sqmL: l.sqmL===''||l.sqmL===undefined?null:l.sqmL, sqmW: l.sqmW===''||l.sqmW===undefined?null:l.sqmW,
+              pieces: l.pQty===''||l.pQty===undefined?null:l.pQty, cpId: l.cpId??null, cpLinked: l.cpLinked??null })),
             discountPct: parseFloat(discount)||0, setupFee: parseFloat(setupFee)||0, notes,
           });
           // BUGFIX (Stage 3 follow-on): _relId/_relRowVersion must be set
@@ -7407,11 +7441,22 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
         <div>
           <div className="flex items-center justify-between mb-2">
             <p className="text-xs font-black text-gray-400 uppercase tracking-widest">Designs & Mockups</p>
-            <label className="cursor-pointer text-xs font-bold text-indigo-600 hover:text-indigo-800 px-3 py-1.5 border border-indigo-200 rounded-lg bg-indigo-50 hover:bg-indigo-100 transition-colors">
-              📎 Attach PDF / Image
-              <input type="file" accept=".pdf,image/*" multiple className="hidden" onChange={handleAttach}/>
-            </label>
+            {quoteAttachmentsReadOnly ? (
+              <span className="flex items-center gap-1 text-xs font-bold text-gray-400 px-3 py-1.5 border border-gray-200 rounded-lg bg-gray-50">
+                📎 Attach PDF / Image <PaymentLockedBadge reason={QUOTE_ATTACHMENTS_BLOCKED_REASON}/>
+              </span>
+            ) : (
+              <label className="cursor-pointer text-xs font-bold text-indigo-600 hover:text-indigo-800 px-3 py-1.5 border border-indigo-200 rounded-lg bg-indigo-50 hover:bg-indigo-100 transition-colors">
+                📎 Attach PDF / Image
+                <input type="file" accept=".pdf,image/*" multiple className="hidden" onChange={handleAttach}/>
+              </label>
+            )}
           </div>
+          {quoteAttachmentsReadOnly && (
+            <div className="bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 mb-2 text-xs text-amber-800">
+              📎 <strong>Attachments are read-only for now.</strong> {QUOTE_ATTACHMENTS_BLOCKED_REASON}
+            </div>
+          )}
           {attachments.length===0 ? (
             <div className="border-2 border-dashed border-gray-200 rounded-xl p-4 text-center">
               <p className="text-xs text-gray-400">No attachments yet — attach design files, mockups, or client briefs.</p>
@@ -7426,7 +7471,9 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                     <p className="text-xs text-gray-400">{(a.size/1024).toFixed(0)} KB</p>
                   </div>
                   <a href={a.data} download={a.name} className="text-xs font-bold text-blue-600 hover:underline px-2 py-1 rounded-lg hover:bg-blue-50">Download</a>
-                  <button type="button" onClick={()=>removeAttachment(a.id)} className="text-gray-300 hover:text-red-400 text-sm">✕</button>
+                  {quoteAttachmentsReadOnly
+                    ? <PaymentLockedBadge reason={QUOTE_ATTACHMENTS_BLOCKED_REASON}/>
+                    : <button type="button" onClick={()=>removeAttachment(a.id)} className="text-gray-300 hover:text-red-400 text-sm">✕</button>}
                 </div>
               ))}
             </div>
@@ -8993,7 +9040,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         // dropping two fields the form has always collected.
         quoteDate: q.date||null, validUntil: q.validUntil||null,
         setupFee: parseFloat(q.setupFee)||0, discountPct: parseFloat(q.discount)||0,
-        lines: (q.lines||[]).map(l=>({ desc: l.desc||'', qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId })),
+        // migration 013 — same five fields as the create payload. Without
+        // them an ordinary edit stripped a quote's dimensions AND repriced it.
+        lines: (q.lines||[]).map(l=>({ desc: l.desc||'', qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId,
+          sqmL: l.sqmL===''||l.sqmL===undefined?null:l.sqmL, sqmW: l.sqmW===''||l.sqmW===undefined?null:l.sqmW,
+          pieces: l.pQty===''||l.pQty===undefined?null:l.pQty, cpId: l.cpId??null, cpLinked: l.cpLinked??null })),
       };
       // Record-scoped concurrency in action: this ONLY ever asserts the
       // linked JOB's version (via expectedJobVersion, checked server-side in
@@ -11189,7 +11240,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                   value: parseFloat(updated.value)||0,
                   notes: updated.notes==null?'':String(updated.notes),
                   discountPct: parseFloat(updated.discount)||0,
-                  lines: (updated.lines||[]).map(l=>({ desc: l.desc||'', qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId })),
+                  // 2026-08-24 — carries the dimensions, the piece count and the
+                  // complete-product link too. Job lines model them exactly as
+                  // quote lines do (migration 013) and conversion populates
+                  // them, so omitting them here would blank the Job Card's
+                  // specification and reprice every multi-piece line.
+                  lines: (updated.lines||[]).map(l=>({ desc: l.desc||'', qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId,
+                    sqmL: l.sqmL===''||l.sqmL===undefined?null:l.sqmL, sqmW: l.sqmW===''||l.sqmW===undefined?null:l.sqmW,
+                    pieces: l.pQty===''||l.pQty===undefined?null:l.pQty, cpId: l.cpId??null, cpLinked: l.cpLinked??null })),
                 });
                 const jobsUpdater = prev=>prev.map(j=>j.id===updated.id?{...updated, _relRowVersion: relResult.rowVersion}:j);
                 setJobs(jobsUpdater);
@@ -14778,10 +14836,17 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     if(isRelationalAuthoritative('jobs')){
       try {
         // services.ts's LineItemPatch shape is {desc, qty, unitPrice, unit,
-        // itemId} — exactly this file's own line-item shape already, so no
-        // field renaming is needed; subtotal is recomputed server-side
-        // from qty*unitPrice (never trusted from the client).
-        const patchLines = cleanLines.map(l=>({ desc: l.desc, qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId }));
+        // itemId} plus, since migration 013 (2026-08-24), {sqmL, sqmW, pieces,
+        // cpId, cpLinked} — the same names this file already uses, except that
+        // the piece count is `pQty` here and `pieces` on the wire. Subtotal is
+        // recomputed server-side as pieces x qty x unitPrice (never trusted
+        // from the client), which is exactly the form's own formula, so the
+        // piece count MUST be sent: this is a wholesale replacement, and
+        // omitting it would silently reprice every multi-piece line to 1/pQty
+        // and blank the Job Card's dimension specification.
+        const patchLines = cleanLines.map(l=>({ desc: l.desc, qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId,
+          sqmL: l.sqmL===''||l.sqmL===undefined?null:l.sqmL, sqmW: l.sqmW===''||l.sqmW===undefined?null:l.sqmW,
+          pieces: l.pQty===''||l.pQty===undefined?null:l.pQty, cpId: l.cpId??null, cpLinked: l.cpLinked??null }));
         const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { lines: patchLines });
         const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j,lines:cleanLines,_relRowVersion:result.rowVersion}:j);
         setJobs(jobsUpdater);
@@ -16720,12 +16785,22 @@ function EditCompleteProductModal({ cp, completeProducts, setCompleteProducts, q
         for(const q of linkedQuotes){
           const nextLines = (q.lines||[]).map(l=>
             l.cpId===cp.id && l.cpLinked
-              ? {...l, desc:updated.name, unitPrice:updated.sellExVat, subtotal:(l.qty||1)*updated.sellExVat}
+              ? {...l, desc:updated.name, unitPrice:updated.sellExVat, subtotal:(parseFloat(l.pQty)||1)*(parseFloat(l.qty)||0)*(parseFloat(updated.sellExVat)||0)}
               : l
           );
           if(q._relId==null){ failures.push(q.num||q.id); continue; }
           try {
-            const patchLines = nextLines.map(l=>({ desc: l.desc, qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId }));
+            // 2026-08-24 — every field the relational line row models must
+            // travel with a WHOLESALE line replacement. Sending only
+            // desc/qty/unitPrice/unit/itemId blanked the dimensions and the
+            // piece count, and cleared cpId/cpLinked — unlinking the very line
+            // this cascade exists to keep in step, so the NEXT price change
+            // would silently stop matching it. The piece count is also
+            // financial: dropping it reprices a multi-piece line by a factor
+            // of pQty (the server prices pieces x qty x unitPrice).
+            const patchLines = nextLines.map(l=>({ desc: l.desc, qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId,
+              sqmL: l.sqmL===''||l.sqmL===undefined?null:l.sqmL, sqmW: l.sqmW===''||l.sqmW===undefined?null:l.sqmW,
+              pieces: l.pQty===''||l.pQty===undefined?null:l.pQty, cpId: l.cpId??null, cpLinked: l.cpLinked??null }));
             const result = await relationalApi.updateQuote(q._relId, q._relRowVersion, { lines: patchLines });
             const quotesUpdater = prev=>prev.map(x=>x.id===q.id?{...x, lines:nextLines, _relRowVersion:result.rowVersion}:x);
             setQuotes(quotesUpdater);
@@ -16742,7 +16817,7 @@ function EditCompleteProductModal({ cp, completeProducts, setCompleteProducts, q
           ...q,
           lines:(q.lines||[]).map(l=>
             l.cpId===cp.id && l.cpLinked
-              ? {...l, desc:updated.name, unitPrice:updated.sellExVat, subtotal:(l.qty||1)*updated.sellExVat}
+              ? {...l, desc:updated.name, unitPrice:updated.sellExVat, subtotal:(parseFloat(l.pQty)||1)*(parseFloat(l.qty)||0)*(parseFloat(updated.sellExVat)||0)}
               : l
           )
         })));

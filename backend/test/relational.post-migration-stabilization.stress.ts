@@ -546,8 +546,17 @@ async function main() {
   ok(j7.notes === '',
     'D3: editing the QUOTE (lines changed, notes unchanged) no longer resurrects the deleted Job note — this is the reported bug, reproduced and fixed',
     j7.notes);
-  ok(Number(j7.value) > 0 && j7.lines.length === 1 && j7.lines[0].desc === 'Revised sign',
-    'D3: the rest of the quote->job cascade still works — only the notes ratchet changed', { value: j7.value, lines: j7.lines });
+  // The job's VALUE still cascades from the quote's new totals — the display
+  // cascade is intact. Its LINE ITEMS deliberately do not: see Blocker 2
+  // (2026-08-24). A quote save must never rewrite production lines, and the
+  // shipped edit patch resends `lines` on every save, so the job keeps the two
+  // lines conversion gave it.
+  const d3Expected = (9000 - 900 + 750) * 1.15; // subtotal 9000, 10% disc, R750 setup fee, +VAT
+  ok(Math.abs(Number(j7.value) - d3Expected) < 0.01,
+    'D3: the quote->job VALUE cascade still works — only the notes ratchet changed', { value: j7.value, expected: d3Expected });
+  ok(j7.lines.length === 2 && j7.lines[0].desc === 'Illuminated fascia sign',
+    'D3b: …and the job\'s own production line items were NOT rewritten by the quote edit (Blocker 2 — production owns them after conversion)',
+    j7.lines.map((l: any) => l.desc));
 
   // D4 — changing the quote's notes DOES still cascade, including to empty.
   const q7ver2 = (await pool.query(`SELECT row_version FROM rel_quotes WHERE id=$1`, [q7.id])).rows[0].row_version;

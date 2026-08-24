@@ -145,7 +145,15 @@ async function testQuoteEditingAndSync() {
   ok(jobAfterSync.tel === '0821234567', 'cascade copied phone onto the job under the correct key "tel"');
   ok(jobAfterSync.vatNum === 'VAT123', 'cascade copied vat number onto the job under the correct key "vatNum"');
   ok(jobAfterSync.notes === 'Rush job', 'cascade overwrote job notes with the quote\'s (truthy) notes, matching q.notes||j.notes||\'\'');
-  ok(jobAfterSync.lines.length === 1 && jobAfterSync.lines[0].qty === 3, 'cascade replaced the job\'s lines with the quote\'s new lines');
+  // ── BLOCKER 2 (2026-08-24) — CONTRACT CHANGE, DELIBERATE ──────────────────
+  // This used to assert "cascade replaced the job's lines with the quote's new
+  // lines". That was the defect: the shipped edit patch resends `lines` on
+  // EVERY save, so an unrelated quote edit destroyed production lines added to
+  // the job after conversion. An ordinary quote save now leaves the job's lines
+  // exactly as conversion left them (qty 2, from the plain edit above); the
+  // display-field cascade below is unaffected.
+  ok(jobAfterSync.lines.length === 1 && jobAfterSync.lines[0].qty === 2,
+    'an ordinary quote save leaves the job\'s own line items untouched (production owns them after conversion)', jobAfterSync.lines);
   // subtotal=3000, disc 5% = 150, afterDisc=2850, *1.15 = 3277.5
   ok(Math.abs(jobAfterSync.value - 3277.5) < 0.01, 'cascade recomputed job.value = afterDisc*1.15 from the quote\'s NEW totals', jobAfterSync.value);
 
@@ -170,6 +178,32 @@ async function testQuoteEditingAndSync() {
   try { await services.updateQuoteWithJobSync(quote.id, 1 /* stale, actual is quoteVersionAfterSync */, { notes: 'stale quote edit' }); }
   catch (e) { quoteStaleBlocked = e instanceof services.ConcurrencyConflictError; }
   ok(quoteStaleBlocked, 'a stale quote row_version on the sync path is rejected before touching the job at all');
+
+  // ── BLOCKER 2 (2026-08-24) — the resync is PRESERVED, as an explicit action.
+  // Removing the implicit cascade must not remove the capability: a caller that
+  // deliberately asks to push the quote's lines onto the job still can, and
+  // that path is still concurrency-protected exactly as before.
+  const curQuoteVer = (await pool.query('SELECT row_version FROM rel_quotes WHERE id=$1', [quote.id])).rows[0].row_version;
+  const curJobVer = (await pool.query('SELECT row_version FROM rel_jobs WHERE id=$1', [jobId])).rows[0].row_version;
+  const resyncLines = [{ desc: 'Sign (rush)', qty: 3, unitPrice: 1000 }];
+
+  let resyncStaleBlocked = false;
+  try {
+    await services.updateQuoteWithJobSync(quote.id, curQuoteVer, { lines: resyncLines } as any,
+      { expectedJobVersion: curJobVer - 1 /* stale */, resyncJobLines: true });
+  } catch (e) { resyncStaleBlocked = e instanceof services.ConcurrencyConflictError; }
+  ok(resyncStaleBlocked, 'an EXPLICIT resync still refuses a stale expectedJobVersion — it never blindly overwrites a newer job');
+  const jobAfterBlockedResync = (await buildJobsJson()).find((j) => j._relId === jobId);
+  ok(jobAfterBlockedResync.lines.length === 1 && jobAfterBlockedResync.lines[0].qty === 2,
+    '…and the refused resync rolled back completely — the job\'s lines are exactly as they were', jobAfterBlockedResync.lines);
+
+  const resync = await services.updateQuoteWithJobSync(quote.id, curQuoteVer, { lines: resyncLines } as any,
+    { expectedJobVersion: curJobVer, resyncJobLines: true });
+  ok(String(resync.jobId) === String(jobId) && !!resync.jobRowVersion, 'the explicit resync reports the linked job and bumps its row_version', resync);
+  const jobResynced = (await buildJobsJson()).find((j) => j._relId === jobId);
+  ok(jobResynced.lines.length === 1 && jobResynced.lines[0].qty === 3 && jobResynced.lines[0].desc === 'Sign (rush)',
+    'the explicit resync DOES replace the job\'s lines with the quote\'s — the workflow is preserved, it is simply no longer implicit',
+    jobResynced.lines);
 }
 
 // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: this test used to also

@@ -14,9 +14,12 @@
  *      a quote AND its linked job both BACKFILLED from historical JSON
  *      (so both .id fields differ from their real relational PKs) —
  *      confirming a field edit on the quote correctly cascades to the
- *      linked job's synced fields (value/discount/setupFee/lines/contact
- *      details), and that status/convertedJobId are never touched by this
- *      path (that's Mark Sent/Approve/Decline/Convert's job).
+ *      linked job's synced DISPLAY fields (value/discount/setupFee/contact
+ *      details), that the job's own production LINE ITEMS are never
+ *      rewritten by a quote save (Blocker 2, 2026-08-24 — the cascade is now
+ *      an explicit service-level action that no HTTP surface exposes), and
+ *      that status/convertedJobId are never touched by this path (that's
+ *      Mark Sent/Approve/Decline/Convert's job).
  *
  * Requires TEST_SERVER_URL_WITH_AUTHORITY for part 2 — skips that part
  * with a clear notice if unset, same convention as every other Stage 2/3
@@ -139,8 +142,42 @@ async function runEndToEndProof() {
   ok(Math.abs(Number(jobAfter.rows[0].value) - 1357) < 0.01, 'the linked job\'s value was recomputed to match the quote\'s new total', jobAfter.rows[0]);
   ok(jobAfter.rows[0].status === 'quote_approved', 'the linked job\'s status was NOT touched by this edit (status is not part of this cascade)');
 
+  // ── BLOCKER 2 (2026-08-24) — CONTRACT CHANGE, DELIBERATE ──────────────────
+  // This assertion used to read "the linked job's line items were replaced to
+  // match the quote's new lines". That cascade was the defect: the shipped edit
+  // patch resends `lines` unconditionally (index.html ~8996), so editing a
+  // contact person on the quote silently deleted every production line the shop
+  // floor had added to the job since conversion. The cascade is now an explicit
+  // service-level action only (updateQuoteWithJobSync opts.resyncJobLines), and
+  // NO HTTP surface exposes it. The job's display fields (contact, value,
+  // discount, setup fee) still cascade — asserted immediately above.
   const jobLineAfter = await pool.query(`SELECT description, qty, unit_price FROM rel_job_line_items WHERE job_id = $1 ORDER BY line_index`, [jobRelId]);
-  ok(jobLineAfter.rows.length === 1 && jobLineAfter.rows[0].description === 'Updated line', 'the linked job\'s line items were replaced to match the quote\'s new lines', jobLineAfter.rows);
+  ok(jobLineAfter.rows.length === 1 && jobLineAfter.rows[0].description === 'Original line',
+    'the linked job\'s OWN line items survive an ordinary quote edit untouched (production owns them after conversion)', jobLineAfter.rows);
+  ok(Math.abs(Number(jobLineAfter.rows[0].qty) - 1) < 0.0001 && Math.abs(Number(jobLineAfter.rows[0].unit_price) - 1000) < 0.0001,
+    '…including their quantities and prices — nothing was partially rewritten', jobLineAfter.rows[0]);
+
+  console.log('\n[Frontend quote wiring] a client cannot re-enable the job-line cascade over HTTP by sending resyncJobLines');
+  const quoteVerAfterEdit = Number(putBody.rowVersion);
+  const jobVerAfterEdit = (await pool.query(`SELECT row_version FROM rel_jobs WHERE id = $1`, [jobRelId])).rows[0].row_version;
+  const forceRes = await fetch(`${base}/api/relational/quotes/${quoteRelId}`, {
+    method: 'PUT', headers: authHeaders,
+    body: JSON.stringify({
+      expectedVersion: quoteVerAfterEdit, expectedJobVersion: jobVerAfterEdit,
+      resyncJobLines: true,
+      lines: [{ desc: 'Forced line', qty: 5, unitPrice: 99, unit: null, itemId: null }],
+    }),
+  });
+  ok(forceRes.status === 200, 'the forced-resync request is accepted as an ordinary quote edit (the flag is simply stripped)', String(forceRes.status));
+  const jobLineForced = await pool.query(`SELECT description FROM rel_job_line_items WHERE job_id = $1 ORDER BY line_index`, [jobRelId]);
+  ok(jobLineForced.rows.length === 1 && jobLineForced.rows[0].description === 'Original line',
+    'resyncJobLines sent over HTTP does NOT reach the service — the job\'s production lines are still untouched', jobLineForced.rows);
+  const quoteLineForced = await pool.query(`SELECT description FROM rel_quote_line_items WHERE quote_id = $1 ORDER BY line_index`, [quoteRelId]);
+  ok(quoteLineForced.rows.length === 1 && quoteLineForced.rows[0].description === 'Forced line',
+    '…while the QUOTE\'s own lines did update, proving the request really was processed and not silently rejected', quoteLineForced.rows);
+  const apiSrc = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'relational', 'api.ts'), 'utf8');
+  ok(/resyncJobLines:\s*_rsjl/.test(apiSrc),
+    'PUT /quotes/:id strips resyncJobLines explicitly rather than relying on the service ignoring unknown keys');
 
   console.log('\n[Frontend quote wiring] proving the OLD bug would have failed: PUT /quotes/:legacyId (q.id, not q._relId) does NOT hit this quote');
   const badRes = await fetch(`${base}/api/relational/quotes/666100`, {
