@@ -106,8 +106,23 @@ function checkSourceWiring(src: string) {
     'the legacy JSON quote-save branch builds _recordBase from that captured BASE, not from live/mutable state');
   ok(src.includes('await forceSaveSections(overrides, recordBase);'),
     'the legacy JSON quote-save branch actually PASSES recordBase into forceSaveSections — proving this is wired into the real save call, not an unused local variable');
-  ok(src.includes('function forceSaveSections(overrides, recordBase){') && src.includes('async function savePartialSectionsNow(overrides, recordBase){') && src.includes('if(recordBase) data._recordBase = recordBase;'),
-    'forceSaveSections/savePartialSectionsNow accept recordBase end-to-end and attach it to the actual request body as _recordBase');
+  // 2026-08-24: both signatures gained an optional third parameter
+  // (`deletedIds`), so this no longer pins the exact parameter list — it pins
+  // what actually matters, and now pins MORE of it: that `recordBase` is
+  // declared by both functions, threaded through the queue between them, and
+  // attached to the real request body. The added `deletedIds` parameter is
+  // asserted alongside it because it is load-bearing for the same path — it is
+  // the ONLY thing that can make a partial save delete a record (the backend
+  // merge is otherwise additive), and a removal that silently fails to persist
+  // is exactly the class of bug this suite exists to catch.
+  ok(/function forceSaveSections\(overrides, recordBase(, deletedIds)?\)\{/.test(src)
+     && /async function savePartialSectionsNow\(overrides, recordBase(, deletedIds)?\)\{/.test(src)
+     && src.includes('if(recordBase) data._recordBase = recordBase;')
+     && src.includes('return enqueueSavePartialSections(overrides, recordBase, deletedIds);')
+     && /savePartialSectionsNow\(overrides, recordBase, deletedIds\)/.test(src),
+    'forceSaveSections/savePartialSectionsNow accept recordBase end-to-end (and now deletedIds too), threading both through the save queue and attaching recordBase to the actual request body as _recordBase');
+  ok(/if\(deletedIds && typeof deletedIds === 'object'\)\{[\s\S]{0,400}data\._deletedIds = scopedDeletes;/.test(src),
+    'and an explicitly-declared deletion reaches the request body as _deletedIds, scoped to the sections this save actually sends');
 }
 
 // ── PART 2 — real end-to-end HTTP proofs (Q1-Q6) ───────────────────────────

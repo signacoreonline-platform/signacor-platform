@@ -21,6 +21,8 @@
     "test:relational:compiled": "node dist/test/relational.stress.js",
     "test:relational:stage3": "ts-node --transpile-only test/relational.stage3.stress.ts",
     "test:post-migration-stabilization": "ts-node --transpile-only test/relational.post-migration-stabilization.stress.ts",
+    "test:save-path-jobs-persistence": "ts-node --transpile-only test/relational.save-path-jobs-persistence.stress.ts",
+    "test:save-path-jobs-persistence:compiled": "node dist/test/relational.save-path-jobs-persistence.stress.js",
     "test:post-migration-stabilization:compiled": "node dist/test/relational.post-migration-stabilization.stress.js",
     "test:relational:stage3:compiled": "node dist/test/relational.stage3.stress.js",
     "test:relational:mixed-mode": "node dist/test/relational.mixed-mode.stress.js",

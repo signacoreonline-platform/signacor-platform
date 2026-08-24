@@ -194,6 +194,11 @@ function forceLogoutExpiredSession() {
    synchronously without a separate round trip. ═══════════════════════════════════════════════════════════ */
 const API_RELATIONAL_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/relational';
 const relationalAuthoritativeSectionsRef = { current: [] };
+// UNION of every cut-over set this session has been told about. The server's
+// per-GET answer is best-effort (a section whose relational read throws is
+// served from JSON and omitted from that answer), and the save path must not
+// flip routing on a transient omission — see mergeAndSave's own note.
+const relationalCutOverSeenRef = { current: [] };
 function isRelationalAuthoritative(section) {
   return relationalAuthoritativeSectionsRef.current.indexOf(section) !== -1;
 }
@@ -670,27 +675,19 @@ function loadPersistedData() {
   return null; // signals: use INITIAL_* constants below
 }
 
-let __sgrSaveTimer = null;
-// Tracks the _autoSavedAt stamp of the last payload WE sent to the server.
-// The poll loop checks this so it never overwrites local state with data we
-// already know about (which would discard edits made since the last debounce).
-let __lastSentAt = null;
-
-function persistStateToServer(payload) {
-  try {
-    // Record the stamp immediately so the poll can compare against it even
-    // before the debounced fetch fires.
-    __lastSentAt = payload._autoSavedAt || null;
-    clearTimeout(__sgrSaveTimer);
-    __sgrSaveTimer = setTimeout(function(){
-      fetch(API_STATE_URL, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data: payload })
-      }).catch(function(e){ console.warn('Server save failed', e); });
-    }, 800);
-  } catch(e) {}
-}
+// ── 2026-08-24 PLATFORM_STATE WRITE AUDIT — `persistStateToServer` REMOVED ──
+// It was a SECOND, independent debounced full-state PUT to /api/platform-state
+// with no Authorization header, no `_partial` tag, and no awareness of the
+// merge / wipe-guard / explicit-deletion protocol every other save path
+// observes. It had zero call sites and was therefore dead — but it remained a
+// live capability to bypass all of that from anywhere in this file, and the
+// audit requirement is that no unclassified platform_state writer remains.
+//
+// There are now exactly TWO writers in this application, both funnelled through
+// saveToServer(): mergeAndSave (the debounced autosave) and
+// savePartialSectionsNow (confirmed section saves). `loadServerStateSync` above
+// is likewise dead (loadPersistedData hard-codes `serverState = null`) but it is
+// a READ, so it is left untouched.
 
 // ── Select-on-focus for all numeric inputs ──────────────────────────────────
 // When the user clicks into any number input the existing value is highlighted,
@@ -15049,7 +15046,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 const DONE_STATUSES = ['completed','invoiced'];
 const WIP_STATUSES  = STAGE_STATUSES.filter(s=>!DONE_STATUSES.includes(s));
 
-function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared, proposedProjects=[], setProposedProjects, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer, purchaseOrders, setPurchaseOrders, suppliers }) {
+function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared, proposedProjects=[], setProposedProjects, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer, purchaseOrders, setPurchaseOrders, suppliers, forceSaveSections }) {
   // ── POST-MIGRATION STABILIZATION (2026-08-24) — FRONTEND AUDIT (BUG 8) ────
   // The job cards in this list render an inline due-date <input> whose onChange
   // called `updateJobDueDate` — a function defined ONLY inside JobDetail. It
@@ -15097,8 +15094,74 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
   };
   const updateProposal = (id, field, val) =>
     setProposedProjects && setProposedProjects(prev=>(prev||[]).map(p=>p.id===id?{...p,[field]:val}:p));
-  const removeProposal = id =>
-    setProposedProjects && setProposedProjects(prev=>(prev||[]).filter(p=>p.id!==id));
+
+  // ── 2026-08-24 PROPOSED PROJECTS PERSISTENCE REPAIR ──────────────────────
+  // Reported: removed proposed projects come back after a refresh.
+  //
+  // These are plain JSON records in platform_state.proposedProjects (they are
+  // NOT jobs, NOT quote-derived, and nothing regenerates them) — a small
+  // company-tagged list of unquoted work. Removal was a bare local-state
+  // filter, leaving persistence entirely to the 800ms debounced autosave. Two
+  // things then went wrong at once:
+  //
+  //   1. that autosave was a FULL-state save, which the backend has rejected
+  //      for every save since the jobs cutover (see mergeAndSave's own note —
+  //      `"jobs" is missing from the incoming payload`), so nothing persisted;
+  //   2. even had it been accepted, the backend's stable-id merge is additive:
+  //      an id merely ABSENT from the incoming array is preserved, never
+  //      deleted. Only an explicit `_deletedIds` entry removes a record.
+  //
+  // So the row was never deleted server-side, and the next GET brought it
+  // straight back — exactly the reported symptom.
+  //
+  // Removal is now a CONFIRMED save that states the deletion explicitly, and
+  // local state is only updated AFTER the server confirms it. A failure leaves
+  // the item on screen with a readable error rather than pretending it is gone
+  // — the same confirmed-save-before-success convention used elsewhere in this
+  // file. `next` is filtered from the FULL array (not the company-filtered
+  // view), so another company's proposals are never dropped.
+  const [proposalBusyId, setProposalBusyId] = useState(null);
+  const [proposalErr, setProposalErr] = useState('');
+  const removeProposal = async (id) => {
+    if(!setProposedProjects || proposalBusyId) return;
+    // No save path available means no removal — NEVER a local-only filter with
+    // no persistence, which is precisely the pre-repair behaviour described
+    // above. Refusing here (like addProposal/updateProposal already refuse
+    // without setProposedProjects) keeps "the item disappeared" and "the item
+    // was actually removed" the same statement.
+    if(!forceSaveSections){
+      setProposalErr('This list cannot be saved right now, so the item was NOT removed. Please reload the page and try again.');
+      return;
+    }
+    const next = (proposedProjects||[]).filter(p=>p.id!==id);
+    setProposalBusyId(id); setProposalErr('');
+    try {
+      await forceSaveSections({ proposedProjects: next }, null, { proposedProjects: [id] });
+      // Removes by id from the CURRENT list rather than assigning the `next`
+      // array captured before the request. A save can take seconds on a cold
+      // backend, and an add or a note edit made while it was in flight lives in
+      // `prev` but not in `next` — assigning `next` would silently destroy it,
+      // with no error, and the pending autosave that would have saved it was
+      // already cancelled by savePartialSectionsNow. Only the one id this
+      // request actually removed is applied.
+      setProposedProjects(prev => (prev||[]).filter(p=>p.id!==id));
+    } catch(e) {
+      // Nothing local changed — the entry stays visible, which is the honest
+      // representation of "not removed".
+      setProposalErr(describeSaveConflictError(e, 'proposed project') + ' The item was NOT removed.');
+      // savePartialSectionsNow synchronously cancels any pending debounced
+      // autosave before it runs. On the SUCCESS path the setProposedProjects
+      // above re-arms it (App-level state changed); on this failure path only
+      // JobsPage-local state changes, so an unrelated edit made moments earlier
+      // — a customer, an employee — would have had its autosave silently
+      // dropped and never retried. Re-arming with a fresh array identity and
+      // identical contents costs nothing (locallyChangedSections compares by
+      // value, so this alone is never seen as a change) and restores it.
+      setProposedProjects(prev => (prev||[]).slice());
+    } finally {
+      setProposalBusyId(null);
+    }
+  };
 
   // Auto-open newly created job when navigated here from Sales
   React.useEffect(()=>{
@@ -15221,6 +15284,12 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
               className="bg-amber-500 hover:bg-amber-600 text-white rounded-xl px-4 py-2.5 text-sm font-bold whitespace-nowrap">＋ Add</button>
           </div>
           <div className="space-y-2">
+            {proposalErr&&(
+              <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl px-3 py-2 text-xs font-semibold flex items-start gap-2">
+                <span className="flex-1 whitespace-pre-wrap">{proposalErr}</span>
+                <button onClick={()=>setProposalErr('')} className="text-red-400 hover:text-red-600 font-black">✕</button>
+              </div>
+            )}
             {visibleProposals.length===0&&(
               <p className="text-xs text-gray-400 italic text-center py-3">No proposed projects yet. Add ones that aren't quoted but need attention.</p>
             )}
@@ -15234,8 +15303,8 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
                     placeholder="Note / next step…"
                     className="w-full bg-transparent text-xs text-gray-500 border-b border-transparent focus:border-amber-300 focus:outline-none"/>
                 </div>
-                <button onClick={()=>removeProposal(p.id)} title="Remove"
-                  className="text-gray-300 hover:text-red-500 text-lg leading-none px-1 flex-shrink-0">✕</button>
+                <button onClick={()=>removeProposal(p.id)} disabled={proposalBusyId===p.id} title="Remove"
+                  className="text-gray-300 hover:text-red-500 text-lg leading-none px-1 flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed">{proposalBusyId===p.id?'…':'✕'}</button>
               </div>
             ))}
           </div>
@@ -24213,6 +24282,162 @@ function App() {
       }
       payload = Object.assign({}, snapshot, { _autoSavedAt: new Date().toISOString() });
     }
+    // ══════════════════════════════════════════════════════════════════════
+    // 2026-08-24 SAVE-PATH REPAIR — the live production failure:
+    //   Save failed — "jobs" is missing from the incoming payload
+    //                 (currently has 111 record(s))
+    //
+    // WHY IT HAPPENS. The payload built above is a FULL-state save: it starts
+    // from the freshest GET and overlays whatever changed. That was correct
+    // before the relational cutover. It is no longer, because of an ORDERING
+    // interaction inside the backend that neither side is individually wrong
+    // about (backend/src/routes/platformState.ts):
+    //
+    //   1. the route DELETES every relational-authoritative section from the
+    //      incoming payload (`delete data[key]`, the cutover strip) — by
+    //      design, so JSON can never make a cut-over section authoritative
+    //      again;
+    //   2. AFTER that, detectWipe() inspects what remains and refuses any save
+    //      that is NOT marked `_partial` and is missing a CRITICAL_KEYS section
+    //      the live row still has records for.
+    //
+    // `jobs` is both cut over AND the first entry in CRITICAL_KEYS, so the
+    // server strips it and then rejects the save for not containing it. The
+    // payload DID contain jobs. Every full-state save has therefore been
+    // rejected since the moment jobs was cut over — which is why a change to
+    // any JSON-owned section (Proposed Projects, customers, quick rates, HR)
+    // silently failed to persist and reappeared on refresh.
+    //
+    // THE FIX — routing, not force. The guard is not weakened, no relational
+    // data is pushed back into JSON, and no authority changes. When any section
+    // is cut over, this save is expressed as what it actually IS: a PARTIAL
+    // save of the JSON-owned sections this client changed. `_partial` is
+    // exactly the shape the backend already supports
+    // (`finalData = {...existingData, ...data}`), and detectWipe deliberately
+    // skips its omission branch for a partial precisely because omission
+    // carries no meaning there. Cut-over sections are simply not sent — this
+    // path could not write one anyway (assertNoUnwiredRelationalSections above
+    // already refuses), so sending them was only ever noise the server stripped.
+    //
+    // With NO section cut over (authority off, local dev, a future rollback)
+    // the full-state path below is taken unchanged, byte for byte.
+    // WHICH sections are cut over is deliberately taken from the UNION of every
+    // answer this session has seen, not from the latest one alone. The server's
+    // `relationalAuthoritativeSections` is best-effort: applyRelationalReadOverlay
+    // omits a section whose relational read THREW, serving it from the frozen JSON
+    // copy instead. A transient rel_* error would therefore report an empty list
+    // for one GET — and routing off that single answer would send a full-state
+    // save, which the PUT-side strip (which reads the flags directly and is NOT
+    // best-effort) would still strip, reproducing the exact error this repair
+    // exists to remove. A section that is cut over does not stop being cut over
+    // mid-session, so remembering is safe; a page reload re-derives it from
+    // scratch, so a genuine rollback is picked up on the next load.
+    const seenCutOver = relationalCutOverSeenRef.current;
+    for (const sct of (relationalAuthoritativeSectionsRef.current || [])) {
+      if (seenCutOver.indexOf(sct) === -1) seenCutOver.push(sct);
+    }
+    if (seenCutOver.length > 0 && mergeBase) {
+      // `changed` is null only when there is no baseline at all — and in that
+      // case assertNoUnwiredRelationalSections above has already thrown (it is
+      // handed all of STATE_SECTIONS, which includes cut-over sections). So
+      // `changed` is always populated by the time this branch can run.
+      const sectionsToSend = STATE_SECTIONS.filter(k => !!(changed && changed[k]) && seenCutOver.indexOf(k) === -1);
+      const partial = {};
+      for (const k of sectionsToSend) if (payload[k] !== undefined) partial[k] = payload[k];
+      // Scalars travel under the same rule: only if this client changed them,
+      // and only when they actually have a value. Assigning `undefined` would
+      // still CREATE the key — enough to pass a naive `Object.keys().length`
+      // emptiness check while JSON.stringify drops it on the wire, producing a
+      // data-free PUT that moves `updated_at` and invalidates every other
+      // session's `_baseRevision` for nothing.
+      const scalarsSent = [];
+      for (const sk of ['logo', 'utLogo', 'holdingsLogo', 'sigOTSmit']) {
+        if (changed && changed[sk] && payload[sk] !== undefined) { partial[sk] = payload[sk]; scalarsSent.push(sk); }
+      }
+      // Deletion stays EXPLICIT and scoped to what is actually being sent. This
+      // is what makes a removal (a Proposed Project, a customer, an employee)
+      // take effect at all: the backend's stable-id merge is additive, so an id
+      // merely absent from an incoming array is PRESERVED, and only
+      // `_deletedIds` can remove it. Dropping this while switching to a partial
+      // payload would have turned "removal fails loudly" into "removal fails
+      // silently" — the same bug with the error taken away.
+      if (payload._deletedIds) {
+        const scoped = {};
+        for (const k of sectionsToSend) {
+          if (Array.isArray(payload._deletedIds[k]) && payload._deletedIds[k].length) scoped[k] = payload._deletedIds[k];
+        }
+        if (Object.keys(scoped).length) partial._deletedIds = scoped;
+      }
+      if (Object.keys(partial).length === 0) return false; // nothing this path may write
+      partial._partial      = true;
+      // Built on top of `mergeBase` — the FRESH read taken moments ago in this
+      // same function — so that is the revision to declare. Declaring
+      // `ownBaseline`'s instead (a render-time snapshot refreshed only by
+      // hydration, the 30s poll, or a confirmed save) meant that any save which
+      // deletes or genuinely updates a record was compared against a revision
+      // that could be up to 30s stale, and the backend — which must fail closed
+      // rather than guess — refused it with `stale_revision`. With three roles
+      // autosaving every 800ms that window is open almost continuously, so this
+      // is the difference between "saves work" and "saves refuse under normal
+      // concurrent use". mergeBase falls back to ownBaseline when the fresh GET
+      // failed, in which case this is exactly the old value.
+      partial._baseRevision = (mergeBase && mergeBase._serverRevision) || payload._baseRevision;
+      partial.v             = DATA_VERSION;
+      partial._autoSavedAt  = payload._autoSavedAt;
+      partial.savedAt       = payload.savedAt;
+      const confirmedPartial = await saveToServer(partial);
+      // Fold in ONLY the sections this save actually sent — as
+      // savePartialSectionsNow does, and for a load-bearing reason: the PUT
+      // response carries the raw platform_state row, whose cut-over sections
+      // are the FROZEN pre-cutover JSON copies, not the relational overlay the
+      // GET serves. Adopting them wholesale would leave the baseline holding
+      // the stale JSON jobs while local state holds the relational ones, so the
+      // very next autosave would diff `jobs` as locally changed and be refused
+      // by assertNoUnwiredRelationalSections — trading one broken save path for
+      // another.
+      if (serverBaselineRef.current) {
+        const foldIn = {};
+        for (const k of sectionsToSend) {
+          const v = (confirmedPartial && confirmedPartial.data && confirmedPartial.data[k] !== undefined)
+            ? confirmedPartial.data[k] : partial[k];
+          if (v !== undefined) foldIn[k] = v;
+        }
+        // The scalars MUST be folded in too. They are not in STATE_SECTIONS, so
+        // a fold-in that iterates only sections leaves the baseline holding the
+        // PRE-save logo/signature while local state holds the new one — and
+        // locallyChangedSections compares them directly. The section would then
+        // read as "locally changed" on every subsequent tick for the rest of the
+        // session: the autosave would re-PUT the whole base64 image forever, the
+        // 30s poll would stop applying anyone else's logo change, and the
+        // localStorage backup would be re-stamped on every render. Silent,
+        // permanent, and invisible to any single-save test.
+        for (const sk of scalarsSent) if (partial[sk] !== undefined) foldIn[sk] = partial[sk];
+        serverBaselineRef.current = { ...serverBaselineRef.current, ...foldIn, _autoSavedAt: partial._autoSavedAt };
+        if (confirmedPartial && confirmedPartial.revision !== undefined) serverBaselineRef.current._serverRevision = confirmedPartial.revision;
+      }
+      // ── Teach LOCAL STATE about records the merge pulled in ────────────────
+      // mergeSectionArray union-merges another session's concurrent additions
+      // into the payload, so the saved list can legitimately contain records
+      // this client's React state has never seen. The baseline then knows about
+      // them and local state does not — and on the NEXT save `_deletedIds` is
+      // computed as (baseline ids) minus (payload ids), so those unseen records
+      // are reported as deliberate deletions and destroyed server-side. The user
+      // never deleted them and never even saw them.
+      //
+      // Closing it at the source: whatever this save actually persisted for the
+      // sections it sent is applied straight back into React state, so state,
+      // baseline and server agree from here on. applyServerData only assigns the
+      // keys present in the object it is given.
+      const reconcile = {};
+      for (const k of sectionsToSend) {
+        const savedList = (confirmedPartial && confirmedPartial.data && Array.isArray(confirmedPartial.data[k]))
+          ? confirmedPartial.data[k] : null;
+        if (savedList && JSON.stringify(savedList) !== JSON.stringify(snapshot[k])) reconcile[k] = savedList;
+      }
+      if (Object.keys(reconcile).length) applyServerData(reconcile);
+      return true;
+    }
+
     const confirmed = await saveToServer(payload);
     // 2026-08-20 hardening: prefer the AUTHORITATIVE data the server just
     // confirmed writing (includes anything its own additive merge preserved
@@ -24294,7 +24519,14 @@ function App() {
   // where this actually gets attached to the request as `_recordBase`, and
   // backend/src/routes/platformState.ts for how the server uses it. Every
   // existing call site that doesn't pass it behaves byte-for-byte as before.
-  function forceSaveSections(overrides, recordBase){
+  // 2026-08-24: `deletedIds` is new and OPTIONAL — `{ <section>: [id, ...] }`.
+  // The backend's stable-id merge is deliberately additive (an id merely absent
+  // from an incoming array is preserved, never deleted), and `_deletedIds` is
+  // the ONLY thing that can remove a record. Without a way to state that intent
+  // a confirmed-save caller could add and update but never delete, so every
+  // deletion had to fall through to the generic autosave and hope. A caller
+  // that omits it behaves byte-for-byte as before.
+  function forceSaveSections(overrides, recordBase, deletedIds){
     if(!apiReadyRef.current){
       return Promise.reject(new Error('Not yet connected to the server — please wait a moment and try again.'));
     }
@@ -24310,17 +24542,17 @@ function App() {
     } catch (e) {
       return Promise.reject(e);
     }
-    return enqueueSavePartialSections(overrides, recordBase);
+    return enqueueSavePartialSections(overrides, recordBase, deletedIds);
   }
 
   // Serializes partial saves through the SAME FIFO queue as normal autosave
   // (saveQueueRef) so a partial save and a full-state autosave from this
   // session can never race against each other — see enqueueMergeAndSave
   // above for why that matters.
-  function enqueueSavePartialSections(overrides, recordBase){
+  function enqueueSavePartialSections(overrides, recordBase, deletedIds){
     const run = saveQueueRef.current.then(
-      () => savePartialSectionsNow(overrides, recordBase),
-      () => savePartialSectionsNow(overrides, recordBase) // previous queued save failed — still attempt this one
+      () => savePartialSectionsNow(overrides, recordBase, deletedIds),
+      () => savePartialSectionsNow(overrides, recordBase, deletedIds) // previous queued save failed — still attempt this one
     );
     saveQueueRef.current = run.catch(() => {});
     return run;
@@ -24356,7 +24588,7 @@ function App() {
   //
   // Throws (never silently no-ops) if the PUT is rejected, so a caller's
   // try/catch is always trustworthy.
-  async function savePartialSectionsNow(overrides, recordBase){
+  async function savePartialSectionsNow(overrides, recordBase, deletedIds){
     if(!apiReadyRef.current) throw new Error('Not yet connected to the server — please wait a moment and try again.');
     // 2026-08-18 (production stabilisation, second layer of protection for
     // the stale-save race described on mergeAndSave/capturedBaseline above):
@@ -24392,6 +24624,17 @@ function App() {
     // pass one, so a save with no opinion on this behaves exactly as if this
     // feature didn't exist.
     if(recordBase) data._recordBase = recordBase;
+    // 2026-08-24: explicit, caller-stated deletion, scoped to the sections this
+    // save actually sends so it can never reach beyond them. Absent entirely
+    // when the caller declares no deletion, keeping this path's "purely
+    // additive unless told otherwise" property visible in the request body.
+    if(deletedIds && typeof deletedIds === 'object'){
+      const scopedDeletes = {};
+      for(const k of Object.keys(overrides||{})){
+        if(Array.isArray(deletedIds[k]) && deletedIds[k].length) scopedDeletes[k] = deletedIds[k];
+      }
+      if(Object.keys(scopedDeletes).length) data._deletedIds = scopedDeletes;
+    }
     data.v = DATA_VERSION;
     const savedAt = new Date().toISOString();
     data._autoSavedAt = savedAt;
@@ -24940,7 +25183,7 @@ function App() {
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} onOpenJob={openJobRecord} forceSaveSections={forceSaveSections}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets} forceSaveSections={forceSaveSections}/>,
-    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>,
+    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} forceSaveSections={forceSaveSections} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
