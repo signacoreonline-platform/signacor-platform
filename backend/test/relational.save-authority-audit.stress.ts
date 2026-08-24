@@ -158,8 +158,8 @@ function checkSyncCallSitesPresent(src: string) {
   ok(count >= 27, `syncRelationalBaseline is called from at least 27 sites (found ${count}) — matches the full audit catalogue, not just a couple of spot-fixes`, count);
 
   // markInvPaid specifically (the accInvoices status-mutation quick action).
-  ok(/async function markInvPaid\(inv\)\{[\s\S]{0,1500}syncRelationalBaseline\('accInvoices', accInvoicesUpdater\);/.test(src),
-    'markInvPaid syncs the accInvoices baseline after its relational payment-record call');
+  ok(/async function markCanonicalInvoicePaid\(inv, ctx\)\{[\s\S]{0,1500}syncRelationalBaseline\('accInvoices', accInvoicesUpdater\);/.test(src),
+    'markInvPaid (hoisted 2026-08-24 as the shared markCanonicalInvoicePaid, called by BOTH Sales and Accounting) syncs the accInvoices baseline after its relational payment-record call');
 }
 
 function checkCompleteProductCascadeFix(src: string) {

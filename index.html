@@ -3099,6 +3099,269 @@ function paymentDeleteBlockReason(payment, user, fallbackSection) {
 
 // Small shared control so all three payment tables show the SAME thing: a
 // padlock that says why, instead of one that just says no.
+// One wording for "this invoice predates the accounting records", used by
+// both the row badge and every locked action, so the explanation can never
+// differ between the two places a person meets it.
+const INVOICE_NO_ACCOUNTING_RECORD_REASON =
+  'This is a historical job invoice. It was raised on the job itself, before invoices were kept as separate accounting records, so there is no accounting record for Accounting to edit, mark paid or delete. It is a real invoice: view and print it here, and record or review its payments against the job. To change its details, open the job in Jobs or Sales.';
+
+// Hoisted to module scope 2026-08-24: the shared ViewInvoiceModal needs it,
+// and a second copy would let the two screens colour the same status
+// differently. Single definition — AccountingPage reads this one.
+const STATUS_COLORS = { draft:'#6b7280', sent:'#2563eb', paid:'#059669', partial:'#f59e0b', overdue:'#dc2626', void:'#9ca3af', approved:'#d97706' };
+
+/* ═══════════════════════════════════════════
+ SHARED READ-ONLY INVOICE VIEW (2026-08-24 invoice list consistency)
+ Hoisted out of AccountingPage — UNCHANGED in behaviour — for exactly the
+ reason InvoiceModal/ManualInvoicePaymentsModal were hoisted before it:
+ Sales and Accounting must present the SAME invoice from the SAME record,
+ not two independently-built views of it. Every closure variable it used
+ is now an explicit prop, and the optional navigation callbacks degrade to
+ inactive pills when a host page does not have them (RecordLinksPanel
+ already handles a null onClick), so neither page needs a second copy.
+═══════════════════════════════════════════ */
+function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, customers,
+  companies, logoDataUrl, onOpenQuote, onOpenJob, onOpenCustomer, onOpenJobPayments,
+  onOpenInvoicePayments , fmtDate, fmtAmt }) {
+  const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+  const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+  const isJob=inv.source==='job';
+  // ── Linked-record lookup (read-only; never edits/relinks/deletes anything) ──
+  const _links = findLinkedRecords(
+    { invoice: { ...inv, jobNum: inv.jobNum || inv.reference || '' } },
+    { quotes, jobs, accInvoices, customers }
+  );
+  const linkPanelLinks = [
+    _links.quote
+      ? { icon:'📋', label:`View Quote ${_links.quote.num}`, onClick: onOpenQuote ? ()=>{ onClose(); onOpenQuote(_links.quote); } : null }
+      : { icon:'📋', label:'No linked quote found' },
+    _links.job
+      ? { icon:'💼', label:`View Job ${_links.job.num}`, onClick: onOpenJob ? ()=>{ onClose(); onOpenJob(_links.job); } : null }
+      : { icon:'💼', label:'No linked job found' },
+    {
+      icon:'💳', label:'View Payments',
+      onClick: isJob
+        ? (onOpenJobPayments && _links.job ? ()=>{ onClose(); onOpenJobPayments(_links.job); } : null)
+        : (onOpenInvoicePayments ? ()=>{ onClose(); onOpenInvoicePayments(inv); } : null)
+    },
+    _links.customer
+      ? { icon:'🏢', label:'View Customer', onClick: onOpenCustomer ? ()=>{ onClose(); onOpenCustomer(_links.customer); } : null }
+      : { icon:'🏢', label:'No matching customer record found' },
+  ];
+  return (
+    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[95vh] overflow-y-auto">
+        <div className="px-5 py-4 flex items-center justify-between" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
+          <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>👁 VIEW INVOICE — {inv.number}</p>
+          <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
+        </div>
+        <div className="p-5 space-y-4">
+          {isJob&&<div className="bg-purple-50 border border-purple-200 rounded-xl px-4 py-2 text-xs text-purple-700 font-semibold">📋 This invoice is linked to Job {inv.jobNum} — edit it in the Jobs section.</div>}
+          <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
+          <div className="grid grid-cols-2 gap-3 text-sm">
+            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">CONTACT</span><span className="font-semibold">{inv.contactName||'—'}</span></div>
+            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">EMAIL</span><span>{inv.contactEmail||'—'}</span></div>
+            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">INVOICE DATE</span><span>{fmtDate(inv.date)}</span></div>
+            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">DUE DATE</span><span>{fmtDate(inv.dueDate)}</span></div>
+            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">REFERENCE</span><span>{inv.reference||'—'}</span></div>
+            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">STATUS</span><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status}</span></div>
+            {inv.discount>0&&<div className="bg-red-50 rounded-xl p-3"><span className="text-xs font-bold text-red-400 block mb-1">DISCOUNT</span><span className="font-semibold text-red-600">{inv.discount}%{inv.discountAmount?' · − '+fmtAmt(inv.discountAmount):''}</span></div>}
+            {inv.contactAddress&&<div className="bg-gray-50 rounded-xl p-3 col-span-2"><span className="text-xs font-bold text-gray-400 block mb-1">ADDRESS</span><span className="whitespace-pre-wrap">{inv.contactAddress}</span></div>}
+          </div>
+          <div className="border border-gray-200 rounded-xl overflow-hidden">
+            <table className="w-full text-xs">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-3 py-2 text-left text-gray-500 font-bold">Description</th>
+                  <th className="px-3 py-2 text-center text-gray-500 font-bold w-16">Qty</th>
+                  <th className="px-3 py-2 text-right text-gray-500 font-bold w-28">Unit Price</th>
+                  <th className="px-3 py-2 text-center text-gray-500 font-bold w-20">Acc Code</th>
+                  <th className="px-3 py-2 text-center text-gray-500 font-bold w-16">VAT</th>
+                  <th className="px-3 py-2 text-right text-gray-500 font-bold w-24">Amount</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(inv.lineItems||[]).map((l,i)=>{
+                  const lNeg = (parseFloat(l.unitAmount)||0) < 0;
+                  return (
+                  <tr key={i} className={`border-t border-gray-100 ${lNeg?'text-red-600':''}`}>
+                    <td className={`px-3 py-2 ${lNeg?'text-red-600':'text-gray-700'}`}>{l.description||'—'}</td>
+                    <td className="px-3 py-2 text-center text-gray-600">{l.qty}</td>
+                    <td className={`px-3 py-2 text-right ${lNeg?'text-red-600':'text-gray-600'}`}>{lNeg?'− ':''}{fmtAmt(parseFloat(l.unitAmount||0))}</td>
+                    <td className="px-3 py-2 text-center text-gray-400">{l.accountCode||'—'}</td>
+                    <td className="px-3 py-2 text-center text-gray-500">{l.taxType||'—'}</td>
+                    <td className={`px-3 py-2 text-right font-semibold ${lNeg?'text-red-600':'text-gray-700'}`}>{lNeg?'− ':''}{fmtAmt(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0))}</td>
+                  </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <div className="bg-gray-50 border-t border-gray-200 px-4 py-2 flex justify-end gap-6 text-xs">
+              <span className="text-gray-500">Excl. VAT: <strong className="text-gray-800">{fmtAmt(sub)}</strong></span>
+              <span className="text-gray-500">VAT (15%): <strong className="text-blue-700">{fmtAmt(vat)}</strong></span>
+              <span className="text-gray-600 font-black text-sm">Total (incl. VAT): <span style={{color:'#06065c'}}>{fmtAmt(sub+vat)}</span></span>
+            </div>
+          </div>
+          <div className="flex gap-3 pt-1">
+            {/* Job-sourced invoices reuse the existing printInvoice(job,...) —
+                same output as Jobs/Sales — via the linked job already resolved
+                above. Manual invoices use buildManualInvoiceHtml/
+                printManualInvoice — the shared print template also used by
+                Accounting's Invoices table and Sales → Invoices, so a
+                manual invoice prints/emails identically everywhere it's
+                opened from. */}
+            {isJob&&_links.job&&(
+              <button onClick={()=>printInvoice(_links.job,companies,logoDataUrl,customers)}
+                className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
+            )}
+            {!isJob&&(
+              <button onClick={()=>printManualInvoice(inv,companies,logoDataUrl)}
+                className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
+            )}
+            {!isJob&&(
+              <button onClick={()=>emailManualInvoiceViaOutlook(inv,companies)}
+                className="px-5 py-2.5 text-white font-bold rounded-xl text-sm" style={{background:'#1e40af'}}>📧 Email Invoice</button>
+            )}
+            {onEdit&&<button onClick={onEdit} className="px-5 py-2.5 text-white font-bold rounded-xl text-sm" style={{background:'#06065c'}}>✏️ Edit Invoice</button>}
+            <button onClick={onClose} className="px-5 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════
+   SHARED CANONICAL INVOICE ACTIONS (2026-08-24 invoice list consistency)
+   Deleting an invoice and marking one paid used to live only inside
+   AccountingPage, so Sales -> Invoices could do neither — a genuine active
+   invoice therefore offered a different set of controls depending on which
+   screen you happened to open it from. Both are hoisted here UNCHANGED in
+   behaviour (same confirmation wording, same relational calls, same
+   row-version handling, same job-linkage reversal, same credit-release and
+   collision notices deployed in the invoice-delete repair) and now take
+   their state setters as an explicit context object, so BOTH pages act on
+   the SAME accInvoices record through the SAME code. There is one
+   implementation of each action; the two screens cannot drift apart, and
+   neither can quietly acquire a behaviour the other lacks.
+   Both are only ever reached for a row that resolved to a real accInvoices
+   record — see resolveJobInvoiceRecord. A job-side representation with no
+   such record never reaches them, because there is nothing for them to act
+   on and inventing one would be exactly the fake action this repair exists
+   to prevent.
+═══════════════════════════════════════════ */
+async function deleteCanonicalInvoice(id, ctx){
+  const { accInvoices, setAccInvoices, setJobs } = ctx || {};
+  // Warn clearly if this invoice has payment history attached — deleting
+  // it discards that history too. Delete logic itself is unchanged.
+  const inv = accInvoices.find(i=>i.id===id);
+  const payCount = inv ? (inv.payments||[]).length : 0;
+  // An invoice raised against a job is ALSO represented as invoice linkage
+  // on that job (invoiceNum/invoiceDate/invoiceDue/invoiceCreated/
+  // invoiceStatus) — that is the second representation this delete now
+  // reverses server-side. The person confirming has to be told, because
+  // after this the job goes back to "ready to invoice, not yet invoiced"
+  // and re-invoicing it will mint a NEW number, not this one.
+  const linkedJobNum = inv ? (inv.reference || inv.jobNum || '') : '';
+  const warnParts = [];
+  if(payCount>0){
+    warnParts.push(`This invoice has ${payCount} recorded payment${payCount>1?'s':''} against it. Deleting the invoice will permanently remove that payment history too, and may affect statements and accounting totals.`);
+  }
+  if(linkedJobNum){
+    warnParts.push(`This invoice belongs to Job ${linkedJobNum}. Deleting it also removes the invoice number from that job, which will go back to "ready to invoice but not yet invoiced". Re-invoicing it later will use a NEW invoice number — ${inv&&inv.number?inv.number:'this number'} is not reused. The job itself, its stage and any payments recorded against the JOB are not affected.`);
+  }
+  const warn = warnParts.length
+    ? warnParts.join('\n\n')+'\n\nDelete anyway?'
+    : 'Delete this invoice? This cannot be undone.';
+  if(!window.confirm(warn)) return;
+  if(isRelationalAuthoritative('accInvoices') && inv && inv._relId!=null){
+    let delResult = null;
+    try {
+      delResult = await relationalApi.deleteInvoice(inv._relId, inv._relRowVersion);
+    } catch(e){
+      alert(describeSaveConflictError(e, 'invoice')+'\n\nThe invoice was NOT deleted.');
+      return;
+    }
+    const accInvoicesUpdater = prev=>prev.filter(i=>i.id!==id);
+    setAccInvoices(accInvoicesUpdater);
+    syncRelationalBaseline('accInvoices', accInvoicesUpdater);
+    // INVOICE-DELETE REPAIR (2026-08-24). An invoice that belongs to a job
+    // is represented twice: as this accInvoices record AND as the invoice
+    // linkage stamped on the job itself (invoiceNum/invoiceDate/invoiceDue/
+    // invoiceCreated/invoiceStatus), out of which Sales, Accounting,
+    // getAllInvoicesUnified, the Payments tab and the dashboard revenue
+    // tile all synthesise a job-derived invoice row. The backend now
+    // reverses BOTH halves in one transaction (services.ts deleteInvoice)
+    // and reports the jobs it cleared; this mirrors that locally — the
+    // exact inverse of what createInvoiceNow already does after
+    // createInvoiceForJob — so the job-side twin goes at the same instant
+    // the record does, instead of surfacing for as long as it takes the
+    // coalesced authoritative re-read to land (or indefinitely, if that
+    // re-read fails). Purely a local mirror of a server fact: it filters
+    // nothing and hides nothing that the server still holds.
+    const clearedJobs = (delResult && delResult.clearedJobs) || [];
+    if(clearedJobs.length && setJobs){
+      const clearedByRelId = {};
+      clearedJobs.forEach(c=>{ if(c && c.id!=null) clearedByRelId[c.id] = c; });
+      const jobsUpdater = prev => (prev||[]).map(j=>{
+        const c = (j && j._relId!=null) ? clearedByRelId[j._relId] : null;
+        if(!c) return j;
+        return {...j, invoiceNum:null, invoiceDate:null, invoiceDue:null,
+                invoiceCreated:false, invoiceStatus:null, _relRowVersion:c.rowVersion};
+      });
+      setJobs(jobsUpdater);
+      syncRelationalBaseline('jobs', jobsUpdater);
+    }
+    // A historical numbering collision (more than one job carrying this
+    // invoice number, on an invoice with no job link to disambiguate them)
+    // is deliberately NOT auto-resolved server-side — see
+    // LegacyInvoiceConflictError. Say so plainly instead of leaving what
+    // remains looking like this delete having failed.
+    // A Credit payment against this invoice had consumed part of a customer
+    // credit note; deleting it gives that amount back (services.ts's shared
+    // releaseCreditForPaymentTx). Say so — the credit note's Remaining has
+    // just changed and the person needs to know it was not lost.
+    const creditReleased = (delResult && delResult.creditReleased) || 0;
+    if(creditReleased > 0){
+      alert('The invoice was deleted.\n\n'+zar(creditReleased)+' of customer credit that had been applied to it has been released back to the customer\'s credit note(s).');
+    }
+    const ambiguousJobs = (delResult && delResult.ambiguousJobs) || [];
+    if(ambiguousJobs.length){
+      alert('The invoice was deleted.\n\nHowever '+ambiguousJobs.length+' jobs ('
+        +ambiguousJobs.map(a=>a.jobNumber).join(', ')
+        +') all carry this same invoice number, which is a historical numbering'
+        +' collision. Their invoice numbers were deliberately left untouched —'
+        +' clearing them automatically could remove the wrong job\'s invoice.'
+        +' Please review those jobs and decide which is correct.');
+    }
+    return;
+  }
+  setAccInvoices(prev=>prev.filter(i=>i.id!==id));
+}
+
+async function markCanonicalInvoicePaid(inv, ctx){
+  const { setAccInvoices, onJsonFallback } = ctx || {};
+  const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
+  const alreadyPaid=(inv.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+  const remaining=Math.max(0,invTotal-alreadyPaid);
+  const today=new Date().toISOString().slice(0,10);
+  if(isRelationalAuthoritative('accInvoices') && inv._relId!=null){
+    if(remaining<=0){ return; } // already fully paid — nothing to record
+    try {
+      const result = await relationalApi.recordPayment('invoice', inv._relId, remaining, { date:today, method:'EFT', notes:'Quick mark paid' });
+      const newP = {id:Date.now(), date:today, method:'EFT', amount:remaining, notes:'Quick mark paid', _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion};
+      const accInvoicesUpdater = prev=>prev.map(i=>i.id===inv.id?{...i, status:'paid', paidDate:today, payments:[...(i.payments||[]),newP]}:i);
+      setAccInvoices(accInvoicesUpdater);
+      syncRelationalBaseline('accInvoices', accInvoicesUpdater);
+    } catch(e){
+      alert(describeSaveConflictError(e, 'invoice')+'\n\nThe payment was NOT recorded.');
+    }
+    return;
+  }
+  const newPayments=remaining>0?[...(inv.payments||[]),{id:Date.now(),date:today,method:'EFT',amount:remaining,notes:'Quick mark paid'}]:(inv.payments||[]);
+  if(onJsonFallback) onJsonFallback({...inv, status:'paid', paidDate:today, payments:newPayments});
+}
+
 function PaymentLockedBadge({ reason }) {
   return (
     <span title={reason}
@@ -3109,12 +3372,133 @@ function PaymentLockedBadge({ reason }) {
   );
 }
 
-function getManualInvoiceJobRefs(accInvoices) {
+/* ═══════════════════════════════════════════
+   CANONICAL JOB -> INVOICE RESOLUTION (2026-08-24 invoice-list consistency)
+   An invoice that belongs to a job exists in TWO representations at once
+   (see 007_relational_core.sql above CREATE TABLE rel_invoices): the
+   accInvoices record, and the invoice linkage fields on the job. Every list
+   in this app renders ONE row per logical invoice by suppressing the
+   job-derived twin whenever the record-side representation is present.
+
+   That suppression used to depend ENTIRELY on the accInvoices record
+   carrying `reference` or `jobNum`. A record with neither — every invoice
+   backfilled from a legacy JSON accInvoices entry that never had those keys
+   — went unmatched, so ONE logical invoice rendered as TWO rows: the record
+   (with the full action set) and the job-derived twin (View-only in
+   Accounting). That is exactly the "some invoices show all the buttons,
+   others show only View" report, and the same mechanism behind the earlier
+   duplicate INV-00099 display.
+
+   resolveJobInvoiceRecord below is now the SINGLE rule. Everything that asks
+   "does this job's invoice already have a record?" goes through it —
+   getManualInvoiceJobRefs (the fast membership index) and
+   getJobManualInvoice (the lookup) are both thin wrappers over it, so the
+   two can no longer drift apart the way they did in the 2026-08-24
+   stabilization pass, when the Set was widened without widening the lookup
+   it gated and every affected invoice silently resolved to nothing.
+
+   Matching is STRICTLY company-scoped. rel_invoices is UNIQUE on
+   (company_code, invoice_number) and both companies legitimately reuse the
+   same numbers, so an SNS job carrying a number that belongs to a Holdings
+   invoice is NOT a match — it is a data fault, reported as such, never
+   merged into one row.
+═══════════════════════════════════════════ */
+// Normalised (company, invoice number) identity. Case- and whitespace-
+// insensitive because backfill stores both sides verbatim from legacy JSON.
+function invoiceIdentityKey(co, number) {
+  const n = (number === null || number === undefined) ? '' : String(number).trim().toUpperCase();
+  if (!n) return null;
+  // An ABSENT company makes this identity unresolvable, exactly like an absent
+  // number. Mapping null/undefined/'' to a shared "" prefix would put every
+  // untagged historical record into ONE bucket, so a Signacore job and a
+  // Holdings invoice that happen to share a number and carry no `co` would
+  // merge into a single row — the precise cross-company merge this key exists
+  // to prevent. Untagged records still resolve through explicit
+  // reference/jobNum linkage and through the server's own company-scoped join.
+  const c = (co === null || co === undefined) ? '' : String(co).trim();
+  if (!c) return null;
+  return c + '|' + n;
+}
+// THE canonical resolver: the one accInvoices record that IS this job's
+// invoice, or null when the job's invoice has no accounting record at all.
+function resolveJobInvoiceRecord(job, accInvoices, jobs) {
+  if (!job || !job.num) return null;
+  const live = (accInvoices||[]).filter(i => i && i.status !== 'void');
+  // 1. Explicit linkage — unchanged, and still highest priority. Matched on
+  //    the JOB number, which is globally unique, so it can never be ambiguous.
+  const linked = live.find(i => invoiceBelongsToJob(i, job.num));
+  if (linked) return linked;
+  if (!job.invoiceNum) return null;
+  // The server resolves this join across both tables and reports 'ambiguous'
+  // when more than one job claims the same invoice. Never guess past that.
+  if (job.invoiceLinkState === 'ambiguous') return null;
+  // 2. The server's own authoritative join (read.ts resolveJobInvoiceLinks),
+  //    when this job came from a relational read.
+  if (job.invoiceRelId !== null && job.invoiceRelId !== undefined) {
+    const byRel = live.find(i => i._relId !== null && i._relId !== undefined
+      && String(i._relId) === String(job.invoiceRelId));
+    if (byRel) return byRel;
+  }
+  // 3. Same company, same invoice number — the fallback for state that has not
+  //    come from a relational read. Exactly one invoice must match, AND no
+  //    OTHER job may be claiming the same number: two jobs carrying one
+  //    invoice number is a historical collision, and silently resolving both
+  //    to the same record would hide the second job's invoice entirely and
+  //    point its payments at the first job's customer.
+  const key = invoiceIdentityKey(job.co, job.invoiceNum);
+  if (!key) return null;
+  const hits = live.filter(i => invoiceIdentityKey(i.co, i.number) === key);
+  if (hits.length !== 1) return null;
+  if (jobs) {
+    let claimants = 0;
+    for (const other of jobs) {
+      if (!other || !other.invoiceNum) continue;
+      if (invoiceIdentityKey(other.co, other.invoiceNum) === key) claimants++;
+    }
+    if (claimants > 1) return null;
+  }
+  return hits[0];
+}
+// What this job's invoice linkage HONESTLY is, for the UI to say out loud:
+//   'none'      no invoice on this job
+//   'matched'   an authoritative accInvoices record exists — render that
+//   'orphaned'  a real historical job invoice with NO accounting record
+//   'ambiguous' more than one candidate — needs a person, not a guess
+//   'invalid'   the number belongs to a DIFFERENT company's invoice
+// Prefers the server's own verdict (job.invoiceLinkState) and falls back to
+// resolving locally, so this is correct before and after a relational read.
+function jobInvoiceLinkState(job, accInvoices, jobs) {
+  if (!job || !job.invoiceNum) return 'none';
+  if (resolveJobInvoiceRecord(job, accInvoices, jobs)) return 'matched';
+  if (job.invoiceLinkState === 'ambiguous') return 'ambiguous';
+  const live = (accInvoices||[]).filter(i => i && i.status !== 'void');
+  const key = invoiceIdentityKey(job.co, job.invoiceNum);
+  const bare = String(job.invoiceNum).trim().toUpperCase();
+  const sameNumberElsewhere = live.filter(i => {
+    const n = (i.number === null || i.number === undefined) ? '' : String(i.number).trim().toUpperCase();
+    return n === bare && invoiceIdentityKey(i.co, i.number) !== key;
+  });
+  if (sameNumberElsewhere.length) return 'invalid';
+  const hits = live.filter(i => invoiceIdentityKey(i.co, i.number) === key);
+  if (hits.length > 1) return 'ambiguous';
+  if (job.invoiceLinkState === 'ambiguous') return 'ambiguous';
+  return 'orphaned';
+}
+// Fast membership index over exactly resolveJobInvoiceRecord: the set of job
+// numbers whose invoice already has an accInvoices record, and whose
+// job-derived twin must therefore NOT be rendered as a second invoice.
+// `jobs` is optional purely for backwards compatibility — without it this
+// behaves exactly as it always did (explicit reference/jobNum keys only).
+function getManualInvoiceJobRefs(accInvoices, jobs) {
   const refs = new Set();
   for (const i of (accInvoices||[])) {
     if (!i || i.status === 'void') continue;
     if (i.reference) refs.add(i.reference);
     if (i.jobNum) refs.add(i.jobNum);
+  }
+  for (const j of (jobs||[])) {
+    if (!j || !j.num || !j.invoiceNum || refs.has(j.num)) continue;
+    if (resolveJobInvoiceRecord(j, accInvoices, jobs)) refs.add(j.num);
   }
   return refs;
 }
@@ -3154,10 +3538,12 @@ function invoiceBelongsToJob(inv, jobNum) {
   if (!inv || !jobNum || inv.status === 'void') return false;
   return inv.reference === jobNum || inv.jobNum === jobNum;
 }
-function getJobManualInvoice(job, accInvoices) {
-  if(!job || !job.num) return null;
-  if(!getManualInvoiceJobRefs(accInvoices).has(job.num)) return null;
-  return (accInvoices||[]).find(i => invoiceBelongsToJob(i, job.num)) || null;
+// Thin wrapper over the single canonical rule above. It used to gate on
+// getManualInvoiceJobRefs and then re-find the record by a NARROWER test,
+// which is precisely how the Set and the lookup drifted apart before. There
+// is now one implementation and no second test to fall out of step with.
+function getJobManualInvoice(job, accInvoices, jobs) {
+  return resolveJobInvoiceRecord(job, accInvoices, jobs);
 }
 
 // Merge job-derived invoices + manual accInvoices into one clean, de-duped,
@@ -3167,7 +3553,7 @@ function getJobManualInvoice(job, accInvoices) {
 // function instead of building its own list, so they can never drift apart.
 // Read-only: never creates, edits, deletes or renumbers any invoice.
 function getAllInvoicesUnified(jobs, quotes, accInvoices) {
-  const manualJobRefs = getManualInvoiceJobRefs(accInvoices);
+  const manualJobRefs = getManualInvoiceJobRefs(accInvoices, jobs);
   const jobInv = (jobs||[]).filter(j=>j && j.invoiceNum && !manualJobRefs.has(j.num)).map(j=>{
     const rec = reconcileJobInvoice(j, quotes||[]);
     return {
@@ -3197,7 +3583,7 @@ function getAllInvoicesUnified(jobs, quotes, accInvoices) {
 // invoiced yet" without changing any invoice count, total or export.
 function getPendingJobInvoices(jobs, accInvoices) {
   const INSTALL_STAGE = 7;
-  const manualJobRefs = getManualInvoiceJobRefs(accInvoices);
+  const manualJobRefs = getManualInvoiceJobRefs(accInvoices, jobs);
   return (jobs||[]).filter(j => j &&
     (parseFloat(j.stage)||0) >= INSTALL_STAGE &&
     !j.invoiceNum && !j.invoiceCreated &&
@@ -3284,7 +3670,7 @@ function resolveQuotePaymentSource(quote, jobs, accInvoices) {
   }
   const linkedJob = (jobs || []).find(j => j && (j.id === quote.convertedJobId || (quote.num && j.quoteNum === quote.num))) || null;
   if (linkedJob) {
-    const jobInvoice = getJobManualInvoice(linkedJob, accInvoices);
+    const jobInvoice = getJobManualInvoice(linkedJob, accInvoices, jobs);
     if (jobInvoice) {
       return { kind: 'invoice', record: jobInvoice, invoice: jobInvoice, job: linkedJob, payments: jobInvoice.payments || [], label: `Invoice ${jobInvoice.number} (via Job ${linkedJob.num})` };
     }
@@ -5828,7 +6214,7 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
     // Same dedup rule as Sales/Accounting (getManualInvoiceJobRefs): a job
     // whose invoice has already been superseded by a manual invoice
     // referencing it must not also show here as a second invoice.
-    const _manualJobRefs = getManualInvoiceJobRefs(myAccInvoices);
+    const _manualJobRefs = getManualInvoiceJobRefs(myAccInvoices, myJobs);
     const jobInv = myJobs.filter(j=>j.invoiceNum && !_manualJobRefs.has(j.num) && nameMatches(j.client,c))
       .map(j=>({id:j.id, num:j.invoiceNum, date:j.invoiceDate, status:j.invoiceStatus||'pending', manual:false}));
     const manualInv = myAccInvoices.filter(i=>i.status!=='void' && nameMatches(i.contactName,c))
@@ -8353,6 +8739,12 @@ function reconcileJobInvoice(job, quotes){
 ═══════════════════════════════════════════ */
 function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, setAccInvoices, onJobCreated, initialOpen, onInitialOpenHandled, onJobPaymentsClosed, creditNotes, setCreditNotes, onOpenCustomer, onOpenJob, forceSaveSections }) {
   const [subTab,    setSubTab]    = useState('quotes'); // 'quotes' | 'invoices'
+  // INVOICE LIST CONSISTENCY (2026-08-24): Sales now presents the SAME
+  // read-only invoice view Accounting does, from the same record — see the
+  // hoisted ViewInvoiceModal. Previously Sales had no View at all, so the
+  // same genuine invoice offered a different set of controls depending on
+  // which screen it was opened from.
+  const [viewInvoiceRow, setViewInvoiceRow] = useState(null);
   const [showCreate,setShowCreate]=useState(false);
   const [viewQuote,setViewQuote]=useState(null);
   const [editQuote, setEditQuote] = useState(null);   // quote open in edit modal
@@ -8438,7 +8830,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // manual accounting invoice referencing this job (getManualInvoiceJobRefs)
   // — same dedup rule Accounting already used, now shared, so a job invoice
   // that also has a manual invoice raised against it never shows twice here.
-  const _manualJobRefs = getManualInvoiceJobRefs(myAccInvoices);
+  const _manualJobRefs = getManualInvoiceJobRefs(myAccInvoices, myJobs);
   const jobInvItems = myJobs.filter(j=>j.invoiceNum && !_manualJobRefs.has(j.num)).map(j=>{
     const link = myQuotes.find(q=>q && q.num && j.quoteNum && q.num===j.quoteNum);
     let job = j;
@@ -10485,6 +10877,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                     </div>
                     <p className="text-xs text-gray-400 mt-0.5">
                       {j._isManual?'Manual invoice':'Job: '+j.num} · Invoice date: {j.invoiceDate||'—'} · Due: {j.invoiceDue||'—'}
+                      {/* Same honest label Accounting shows: this invoice was raised
+                          on the job before invoices were separate accounting records.
+                          Everything Sales offers here acts on the JOB, so every action
+                          still has a real target — this only says where it lives. */}
+                      {!j._isManual && jobInvoiceLinkState(j, myAccInvoices)!=='matched' && (
+                        <span className="ml-1 bg-amber-100 text-amber-800 rounded-full px-2 py-0.5 font-bold"
+                          title={INVOICE_NO_ACCOUNTING_RECORD_REASON}>📜 No accounting record</span>
+                      )}
                       {isPaid&&j.paidAt&&` · Paid: ${j.paidAt}`}
                       {isPartial&&` · Paid: ${zar(totalPaid)} · Balance: ${zar(balance)}`}
                     </p>
@@ -10494,10 +10894,26 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                     <p className="text-xs text-gray-400">incl. VAT</p>
                     {isPartial&&<p className="text-xs font-bold text-blue-600 mt-0.5">Balance: {zar(balance)}</p>}
                   </div>
+                  {/* ── INVOICE ACTION CONTRACT (2026-08-24) ──────────────────
+                      A row that resolves to a genuine canonical invoice record
+                      gets the established full control set — View, Payments,
+                      Edit, Print, Email, Status, Delete × — driven by the SAME
+                      shared implementations Accounting uses, so the two screens
+                      cannot offer different capabilities for the same invoice.
+                      A job row that reaches here is, after canonical resolution,
+                      necessarily one with NO accounting record behind it: its
+                      Payments/Edit/Print/Email all act on the JOB (real targets,
+                      unchanged behaviour), while Status and Delete — which can
+                      only act on an accInvoices record — are shown locked with a
+                      persistent explanation rather than fabricated. */}
                   <div className="flex flex-col gap-1">
                     {j._isManual?(
                       manualRec?(
                         <>
+                          <button onClick={()=>setViewInvoiceRow({...manualRec, source:'manual'})}
+                            className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#f0f4ff',color:'#4338ca'}}>
+                            👁 View
+                          </button>
                           <button onClick={()=>setManualInvPayModal(manualRec)}
                             className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#ecfdf5',color:'#059669'}}>
                             💳 Payments
@@ -10514,6 +10930,18 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                             className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#dbeafe',color:'#1e40af'}}>
                             📧 Email
                           </button>
+                          {manualRec.status!=='paid'&&(
+                            <button onClick={()=>guardAction('markInvPaid:'+relKey(manualRec), ()=>markCanonicalInvoicePaid(manualRec, { setAccInvoices, onJsonFallback: saveManualInvoiceFromSales }))}
+                              className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#dcfce7',color:'#059669'}}>
+                              ✓ Paid
+                            </button>
+                          )}
+                          {isAdmin&&(
+                            <button onClick={()=>guardAction('deleteInvoice:'+manualRec.id, ()=>deleteCanonicalInvoice(manualRec.id, { accInvoices: myAccInvoices, setAccInvoices, setJobs }))}
+                              className="text-xs font-bold px-3 py-1.5 rounded-xl border border-gray-200 text-gray-400 hover:text-red-500 hover:border-red-200">
+                              ✕ Delete
+                            </button>
+                          )}
                         </>
                       ):(
                         <span className="text-xs font-semibold px-3 py-1.5 rounded-xl text-center" style={{background:'#eff6ff',color:'#1d4ed8'}}>
@@ -10522,6 +10950,17 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       )
                     ):(
                       <>
+                        <button onClick={()=>setViewInvoiceRow({
+                            id:'job-'+j.id, number:j.invoiceNum, source:'job', jobNum:j.num,
+                            reference:j.num, contactName:j.client||'', contactEmail:j.email||'',
+                            contactAddress:j.address||'', date:j.invoiceDate||'', dueDate:j.invoiceDue||'',
+                            status:j.invoiceStatus||'pending', payments:j.payments||[],
+                            lineItems:[{description:j.desc||'Signage / Production Job', qty:1,
+                              unitAmount:(parseFloat(j.value)||0)/1.15, accountCode:'4000', taxType:'15%'}]
+                          })}
+                          className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#f0f4ff',color:'#4338ca'}}>
+                          👁 View
+                        </button>
                         <button onClick={()=>{setJobPayModal(j);setJobPayModalExternal(false);}}
                           className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#ecfdf5',color:'#059669'}}>
                           💳 Payments
@@ -10538,6 +10977,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                           className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#dbeafe',color:'#1e40af'}}>
                           📧 Email
                         </button>
+                        <span className="flex items-center justify-center gap-1 text-xs font-semibold text-gray-400 px-3 py-1.5">
+                          ✓ Paid <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/>
+                        </span>
+                        {isAdmin&&(
+                          <span className="flex items-center justify-center gap-1 text-xs font-semibold text-gray-400 px-3 py-1.5">
+                            ✕ Delete <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/>
+                          </span>
+                        )}
                       </>
                     )}
                   </div>
@@ -10547,6 +10994,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           </div>
         )}
       </>)}
+
+      {viewInvoiceRow&&<ViewInvoiceModal inv={viewInvoiceRow} onClose={()=>setViewInvoiceRow(null)}
+        onEdit={viewInvoiceRow.source!=='job'?()=>{ const rec=myAccInvoices.find(i=>i.id===viewInvoiceRow.id)||viewInvoiceRow; setViewInvoiceRow(null); setEditManualInv(rec); setShowManualInvModal(true); }:null}
+        quotes={myQuotes} jobs={myJobs} accInvoices={myAccInvoices} customers={customers}
+        companies={companies} logoDataUrl={logoDataUrl} onOpenQuote={null} onOpenJob={onOpenJob}
+        onOpenCustomer={onOpenCustomer} onOpenJobPayments={(j)=>{setJobPayModal(j);setJobPayModalExternal(false);}}
+        onOpenInvoicePayments={(i)=>setManualInvPayModal(i)} fmtDate={fmtDate} fmtAmt={fmtAmt}/>}
 
       {/* ── Job Payment History Modal ── */}
       {jobPayModal&&<JobPaymentHistoryModal job={jobPayModal} onClose={()=>{
@@ -13666,7 +14120,7 @@ function RevenueChart({ jobs=[], accInvoices=[] }) {
     // instead of a separate local Set — also correctly ignores void manual
     // invoices, so a voided invoice can no longer suppress a job's real
     // revenue bar here, nor still count as revenue itself below.
-    const manualRefs=getManualInvoiceJobRefs(accInvoices);
+    const manualRefs=getManualInvoiceJobRefs(accInvoices, jobs);
     jobs.forEach(j=>{
       if(!j.value)return;
       if(!([7,8,9].includes(j.stage)||j.invoiceNum))return;
@@ -13858,7 +14312,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
             // correctly ignores void manual invoices — instead of a separate
             // local calculation, so a voided invoice can no longer (a) hide a
             // job's real revenue here or (b) still count as revenue itself.
-            const manualRefs = getManualInvoiceJobRefs(visibleAccInvoices);
+            const manualRefs = getManualInvoiceJobRefs(visibleAccInvoices, visibleJobs);
             const jobInv = visibleJobs
               .filter(j=>([7,8,9].includes(j.stage)||j.invoiceNum) && !manualRefs.has(j.num) && inCurrentMonth(j.invoiceDate||j.id))
               .reduce((s,j)=>s+(parseFloat(j.value)||0),0);
@@ -21203,92 +21657,15 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   // guard (see guardAction near the top of this file): the second call is
   // dropped before it leaves the browser, while the server keeps its own
   // transactional/row-version protection as the authoritative backstop.
+  // Thin wrappers over the shared, hoisted implementations above — this page
+  // supplies only its own state setters. See deleteCanonicalInvoice /
+  // markCanonicalInvoicePaid for the behaviour, which is byte-for-byte the
+  // logic this page has always run.
   async function deleteInvoice(id){
-    // Warn clearly if this invoice has payment history attached — deleting
-    // it discards that history too. Delete logic itself is unchanged.
-    const inv = accInvoices.find(i=>i.id===id);
-    const payCount = inv ? (inv.payments||[]).length : 0;
-    // An invoice raised against a job is ALSO represented as invoice linkage
-    // on that job (invoiceNum/invoiceDate/invoiceDue/invoiceCreated/
-    // invoiceStatus) — that is the second representation this delete now
-    // reverses server-side. The person confirming has to be told, because
-    // after this the job goes back to "ready to invoice, not yet invoiced"
-    // and re-invoicing it will mint a NEW number, not this one.
-    const linkedJobNum = inv ? (inv.reference || inv.jobNum || '') : '';
-    const warnParts = [];
-    if(payCount>0){
-      warnParts.push(`This invoice has ${payCount} recorded payment${payCount>1?'s':''} against it. Deleting the invoice will permanently remove that payment history too, and may affect statements and accounting totals.`);
-    }
-    if(linkedJobNum){
-      warnParts.push(`This invoice belongs to Job ${linkedJobNum}. Deleting it also removes the invoice number from that job, which will go back to "ready to invoice but not yet invoiced". Re-invoicing it later will use a NEW invoice number — ${inv&&inv.number?inv.number:'this number'} is not reused. The job itself, its stage and any payments recorded against the JOB are not affected.`);
-    }
-    const warn = warnParts.length
-      ? warnParts.join('\n\n')+'\n\nDelete anyway?'
-      : 'Delete this invoice? This cannot be undone.';
-    if(!window.confirm(warn)) return;
-    if(isRelationalAuthoritative('accInvoices') && inv && inv._relId!=null){
-      let delResult = null;
-      try {
-        delResult = await relationalApi.deleteInvoice(inv._relId, inv._relRowVersion);
-      } catch(e){
-        alert(describeSaveConflictError(e, 'invoice')+'\n\nThe invoice was NOT deleted.');
-        return;
-      }
-      const accInvoicesUpdater = prev=>prev.filter(i=>i.id!==id);
-      setAccInvoices(accInvoicesUpdater);
-      syncRelationalBaseline('accInvoices', accInvoicesUpdater);
-      // INVOICE-DELETE REPAIR (2026-08-24). An invoice that belongs to a job
-      // is represented twice: as this accInvoices record AND as the invoice
-      // linkage stamped on the job itself (invoiceNum/invoiceDate/invoiceDue/
-      // invoiceCreated/invoiceStatus), out of which Sales, Accounting,
-      // getAllInvoicesUnified, the Payments tab and the dashboard revenue
-      // tile all synthesise a job-derived invoice row. The backend now
-      // reverses BOTH halves in one transaction (services.ts deleteInvoice)
-      // and reports the jobs it cleared; this mirrors that locally — the
-      // exact inverse of what createInvoiceNow already does after
-      // createInvoiceForJob — so the job-side twin goes at the same instant
-      // the record does, instead of surfacing for as long as it takes the
-      // coalesced authoritative re-read to land (or indefinitely, if that
-      // re-read fails). Purely a local mirror of a server fact: it filters
-      // nothing and hides nothing that the server still holds.
-      const clearedJobs = (delResult && delResult.clearedJobs) || [];
-      if(clearedJobs.length && setJobs){
-        const clearedByRelId = {};
-        clearedJobs.forEach(c=>{ if(c && c.id!=null) clearedByRelId[c.id] = c; });
-        const jobsUpdater = prev => (prev||[]).map(j=>{
-          const c = (j && j._relId!=null) ? clearedByRelId[j._relId] : null;
-          if(!c) return j;
-          return {...j, invoiceNum:null, invoiceDate:null, invoiceDue:null,
-                  invoiceCreated:false, invoiceStatus:null, _relRowVersion:c.rowVersion};
-        });
-        setJobs(jobsUpdater);
-        syncRelationalBaseline('jobs', jobsUpdater);
-      }
-      // A historical numbering collision (more than one job carrying this
-      // invoice number, on an invoice with no job link to disambiguate them)
-      // is deliberately NOT auto-resolved server-side — see
-      // LegacyInvoiceConflictError. Say so plainly instead of leaving what
-      // remains looking like this delete having failed.
-      // A Credit payment against this invoice had consumed part of a customer
-      // credit note; deleting it gives that amount back (services.ts's shared
-      // releaseCreditForPaymentTx). Say so — the credit note's Remaining has
-      // just changed and the person needs to know it was not lost.
-      const creditReleased = (delResult && delResult.creditReleased) || 0;
-      if(creditReleased > 0){
-        alert('The invoice was deleted.\n\n'+zar(creditReleased)+' of customer credit that had been applied to it has been released back to the customer\'s credit note(s).');
-      }
-      const ambiguousJobs = (delResult && delResult.ambiguousJobs) || [];
-      if(ambiguousJobs.length){
-        alert('The invoice was deleted.\n\nHowever '+ambiguousJobs.length+' jobs ('
-          +ambiguousJobs.map(a=>a.jobNumber).join(', ')
-          +') all carry this same invoice number, which is a historical numbering'
-          +' collision. Their invoice numbers were deliberately left untouched —'
-          +' clearing them automatically could remove the wrong job\'s invoice.'
-          +' Please review those jobs and decide which is correct.');
-      }
-      return;
-    }
-    setAccInvoices(prev=>prev.filter(i=>i.id!==id));
+    return deleteCanonicalInvoice(id, { accInvoices, setAccInvoices, setJobs });
+  }
+  async function markInvPaid(inv){
+    return markCanonicalInvoicePaid(inv, { setAccInvoices, onJsonFallback: saveInvoice });
   }
   function deleteBill(id){ if(window.confirm('Delete this bill?')) setAccBills(prev=>prev.filter(b=>b.id!==id)); }
   // CUTOVER BLOCKER COMPLETION — relational payments are separate rel_payments
@@ -21306,27 +21683,6 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   // guard (see guardAction near the top of this file): the second call is
   // dropped before it leaves the browser, while the server keeps its own
   // transactional/row-version protection as the authoritative backstop.
-  async function markInvPaid(inv){
-    const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
-    const alreadyPaid=(inv.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-    const remaining=Math.max(0,invTotal-alreadyPaid);
-    const today=new Date().toISOString().slice(0,10);
-    if(isRelationalAuthoritative('accInvoices') && inv._relId!=null){
-      if(remaining<=0){ return; } // already fully paid — nothing to record
-      try {
-        const result = await relationalApi.recordPayment('invoice', inv._relId, remaining, { date:today, method:'EFT', notes:'Quick mark paid' });
-        const newP = {id:Date.now(), date:today, method:'EFT', amount:remaining, notes:'Quick mark paid', _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion};
-        const accInvoicesUpdater = prev=>prev.map(i=>i.id===inv.id?{...i, status:'paid', paidDate:today, payments:[...(i.payments||[]),newP]}:i);
-        setAccInvoices(accInvoicesUpdater);
-        syncRelationalBaseline('accInvoices', accInvoicesUpdater);
-      } catch(e){
-        alert(describeSaveConflictError(e, 'invoice')+'\n\nThe payment was NOT recorded.');
-      }
-      return;
-    }
-    const newPayments=remaining>0?[...(inv.payments||[]),{id:Date.now(),date:today,method:'EFT',amount:remaining,notes:'Quick mark paid'}]:(inv.payments||[]);
-    saveInvoice({...inv, status:'paid', paidDate:today, payments:newPayments});
-  }
   function markBillPaid(bill){ saveBill({...bill, status:'paid', paidDate: new Date().toISOString().slice(0,10)}); }
 
   // ── Credit Notes ──────────────────────────────────────────────
@@ -21763,115 +22119,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
     document.body.removeChild(a); URL.revokeObjectURL(url);
   }
 
-  // ── View Invoice Modal (read-only) ──
-  function ViewInvoiceModal({ inv, onClose, onEdit }) {
-    const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-    const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
-    const isJob=inv.source==='job';
-    // ── Linked-record lookup (read-only; never edits/relinks/deletes anything) ──
-    const _links = findLinkedRecords(
-      { invoice: { ...inv, jobNum: inv.jobNum || inv.reference || '' } },
-      { quotes, jobs, accInvoices, customers }
-    );
-    const linkPanelLinks = [
-      _links.quote
-        ? { icon:'📋', label:`View Quote ${_links.quote.num}`, onClick: onOpenQuote ? ()=>{ onClose(); onOpenQuote(_links.quote); } : null }
-        : { icon:'📋', label:'No linked quote found' },
-      _links.job
-        ? { icon:'💼', label:`View Job ${_links.job.num}`, onClick: onOpenJob ? ()=>{ onClose(); onOpenJob(_links.job); } : null }
-        : { icon:'💼', label:'No linked job found' },
-      {
-        icon:'💳', label:'View Payments',
-        onClick: isJob
-          ? (onOpenJobPayments && _links.job ? ()=>{ onClose(); onOpenJobPayments(_links.job); } : null)
-          : ()=>{ setPayModalInv(inv); setShowPayModal(true); }
-      },
-      _links.customer
-        ? { icon:'🏢', label:'View Customer', onClick: onOpenCustomer ? ()=>{ onClose(); onOpenCustomer(_links.customer); } : null }
-        : { icon:'🏢', label:'No matching customer record found' },
-    ];
-    return (
-      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[95vh] overflow-y-auto">
-          <div className="px-5 py-4 flex items-center justify-between" style={{background:'#06065c',borderRadius:'1rem 1rem 0 0'}}>
-            <p className="text-white font-black" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'1.1rem'}}>👁 VIEW INVOICE — {inv.number}</p>
-            <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
-          </div>
-          <div className="p-5 space-y-4">
-            {isJob&&<div className="bg-purple-50 border border-purple-200 rounded-xl px-4 py-2 text-xs text-purple-700 font-semibold">📋 This invoice is linked to Job {inv.jobNum} — edit it in the Jobs section.</div>}
-            <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
-            <div className="grid grid-cols-2 gap-3 text-sm">
-              <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">CONTACT</span><span className="font-semibold">{inv.contactName||'—'}</span></div>
-              <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">EMAIL</span><span>{inv.contactEmail||'—'}</span></div>
-              <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">INVOICE DATE</span><span>{fmtDate(inv.date)}</span></div>
-              <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">DUE DATE</span><span>{fmtDate(inv.dueDate)}</span></div>
-              <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">REFERENCE</span><span>{inv.reference||'—'}</span></div>
-              <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">STATUS</span><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status}</span></div>
-              {inv.discount>0&&<div className="bg-red-50 rounded-xl p-3"><span className="text-xs font-bold text-red-400 block mb-1">DISCOUNT</span><span className="font-semibold text-red-600">{inv.discount}%{inv.discountAmount?' · − '+fmtAmt(inv.discountAmount):''}</span></div>}
-              {inv.contactAddress&&<div className="bg-gray-50 rounded-xl p-3 col-span-2"><span className="text-xs font-bold text-gray-400 block mb-1">ADDRESS</span><span className="whitespace-pre-wrap">{inv.contactAddress}</span></div>}
-            </div>
-            <div className="border border-gray-200 rounded-xl overflow-hidden">
-              <table className="w-full text-xs">
-                <thead className="bg-gray-50">
-                  <tr>
-                    <th className="px-3 py-2 text-left text-gray-500 font-bold">Description</th>
-                    <th className="px-3 py-2 text-center text-gray-500 font-bold w-16">Qty</th>
-                    <th className="px-3 py-2 text-right text-gray-500 font-bold w-28">Unit Price</th>
-                    <th className="px-3 py-2 text-center text-gray-500 font-bold w-20">Acc Code</th>
-                    <th className="px-3 py-2 text-center text-gray-500 font-bold w-16">VAT</th>
-                    <th className="px-3 py-2 text-right text-gray-500 font-bold w-24">Amount</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(inv.lineItems||[]).map((l,i)=>{
-                    const lNeg = (parseFloat(l.unitAmount)||0) < 0;
-                    return (
-                    <tr key={i} className={`border-t border-gray-100 ${lNeg?'text-red-600':''}`}>
-                      <td className={`px-3 py-2 ${lNeg?'text-red-600':'text-gray-700'}`}>{l.description||'—'}</td>
-                      <td className="px-3 py-2 text-center text-gray-600">{l.qty}</td>
-                      <td className={`px-3 py-2 text-right ${lNeg?'text-red-600':'text-gray-600'}`}>{lNeg?'− ':''}{fmtAmt(parseFloat(l.unitAmount||0))}</td>
-                      <td className="px-3 py-2 text-center text-gray-400">{l.accountCode||'—'}</td>
-                      <td className="px-3 py-2 text-center text-gray-500">{l.taxType||'—'}</td>
-                      <td className={`px-3 py-2 text-right font-semibold ${lNeg?'text-red-600':'text-gray-700'}`}>{lNeg?'− ':''}{fmtAmt(parseFloat(l.qty||0)*parseFloat(l.unitAmount||0))}</td>
-                    </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-              <div className="bg-gray-50 border-t border-gray-200 px-4 py-2 flex justify-end gap-6 text-xs">
-                <span className="text-gray-500">Excl. VAT: <strong className="text-gray-800">{fmtAmt(sub)}</strong></span>
-                <span className="text-gray-500">VAT (15%): <strong className="text-blue-700">{fmtAmt(vat)}</strong></span>
-                <span className="text-gray-600 font-black text-sm">Total (incl. VAT): <span style={{color:'#06065c'}}>{fmtAmt(sub+vat)}</span></span>
-              </div>
-            </div>
-            <div className="flex gap-3 pt-1">
-              {/* Job-sourced invoices reuse the existing printInvoice(job,...) —
-                  same output as Jobs/Sales — via the linked job already resolved
-                  above. Manual invoices use buildManualInvoiceHtml/
-                  printManualInvoice — the shared print template also used by
-                  Accounting's Invoices table and Sales → Invoices, so a
-                  manual invoice prints/emails identically everywhere it's
-                  opened from. */}
-              {isJob&&_links.job&&(
-                <button onClick={()=>printInvoice(_links.job,companies,logoDataUrl,customers)}
-                  className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
-              )}
-              {!isJob&&(
-                <button onClick={()=>printManualInvoice(inv,companies,logoDataUrl)}
-                  className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
-              )}
-              {!isJob&&(
-                <button onClick={()=>emailManualInvoiceViaOutlook(inv,companies)}
-                  className="px-5 py-2.5 text-white font-bold rounded-xl text-sm" style={{background:'#1e40af'}}>📧 Email Invoice</button>
-              )}
-              {onEdit&&<button onClick={onEdit} className="px-5 py-2.5 text-white font-bold rounded-xl text-sm" style={{background:'#06065c'}}>✏️ Edit Invoice</button>}
-              <button onClick={onClose} className="px-5 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600">Close</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
+
 
   // ── Bill Modal ──
   function BillModal({ bill, onSave, onClose }) {
@@ -22042,7 +22290,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   // (and correctly ignores void manual invoices, which previously could
   // wrongly hide a job's real invoice here if the linked manual invoice had
   // since been voided).
-  const manualRefs = getManualInvoiceJobRefs(accInvoices);
+  const manualRefs = getManualInvoiceJobRefs(accInvoices, jobs);
   const jobInvsFiltered = jobInvoices.filter(j=>!manualRefs.has(j.jobNum));
   // Exclude void manual invoices from the active list — matches Sales /
   // getAllInvoicesUnified, which already exclude status==='void'. Void
@@ -22194,7 +22442,6 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   const invStats = { total: allInvoices.length, paid: allInvoices.filter(i=>i.status==='paid').length, partial: allInvoices.filter(i=>i.status==='partial').length, outstanding: allInvoices.filter(i=>['sent','overdue','partial'].includes(i.status)).length, draft: allInvoices.filter(i=>i.status==='draft').length };
   const billStats = { total: accBills.length, paid: accBills.filter(b=>b.status==='paid').length, outstanding: accBills.filter(b=>['approved','overdue'].includes(b.status)).length };
 
-  const STATUS_COLORS = { draft:'#6b7280', sent:'#2563eb', paid:'#059669', partial:'#f59e0b', overdue:'#dc2626', void:'#9ca3af', approved:'#d97706' };
 
   const TABS = [
     {id:'dashboard', label:'🏠 Dashboard'},
@@ -22213,7 +22460,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
       {editTxn&&<AllocationModal txn={editTxn} onSave={saveAllocation} onClose={()=>setEditTxn(null)}/>}
       {showAddAccount&&<AddAccountModal onClose={()=>setShowAddAccount(false)}/>}
       {showInvModal&&<InvoiceModal inv={editInv} onSave={saveInvoice} onClose={()=>{setShowInvModal(false);setEditInv(null);}} customers={customers} fmtAmt={fmtAmt}/>}
-      {viewInv&&<ViewInvoiceModal inv={viewInv} onClose={()=>setViewInv(null)} onEdit={viewInv.source!=='job'?()=>{setEditInv(viewInv);setShowInvModal(true);setViewInv(null);}:null}/>}
+      {viewInv&&<ViewInvoiceModal inv={viewInv} onClose={()=>setViewInv(null)} onEdit={viewInv.source!=='job'?()=>{setEditInv(viewInv);setShowInvModal(true);setViewInv(null);}:null} quotes={quotes} jobs={jobs} accInvoices={accInvoices} customers={customers} companies={companies} logoDataUrl={logoDataUrl} onOpenQuote={onOpenQuote} onOpenJob={onOpenJob} onOpenCustomer={onOpenCustomer} onOpenJobPayments={onOpenJobPayments} onOpenInvoicePayments={(i)=>{setPayModalInv(i);setShowPayModal(true);}} fmtDate={fmtDate} fmtAmt={fmtAmt}/>}
       {showBillModal&&<BillModal bill={editBill} onSave={saveBill} onClose={()=>{setShowBillModal(false);setEditBill(null);}}/>}
       {showPayModal&&payModalInv&&<PaymentHistoryModal inv={payModalInv} onClose={()=>{setShowPayModal(false);setPayModalInv(null);}}
         accInvoices={accInvoices} setAccInvoices={setAccInvoices} forceSaveSections={forceSaveSections}
@@ -22513,6 +22760,9 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                     const today=new Date(); const due=new Date(inv.dueDate||inv.date);
                     const overdue=inv.status!=='paid'&&inv.status!=='void'&&today>due;
                     const isJob = inv.source==='job';
+                    // The real job behind an unbacked historical job invoice —
+                    // the backend target for the two actions that ARE safe here.
+                    const linkedJobForRow = isJob ? (jobs.find(j=>j && j.num===inv.jobNum) || null) : null;
                     // Display-only: how much is still owed on this invoice —
                     // same total (sub+vat) and payments already used elsewhere
                     // in this row, just subtracted. Never changes inv.status
@@ -22537,7 +22787,11 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                         <td className={`px-4 py-2.5 text-xs ${overdue?'text-red-600 font-bold':'text-gray-500'}`}>{fmtDate(inv.dueDate)}{overdue?' ⚠':''}</td>
                         <td className="px-4 py-2.5 text-xs">
                           {isJob
-                            ? <span className="bg-purple-100 text-purple-700 rounded-full px-2 py-0.5 font-bold text-xs">Job {inv.jobNum}</span>
+                            ? (<span className="inline-flex flex-col items-start gap-0.5">
+                                 <span className="bg-purple-100 text-purple-700 rounded-full px-2 py-0.5 font-bold text-xs">Job {inv.jobNum}</span>
+                                 <span className="bg-amber-100 text-amber-800 rounded-full px-2 py-0.5 font-bold text-xs whitespace-nowrap"
+                                   title={INVOICE_NO_ACCOUNTING_RECORD_REASON}>📜 No accounting record</span>
+                               </span>)
                             : <span className="bg-blue-100 text-blue-700 rounded-full px-2 py-0.5 font-bold text-xs">Manual</span>}
                         </td>
                         <td className="px-4 py-2.5 text-xs text-right text-gray-700">{fmtAmt(sub)}</td>
@@ -22550,8 +22804,32 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                         </td>
                         <td className="px-4 py-2.5 text-center">
                           {isJob?(
-                            <div className="flex items-center justify-center gap-1">
+                            /* ── INVOICE LIST CONSISTENCY (2026-08-24) ──────────────
+                               A row reaches this branch ONLY when the job's invoice
+                               has no authoritative accInvoices record behind it —
+                               canonical resolution (resolveJobInvoiceRecord) now
+                               collapses every job whose invoice DOES have one into
+                               the single record-backed row above, so a genuine
+                               active invoice can no longer land here.
+                               What remains is a real historical job invoice created
+                               by the pre-cutover flow, which only ever wrote the job.
+                               Edit / ✓Paid / Delete all act on an accInvoices record,
+                               and there is none — so they are not manufactured here.
+                               Everything that DOES have a real target is offered:
+                               View, the JOB's own payment history (rel_payments
+                               owner_type='job'), and the same job-invoice print
+                               Sales uses. The two unavailable actions are shown as
+                               locked with a persistent explanation, using the same
+                               🔒 convention as locked payments — never a silently
+                               reduced row. */
+                            <div className="flex items-center justify-center gap-1 flex-wrap">
                               <button onClick={()=>setViewInv(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f0f4ff',color:'#4338ca'}}>👁 View</button>
+                              {linkedJobForRow&&<button onClick={()=>onOpenJobPayments&&onOpenJobPayments(linkedJobForRow)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#ecfdf5',color:'#059669'}}>💳 Payments</button>}
+                              {linkedJobForRow&&<button onClick={()=>printInvoice(linkedJobForRow,companies,logoDataUrl,customers)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f3f4f6',color:'#1f2937'}}>🧾 Print</button>}
+                              <span className="flex items-center gap-1 text-xs font-semibold text-gray-400">Edit <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/></span>
+                              <span className="flex items-center gap-1 text-xs font-semibold text-gray-400">Email <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/></span>
+                              <span className="flex items-center gap-1 text-xs font-semibold text-gray-400">✓ Paid <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/></span>
+                              <span className="flex items-center gap-1 text-xs font-semibold text-gray-400">✕ Delete <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/></span>
                             </div>
                           ):(
                             <div className="flex items-center justify-center gap-1 flex-wrap">

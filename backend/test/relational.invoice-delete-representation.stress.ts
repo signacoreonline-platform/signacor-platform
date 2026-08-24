@@ -87,7 +87,8 @@ const HTML = fs.readFileSync(INDEX_HTML_PATH, 'utf8').replace(/\r\n/g, '\n');
 /** Sandbox holding the shipped read-only list builders. */
 const listBox: any = { console, Math, Date, parseFloat, parseInt, JSON, Set, Array, Object, isNaN, String, Number };
 vm.createContext(listBox);
-for (const n of ['getManualInvoiceJobRefs', 'invoiceBelongsToJob', 'getJobManualInvoice',
+for (const n of ['invoiceBelongsToJob', 'invoiceIdentityKey', 'resolveJobInvoiceRecord',
+  'jobInvoiceLinkState', 'getManualInvoiceJobRefs', 'getJobManualInvoice',
   'getQuoteInvoice', 'reconcileJobInvoice', 'numSort', 'getAllInvoicesUnified',
   'getPendingJobInvoices', 'getJobInvoices']) {
   vm.runInContext(extractFunction(HTML, n), listBox);
@@ -115,7 +116,7 @@ const PAYMENTS_TAB_RULE = 'const invoicedJobs = visibleJobs.filter(j=>j.invoiceN
 const DASHBOARD_REVENUE_RULE = '.filter(j=>([7,8,9].includes(j.stage)||j.invoiceNum) && !manualRefs.has(j.num)';
 
 function salesInvoiceList(jobs: any[], quotes: any[], accInvoices: any[]) {
-  const refs = listBox.getManualInvoiceJobRefs(accInvoices);
+  const refs = listBox.getManualInvoiceJobRefs(accInvoices, jobs);
   const jobInvItems = jobs.filter((j) => j.invoiceNum && !refs.has(j.num))
     .map((j) => ({ invoiceNum: j.invoiceNum, num: j.num, _isManual: false }));
   const manualInvItems = accInvoices.filter((i) => i.status !== 'void')
@@ -125,7 +126,7 @@ function salesInvoiceList(jobs: any[], quotes: any[], accInvoices: any[]) {
 function accountingInvoiceList(jobs: any[], quotes: any[], accInvoices: any[]) {
   listBox.jobs = jobs; listBox.quotes = quotes;
   const jobInvoices = listBox.getJobInvoices();
-  const manualRefs = listBox.getManualInvoiceJobRefs(accInvoices);
+  const manualRefs = listBox.getManualInvoiceJobRefs(accInvoices, jobs);
   const jobInvsFiltered = jobInvoices.filter((j: any) => !manualRefs.has(j.jobNum));
   return [
     ...accInvoices.filter((i: any) => i && i.status !== 'void').map((i: any) => ({ ...i, source: i.source || 'manual' })),
@@ -134,7 +135,7 @@ function accountingInvoiceList(jobs: any[], quotes: any[], accInvoices: any[]) {
 }
 function paymentsTabList(jobs: any[]) { return jobs.filter((j) => j.invoiceNum); }
 function dashboardRevenueJobs(jobs: any[], accInvoices: any[]) {
-  const refs = listBox.getManualInvoiceJobRefs(accInvoices);
+  const refs = listBox.getManualInvoiceJobRefs(accInvoices, jobs);
   return jobs.filter((j) => ([7, 8, 9].includes(j.stage) || j.invoiceNum) && !refs.has(j.num));
 }
 
@@ -514,9 +515,17 @@ async function main() {
       ],
     };
     box.baseline = { accInvoices: [{ id: 'inv-1', number: 'INV-00099' }], jobs: box.jobState.slice() };
+    // The shared delete is module-level; give each sandbox the same module-level
+    // helpers it really has at runtime.
+    const loadShared = (ctx: any) => {
+      for (const fn of ['invoiceBelongsToJob', 'invoiceIdentityKey', 'resolveJobInvoiceRecord',
+        'getManualInvoiceJobRefs', 'getJobManualInvoice', 'deleteCanonicalInvoice']) {
+        vm.runInContext(extractFunction(HTML, fn), ctx);
+      }
+    };
     vm.createContext(box);
-    vm.runInContext(extractFunction(HTML, 'deleteInvoice'), box);
-    await vm.runInContext('deleteInvoice("inv-1")', box);
+    loadShared(box);
+    await vm.runInContext('deleteCanonicalInvoice("inv-1", { accInvoices, setAccInvoices, setJobs })', box);
 
     ok((box.calls || []).length === 1 && box.calls[0].relId === 7 && box.calls[0].ver === 3,
       'K1 the relational delete is called with the record\'s _relId and _relRowVersion', box.calls);
@@ -544,6 +553,15 @@ async function main() {
       'K8 the handler only ever clears jobs the SERVER reported clearing');
     ok(HTML.indexOf("guardAction('deleteInvoice:'+inv.id") !== -1,
       'K9 the delete button keeps its in-flight duplicate-submission guard');
+    // 2026-08-24 (canonicalization): the delete was hoisted to module scope so
+    // Sales and Accounting run ONE implementation. Pin both the hoist and the
+    // delegation, so the page cannot quietly grow a second copy.
+    ok(HTML.indexOf('async function deleteCanonicalInvoice(id, ctx){') !== -1,
+      'K9b the delete lives in ONE shared, hoisted implementation');
+    ok(HTML.indexOf('return deleteCanonicalInvoice(id, { accInvoices, setAccInvoices, setJobs });') !== -1,
+      'K9c …which AccountingPage delegates to');
+    ok(HTML.indexOf('deleteCanonicalInvoice(manualRec.id, { accInvoices: myAccInvoices, setAccInvoices, setJobs })') !== -1,
+      'K9d …and Sales delegates to, against its company-filtered list');
 
     // K10/K11 — behavioural versions of K8: a response that reports nothing,
     // and a page with no setJobs at all, must both leave every job untouched
@@ -558,8 +576,8 @@ async function main() {
     quietBox.syncRelationalBaseline = (section: string, u: any) => { quietBox.baseline[section] = u(quietBox.baseline[section]); };
     quietBox.relationalApi = { deleteInvoice: async () => ({ success: true, deleted: true }) };
     vm.createContext(quietBox);
-    vm.runInContext(extractFunction(HTML, 'deleteInvoice'), quietBox);
-    await vm.runInContext('deleteInvoice("inv-1")', quietBox);
+    loadShared(quietBox);
+    await vm.runInContext('deleteCanonicalInvoice("inv-1", { accInvoices, setAccInvoices, setJobs })', quietBox);
     ok(quietBox.accState.length === 0, 'K10 a response with no clearedJobs still removes the invoice');
     ok(quietBox.jobState[0].invoiceNum === 'INV-00099' && quietBox.jobState[0]._relRowVersion === 8,
       'K10b …and touches no job at all', quietBox.jobState[0]);
@@ -574,8 +592,8 @@ async function main() {
     noSetJobsBox.relationalApi = { deleteInvoice: async () => ({ success: true, deleted: true, ambiguousJobs: [], clearedJobs: [{ id: 42, sourceId: '42', jobNumber: 'SNS-00112', rowVersion: 9 }] }) };
     let threw: Error | null = null;
     vm.createContext(noSetJobsBox);
-    vm.runInContext(extractFunction(HTML, 'deleteInvoice'), noSetJobsBox);
-    try { await vm.runInContext('deleteInvoice("inv-1")', noSetJobsBox); } catch (e) { threw = e as Error; }
+    loadShared(noSetJobsBox);
+    try { await vm.runInContext('deleteCanonicalInvoice("inv-1", { accInvoices, setAccInvoices, setJobs })', noSetJobsBox); } catch (e) { threw = e as Error; }
     ok(threw === null, 'K11 a page without setJobs does not throw', threw && threw.message);
     ok(noSetJobsBox.accState.length === 0, 'K11b …and the invoice is still removed (the re-read heals the rest)');
 
@@ -592,8 +610,8 @@ async function main() {
     ambigBox.syncRelationalBaseline = (section: string, u: any) => { ambigBox.baseline[section] = u(ambigBox.baseline[section]); };
     ambigBox.relationalApi = { deleteInvoice: async () => ({ success: true, deleted: true, clearedJobs: [], ambiguousJobs: [{ id: 1, jobNumber: 'SNS-00112' }, { id: 2, jobNumber: 'SNS-00113' }] }) };
     vm.createContext(ambigBox);
-    vm.runInContext(extractFunction(HTML, 'deleteInvoice'), ambigBox);
-    await vm.runInContext('deleteInvoice("inv-1")', ambigBox);
+    loadShared(ambigBox);
+    await vm.runInContext('deleteCanonicalInvoice("inv-1", { accInvoices, setAccInvoices, setJobs })', ambigBox);
     ok(ambigBox.alerted.length === 1 && /SNS-00112/.test(ambigBox.alerted[0]) && /SNS-00113/.test(ambigBox.alerted[0])
       && /deleted/i.test(ambigBox.alerted[0]),
       'K12 a quarantined numbering collision is explained to the user, naming both jobs',
@@ -826,8 +844,14 @@ async function main() {
     // invoice render as TWO rows (the real one, and an R0.00 job-derived twin).
     await pool.query(`UPDATE rel_invoices SET reference = NULL, job_number_raw = NULL WHERE invoice_number = $1`, [inv.invoiceNumber]);
     const broken = await everyRepresentationOf(inv.invoiceNumber);
-    ok(broken.inUnified === 2 && broken.inSales === 2 && broken.inAcct === 2,
-      'Q1 precondition reproduced: with no dedup key the SAME invoice renders twice on every list',
+    // 2026-08-24 (invoice canonicalization): stripping `reference`/
+    // `job_number_raw` USED to make this same invoice render twice — the record
+    // plus a job-derived twin. Canonical resolution (company-scoped invoice
+    // number, plus read.ts's own join) now collapses them, so the duplicate
+    // cannot be produced at all. That is the repair, asserted here rather than
+    // the old broken precondition.
+    ok(broken.inUnified === 1 && broken.inSales === 1 && broken.inAcct === 1,
+      'Q1 even with every de-duplication key stripped, ONE canonical row renders',
       { u: broken.inUnified, s: broken.inSales, a: broken.inAcct });
     const relBroken = (await buildInvoicesJson())[0];
     await services.deleteInvoice(relBroken._relId, relBroken._relRowVersion);
@@ -915,7 +939,7 @@ async function main() {
   // ── TEST S — SAVE-PATH + COMPANY-ISOLATION (brief TESTS K and I) ────────
   console.log('\n[S] invoice delete never touches the platform_state save path');
   {
-    const src = extractFunction(HTML, 'deleteInvoice');
+    const src = extractFunction(HTML, 'deleteCanonicalInvoice');
     for (const forbidden of ['forceSaveSections', 'saveToServer', 'mergeAndSave', 'platform-state', '_partial', '_deletedIds']) {
       ok(src.indexOf(forbidden) === -1,
         `S1 the delete handler contains no reference to ${forbidden} — it is a purely relational write`);
@@ -957,10 +981,13 @@ async function main() {
       if (Array.isArray(saveBox.baselineState[section])) saveBox.baselineState[section] = u(saveBox.baselineState[section]);
     };
     vm.createContext(saveBox);
-    vm.runInContext(extractFunction(HTML, 'deleteInvoice'), saveBox);
+    for (const fn of ['invoiceBelongsToJob', 'invoiceIdentityKey', 'resolveJobInvoiceRecord',
+      'getManualInvoiceJobRefs', 'getJobManualInvoice', 'deleteCanonicalInvoice']) {
+      vm.runInContext(extractFunction(HTML, fn), saveBox);
+    }
     if (STATE_SECTIONS_SRC) vm.runInContext(STATE_SECTIONS_SRC[0], saveBox);
     vm.runInContext(extractFunction(HTML, 'locallyChangedSections'), saveBox);
-    await vm.runInContext('deleteInvoice("inv-1")', saveBox);
+    await vm.runInContext('deleteCanonicalInvoice("inv-1", { accInvoices, setAccInvoices, setJobs })', saveBox);
 
     ok(saveBox.illegal.length === 0,
       'S2 no legacy save function and no network call of any kind was invoked', saveBox.illegal);

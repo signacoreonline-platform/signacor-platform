@@ -742,10 +742,20 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
     // number from the atomic pool permanently.
     //
     // Checked BEFORE any reservation, so the number pool is never touched on
-    // the reuse path. Adoption is deliberately narrow: only an invoice already
-    // pointing at this job, or one linked to this job's source quote / carrying
-    // this job's number as its reference and not yet claimed by any other job.
-    // Anything ambiguous falls through to a fresh reservation exactly as before.
+    // the reuse path. Adoption is deliberately narrow: ONLY an invoice already
+    // pointing at this job (job_id), or one linked to this job's source quote
+    // (quote_id). Anything else falls through to a fresh reservation.
+    //
+    // 2026-08-24: this comment previously also claimed an invoice "carrying
+    // this job's number as its reference" was adopted. It never was, and it
+    // MUST NOT be — `reference` is a free-text field a person types, so
+    // adopting on it lets a standalone invoice for a DIFFERENT customer be
+    // absorbed into this job (relinking their document and leaving this job's
+    // own work uninvoiced while marking it Invoiced). That invariant is
+    // asserted by relational.post-migration-stabilization.stress.ts [R2a].
+    // The frontend's own createInvoiceNow guard (getJobManualInvoice) is the
+    // right place for the softer reference-based match, because it only ever
+    // OPENS the existing invoice — it never rewrites ownership.
     const reusableInvRes = await client.query(
       `SELECT id, invoice_number FROM rel_invoices
         WHERE company_code = $1

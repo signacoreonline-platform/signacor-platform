@@ -317,9 +317,83 @@ export async function buildQuotesJson(): Promise<any[]> {
   return out;
 }
 
+// ── CANONICAL JOB -> INVOICE RESOLUTION (2026-08-24) ───────────────────────
+// A job's invoice is represented two ways at once (see the header above
+// CREATE TABLE rel_invoices in 007_relational_core.sql): as a rel_invoices
+// row, and as invoice linkage fields on the job. Deciding whether a given
+// job's `invoice_num` actually HAS an authoritative accounting record behind
+// it is a join across both tables, so it is answered HERE — once, in SQL,
+// where both are visible — rather than re-guessed by every list builder in
+// the browser from whichever key each record happens to carry.
+//
+// Resolution order, strictly company-scoped (rel_invoices is UNIQUE on
+// (company_code, invoice_number), and both companies legitimately reuse the
+// same numbers, so a match must never cross a company boundary):
+//   1. rel_invoices.job_id = this job                    — explicit linkage
+//   2. same company + same invoice number (case/whitespace-normalised, as
+//      backfill stores both sides verbatim from JSON)    — historical linkage
+// `matchCount` distinguishes 0 (orphaned — a real historical job invoice with
+// no accounting record) from exactly 1 (matched) from 2+ (ambiguous; cannot
+// happen under the UNIQUE constraint, kept because legacy JSON never had it).
+// Void invoices never count — a voided record is not an active invoice.
+interface JobInvoiceLink { relId: number | null; rowVersion: number | null; matchCount: number; claimingJobs: number }
+async function resolveJobInvoiceLinks(): Promise<Map<string, JobInvoiceLink>> {
+  // Two EQUALITY joins UNIONed, deliberately not one join with an OR: an OR
+  // across job_id and a normalised invoice number cannot use an index, so
+  // Postgres fell back to hash-joining on company_code alone and filtering
+  // every job x invoice pair inside a company — measurably quadratic (9s at
+  // 4000x4000 locally) on a query that runs on EVERY authoritative jobs read.
+  // Each half below is a plain equality join Postgres can hash.
+  const res = await pool.query(`
+    WITH cand AS (
+      SELECT j.id AS job_id, i.id AS inv_id, i.row_version AS rv
+        FROM rel_jobs j
+        JOIN rel_invoices i ON i.job_id = j.id
+       WHERE COALESCE(i.status, '') <> 'void'
+      UNION
+      SELECT j.id AS job_id, i.id AS inv_id, i.row_version AS rv
+        FROM rel_jobs j
+        JOIN rel_invoices i
+          ON i.company_code = j.company_code
+         AND UPPER(BTRIM(i.invoice_number)) = UPPER(BTRIM(j.invoice_num))
+       WHERE j.invoice_num IS NOT NULL AND BTRIM(j.invoice_num) <> ''
+         AND COALESCE(i.status, '') <> 'void'
+    ), per_job AS (
+      SELECT job_id, COUNT(*)::int AS match_count,
+             (ARRAY_AGG(inv_id ORDER BY inv_id))[1] AS inv_id,
+             (ARRAY_AGG(rv     ORDER BY inv_id))[1] AS rv
+        FROM cand GROUP BY job_id
+    ), claims AS (
+      -- How many DISTINCT jobs claim each invoice. Counting matches per job
+      -- alone is not enough: when two jobs carry the same invoice number they
+      -- each see exactly one match and would both be reported 'matched',
+      -- collapsing two jobs' invoices into one row and pointing the second
+      -- job's payments at the first job's customer. That is a human decision,
+      -- so it is reported as ambiguous instead.
+      SELECT inv_id, COUNT(DISTINCT job_id)::int AS claiming_jobs FROM cand GROUP BY inv_id
+    )
+    SELECT p.job_id, p.match_count, p.inv_id, p.rv,
+           COALESCE(c.claiming_jobs, 0) AS claiming_jobs
+      FROM per_job p
+      LEFT JOIN claims c ON c.inv_id = p.inv_id
+  `);
+  const map = new Map<string, JobInvoiceLink>();
+  for (const r of res.rows) {
+    const unique = r.match_count === 1 && Number(r.claiming_jobs) === 1;
+    map.set(String(r.job_id), {
+      relId: unique && r.inv_id != null ? Number(r.inv_id) : null,
+      rowVersion: unique && r.rv != null ? Number(r.rv) : null,
+      matchCount: r.match_count,
+      claimingJobs: Number(r.claiming_jobs),
+    });
+  }
+  return map;
+}
+
 // ── JOBS (+ line items + payments) ─────────────────────────────────────────
 export async function buildJobsJson(): Promise<any[]> {
   const jobsRes = await pool.query('SELECT * FROM rel_jobs ORDER BY id');
+  const invoiceLinks = await resolveJobInvoiceLinks();
   const out: any[] = [];
   for (const r of jobsRes.rows) {
     const linesRes = await pool.query(
@@ -371,6 +445,36 @@ export async function buildJobsJson(): Promise<any[]> {
       invoiceDue: dateStr(r.invoice_due) ?? legacyBase(r).invoiceDue ?? null,
       invoiceCreated: r.invoice_created ?? legacyBase(r).invoiceCreated ?? false,
       invoiceStatus: r.invoice_status ?? legacyBase(r).invoiceStatus ?? null,
+      // ── INVOICE LIST CONSISTENCY (2026-08-24) ────────────────────────────
+      // The authoritative answer to "does this job's invoice have a real
+      // accounting record?" — see resolveJobInvoiceLinks above. `invoiceRelId`
+      // is the rel_invoices PK when exactly one matches, so the UI can collapse
+      // the job-side and record-side representations into ONE canonical row
+      // instead of rendering the job-derived twin alongside it.
+      // `invoiceLinkState` is what the UI must show honestly:
+      //   'none'      — this job has no invoice at all
+      //   'matched'   — an authoritative rel_invoices row exists (canonical)
+      //   'orphaned'  — a real historical job invoice with NO accounting record
+      //                 (the pre-cutover "Create Invoice" flow only ever wrote
+      //                 the job; backfill preserves that faithfully and never
+      //                 synthesises a rel_invoices row from job fields)
+      //   'ambiguous' — more than one candidate; needs a person, not a guess
+      // Purely additive: nothing that already reads these jobs changes.
+      invoiceRelId: (() => {
+        const lk = invoiceLinks.get(String(r.id));
+        return lk && lk.relId != null ? lk.relId : null;
+      })(),
+      invoiceRelRowVersion: (() => {
+        const lk = invoiceLinks.get(String(r.id));
+        return lk && lk.rowVersion != null ? lk.rowVersion : null;
+      })(),
+      invoiceLinkState: (() => {
+        if (!r.invoice_num) return 'none';
+        const lk = invoiceLinks.get(String(r.id));
+        if (!lk || lk.matchCount === 0) return 'orphaned';
+        if (lk.matchCount === 1 && lk.claimingJobs === 1) return 'matched';
+        return 'ambiguous';
+      })(),
       setupFee: num(r.setup_fee),
       discount: num(r.discount_pct),
       salesperson: r.salesperson ?? legacyBase(r).salesperson ?? null,

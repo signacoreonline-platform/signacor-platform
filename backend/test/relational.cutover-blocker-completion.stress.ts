@@ -85,8 +85,18 @@ function checkFrontendWiring(src: string) {
   // checks below pin the second half of the delete, which did not exist when
   // the original bound was written and which a purely distance-bounded regex
   // would happily have let regress.
-  ok(/async function deleteInvoice\(id\)\{[\s\S]{0,2500}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,300}relationalApi\.deleteInvoice\(inv\._relId, inv\._relRowVersion\)/.test(src),
+  // 2026-08-24 (invoice canonicalization): the handler was HOISTED to module
+  // scope as deleteCanonicalInvoice so Sales and Accounting run ONE
+  // implementation instead of Accounting owning the only copy. The assertion
+  // follows it there and is STRENGTHENED — it now also pins that BOTH pages
+  // delegate to that single implementation, which the page-local form could
+  // not express at all.
+  ok(/async function deleteCanonicalInvoice\(id, ctx\)\{[\s\S]{0,2500}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,300}relationalApi\.deleteInvoice\(inv\._relId, inv\._relRowVersion\)/.test(src),
     'AccountingPage.deleteInvoice() checks isRelationalAuthoritative(\'accInvoices\') and calls relationalApi.deleteInvoice(inv._relId, inv._relRowVersion)');
+  ok(src.includes('return deleteCanonicalInvoice(id, { accInvoices, setAccInvoices, setJobs });'),
+    'AccountingPage delegates its delete to that ONE shared implementation');
+  ok(src.includes('deleteCanonicalInvoice(manualRec.id, { accInvoices: myAccInvoices, setAccInvoices, setJobs })'),
+    'Sales -> Invoices delegates to the SAME implementation, against its company-filtered list');
   ok(/relationalApi\.deleteInvoice\(inv\._relId, inv\._relRowVersion\)[\s\S]{0,2500}delResult\.clearedJobs[\s\S]{0,1500}syncRelationalBaseline\('jobs',/.test(src),
     'AccountingPage.deleteInvoice() also reverses the JOB-side half locally (clearedJobs -> setJobs + jobs baseline), so the job-derived invoice twin cannot survive the delete');
   ok(/delResult\.ambiguousJobs/.test(src),
@@ -101,8 +111,15 @@ function checkFrontendWiring(src: string) {
     'PaymentHistoryModal.deletePayment() checks isRelationalAuthoritative(\'accInvoices\') and calls relationalApi.deletePayment with ownerSection \'accInvoices\'');
 
   console.log('\n  -- markInvPaid records a REAL relational payment --');
-  ok(/async function markInvPaid\(inv\)\{[\s\S]{0,500}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,300}relationalApi\.recordPayment\('invoice', inv\._relId, remaining,/.test(src),
+  // Hoisted alongside the delete, for the same reason and with the same
+  // strengthening: the relational behaviour is pinned where it now lives, and
+  // both pages are pinned to it.
+  ok(/async function markCanonicalInvoicePaid\(inv, ctx\)\{[\s\S]{0,500}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,300}relationalApi\.recordPayment\('invoice', inv\._relId, remaining,/.test(src),
     'markInvPaid() checks isRelationalAuthoritative(\'accInvoices\') and calls relationalApi.recordPayment for the remaining balance, instead of routing an embedded payments array through saveInvoice');
+  ok(src.includes('return markCanonicalInvoicePaid(inv, { setAccInvoices, onJsonFallback: saveInvoice });'),
+    'AccountingPage delegates mark-paid to that ONE shared implementation');
+  ok(src.includes('markCanonicalInvoicePaid(manualRec, { setAccInvoices, onJsonFallback: saveManualInvoiceFromSales })'),
+    'Sales -> Invoices delegates to the SAME implementation, with a real persistence fallback (never a silent no-op)');
 
   console.log('\n  -- PO gap #2: onEmail "sent" transition --');
   ok(src.includes(`onEmail={updated=>updatePO({...updated, status:'sent'})}`),
