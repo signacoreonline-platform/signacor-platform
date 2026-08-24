@@ -137,6 +137,25 @@ function coNum(v: any): number | string | null {
 }
 
 // ── payments (embedded sub-array on job / quote / accInvoices records) ────
+//
+// POST-MIGRATION STABILIZATION (2026-08-24) — BUG 1 / BUG 7.
+//
+// `_relOwnerType` is new and is the fix for a real cross-screen defect: the Job
+// Payment History modal shows a MERGED list (the job's own payments plus the
+// linked quote's), but had to guess which relational section each row belonged
+// to and hard-coded 'jobs' for all of them. A quote-owned payment shown in that
+// list was therefore deleted/edited against the wrong owner section. Every row
+// now states its own owner, so the frontend resolves the section from the data
+// instead of inferring it from which screen happens to be open.
+//
+// NOTE — deliberately NO legacy_data fallback for `payments`, unlike `lines`
+// and `items`. backfill.ts materialises every historical payment into
+// rel_payments AND keeps the original record verbatim in legacy_data, so both
+// copies exist for a backfilled record. A fallback would therefore fire the
+// moment a record's LAST relational payment is legitimately deleted, silently
+// resurrecting every deleted payment and restating money that is no longer in
+// the books. rel_payments is the sole authority for a cut-over record's
+// payments, and an empty array genuinely means "no payments".
 async function paymentsFor(ownerType: 'job' | 'quote' | 'invoice', ownerId: number): Promise<any[]> {
   const res = await pool.query(
     `SELECT * FROM rel_payments WHERE owner_type = $1 AND owner_id = $2 ORDER BY line_index`,
@@ -151,6 +170,7 @@ async function paymentsFor(ownerType: 'job' | 'quote' | 'invoice', ownerId: numb
     reference: p.reference ?? null,
     notes: p.notes ?? null,
     _relPaymentId: p.id,
+    _relOwnerType: ownerType,
     _relRowVersion: p.row_version,
   }));
 }
@@ -277,6 +297,15 @@ export async function buildQuotesJson(): Promise<any[]> {
       subtotal: num(r.subtotal),
       vat: num(r.vat_amount),
       total: num(r.total),
+      // 012_post_migration_stabilization.sql (2026-08-24) — BUG 2. "Quote Date"
+      // and "Valid Until" are entered on every quote but had no relational
+      // column, so a post-cutover quote lost them and the Job detail screen's
+      // "Quote date / Valid until" line rendered as "—". The legacy fallbacks
+      // keep backfilled quotes (whose values live only in legacy_data, and
+      // which the 012 columns are not retro-populated for) rendering exactly as
+      // they do today.
+      date: dateStr(r.quote_date) ?? legacyBase(r).date ?? null,
+      validUntil: dateStr(r.valid_until) ?? legacyBase(r).validUntil ?? null,
       proformaNum: r.proforma_num ?? legacyBase(r).proformaNum ?? null,
       convertedJobId: r.converted_job_source_id != null ? restoreId(r.converted_job_source_id) : (legacyBase(r).convertedJobId ?? null),
       lines: items.length ? items : (legacyBase(r).lines ?? []),
@@ -327,6 +356,15 @@ export async function buildJobsJson(): Promise<any[]> {
       // 010_job_writeoff_duedate.sql (2026-08-23 save-authority audit)
       writeOff: r.write_off ?? legacyBase(r).writeOff ?? null,
       dueDate: dateStr(r.due_date) ?? legacyBase(r).dueDate ?? null,
+      // 012_post_migration_stabilization.sql (2026-08-24) — BUG 5. The explicit
+      // "progressed without payment" business override. Hydrated as a real
+      // boolean (never null) so the lifecycle UI can distinguish "Deposit
+      // Received — payment recorded" from "Progressed without payment" without
+      // a null check at every read site. Deliberately carries NO financial
+      // meaning: invoiceStatus above still reports the true payment position.
+      depositWaived: r.deposit_waived === true,
+      depositWaivedAt: r.deposit_waived_at ? new Date(r.deposit_waived_at).toISOString() : null,
+      depositWaivedBy: r.deposit_waived_by ?? null,
       quoteNum: r.quote_number_raw ?? legacyBase(r).quoteNum ?? null,
       invoiceNum: r.invoice_num ?? legacyBase(r).invoiceNum ?? null,
       invoiceDate: dateStr(r.invoice_date) ?? legacyBase(r).invoiceDate ?? null,
@@ -380,7 +418,32 @@ export async function buildInvoicesJson(): Promise<any[]> {
       status: r.status ?? legacyBase(r).status ?? null,
       issueDate: dateStr(r.issue_date) ?? legacyBase(r).issueDate ?? null,
       dueDate: dateStr(r.due_date) ?? legacyBase(r).dueDate ?? null,
+      // ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 6, second half ─────
+      // This builder emitted the invoice's line array as `items` only. The
+      // ENTIRE frontend reads an invoice's lines as `lineItems` — the Sales
+      // invoice list, the Accounting list, aged debtors, client statements, the
+      // dashboard revenue tile and the printed invoice all compute their amount
+      // as `(inv.lineItems||[]).reduce(...)`. With no `lineItems` key, that
+      // reduce ran over an empty array and EVERY relationally-hydrated invoice
+      // rendered as R0.00. That is the "R0.00 twin" half of the duplicate
+      // INV-00099 report: the job-derived row showed the job's real value while
+      // the relational row for the same number showed zero.
+      //
+      // `lineItems` is the shape the app actually consumes; `items` is kept
+      // alongside it, identical, so nothing that already reads `items`
+      // (fullBackupV2, reconcile.ts, existing tests, any legacy_data round-trip)
+      // changes behavior. Both keys always describe the same lines.
+      // Same class of key mismatch as items/lineItems below: the frontend reads
+      // an invoice's date as `inv.date` (the dashboard revenue chart, the
+      // invoice list's Date column and its date sort all use it), while this
+      // builder emitted only `issueDate`. For a relationally-created invoice
+      // legacy_data is '{}', so `date` came back undefined and the invoice was
+      // skipped entirely by the revenue chart's `if(!d)return`. Emitted here
+      // alongside issueDate — same value, both keys — so nothing that already
+      // reads issueDate changes.
+      date: dateStr(r.issue_date) ?? legacyBase(r).date ?? legacyBase(r).issueDate ?? null,
       items: items.length ? items : (legacyBase(r).items ?? []),
+      lineItems: items.length ? items : (legacyBase(r).lineItems ?? legacyBase(r).items ?? []),
       payments,
       _relId: r.id,
       _relRowVersion: r.row_version,

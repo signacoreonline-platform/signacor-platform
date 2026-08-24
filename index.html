@@ -251,6 +251,91 @@ function syncRelationalBaseline(sectionKey, updater) {
   }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   POST-MIGRATION STABILIZATION (2026-08-24) — AUTHORITATIVE POST-WRITE REFRESH
+   Root cause of BUG 1 ("payments are inconsistent / appear unsaved"), and a
+   contributing cause of BUG 3's spurious "Internal error"/conflict reports.
+
+   WHAT WAS ACTUALLY WRONG. Relational payments were persisting correctly all
+   along — nothing was ever lost. What failed was hydration. Each payment modal
+   holds its OWN `useState` copy of the payment list, seeded once at mount from
+   whichever global array resolvePaymentSource() picked. On a successful
+   relational write the handlers updated only that modal-local copy. The global
+   `jobs[].payments` / `quotes[].payments` / `accInvoices[].payments` arrays —
+   which every OTHER surface reads (the Sales invoice list, Accounting, aged
+   debtors, statements, the dashboard tiles, the stage-5 deposit auto-advance)
+   — were never touched, and nothing refetched.
+
+   AND THE POLL COULD NOT HEAL IT. The 30s poll compares `stateStamp()`
+   (`_autoSavedAt`/`savedAt`, both of which live INSIDE the platform_state JSON
+   blob) and returns early when the server's stamp is not newer. A purely
+   relational write never touches that blob, so the stamp never moves and the
+   poll always short-circuits. The stale view therefore persisted for the whole
+   session, not 30 seconds.
+
+   WHY THE SYMPTOM LOOKED LIKE "the payment did not save". Recording a deposit
+   on the Quote wrote it to rel_payments but left every screen showing the old
+   list. Recording another on the Job did the same. Creating the invoice then
+   flipped `job.invoiceCreated`, which changes which branch
+   resolvePaymentSource() takes — from the quote's list to the MERGED job∪quote
+   list — so both real, long-persisted payments finally became visible at once.
+   Nothing was duplicated and nothing was created twice; two genuinely separate
+   payments had simply been invisible until the resolution branch changed.
+
+   THE FIX. One shared, coalesced "re-read the authoritative state now" helper.
+   Every relational mutation calls it after the server confirms the write. It
+   re-reads GET /api/platform-state (whose cut-over sections are served from the
+   rel_* tables) and applies ONLY the relational-authoritative sections into
+   React state and into serverBaselineRef — deliberately never the JSON-owned
+   sections, which the user may be actively editing and which this refresh has
+   no authority over. Because the relational sections are server-authoritative
+   by definition, replacing them wholesale is always correct and can never
+   discard a local edit that mattered.
+
+   This also closes the stale-`_relRowVersion` family behind BUG 3: after every
+   mutation the client's row versions come back in step with the server's, so
+   the next save can no longer send an expectedVersion the user themselves
+   invalidated one action earlier.
+
+   Registered by App (which owns the setters and fetchFromServer) into the ref
+   below, so page/detail components declared earlier in this file can trigger it
+   without prop-drilling — the same pattern serverBaselineRef already uses.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const relationalRefreshRef = { current: null };
+let _relationalRefreshTimer = null;
+let _relationalRefreshPending = false;
+function requestRelationalRefresh(reason) {
+  // Coalesced: a burst of writes (a payment plus its owner-status recompute, a
+  // convert that touches quote+job+inventory) results in ONE refetch shortly
+  // after the last of them, never one per call.
+  _relationalRefreshPending = true;
+  if (_relationalRefreshTimer) clearTimeout(_relationalRefreshTimer);
+  _relationalRefreshTimer = setTimeout(() => {
+    _relationalRefreshTimer = null;
+    const fn = relationalRefreshRef.current;
+    if (typeof fn === 'function') {
+      // Never let a refresh failure surface as if the user's write failed — the
+      // write already succeeded and is committed. A failed refresh only means
+      // the screen may still be showing the pre-write view, so it is reported
+      // quietly and ONE retry is scheduled: the 30s poll cannot recover this
+      // (a relational write never moves platform_state's `_autoSavedAt`, which
+      // is what the poll gates on), so without a retry a transient network
+      // blip would leave the view stale until the user's next mutation.
+      Promise.resolve(fn(reason)).then(() => {
+        _relationalRefreshPending = false;
+      }).catch((e) => {
+        console.warn('[relational-refresh] could not re-read authoritative state after "' + (reason || 'a change') + '":', e);
+        if (_relationalRefreshPending) {
+          _relationalRefreshPending = false;
+          setTimeout(() => requestRelationalRefresh(reason), 4000);
+        }
+      });
+    } else {
+      _relationalRefreshPending = false;
+    }
+  }, 250);
+}
+
 // Mirrors saveToServer's auth/error conventions (401 -> forced logout,
 // non-2xx -> thrown Error). The parsed body (when present) is attached as
 // `.body` so callers can inspect `.body.type` for 'stale_record' /
@@ -258,6 +343,7 @@ function syncRelationalBaseline(sectionKey, updater) {
 // handles platform-state's `stale_revision` 409 via `.conflict`.
 async function relationalFetch(path, options) {
   options = options || {};
+  const method = (options.method || 'GET').toUpperCase();
   const res = await fetch(API_RELATIONAL_URL + path, Object.assign({
     headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders())
   }, options));
@@ -269,6 +355,26 @@ async function relationalFetch(path, options) {
     err.body = body;
     err.status = res.status;
     throw err;
+  }
+  // POST-MIGRATION STABILIZATION (2026-08-24) — the single choke point that
+  // makes "the UI shows what the server actually holds" true for EVERY
+  // relational mutation, present and future.
+  //
+  // Deliberately here rather than at each of the ~40 call sites: that is
+  // exactly how the original defect arose — each call site optimistically
+  // patched whatever local state it happened to know about, and the ones that
+  // knew about less (all nine relational payment paths, which only ever saw a
+  // modal-local array) left every other screen stale with no way to notice.
+  // Any relational write that succeeds, wherever it is called from, now
+  // schedules one coalesced re-read of the authoritative state. Existing
+  // optimistic setJobs/setQuotes/... updates are kept exactly as they are —
+  // they still give instant feedback; this only guarantees the server's own
+  // version lands shortly after, so no surface can stay behind and no user ever
+  // has to refresh by hand to see a change they just made.
+  //
+  // Only mutations trigger it. A read can never make the client stale.
+  if (method !== 'GET' && method !== 'HEAD') {
+    requestRelationalRefresh(method + ' ' + path);
   }
   return body;
 }
@@ -297,16 +403,67 @@ async function relationalFetch(path, options) {
 // local state — every caller remains solely responsible for leaving the
 // user's draft exactly as they left it; this only ever affects what text is
 // shown.
-function describeSaveConflictError(err, entityLabel) {
+// POST-MIGRATION STABILIZATION (2026-08-24) — BUG 3 / ERROR VISIBILITY.
+//
+// Previously EVERY non-conflict failure fell through to `err.message` verbatim.
+// For a server fault that message is the literal string "Internal error"
+// (backend/src/relational/api.ts's 500 body) — five words, no indication of
+// what failed, whether the user's work survived, whether retrying is sensible,
+// or that it is a server fault at all rather than something they did wrong. It
+// also read exactly like an ordinary save conflict, so a real backend fault and
+// a routine "someone else edited this" were indistinguishable in the UI.
+//
+// Now classified into four distinct, actionable outcomes. The underlying save
+// defects are fixed at their source (see services.ts); this makes whatever
+// still fails legible instead of cryptic. Like before, this function NEVER
+// retries, refetches, clears or replaces any local state — the caller remains
+// solely responsible for leaving the user's draft exactly as they left it.
+function classifySaveError(err, entityLabel) {
   const label = entityLabel || 'record';
   const conflictType = (err && err.body && err.body.type) || (err && err.conflict && err.conflict.type);
+  const status = err && err.status;
+  const serverText = (err && err.body && err.body.error) || (err && err.message) || '';
+
   if (conflictType === 'stale_record') {
-    return 'This ' + label + ' was changed elsewhere while you were editing it. Your changes have been kept. Review the latest version before saving.';
+    return { kind: 'conflict', critical: false, retryable: true,
+      message: 'This ' + label + ' was changed elsewhere while you were editing it. Your changes have been kept. Review the latest version before saving.' };
   }
   if (conflictType === 'stale_revision') {
-    return 'Something else changed on the platform while you were editing this ' + label + '. Your changes have been kept — please review the latest version before saving again.';
+    return { kind: 'conflict', critical: false, retryable: true,
+      message: 'Something else changed on the platform while you were editing this ' + label + '. Your changes have been kept — please review the latest version before saving again.' };
   }
-  return (err && err.message) ? err.message : 'Save failed. Please check your connection and try again.';
+  if (conflictType === 'business_rule' || conflictType === 'legacy_conflict' || conflictType === 'cutover_dependency' || conflictType === 'not_cut_over') {
+    // A deliberate refusal by a business rule — the server explained itself, so
+    // show its own words. Not a fault; retrying unchanged will refuse again.
+    return { kind: 'business_rule', critical: false, retryable: false,
+      message: serverText || 'This action is not allowed for this ' + label + '.' };
+  }
+  if (status >= 500) {
+    return { kind: 'server_error', critical: true, retryable: true,
+      message: 'The server could not complete this save (' + label + ') — it reported: "' + (serverText || 'Internal error') + '".'
+        + '\n\nYour changes have NOT been saved, and are still on screen. Nothing was partially written — the server rolls the whole operation back.'
+        + '\n\nTry saving again. If it keeps failing, note what you were saving and report it, quoting the message above.' };
+  }
+  if (status >= 400) {
+    return { kind: 'rejected', critical: true, retryable: false,
+      message: 'The server rejected this ' + label + ' save: ' + (serverText || 'HTTP ' + status)
+        + '\n\nYour changes have NOT been saved and are still on screen. Please check the highlighted fields and try again.' };
+  }
+  // No HTTP status at all — the request never reached (or never returned from)
+  // the server: offline, DNS, timeout, or the systemic relational-authority
+  // guard throwing before the network call.
+  return { kind: 'network', critical: true, retryable: true,
+    message: serverText
+      ? serverText + '\n\nYour changes have NOT been saved and are still on screen.'
+      : 'Could not reach the server, so this ' + label + ' was NOT saved. Your changes are still on screen — check your connection and try again.' };
+}
+
+// Kept as the single text-only entry point so every existing call site keeps
+// working unchanged; new call sites that need the classification (to decide how
+// long to show a message, or whether it is a server fault) call
+// classifySaveError directly.
+function describeSaveConflictError(err, entityLabel) {
+  return classifySaveError(err, entityLabel).message;
 }
 
 // Thin wrappers, one per wired workflow. Every one of these is a direct,
@@ -326,6 +483,11 @@ const relationalApi = {
   updateQuoteStatus(id, expectedVersion, status) { return relationalFetch('/quotes/' + id + '/status', { method: 'PATCH', body: JSON.stringify({ expectedVersion: expectedVersion, status: status }) }); },
   convertQuoteToJob(quoteId) { return relationalFetch('/quotes/' + quoteId + '/convert-to-job', { method: 'POST' }); },
   finalizeProforma(quoteId) { return relationalFetch('/quotes/' + quoteId + '/finalize-proforma', { method: 'POST' }); },
+  // POST-MIGRATION STABILIZATION (2026-08-24) — the Jobs page's "Add New Job"
+  // action (a job with no source quote) had no relational path at all; see
+  // services.ts's createJob. The SNS-##### number is reserved server-side from
+  // the same atomic pool, so the client never proposes one.
+  createJob(data) { return relationalFetch('/jobs', { method: 'POST', body: JSON.stringify(data) }); },
   updateJob(id, expectedVersion, patch) { return relationalFetch('/jobs/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
   // CUTOVER BLOCKER COMPLETION — "job deletion" named blocker.
   deleteJob(id, expectedVersion) { return relationalFetch('/jobs/' + id, { method: 'DELETE', body: JSON.stringify({ expectedVersion: expectedVersion }) }); },
@@ -380,6 +542,53 @@ const relationalApi = {
 // SAME try/catch+alert/setApiMsg conventions already present at every
 // existing call site — nothing else needs to change for those call sites
 // to behave safely.
+/* ═══════════════════════════════════════════════════════════════════════════
+   POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY / DUPLICATE SUBMISSION
+
+   The audit of "every primary financial and workflow action button" found that
+   in-flight protection was the exception, not the rule. Only CreateQuoteModal,
+   InvoiceModal, CreateCustomPOModal, the three payment modals and
+   handleConvertToJob had any. Every supplier, inventory, credit-note, job
+   delete, invoice delete, PO edit, quote status, mark-paid and create-invoice
+   button was a bare un-disabled onClick on an async handler.
+
+   The consequences differ by verb and both are bad:
+     - on CREATE, a double-click can produce two records and burn two
+       atomically-reserved document numbers;
+     - on UPDATE/DELETE, the second click carries a now-stale _relRowVersion and
+       comes back 409, which the UI reported as "this record was changed
+       elsewhere" — blaming a phantom other user for a conflict the user caused
+       with their own second click. That specific false alarm is part of what
+       made the save behaviour feel unreliable after the migration.
+
+   `guardAction` is the frontend half: a keyed in-flight registry that drops a
+   re-entrant call for the same logical action while the first is still running.
+   It is deliberately module-level and keyed by a caller-supplied string, so a
+   handler can be protected without restructuring the component that owns it
+   (which is what left so many of them unprotected in the first place). It is
+   NOT a substitute for server-side protection and never presented as one — the
+   backend keeps its own transactional/row-locking guarantees (SELECT ... FOR
+   UPDATE on invoice creation, UNIQUE(quote_id) on conversion, row_version on
+   every update, UNIQUE(company_code, invoice_number) on invoices). Per the
+   brief, both layers are in place; this one also stops the pointless second
+   request ever leaving the browser.
+   ═══════════════════════════════════════════════════════════════════════════ */
+// A stable per-record key for the guard: the relational PK when the record has
+// one, otherwise its legacy id. Keeping actions keyed PER RECORD (rather than
+// one global lock per action name) means two users' — or one user's — work on
+// two different jobs/invoices never blocks each other.
+function relKey(rec) { return rec ? (rec._relId != null ? rec._relId : rec.id) : ''; }
+const _actionsInFlight = new Set();
+async function guardAction(key, fn) {
+  if (_actionsInFlight.has(key)) return undefined;
+  _actionsInFlight.add(key);
+  try {
+    return await fn();
+  } finally {
+    _actionsInFlight.delete(key);
+  }
+}
+
 function assertNoUnwiredRelationalSections(sectionNames, contextLabel) {
   const blocked = (sectionNames || []).filter(isRelationalAuthoritative);
   if (blocked.length > 0) {
@@ -2412,7 +2621,19 @@ async function ensureProformaNumber(quote, quotes, forceSaveSections, onUpdate) 
   if (result.error) { alert(result.error); return null; }
   const updatedQuote = { ...quote, proformaNum: result.number };
   try {
-    await forceSaveSections({ quotes: (quotes||[]).map(q=>q.id===quote.id?updatedQuote:q) });
+    if (isRelationalAuthoritative('quotes') && quote._relId != null) {
+      // 2026-08-24: this whole function was JSON-only, so once "quotes" became
+      // relational-authoritative the save below was refused by the systemic
+      // write guard and BOTH proforma actions (Print / Email) aborted — each
+      // attempt having already burned a reserved number from the atomic pool.
+      // services.ts's updateQuote now exposes proforma_num for exactly this.
+      const relResult = await relationalApi.updateQuote(quote._relId, quote._relRowVersion, { proformaNum: result.number });
+      updatedQuote._relRowVersion = relResult.rowVersion;
+      const quotesUpdater = prev=>prev.map(q=>q.id===quote.id?{...q, proformaNum: result.number, _relRowVersion: relResult.rowVersion}:q);
+      syncRelationalBaseline('quotes', quotesUpdater);
+    } else {
+      await forceSaveSections({ quotes: (quotes||[]).map(q=>q.id===quote.id?updatedQuote:q) });
+    }
   } catch(err) {
     alert(`Could not save the proforma number.\n\nThe reservation ${result.number} was made but the save was not confirmed by the server, so nothing was changed on this quote — the reserved number simply goes unused.\n\nReason: ${err&&err.message?err.message:'unknown error'}\n\nPlease try again.`);
     return null;
@@ -2777,8 +2998,128 @@ function numSort(list, field) {
 // invoice. Shared by getAllInvoicesUnified below and by every page that
 // used to compute this set locally (Sales / Accounting / Customers), so
 // they can never disagree about which record wins for a given job.
+// ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 6 (duplicate INV-00099) ──
+// This Set is THE de-duplication key for the whole app: every place that merges
+// job-derived invoices with the accInvoices array (getAllInvoicesUnified, the
+// Sales invoice list, the Customers dropdown, findLinkedRecords,
+// getPendingJobInvoices, the dashboard revenue tile) drops a job-derived row
+// when the job's number appears here.
+//
+// It used to read `i.reference` alone. Relationally-created job invoices had
+// `reference` NULL — services.ts's createInvoiceForJob never wrote the column —
+// so the key was empty and the SAME invoice appeared twice: once derived from
+// jobs[].invoiceNum showing the job's value, and once from accInvoices showing
+// R0.00 (the second half of that bug: read.ts emitted the lines as `items`
+// while every consumer reads `lineItems`). Both halves are fixed at source, so
+// this is no longer load-bearing for new invoices.
+//
+// It is widened to `reference || jobNum` anyway, deliberately: `jobNum` is
+// hydrated from rel_invoices.job_number_raw, which createInvoiceForJob HAS
+// always written, on every branch. That makes the de-duplication self-healing
+// for every invoice already created in production before the reference fix —
+// including the live INV-00099 — with no data repair required, and leaves a
+// second independent key in place so a single missing field can never
+// resurrect this class of duplicate again.
+/* ═══════════════════════════════════════════════════════════════════════════
+   POST-MIGRATION STABILIZATION (2026-08-24) — BUG 7: PAYMENT DELETE / LOCK
+   "Some payments show a lock icon and cannot be deleted even when they are
+   unnecessary and need removing."
+
+   WHAT THE LOCK ACTUALLY MEANT. Nothing to do with accounting integrity. The 🔒
+   was rendered purely from `isAdmin` — and `isAdmin` was defined THREE different
+   ways depending on which page happened to mount the modal:
+       QuotesPage      isAdmin = user.role === 'admin'
+       AccountingPage  isAdmin = user.role !== 'assistant'
+       JobsPage        isAdmin = user.role !== 'assistant' && !isFactory
+   So an `accounts` user opening the SAME invoice's payments saw a padlock from
+   Sales and full edit/delete from Accounting. The icon carried no reason, no
+   tooltip and no message: it simply asserted "no" with no way to find out why.
+   Worse, QuotePaymentsModal had no check at ALL — quote-side payments were
+   deletable by every role, including factory.
+
+   THE SECOND, HIDDEN HALF. A payment with no `_relPaymentId` (a historical row
+   never materialised into rel_payments, or a quote-owned row shown inside the
+   Job modal's merged job∪quote list) fell through to the JSON delete path,
+   which calls forceSaveSections — which assertNoUnwiredRelationalSections
+   correctly refuses for a cut-over section. The row stayed on screen behind a
+   generic "Cannot save jobs here…" banner. Users read the two symptoms together
+   as "the system won't let me delete payments".
+
+   THE RULE NOW. One predicate for every screen, and a REASON for every refusal.
+   Deletion is a legitimate correction, not a privilege: an unnecessary or
+   mis-keyed payment must be removable by the people who own the books. What is
+   genuinely protected is protected server-side and explained here — never
+   implied by an unlabelled icon. Existing safeguards are untouched: Credit-
+   funded payments still cannot be EDITED (they must be deleted and re-recorded,
+   so the credit-note balance is released correctly), the server still releases
+   credit-note usage and recomputes the owner's payment status inside the delete
+   transaction, and the cutover-dependency refusal still stands.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// admin and accounts own the books and may correct payments. assistant
+// (sales/quoting) and factory (manufacturing, no Rand values at all) may not.
+// This is the SAME rule everywhere — the divergence above was the bug.
+function canManagePayments(user) {
+  const role = user && user.role;
+  return role === 'admin' || role === 'accounts';
+}
+
+// A payment's owning relational section, taken from the payment ITSELF
+// (read.ts stamps `_relOwnerType` on every rel_payments row) rather than from
+// whichever screen is displaying it. The Job payment modal shows a MERGED
+// job∪quote list but hard-coded 'jobs' for every row in it, so a quote-owned
+// payment was edited/deleted against the wrong section's cutover gate.
+const PAYMENT_OWNER_SECTIONS = { job: 'jobs', quote: 'quotes', invoice: 'accInvoices' };
+function paymentOwnerSection(payment, fallbackSection) {
+  const ownerType = payment && payment._relOwnerType;
+  return (ownerType && PAYMENT_OWNER_SECTIONS[ownerType]) || fallbackSection;
+}
+
+// Returns null when the payment can be deleted, or a plain-English reason when
+// it cannot. Every caller shows this text — the requirement is that the UI
+// "must clearly explain WHY, not merely display a lock icon".
+function paymentDeleteBlockReason(payment, user, fallbackSection) {
+  if (!canManagePayments(user)) {
+    return 'Only Admin and Accounts users can delete payment records. Ask an administrator to remove this payment.';
+  }
+  if (!payment) return 'This payment record could not be found — refresh the page and try again.';
+  const section = paymentOwnerSection(payment, fallbackSection);
+  if (isRelationalAuthoritative(section)) {
+    if (payment._relPaymentId == null) {
+      // A historical payment that lives only in legacy_data. Deleting it would
+      // require a JSON write to a section the server no longer accepts JSON
+      // writes for, so it would silently vanish from the request and reappear
+      // on refresh. Refusing with an explanation is the honest outcome.
+      return 'This is a historical payment recorded before the database migration, so it cannot be removed from this screen. '
+        + 'Contact support to have it migrated or corrected — deleting it here would appear to work and then come back on refresh.';
+    }
+    if (payment.method === 'Credit' && !isRelationalAuthoritative('creditNotes')) {
+      return 'This payment was funded by a credit note. Deleting it must also release that credit, which is not possible until Credit Notes are migrated. Contact support.';
+    }
+  }
+  return null;
+}
+
+// Small shared control so all three payment tables show the SAME thing: a
+// padlock that says why, instead of one that just says no.
+function PaymentLockedBadge({ reason }) {
+  return (
+    <span title={reason}
+      aria-label={reason}
+      onClick={()=>{ if(reason) window.alert(reason); }}
+      style={{cursor:'help'}}
+      className="text-gray-300 text-xs">🔒</span>
+  );
+}
+
 function getManualInvoiceJobRefs(accInvoices) {
-  return new Set((accInvoices||[]).filter(i=>i && i.status!=='void').map(i=>i.reference).filter(Boolean));
+  const refs = new Set();
+  for (const i of (accInvoices||[])) {
+    if (!i || i.status === 'void') continue;
+    if (i.reference) refs.add(i.reference);
+    if (i.jobNum) refs.add(i.jobNum);
+  }
+  return refs;
 }
 
 /* ═══════════════════════════════════════════
@@ -2806,10 +3147,20 @@ function getQuoteInvoice(quote, accInvoices) {
 // `reference` field equals this job's number) — same rule
 // getManualInvoiceJobRefs()/getAllInvoicesUnified() already use to suppress
 // a second, synthetic job-derived invoice row for the same job.
+// The single predicate for "does this accInvoices record belong to this job?".
+// It MUST stay in step with getManualInvoiceJobRefs above — that Set is only a
+// fast membership index over exactly this test, and when the two drifted apart
+// (the Set matching `reference || jobNum` while the lookups still matched
+// `reference` alone) every invoice created before the reference fix passed the
+// gate and then resolved to nothing, silently removing the job's invoice link.
+function invoiceBelongsToJob(inv, jobNum) {
+  if (!inv || !jobNum || inv.status === 'void') return false;
+  return inv.reference === jobNum || inv.jobNum === jobNum;
+}
 function getJobManualInvoice(job, accInvoices) {
   if(!job || !job.num) return null;
   if(!getManualInvoiceJobRefs(accInvoices).has(job.num)) return null;
-  return (accInvoices||[]).find(i => i && i.status!=='void' && i.reference===job.num) || null;
+  return (accInvoices||[]).find(i => invoiceBelongsToJob(i, job.num)) || null;
 }
 
 // Merge job-derived invoices + manual accInvoices into one clean, de-duped,
@@ -3104,9 +3455,12 @@ function findLinkedRecords({ quote, job, invoice }, { quotes=[], jobs=[], accInv
   if(invoice){
     linkedInvoices = [invoice];
   } else if(linkedJob){
-    const manualJobRefs = getManualInvoiceJobRefs(accInvoices);
-    if(manualJobRefs.has(linkedJob.num)){
-      linkedInvoices = (accInvoices||[]).filter(i=>i && i.status!=='void' && i.reference===linkedJob.num);
+    // Same shared predicate as getJobManualInvoice — and a real fallback rather
+    // than an empty list, so a job whose invoice cannot be matched still shows
+    // its own invoiceNum link instead of appearing to have no invoice at all.
+    const matchedManual = (accInvoices||[]).filter(i=>invoiceBelongsToJob(i, linkedJob.num));
+    if(matchedManual.length){
+      linkedInvoices = matchedManual;
     } else if(linkedJob.invoiceNum){
       linkedInvoices = [{ id:'job-'+linkedJob.id, number:linkedJob.invoiceNum, source:'job', jobNum:linkedJob.num }];
     }
@@ -3390,6 +3744,18 @@ function lineItemCount(l){
 /* ═══════════════════════════════════════════
    PRINT JOB CARD (no financials)
 ═══════════════════════════════════════════ */
+// POST-MIGRATION STABILIZATION (2026-08-24): shared HTML escaper for the
+// print/export builders, which assemble their output by string concatenation.
+// Added because printJobCard interpolated the user-typed job note straight into
+// its markup — a note containing "<" or "&" (or any markup at all) corrupted or
+// injected into the printed card. Mirrors the identical `esc` helper already
+// defined locally inside the statement builder; this is the module-level one so
+// the other builders can use the same implementation rather than each rolling
+// their own.
+function escapeHtml(s){
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
 function printJobCard(job, companies) {
   const co = companies.find(c=>c.id===job.co)||{name:'Signacore',short:'SGR'};
   const lines = job.lines||[];
@@ -3479,7 +3845,7 @@ stageNames.map(function(s,i){
 '</tr></thead><tbody>'+rows+'</tbody></table>'
 :'<div style="border:1px solid #e5e7eb;border-radius:8px;padding:16px;text-align:center;color:#333;font-size:11px;margin-bottom:14px;">No line items recorded.</div>')+
 
-(job.notes?'<div class="notes-box"><div class="lbl">Notes</div><p>'+job.notes+'</p></div>':'')+
+(job.notes?'<div class="notes-box"><div class="lbl">Notes</div><p>'+escapeHtml(job.notes)+'</p></div>':'')+
 
 '<div class="info-grid">'+
 '<div class="info-box"><div class="lbl">Client</div><div class="val">'+job.client+'</div></div>'+
@@ -4884,6 +5250,34 @@ function AddJobModal({ companies, onClose, onAdd }) {
     e.preventDefault();
     if (!client.trim() || saving) return;
     setSaving(true); setSaveErr('');
+    // ── POST-MIGRATION STABILIZATION (2026-08-24) — FRONTEND AUDIT (BUG 8) ──
+    // This modal had no relational branch, so with "jobs" cut over a manually
+    // added job was written to local state, stripped from the JSON save
+    // server-side, and gone on the next reload — silently. Wired to
+    // relationalApi.createJob, which reserves the SNS number itself from the
+    // SAME atomic pool reserveJobNumber() below uses, so this branch must NOT
+    // also call reserveJobNumber (that would burn a second, unused number —
+    // exactly the mistake CreateQuoteModal's own relational branch documents).
+    if (isRelationalAuthoritative('jobs')) {
+      try {
+        const result = await relationalApi.createJob({
+          companyCode: String(parseInt(co)),
+          customerNameRaw: client.trim(),
+          description: desc.trim(),
+          status, stage: STATUS_TO_STAGE[status] || 0,
+          value: parseFloat(value) || 0,
+          notes: notes.trim(),
+        });
+        onAdd({ id: result.id, num: result.jobNumber, client: client.trim(), desc: desc.trim(),
+                status, co: parseInt(co), value: parseFloat(value)||0,
+                stage: STATUS_TO_STAGE[status]||0, breakdown: null, notes: notes.trim(),
+                payments: [], _relId: result.id, _relRowVersion: result.rowVersion });
+        onClose();
+      } catch (err) {
+        setSaveErr(describeSaveConflictError(err, 'job'));
+      } finally { setSaving(false); }
+      return;
+    }
     const jobNum = await reserveJobNumber();
     if(!jobNum){
       setSaving(false);
@@ -5654,12 +6048,24 @@ function SaveAsInventoryModal({ line, inventory, setInventory, onClose, onSaved 
   const upd = k => e => setF(p=>({...p,[k]:e.target.value}));
   const iCls = "w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 bg-white";
   const lCls = "block text-xs font-semibold text-gray-500 mb-1";
-  function handleSave(e) {
+  // ── POST-MIGRATION STABILIZATION (2026-08-24) — FRONTEND AUDIT (BUG 8) ────
+  // This "Save as standard inventory item" action (reachable from a quote line)
+  // was the last inventory-create path with NO relational branch: it pushed the
+  // item into local state and left the debounced JSON autosave to persist it.
+  // With `inventory` cut over, that autosave is refused by
+  // assertNoUnwiredRelationalSections — so the item appeared in the list, a
+  // "Save failed…" notice flashed in the corner, and the item was gone on the
+  // next refresh. Exactly the silent-loss failure mode the guard exists to make
+  // visible; visible, but with nothing to recover it. Now wired to
+  // relationalApi.createInventoryItem like every other inventory create, with
+  // the JSON path kept byte-for-byte as the pre-cutover fallback.
+  const [savingItem, setSavingItem] = React.useState(false);
+  async function handleSave(e) {
     e.preventDefault();
+    if (savingItem) return;
     if (!f.sku.trim()) return alert('SKU is required.');
     if (!f.name.trim()) return alert('Item name is required.');
-    const newItem = {
-      id: Date.now(),
+    const base = {
       sku: f.sku.trim(),
       name: f.name.trim(),
       cat: f.cat || 'General',
@@ -5672,6 +6078,25 @@ function SaveAsInventoryModal({ line, inventory, setInventory, onClose, onSaved 
       notes: f.notes || '',
       active: true,
     };
+    if (isRelationalAuthoritative('inventory')) {
+      setSavingItem(true);
+      try {
+        const result = await relationalApi.createInventoryItem({
+          sku: base.sku, name: base.name, category: base.cat, unit: base.unit,
+          cost: base.cost, sell: base.sell, stock: base.stock, reorder: base.reorder,
+          supplierId: base.supplierId,
+        });
+        const created = { ...base, id: result.id, _relId: result.id, _relRowVersion: result.rowVersion };
+        const invUpdater = prev => [...prev, created];
+        setInventory(invUpdater);
+        syncRelationalBaseline('inventory', invUpdater);
+        onSaved(line.id);
+      } catch (err) {
+        alert(describeSaveConflictError(err, 'inventory item') + '\n\nThe item was NOT saved.');
+      } finally { setSavingItem(false); }
+      return;
+    }
+    const newItem = { id: Date.now(), ...base };
     setInventory(prev => [...prev, newItem]);
     onSaved(line.id);
   }
@@ -5744,7 +6169,7 @@ function SaveAsInventoryModal({ line, inventory, setInventory, onClose, onSaved 
           </p>
           <div className="flex gap-3 pt-1">
             <button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Cancel</button>
-            <button type="submit" className="flex-1 text-white rounded-xl py-2.5 text-sm font-bold" style={{background:'#06065c'}}>💾 Save to Inventory</button>
+            <button type="submit" disabled={savingItem} className="flex-1 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed" style={{background:'#06065c'}}>{savingItem?'Saving…':'💾 Save to Inventory'}</button>
           </div>
         </form>
       </div>
@@ -6058,9 +6483,30 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
           // unitPrice happened to already match and looked fine. Mapped
           // explicitly here, same convention as saveLines/handleSave
           // elsewhere in this file.
+          // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 2 ROOT CAUSE,
+          // create half. This payload carried only company/customer/lines/
+          // discount/setupFee/notes. Everything else the user had just typed
+          // into this form — contact person, email, tel, address, VAT number,
+          // sales person, reference, PO ref, quote date, valid-until — was
+          // never sent, so it existed only in this browser tab and was gone on
+          // the next reload. That is also the upstream cause of half of the
+          // "quote information does not carry to the Job": convertQuoteToJob
+          // copies FROM these columns, so a field that was never stored on the
+          // quote could not possibly reach the job or the job card.
+          //
+          // Every field below has a real rel_quotes column (007, plus
+          // quote_date/valid_until from migration 012) and is now accepted by
+          // createQuote/POST /quotes. Line `unit` is included too — it has had
+          // a column since migration 008 but was dropped on create, so units
+          // were lost until the first edit.
           const result = await relationalApi.createQuote({
             companyCode: quoteCo, customerNameRaw: client.trim(),
-            lines: lines.map(l=>({ description: l.desc||'', qty: parseFloat(l.qty)||0, unitPrice: parseFloat(l.unitPrice)||0, inventoryItemId: l.itemId||null })),
+            contactPerson: contact||null, email: email||null, phone: tel||null,
+            address: address||null, vatNumber: vatNum||null,
+            salesperson: salesperson||null, preparedBy: preparedBy||null,
+            poRef: poRef||null, reference: reference||null,
+            quoteDate: date||null, validUntil: valid||null,
+            lines: lines.map(l=>({ description: l.desc||'', qty: parseFloat(l.qty)||0, unitPrice: parseFloat(l.unitPrice)||0, unit: l.unit||null, inventoryItemId: l.itemId||null })),
             discountPct: parseFloat(discount)||0, setupFee: parseFloat(setupFee)||0, notes,
           });
           // BUGFIX (Stage 3 follow-on): _relId/_relRowVersion must be set
@@ -6639,7 +7085,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
    Invoice view. Before an invoice exists, quote.payments is still
    authoritative and persisted via onUpdate (platform_state), same as before.
 ═══════════════════════════════════════════ */
-function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose, creditNotes, setCreditNotes, linkedJob, linkedJobHasInvoice, linkedCustomer, onOpenJob, onOpenInvoice, onOpenCustomer, accInvoices, setAccInvoices, jobs, setJobs, quotes, setQuotes, forceSaveSections }) {
+function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose, creditNotes, setCreditNotes, linkedJob, linkedJobHasInvoice, linkedCustomer, onOpenJob, onOpenInvoice, onOpenCustomer, accInvoices, setAccInvoices, jobs, setJobs, quotes, setQuotes, forceSaveSections, user }) {
   // Resolved once per mount via the quote-specific chain-walking resolver
   // (quote's own invoice → linked job's invoice → linked job's own
   // job-created invoice → quote.payments) — matches exactly what
@@ -7015,10 +7461,23 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
                         <td className="px-3 py-2 text-right font-bold text-green-700">{zr(p.amount)}</td>
                         <td className="px-3 py-2 text-gray-400">{p.notes||'—'}</td>
                         <td className="px-1 text-center">
-                          <span className="flex gap-1 justify-center">
-                            <button onClick={()=>editPayment(p.id)} disabled={saving} className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
-                            <button onClick={()=>deletePayment(p.id)} disabled={saving} className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
-                          </span>
+                          {(() => {
+                            // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 7.
+                            // Previously this cell had NO permission check at all
+                            // (quote payments were deletable by every role,
+                            // including factory), while the two sibling tables
+                            // showed an unlabelled padlock driven by a per-page
+                            // definition of "admin". One rule now, and every
+                            // refusal states its reason.
+                            const blockReason = paymentDeleteBlockReason(p, user, 'quotes');
+                            if (blockReason) return <PaymentLockedBadge reason={blockReason}/>;
+                            return (
+                              <span className="flex gap-1 justify-center">
+                                <button onClick={()=>editPayment(p.id)} disabled={saving} title="Edit this payment" className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
+                                <button onClick={()=>deletePayment(p.id)} disabled={saving} title="Delete this payment" className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
+                              </span>
+                            );
+                          })()}
                         </td>
                       </tr>
                     ))}
@@ -7051,7 +7510,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
   );
 }
 
-function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvertToJob, companies, logoDataUrl, onEdit, jobs, setJobs, quotes, setQuotes, creditNotes, setCreditNotes, isAdmin, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob, customers, onOpenCustomer, accInvoices, setAccInvoices, onCreateInvoiceFromQuote, onOpenQuoteInvoice, forceSaveSections }) {
+function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvertToJob, companies, logoDataUrl, onEdit, jobs, setJobs, quotes, setQuotes, creditNotes, setCreditNotes, isAdmin, user, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob, customers, onOpenCustomer, accInvoices, setAccInvoices, onCreateInvoiceFromQuote, onOpenQuoteInvoice, forceSaveSections }) {
   const [showEmailFlow, setShowEmailFlow] = useState(false);
   const [showProformaEmail, setShowProformaEmail] = useState(false);
   const [showPayments, setShowPayments] = useState(false);
@@ -7515,6 +7974,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
           jobs={jobs} setJobs={setJobs}
           quotes={quotes} setQuotes={setQuotes}
           forceSaveSections={forceSaveSections}
+          user={user}
         />
       )}
     </Modal>
@@ -8119,14 +8579,32 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // describeSaveConflictError) is now the ONE place this message is
       // shown, and the modal — and this quote's local edits — stay open.
       const live = (quotes||[]).find(x=>x.id===q.id);
-      const linkedJob = (jobs||[]).find(j=>j.quoteNum===q.num);
+      // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 3. The linked job was
+      // looked up ONLY by `j.quoteNum === q.num`. When that missed (a job whose
+      // quoteNum never hydrated, or a restored conversion where two jobs share
+      // a quote number), two things went wrong at once: the job's own
+      // `_relRowVersion` was never refreshed from the response, and — worse —
+      // `expectedJobVersion` below could assert a DIFFERENT job's version,
+      // producing a 409 on the QUOTE save for a job the user was not editing.
+      // The relational link (quote.convertedJobId -> job._relId) is the
+      // authoritative one and is tried first; quoteNum remains the fallback for
+      // records that predate it.
+      const _convertedJobId = (live && live.convertedJobId != null) ? live.convertedJobId : q.convertedJobId;
+      const linkedJob = (_convertedJobId != null
+          ? (jobs||[]).find(j=>Number(j._relId)===Number(_convertedJobId) || j.id===_convertedJobId)
+          : null)
+        || (jobs||[]).find(j=>j.quoteNum===q.num);
       const patch = {
         customerNameRaw: q.client, contactPerson: q.contact||'', email: q.email||'',
         phone: q.tel||'', address: q.address||'', vatNumber: q.vatNum||'',
         notes: q.notes||'', terms: q.terms||'', salesperson: q.salesperson||'',
         preparedBy: q.preparedBy||'', poRef: q.poRef||'', reference: q.reference||'',
+        // migration 012 (2026-08-24) — BUG 2: "Quote Date" / "Valid Until" now
+        // have real columns, so an edit persists them instead of silently
+        // dropping two fields the form has always collected.
+        quoteDate: q.date||null, validUntil: q.validUntil||null,
         setupFee: parseFloat(q.setupFee)||0, discountPct: parseFloat(q.discount)||0,
-        lines: (q.lines||[]).map(l=>({ desc: l.desc, qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId })),
+        lines: (q.lines||[]).map(l=>({ desc: l.desc||'', qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId })),
       };
       // Record-scoped concurrency in action: this ONLY ever asserts the
       // linked JOB's version (via expectedJobVersion, checked server-side in
@@ -8149,10 +8627,25 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         const _discPct = parseFloat(q.discount)||0;
         const _setupFee = parseFloat(q.setupFee)||0;
         const _afterDisc = _sub - _sub*(_discPct/100) + _setupFee;
+        // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 4, client mirror.
+        // This must reproduce exactly what services.ts's updateQuoteWithJobSync
+        // now does server-side, or the optimistic view and the authoritative
+        // row disagree for the 250ms until the refresh lands (and the user sees
+        // a deleted note flash back). The old `q.notes||j.notes||''` was a
+        // one-way ratchet: it re-pushed the quote's notes onto the job on EVERY
+        // quote save — including saves that never touched notes — so a note
+        // deleted on the Job page came back the next time anyone edited the
+        // quote for any reason at all. The job's notes are only part of the
+        // cascade when the QUOTE's notes actually changed in this save.
+        const _quoteNotesBefore = (live && live.notes != null) ? String(live.notes) : '';
+        const _quoteNotesAfter = q.notes == null ? '' : String(q.notes);
+        const _quoteNotesChanged = _quoteNotesAfter !== _quoteNotesBefore;
         const jobsUpdater = prev=>prev.map(j=>j.id===linkedJob.id
           ? {...j, lines:q.lines, discount:q.discount||'', setupFee:q.setupFee||'', value:_afterDisc*1.15,
              client:q.client, contact:q.contact||'', email:q.email||'', tel:q.tel||'',
-             address:q.address||'', vatNum:q.vatNum||'', notes:q.notes||j.notes||'',
+             address:q.address||'', vatNum:q.vatNum||'',
+             salesperson:q.salesperson||'', preparedBy:q.preparedBy||'', poRef:q.poRef||'', reference:q.reference||'',
+             notes: _quoteNotesChanged ? _quoteNotesAfter : (j.notes==null?'':String(j.notes)),
              _relRowVersion: result.jobRowVersion}
           : j);
         setJobs(jobsUpdater);
@@ -8190,13 +8683,23 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         const _discPct  = parseFloat(q.discount)||0;
         const _setupFee = parseFloat(q.setupFee)||0;
         const _afterDisc= _sub - _sub*(_discPct/100) + _setupFee;
+        // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 4, JSON path. Same
+        // correction as the relational branch above: an unchanged quote note
+        // must never overwrite the job's own note, and a cleared quote note
+        // must clear it rather than falling back to the job's previous text.
+        const _liveQ = (quotes||[]).find(x=>x.id===q.id);
+        const _qNotesBefore = (_liveQ && _liveQ.notes != null) ? String(_liveQ.notes) : '';
+        const _qNotesAfter = q.notes == null ? '' : String(q.notes);
+        const _qNotesChanged = _qNotesAfter !== _qNotesBefore;
         return {
           ...j,
           lines: q.lines, discount: q.discount||'', setupFee: q.setupFee||'',
           value: _afterDisc*1.15,
           client: q.client, contact: q.contact||'', email: q.email||'',
           tel: q.tel||'', address: q.address||'', vatNum: q.vatNum||'',
-          notes: q.notes||j.notes||'',
+          salesperson: q.salesperson||'', preparedBy: q.preparedBy||'',
+          poRef: q.poRef||'', reference: q.reference||'',
+          notes: _qNotesChanged ? _qNotesAfter : (j.notes==null?'':String(j.notes)),
         };
       });
       if(jobsChanged) nextJobs = mapped;
@@ -8250,7 +8753,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // if that's genuinely intended). On failure the optimistic status change
   // is NOT applied — the quote's on-screen status stays whatever it actually
   // is server-side, per the "rejected saves preserve the user's draft" rule.
-  async function handleUpdate(updated){
+  // 2026-08-24 CONCURRENCY: in-flight guard, see guardAction's own note.
+  async function handleUpdate(updated){ return guardAction('quoteStatus:'+relKey(updated), () => handleUpdate__impl(updated)); }  // 2026-08-24 concurrency guard — see guardAction
+  async function handleUpdate__impl(updated){
     if(isRelationalAuthoritative('quotes') && updated._relId!=null){
       try {
         const result = await relationalApi.updateQuoteStatus(updated._relId, updated._relRowVersion, updated.status);
@@ -8398,10 +8903,49 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       ? `Job ${job.num} is currently linked to a different quote (${job.quoteNum}).\n\nRelinking it to ${q.num} will change that job's quote reference. No quote, job, invoice or payment data is deleted — only the link changes. Continue?`
       : `Relink quote ${q.num} to existing job ${job.num}?\n\nThis only updates the link between the quote and the job — no line items, amounts or payment history are changed on either record. Continue?`;
     if(!window.confirm(msg)) return;
-    setJobs(prev=>prev.map(j=>j.id===job.id?{...j, quoteNum:q.num}:j));
-    setQuotes(prev=>prev.map(qx=>qx.id===q.id?{...qx, convertedJobId:job.id, status:'converted'}:qx));
-    setViewQuote(null);
-    alert(`Quote ${q.num} is now linked to Job ${job.num}.`);
+    return guardAction('relinkJob:'+relKey(q)+':'+relKey(job), async () => {
+      // 2026-08-24 FRONTEND AUDIT: this used to mutate `jobs` AND `quotes`
+      // locally and then declare success, with no relational call at all. Once
+      // those sections were cut over the follow-up autosave was refused by the
+      // write-authority guard, so the relink vanished on the next refresh — a
+      // silent loss sitting behind an explicit confirmation dialog. Both sides
+      // are now persisted BEFORE any local state changes (the
+      // confirmed-save-before-success convention used throughout this file), and
+      // a failure changes nothing and says so.
+      if(isRelationalAuthoritative('jobs') || isRelationalAuthoritative('quotes')){
+        if(!isRelationalAuthoritative('jobs') || !isRelationalAuthoritative('quotes')
+           || job._relId == null || q._relId == null){
+          alert('This quote/job relink cannot be saved right now — the two records are not both available for relational editing.\n\nNothing was changed.');
+          return;
+        }
+        try {
+          const jobRes = await relationalApi.updateJob(job._relId, job._relRowVersion, { reference: q.num });
+          const quoteRes = await relationalApi.updateQuoteStatus(q._relId, q._relRowVersion, 'converted');
+          const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j, quoteNum:q.num, _relRowVersion: jobRes.rowVersion}:j);
+          const quotesUpdater = prev=>prev.map(qx=>qx.id===q.id?{...qx, convertedJobId:job.id, status:'converted', _relRowVersion: quoteRes.rowVersion}:qx);
+          setJobs(jobsUpdater); syncRelationalBaseline('jobs', jobsUpdater);
+          setQuotes(quotesUpdater); syncRelationalBaseline('quotes', quotesUpdater);
+        } catch(e){
+          alert(describeSaveConflictError(e, 'quote/job link')+'\n\nThe relink was NOT saved.');
+          return;
+        }
+        setViewQuote(null);
+        alert(`Quote ${q.num} is now linked to Job ${job.num}.`);
+        return;
+      }
+      const nextJobs = jobs.map(j=>j.id===job.id?{...j, quoteNum:q.num}:j);
+      const nextQuotes = quotes.map(qx=>qx.id===q.id?{...qx, convertedJobId:job.id, status:'converted'}:qx);
+      try {
+        await forceSaveSections({ jobs: nextJobs, quotes: nextQuotes });
+      } catch(e){
+        alert(describeSaveConflictError(e, 'quote/job link')+'\n\nThe relink was NOT saved.');
+        return;
+      }
+      setJobs(nextJobs);
+      setQuotes(nextQuotes);
+      setViewQuote(null);
+      alert(`Quote ${q.num} is now linked to Job ${job.num}.`);
+    });
   }
   // restore=true rebuilds a job for a quote that was already converted but whose
   // job went missing. On restore we skip inventory deduction / PO generation
@@ -8497,6 +9041,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           id: result.jobId, num: result.jobNumber, client: q.client,
           contact: q.contact||'', email: q.email||'', tel: q.tel||'',
           address: q.address||'', vatNum: q.vatNum||'',
+          // 2026-08-24 BUG 2: these four were dropped by BOTH this stub and the
+          // server's INSERT — see convertQuoteToJob in services.ts.
+          salesperson: q.salesperson||'', preparedBy: q.preparedBy||'',
+          poRef: q.poRef||'', reference: q.reference||'',
           desc: 'From Quote '+q.num, status: 'quote_approved', co: q.co,
           lines: q.lines, quoteNum: q.num, notes: q.notes||'',
           setupFee: q.setupFee||'', discount: q.discount||'',
@@ -8519,7 +9067,24 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           _relId: result.jobId, _relRowVersion: result.jobRowVersion,
         };
         const jobsUpdater = prev=>[stubJob, ...prev];
-        const quotesUpdater = prev=>prev.map(qx=>qx.id===q.id?{...qx,status:'converted',convertedJobId:result.jobId}:qx);
+        // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 3 ROOT CAUSE.
+        // Converting bumps the QUOTE's row_version server-side (rel_quotes is
+        // updated to status='converted' with the job link). This updater used
+        // to leave `_relRowVersion` untouched, so the client kept the
+        // pre-conversion version and the user's very NEXT action on that quote
+        // — an edit, or Mark Sent / Approve / Decline — sent a stale
+        // expectedVersion and was refused 409 stale_record. Nothing could heal
+        // it either: a purely relational write never moves platform_state's
+        // `_autoSavedAt`, so the 30s poll's staleness check always short-
+        // circuits. The quote stayed unsaveable for the whole session, and the
+        // user saw "changed elsewhere" (or, once a save failed differently, an
+        // opaque error) for a conflict they had caused themselves one click
+        // earlier. The endpoint now reports the new version and it is applied
+        // here. `??` not `||` so a legitimate version of 0 is never discarded.
+        const quotesUpdater = prev=>prev.map(qx=>qx.id===q.id
+          ? {...qx, status:'converted', convertedJobId:result.jobId,
+             _relRowVersion: (result.quoteRowVersion ?? qx._relRowVersion)}
+          : qx);
         setJobs(jobsUpdater);
         syncRelationalBaseline('jobs', jobsUpdater);
         setQuotes(quotesUpdater);
@@ -8795,7 +9360,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const ok = await saveManualInvoice(inv, { user, jobsAll: jobs, accInvoicesAll: accInvoices, quotesAll: quotes, setAccInvoices, forceSaveSections });
     if(ok){ setShowManualInvModal(false); setEditManualInv(null); }
   }
-  async function createInvoiceNow(job){
+  // POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY / DUPLICATE
+  // SUBMISSION. This action's button had no in-flight protection, so a
+  // double-click fired the request twice. Wrapped in the shared keyed
+  // guard (see guardAction near the top of this file): the second call is
+  // dropped before it leaves the browser, while the server keeps its own
+  // transactional/row-version protection as the authoritative backstop.
+  async function createInvoiceNow(job){ return guardAction('createInvoiceNow:'+relKey(job), () => createInvoiceNow__impl(job)); }  // 2026-08-24 concurrency guard — see guardAction
+  async function createInvoiceNow__impl(job){
     if(!job) return;
     // 2026-08-23 (production cutover repair): same threshold used by
     // JobDetail's own "Create Invoice" button / getPendingJobInvoices() to
@@ -8956,7 +9528,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // If this quote is later converted to a job, handleConvertToJob relinks
   // this SAME record (reference/jobId/jobNum) — it never creates a second
   // invoice or reserves a second number for the same quote.
-  async function createInvoiceFromQuote(quote){
+  // POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY / DUPLICATE
+  // SUBMISSION. This action's button had no in-flight protection, so a
+  // double-click fired the request twice. Wrapped in the shared keyed
+  // guard (see guardAction near the top of this file): the second call is
+  // dropped before it leaves the browser, while the server keeps its own
+  // transactional/row-version protection as the authoritative backstop.
+  async function createInvoiceFromQuote(quote){ return guardAction('createInvoiceFromQuote:'+relKey(quote), () => createInvoiceFromQuote__impl(quote)); }  // 2026-08-24 concurrency guard — see guardAction
+  async function createInvoiceFromQuote__impl(quote){
     if(!quote) return;
     // Duplicate guard — re-checked against the live accInvoices array at
     // the moment of the click, not a stale closure.
@@ -8983,13 +9562,29 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         // PK for a quote created after cutover. Any BACKFILLED historical
         // quote has a legacy id that differs from its relational PK.
         const result = await relationalApi.finalizeProforma(quote._relId);
+        // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 6, same defect class
+        // as the duplicate INV-00099 report. This optimistic stub carried the
+        // server's REAL invoice number with `lineItems: []`, so until the next
+        // full reload the freshly-created invoice displayed as R0.00 everywhere
+        // — a genuine invoice showing no value, which is exactly the "R0.00
+        // twin" users saw and could not distinguish from a duplicate. The
+        // backend (finalizeProformaToInvoice) does copy the quote's lines, so
+        // the stub was the only thing claiming zero. It now mirrors those same
+        // lines in the accInvoices shape (`description`/`qty`/`unitAmount`),
+        // and the authoritative refresh scheduled by relationalFetch replaces
+        // it with the server's own copy moments later either way.
         const stubInvoice = {
           id: result.invoiceId, number: result.invoiceNumber, co: quote.co,
           date: new Date().toISOString().slice(0,10),
           contactName: quote.client||'', contactEmail: quote.email||'', contactAddress: quote.address||'',
-          reference:'', jobId:null, jobNum:'',
+          reference: quote.num||'', jobId:null, jobNum:'',
           quoteId: quote.id, quoteNum: quote.num,
-          status:'sent', lineItems: [], payments: (quote.payments||[]).map(p=>({...p})),
+          status:'sent',
+          lineItems: (quote.lines||[]).map(l=>({
+            description: l.desc||'', qty: parseFloat(l.qty)||0,
+            unitAmount: parseFloat(l.unitPrice)||0, accountCode:'4000', taxType:'15%',
+          })),
+          payments: (quote.payments||[]).map(p=>({...p})),
         };
         const accInvoicesUpdater = prev=>[stubInvoice, ...prev];
         setAccInvoices(accInvoicesUpdater);
@@ -9206,6 +9801,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // this branch does not attempt to reproduce that locally; the next
       // GET's relational read-overlay (backend/src/relational/read.ts)
       // reflects it.
+      // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 7, add path. A brand-new
+      // payment has no existing row to read an owner from, so it is owned by
+      // whatever record this modal is writing against: the resolved kind IS the
+      // correct section here. (The edit and delete paths below resolve the
+      // owner from each payment's own `_relOwnerType` instead — see their
+      // notes; they operate on a MERGED job∪quote list where this assumption
+      // was the bug.)
       const relSection = paySource.kind==='invoice' ? 'accInvoices' : 'jobs';
       if(isRelationalAuthoritative(relSection)){
         if(method==='Credit' && amt > availableCredit + 0.005){
@@ -9276,7 +9878,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     }
     async function deletePayment(pid) {
       if(saving) return;
-      if(!isAdmin){alert('Only admins can delete payments.');return;}
+      // 2026-08-24 BUG 7: one rule everywhere; refusals explain themselves.
+      { const _b = paymentDeleteBlockReason(payments.find(x=>x.id===pid), user, (paySource.kind==='invoice' ? 'accInvoices' : 'jobs')); if(_b){ alert(_b); return; } }
       if(!window.confirm('Delete this payment record? This may change the invoice status.'))return;
       const removed = payments.find(p=>p.id===pid);
       // Stage 3 Phase 4: route through the relational REST API when this
@@ -9292,7 +9895,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // usage AND recomputes the owner's invoice_status/status in the SAME
       // transaction — this branch does not reproduce either locally; the
       // next GET's relational read-overlay reflects both.
-      const relSection = paySource.kind==='invoice' ? 'accInvoices' : 'jobs';
+      // 2026-08-24 BUG 7: resolve the owner from the payment, not the screen.
+      const relSectionFallback = paySource.kind==='invoice' ? 'accInvoices' : 'jobs';
+      const relSection = paymentOwnerSection(removed, relSectionFallback);
       if(removed && removed._relPaymentId!=null && isRelationalAuthoritative(relSection)){
         setSaveErr('');
         setSaving(true);
@@ -9331,7 +9936,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     }
     async function editPayment(pid) {
       if(saving) return;
-      if(!isAdmin){alert('Only admins can edit payments.');return;}
+      { const _b = paymentDeleteBlockReason(payments.find(x=>x.id===pid), user, (paySource.kind==='invoice' ? 'accInvoices' : 'jobs')); if(_b){ alert(_b); return; } }
       const p=payments.find(x=>x.id===pid);
       const patch = promptEditPayment(p);
       if(!patch) return;
@@ -9340,7 +9945,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // (or change method INTO Credit) — the exact same rule
       // services.ts's updatePayment enforces server-side, so this branch
       // never needs its own separate Credit guard.
-      const relSection = paySource.kind==='invoice' ? 'accInvoices' : 'jobs';
+      // 2026-08-24 BUG 7: resolve the owner from the payment, not the screen.
+      const relSectionFallback = paySource.kind==='invoice' ? 'accInvoices' : 'jobs';
+      const relSection = paymentOwnerSection(p, relSectionFallback);
       if(p && p._relPaymentId!=null && isRelationalAuthoritative(relSection)){
         setSaveErr('');
         setSaving(true);
@@ -9461,13 +10068,24 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                           <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold">{p.method}</span></td>
                           <td className="px-3 py-2 text-right font-bold text-green-700">{zr(p.amount)}</td>
                           <td className="px-3 py-2 text-gray-400">{p.notes||'—'}</td>
-                          <td className="px-1 text-center">
-                            {isAdmin?(
-                              <span className="flex gap-1 justify-center">
-                                <button onClick={()=>editPayment(p.id)} disabled={saving} className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
-                                <button onClick={()=>deletePayment(p.id)} disabled={saving} className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
-                              </span>
-                            ):<span className="text-gray-200 text-xs">🔒</span>}
+                        <td className="px-1 text-center">
+                            {(() => {
+                              // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 7.
+                              // Previously this cell had NO permission check at all
+                              // (quote payments were deletable by every role,
+                              // including factory), while the two sibling tables
+                              // showed an unlabelled padlock driven by a per-page
+                              // definition of "admin". One rule now, and every
+                              // refusal states its reason.
+                              const blockReason = paymentDeleteBlockReason(p, user, (paySource.kind==='invoice' ? 'accInvoices' : 'jobs'));
+                              if (blockReason) return <PaymentLockedBadge reason={blockReason}/>;
+                              return (
+                                <span className="flex gap-1 justify-center">
+                                  <button onClick={()=>editPayment(p.id)} disabled={saving} title="Edit this payment" className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
+                                  <button onClick={()=>deletePayment(p.id)} disabled={saving} title="Delete this payment" className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
+                                </span>
+                              );
+                            })()}
                           </td>
                         </tr>
                       ))}
@@ -9500,7 +10118,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
               {method==='Credit'&&<p className="text-xs text-emerald-600 mt-2">This will draw down {job.client}'s available credit instead of taking a cash payment.</p>}
               <button onClick={addPayment} disabled={saving} className="mt-3 w-full text-white font-bold py-2.5 rounded-xl text-sm disabled:opacity-50 disabled:cursor-not-allowed" style={{background:'#059669'}}>{saving?'Saving…':'＋ Record Payment'}</button>
             </div>
-            {!isAdmin&&<p className="text-xs text-gray-400 text-center">🔒 Only admins can edit or delete payment records.</p>}
+            {!canManagePayments(user)&&<p className="text-xs text-gray-400 text-center">🔒 Only Admin and Accounts users can edit or delete payment records.</p>}
             <div className="flex justify-end pt-1">
               <button onClick={onClose} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-4 py-2 font-semibold hover:bg-gray-50">Close</button>
             </div>
@@ -10016,7 +10634,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       {manualInvPayModal&&(
         <PaymentHistoryModal inv={manualInvPayModal} onClose={()=>setManualInvPayModal(null)}
           accInvoices={myAccInvoices} setAccInvoices={setAccInvoices} forceSaveSections={forceSaveSections}
-          creditNotes={myCreditNotes} setCreditNotes={setCreditNotes} isAdmin={isAdmin} quotes={quotes} jobs={jobs} customers={customers}
+          creditNotes={myCreditNotes} setCreditNotes={setCreditNotes} isAdmin={isAdmin} user={user} quotes={quotes} jobs={jobs} customers={customers}
           onOpenJob={onOpenJob} onOpenCustomer={onOpenCustomer} onViewInvoice={null} onSaved={setManualInvPayModal}
           fmtAmt={fmtAmt} fmtDate={fmtDate}/>
       )}
@@ -10079,7 +10697,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         onOpenInvoice={revealJobInvoice}
         onRelinkJob={handleRelinkJob}
         creditNotes={myCreditNotes} setCreditNotes={setCreditNotes}
-        isAdmin={isAdmin}
+        isAdmin={isAdmin} user={user}
         customers={customers}
         onOpenCustomer={onOpenCustomer}
         accInvoices={accInvoices} setAccInvoices={setAccInvoices}
@@ -10103,6 +10721,31 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
               // before touching local state; a rejection here propagates to
               // EditInvoiceForm.save(), which keeps the form open and shows
               // the error instead of a false "saved".
+              // 2026-08-24 FRONTEND AUDIT: this branch was JSON-only, so once
+              // "jobs" was cut over every field on this form became unsaveable
+              // — the guard threw before the request and the banner showed
+              // 'Cannot save "jobs" here…'. Now goes through the relational job
+              // patch, using the same field names services.ts's JobPatchInput
+              // declares. invoiceNum/invoiceDate/invoiceDue are deliberately NOT
+              // sent: those are owned by the invoice-creation flow
+              // (createInvoiceForJob reserves and writes them atomically), and a
+              // manual edit must not be able to rewrite a reserved document
+              // number behind that flow's back.
+              if(isRelationalAuthoritative('jobs')){
+                if(updated._relId == null) throw new Error('This job cannot be edited right now — it is not available for relational editing. Nothing was saved.');
+                const relResult = await relationalApi.updateJob(updated._relId, updated._relRowVersion, {
+                  customerNameRaw: updated.client,
+                  value: parseFloat(updated.value)||0,
+                  notes: updated.notes==null?'':String(updated.notes),
+                  discountPct: parseFloat(updated.discount)||0,
+                  lines: (updated.lines||[]).map(l=>({ desc: l.desc||'', qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId })),
+                });
+                const jobsUpdater = prev=>prev.map(j=>j.id===updated.id?{...updated, _relRowVersion: relResult.rowVersion}:j);
+                setJobs(jobsUpdater);
+                syncRelationalBaseline('jobs', jobsUpdater);
+                setEditInvoice(null);
+                return;
+              }
               const nextJobs = jobs.map(j=>j.id===updated.id?updated:j);
               await forceSaveSections({ jobs: nextJobs });
               setJobs(nextJobs);
@@ -13357,6 +14000,9 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   // createPurchaseOrder).
   const [showCreatePO, setShowCreatePO] = useState(false);
   const [invoiceCreatedInfo, setInvoiceCreatedInfo] = useState(null); // {invoiceNum} after creating an invoice here — replaces the old blocking alert()
+  // POST-MIGRATION STABILIZATION (2026-08-24) — in-flight state for the inline
+  // "Create Invoice" action below, which previously had none.
+  const [creatingInvoice, setCreatingInvoice] = useState(false);
   const job=jobs.find(j=>j.id===jobId);
   const [editingCosts, setEditingCosts]=useState(false);
   const [bd, setBd]=useState(null); // local copy of breakdown being edited
@@ -13369,6 +14015,13 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   useEffect(()=>{
     if (job) setBd(job.breakdown ? {...job.breakdown} : emptyBreakdown());
   },[jobId]);
+
+  // 2026-08-24: in-flight flag for advanceStage/progressWithoutPayment. Declared
+  // HERE, with every other hook, and deliberately ABOVE the missing-job guard
+  // just below — a hook after an early return is committed on some renders and
+  // not others, which React rejects with "Rendered fewer hooks than expected"
+  // and which, with no error boundary in this app, blanks the entire page.
+  const [advancing, setAdvancing] = useState(false);
 
   if (!job) return <div className="p-4"><button onClick={onBack} className="text-brand-500 text-sm">← Back</button></div>;
 
@@ -13428,9 +14081,41 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   const numericJobValue = (rawJobValue === null || rawJobValue === undefined || rawJobValue === '') ? NaN : Number(rawJobValue);
   const hasValidJobValue = Number.isFinite(numericJobValue);
   const isZeroValueJob = hasValidJobValue && numericJobValue <= 0;
-  const LOCKED_STAGES = isZeroValueJob ? [] : BASE_LOCKED_STAGES;
+  // ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 5 ────────────────────
+  // BUSINESS RULE CORRECTION: "payment status must NOT hard-block Job
+  // progression." Some clients pay a deposit upfront, some during production,
+  // some only on completion, some after. Until now the ONLY route past stage 5
+  // (Deposit Received) was the automatic "a payment exists" bump, so a job for
+  // a pay-on-completion client was stuck at Quote Approved indefinitely with no
+  // way out — the Advance button was not even rendered, and advanceStage()
+  // returned silently with no message at all.
+  //
+  // `depositWaived` is the explicit business override (migration 012). It
+  // records that a user consciously chose to continue without payment. It is
+  // NOT a payment: no payment row is created, job.value and every total are
+  // untouched, no invoice is marked paid, and invoiceStatus keeps reporting the
+  // true position. It only unlocks the lifecycle, which is exactly the scope of
+  // the rule being corrected.
+  //
+  // Kept separate from isZeroValueJob deliberately. A zero-value job is one
+  // where no payment is ever EXPECTED; a waived job is one where payment IS
+  // expected but has not arrived yet. Collapsing the two would have meant
+  // classifying unpaid jobs as zero-value, which the brief explicitly forbids
+  // and which would corrupt every revenue figure the job feeds.
+  const isDepositWaived = job.depositWaived === true;
+  const paymentLockBypassed = isZeroValueJob || isDepositWaived;
+  const LOCKED_STAGES = paymentLockBypassed
+    ? (isZeroValueJob ? [] : BASE_LOCKED_STAGES.filter(st => st !== 5))
+    : BASE_LOCKED_STAGES;
   const nextStage=job.stage+1;
   const nextLocked=LOCKED_STAGES.includes(nextStage);
+  // Real money actually received against this job (its own payments plus those
+  // recorded on the linked quote, via the same reconcile the lifecycle
+  // auto-advance uses). Drives the wording below — never the permission.
+  const _jobRecordedPayments = (job.payments||[]).concat(
+    ((quotes||[]).find(q=>q.num===job.quoteNum)||{}).payments||[]
+  );
+  const jobHasAnyPayment = _jobRecordedPayments.some(p=>(parseFloat(p&&p.amount)||0)>0);
 
   // STAGE 3 Phase 1 — job editing wiring. Every function below follows the
   // SAME pattern already established at createInvoiceNow/handleConvertToJob:
@@ -13449,23 +14134,78 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   // file. When 'jobs' is NOT relational-authoritative, behavior is
   // byte-for-byte unchanged from before — setJobs() + the existing
   // debounced JSON autosave.
+  // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 5. In-flight guard added
+  // at the same time (CONCURRENCY / DUPLICATE SUBMISSION): a double-click on
+  // Advance previously fired two updateJob calls, the second of which carried a
+  // now-stale _relRowVersion and came back 409 — reported to the user as "this
+  // job was changed elsewhere" for a conflict they had caused with their own
+  // second click.
   async function advanceStage(){
-    if(isLast) return;
+    if(isLast || advancing) return;
     const ns=job.stage+1;
     if(LOCKED_STAGES.includes(ns)) return; // locked — system-controlled only
     const nextStatus = STAGE_STATUSES[ns];
-    if(isRelationalAuthoritative('jobs')){
-      try {
-        const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { stage: ns, status: nextStatus });
-        const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j,stage:ns,status:nextStatus,_relRowVersion:result.rowVersion}:j);
-        setJobs(jobsUpdater);
-        syncRelationalBaseline('jobs', jobsUpdater);
-      } catch(e){
-        alert(describeSaveConflictError(e, 'job')+'\n\nThe job stage was NOT advanced.');
+    setAdvancing(true);
+    try {
+      if(isRelationalAuthoritative('jobs')){
+        try {
+          const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { stage: ns, status: nextStatus });
+          const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j,stage:ns,status:nextStatus,_relRowVersion:result.rowVersion}:j);
+          setJobs(jobsUpdater);
+          syncRelationalBaseline('jobs', jobsUpdater);
+        } catch(e){
+          alert(describeSaveConflictError(e, 'job')+'\n\nThe job stage was NOT advanced.');
+        }
+        return;
       }
-      return;
-    }
-    setJobs(prev=>prev.map(j=>j.id===job.id?{...j,stage:ns,status:nextStatus}:j));
+      setJobs(prev=>prev.map(j=>j.id===job.id?{...j,stage:ns,status:nextStatus}:j));
+    } finally { setAdvancing(false); }
+  }
+
+  // ── BUG 5 — "Continue without payment" business override ─────────────────
+  // Offered wherever the deposit stage is currently blocking progression. Asks
+  // for an explicit decision, then records ONLY that decision (depositWaived)
+  // and advances the job. Deliberately does NOT fabricate a payment, does not
+  // mark Deposit Received as actually paid in any financial sense, and does not
+  // touch invoiceStatus/value/totals — the financial position stays exactly as
+  // true as it was a moment before.
+  //
+  // The stage is advanced in the SAME updateJob call as the flag, so the two can
+  // never land apart (a job can never end up waived-but-not-advanced, or
+  // advanced-without-the-flag-that-explains-why).
+  async function progressWithoutPayment(){
+    if(advancing) return;
+    const targetStage = 5;
+    if(job.stage >= targetStage) return;
+    const ok = window.confirm(
+      'No payment/deposit has been recorded for this job.\n\n'
+      + 'Do you want to continue anyway?\n\n'
+      + 'The job will move to "Deposit Received" so production can proceed. '
+      + 'No payment will be created and nothing will be marked as paid — this job '
+      + 'will still show as unpaid on every invoice, statement and report until a '
+      + 'real payment is recorded.'
+    );
+    if(!ok) return;
+    setAdvancing(true);
+    try {
+      const nextStatus = STAGE_STATUSES[targetStage];
+      if(isRelationalAuthoritative('jobs')){
+        try {
+          const result = await relationalApi.updateJob(job._relId, job._relRowVersion, {
+            stage: targetStage, status: nextStatus, depositWaived: true,
+          });
+          const jobsUpdater = prev=>prev.map(j=>j.id===job.id
+            ? {...j, stage:targetStage, status:nextStatus, depositWaived:true, _relRowVersion:result.rowVersion}
+            : j);
+          setJobs(jobsUpdater);
+          syncRelationalBaseline('jobs', jobsUpdater);
+        } catch(e){
+          alert(describeSaveConflictError(e, 'job')+'\n\nThe job was NOT advanced and no override was recorded.');
+        }
+        return;
+      }
+      setJobs(prev=>prev.map(j=>j.id===job.id?{...j, stage:targetStage, status:nextStatus, depositWaived:true}:j));
+    } finally { setAdvancing(false); }
   }
   // CUTOVER BLOCKER COMPLETION — "job deletion" named blocker. When "jobs"
   // is relational-authoritative this now goes through relationalApi.deleteJob
@@ -13477,6 +14217,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   // NOT call onBack() — the user stays on the job so the failure (e.g. a
   // linked invoice/PO blocking the delete, or a stale row) is visible rather
   // than silently navigating away from an un-deleted record.
+  // 2026-08-24 CONCURRENCY: in-flight guard, see guardAction's own note.
   async function deleteJob(){
     // Warn clearly if this job has an invoice number and/or recorded
     // payments — deleting the job discards that history too. Delete logic
@@ -13489,8 +14230,9 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
       : `Delete job ${job.num} — ${job.client}? This cannot be undone.`;
     if(!window.confirm(deleteWarning)) return;
     if(isRelationalAuthoritative('jobs') && job._relId!=null){
+      let delResult;
       try {
-        await relationalApi.deleteJob(job._relId, job._relRowVersion);
+        delResult = await relationalApi.deleteJob(job._relId, job._relRowVersion);
       } catch(e){
         alert(describeSaveConflictError(e, 'job')+'\n\nThe job was NOT deleted.');
         return;
@@ -13498,6 +14240,26 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
       const jobsUpdater = prev=>prev.filter(j=>j.id!==job.id);
       setJobs(jobsUpdater);
       syncRelationalBaseline('jobs', jobsUpdater);
+      // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 3, same stale-version
+      // class as convert-to-job. Deleting a job reverts its source quote
+      // ('converted' -> 'approved', link cleared) server-side, which bumps that
+      // quote's row_version — but this branch only ever touched `jobs`, so the
+      // quote was left showing status 'converted' AND carrying a version the
+      // server had already superseded. The next save on it failed 409, and
+      // (because a relational write never moves platform_state's `_autoSavedAt`)
+      // the 30s poll could not recover it. The endpoint now reports which
+      // quotes it unlinked and their new versions/statuses, applied here.
+      const unlinked = (delResult && delResult.unlinkedQuotes) || [];
+      if(setQuotes && unlinked.length){
+        const byRelId = new Map(unlinked.map(u=>[Number(u.id), u]));
+        const quotesUpdater = prev=>prev.map(qx=>{
+          const u = byRelId.get(Number(qx._relId));
+          if(!u) return qx;
+          return {...qx, convertedJobId:null, status:u.status, _relRowVersion:u.rowVersion};
+        });
+        setQuotes(quotesUpdater);
+        syncRelationalBaseline('quotes', quotesUpdater);
+      }
       onBack();
       return;
     }
@@ -13632,7 +14394,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     <div className="p-4 space-y-4">
       <div className="flex items-center justify-between">
         <button onClick={onBack} className="flex items-center gap-1 text-brand-500 hover:text-brand-600 text-sm font-semibold">← Back to Jobs</button>
-        {isAdmin&&<button onClick={deleteJob} className="text-xs text-red-500 hover:text-red-600 border border-red-200 hover:border-red-300 rounded-xl px-3 py-1.5 transition-colors font-semibold">🗑 Delete Job</button>}
+        {isAdmin&&<button onClick={()=>guardAction('deleteJob:'+relKey(job), deleteJob)} className="text-xs text-red-500 hover:text-red-600 border border-red-200 hover:border-red-300 rounded-xl px-3 py-1.5 transition-colors font-semibold">🗑 Delete Job</button>}
       </div>
 
       {/* Linked records — read-only navigation, never edits/relinks/deletes anything */}
@@ -13695,17 +14457,34 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
               const reached=i<job.stage, active=i===job.stage, locked=LOCKED_STAGES.includes(i);
               let dotCls;
               if(i===5){ // Deposit Received — system-controlled (amber)
-                dotCls=reached?'bg-amber-500 text-white':active?'bg-amber-100 text-amber-700 ring-2 ring-amber-400':'bg-amber-50 text-amber-500 border border-dashed border-amber-300';
+                // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 5. The
+                // lifecycle DOES need to distinguish "payment received" from
+                // "payment requirement overridden", otherwise a waived job is
+                // indistinguishable from a paid one at a glance — which is
+                // exactly the kind of quiet financial misstatement this whole
+                // stabilization pass exists to prevent. A stage 5 reached by
+                // override with no money actually recorded is drawn slate/
+                // dashed with a ⤳ mark, never the solid amber "paid" dot.
+                const depositByOverride = isDepositWaived && !jobHasAnyPayment;
+                if(depositByOverride){
+                  dotCls=reached?'bg-slate-400 text-white border border-dashed border-slate-500':active?'bg-slate-100 text-slate-600 ring-2 ring-slate-400 border border-dashed border-slate-400':'bg-slate-50 text-slate-400 border border-dashed border-slate-300';
+                } else {
+                  dotCls=reached?'bg-amber-500 text-white':active?'bg-amber-100 text-amber-700 ring-2 ring-amber-400':'bg-amber-50 text-amber-500 border border-dashed border-amber-300';
+                }
               } else if(i===9){ // Invoiced — system-controlled (violet)
                 dotCls=reached?'bg-violet-500 text-white':active?'bg-violet-100 text-violet-700 ring-2 ring-violet-400':'bg-violet-50 text-violet-500 border border-dashed border-violet-300';
               } else {
                 dotCls=reached?'bg-brand-500 text-white':active?'bg-brand-100 text-brand-700 ring-2 ring-brand-400':'bg-gray-100 text-gray-400';
               }
-              const content=reached?'✓':(locked&&!active?'🔒':i+1);
+              const waivedHere = i===5 && isDepositWaived && !jobHasAnyPayment && (reached||active);
+              const content=waivedHere?'⤳':(reached?'✓':(locked&&!active?'🔒':i+1));
               const lblCls=active?'text-gray-800 font-bold':reached?'text-gray-600 font-semibold':'text-gray-400';
               return (
                 <div key={i} className="flex flex-col items-center gap-1 w-[4.5rem]">
-                  <div title={STAGE_NAMES[i]+(locked?' — activates automatically':'')} className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all ${dotCls}`}>
+                  <div title={waivedHere
+                      ? 'Progressed without payment — no deposit was recorded for this job'
+                      : STAGE_NAMES[i]+(locked?' — activates automatically':'')}
+                    className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all ${dotCls}`}>
                     {content}
                   </div>
                   <span className={`text-[10px] leading-tight text-center ${lblCls}`}>{s}</span>
@@ -13716,9 +14495,13 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
           <div className="flex flex-wrap gap-3 mb-3 text-xs text-gray-400">
             <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full bg-amber-400"></span>Deposit Received — auto on payment</span>
             <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full bg-violet-400"></span>Invoiced — auto on tax invoice</span>
+            {isDepositWaived&&!jobHasAnyPayment&&<span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full bg-slate-400 border border-dashed border-slate-500"></span>Progressed without payment</span>}
           </div>
           <p className="text-xs text-gray-500 mb-3">Current: <strong>{STAGE_NAMES[job.stage]}</strong></p>
           {isZeroValueJob&&!isLast&&<div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-2 mb-3 flex items-start gap-2"><span className="text-base">🎗️</span><p className="text-xs text-blue-700"><strong>Zero-value job</strong> (sponsored / warranty / no-charge). Deposit &amp; payment stages are unlocked — you can advance the job manually without recording a deposit or payment.</p></div>}
+          {/* BUG 5 — the override, once taken, is stated plainly and permanently
+              on the job, and says in as many words that nothing is paid. */}
+          {isDepositWaived&&!isZeroValueJob&&<div className="bg-slate-50 border border-slate-300 rounded-xl px-4 py-2 mb-3 flex items-start gap-2"><span className="text-base">⤳</span><p className="text-xs text-slate-600"><strong>Progressed without payment.</strong> A user chose to continue this job before a deposit was received{job.depositWaivedBy?' ('+job.depositWaivedBy+')':''}{job.depositWaivedAt?' on '+String(job.depositWaivedAt).slice(0,10):''}. {jobHasAnyPayment?'Payments have since been recorded — see Payments for the current position.':'No payment has been recorded and nothing is marked as paid; this job still shows as unpaid on every invoice, statement and report.'}</p></div>}
           {isLast
             ? <div className="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 flex items-center gap-2"><span className="text-emerald-500 text-lg">✅</span><p className="text-sm font-bold text-emerald-700">Job Complete — Invoiced</p></div>
             : nextLocked
@@ -13726,16 +14509,30 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                   <span className="text-lg">🔒</span>
                   <div className="flex-1">
                     <p className="text-sm font-bold text-gray-600">{STAGE_NAMES[nextStage]} — activates automatically</p>
-                    <p className="text-xs text-gray-400 mt-0.5">{nextStage===5?'Record a deposit / partial payment on the linked quote, proforma or invoice and this stage advances on its own.':'Activates automatically once this job carries a tax invoice (quote converted to an invoice).'}</p>
-                    {nextStage===5&&onOpenJobPayments&&(
-                      <button onClick={()=>onOpenJobPayments(job)} className="mt-2 flex items-center gap-1.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl px-3 py-1.5 text-xs font-bold transition-colors">
-                        <span>💳</span><span>Go to Payments</span>
-                      </button>
+                    <p className="text-xs text-gray-400 mt-0.5">{nextStage===5?'Record a deposit / partial payment on the linked quote, proforma or invoice and this stage advances on its own — or continue without payment if this client pays later.':'Activates automatically once this job carries a tax invoice (quote converted to an invoice).'}</p>
+                    {/* POST-MIGRATION STABILIZATION (2026-08-24) — BUG 5. The
+                        payment action is still offered first and unchanged (it
+                        remains the normal path); the override sits beside it as
+                        a deliberate second choice, worded so the user knows
+                        exactly what it does and does not do. */}
+                    {nextStage===5&&(
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        {onOpenJobPayments&&(
+                          <button onClick={()=>onOpenJobPayments(job)} className="flex items-center gap-1.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl px-3 py-1.5 text-xs font-bold transition-colors">
+                            <span>💳</span><span>Record Payment / Deposit</span>
+                          </button>
+                        )}
+                        <button onClick={progressWithoutPayment} disabled={advancing}
+                          title="Move this job forward without a deposit. No payment is created and nothing is marked paid."
+                          className="flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-xl px-3 py-1.5 text-xs font-bold transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+                          <span>⤳</span><span>{advancing?'Working…':'Continue Without Payment'}</span>
+                        </button>
+                      </div>
                     )}
                   </div>
                 </div>
-              : <button onClick={advanceStage} className="flex items-center gap-2 bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-5 py-2.5 text-sm font-bold transition-colors">
-                  <span>→</span><span>Advance to: <strong>{STAGE_NAMES[job.stage+1]}</strong></span>
+              : <button onClick={advanceStage} disabled={advancing} className="flex items-center gap-2 bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-5 py-2.5 text-sm font-bold transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                  <span>→</span><span>{advancing?'Advancing…':<>Advance to: <strong>{STAGE_NAMES[job.stage+1]}</strong></>}</span>
                 </button>
           }
         </div>
@@ -13913,7 +14710,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
               onChange={e=>setNoteDraft(e.target.value)}
               rows={4}
               autoFocus
-              placeholder="Type your notes here — internal only, not printed on job card or invoice…"
+              placeholder="Type your notes here — these DO print on the job card…"
               className="w-full border border-gray-300 rounded-xl px-3 py-2.5 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 resize-none"/>
           ) : job.notes ? (
             <p className="text-sm text-gray-700 whitespace-pre-wrap">{job.notes}</p>
@@ -14056,7 +14853,18 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
             const canCreateInvoice= job.stage>=INSTALL_STAGE;
             if(!invoiceCreated){
               return canCreateInvoice ? (
-                <button onClick={async ()=>{
+                // POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY.
+                // This inline handler was the least protected of the three
+                // invoice-creation entry points: no `saving` state, no disabled
+                // attribute, nothing. Two fast clicks fired two POSTs. The
+                // server serialises them (SELECT ... FOR UPDATE on the job) so
+                // no duplicate invoice could actually be written, but the
+                // second came back "job ... already has invoice ..." — an alarming
+                // failure message for what was simply the user's own second
+                // click. Now dropped in the browser via the shared keyed guard.
+                <button disabled={creatingInvoice} onClick={()=>guardAction('jobDetailCreateInvoice:'+(job._relId!=null?job._relId:job.id), async ()=>{
+                  setCreatingInvoice(true);
+                  try {
                     const today=new Date().toISOString().slice(0,10);
                     const due=new Date(Date.now()+30*864e5).toISOString().slice(0,10);
                     // Creating the tax invoice LINKS it to this job. It does
@@ -14143,9 +14951,10 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                       return prev.map(j=>j.id===job.id?{...j, invoiceCreated:true, invoiceNum:reserved, invoiceDate:today, invoiceDue:(j.invoiceDue||due), ...(j.stage>=INSTALL_STAGE ? {stage:9, status:'invoiced'} : {})}:j);
                     });
                     setInvoiceCreatedInfo({ invoiceNum: reserved });
-                  }}
-                  className="flex items-center gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl px-4 py-2.5 font-bold">
-                  🧾 Create Invoice
+                  } finally { setCreatingInvoice(false); }
+                  })}
+                  className="flex items-center gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl px-4 py-2.5 font-bold disabled:opacity-50 disabled:cursor-not-allowed">
+                  {creatingInvoice ? 'Creating…' : '🧾 Create Invoice'}
                 </button>
               ) : (
                 <div className="text-xs text-gray-400 italic py-2 px-1">Invoice can be created once the job is advanced to the <strong>Installation</strong> stage.</div>
@@ -14241,6 +15050,31 @@ const DONE_STATUSES = ['completed','invoiced'];
 const WIP_STATUSES  = STAGE_STATUSES.filter(s=>!DONE_STATUSES.includes(s));
 
 function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared, proposedProjects=[], setProposedProjects, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer, purchaseOrders, setPurchaseOrders, suppliers }) {
+  // ── POST-MIGRATION STABILIZATION (2026-08-24) — FRONTEND AUDIT (BUG 8) ────
+  // The job cards in this list render an inline due-date <input> whose onChange
+  // called `updateJobDueDate` — a function defined ONLY inside JobDetail. It
+  // does not exist in this scope, so changing a due date from the Jobs list
+  // threw ReferenceError: the date reverted on the next render and nothing was
+  // saved, with no error the user could see (the throw landed in React's event
+  // handler, not in any catch this app owns). This is JobsPage's own handler,
+  // following the same relational-first pattern as JobDetail's, including the
+  // relational write that the list previously had no way to perform at all.
+  async function setJobDueDateFromList(job, val){
+    if(!job) return;
+    if(isRelationalAuthoritative('jobs') && job._relId!=null){
+      try {
+        const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { dueDate: val });
+        const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j,dueDate:val,_relRowVersion:result.rowVersion}:j);
+        setJobs(jobsUpdater);
+        syncRelationalBaseline('jobs', jobsUpdater);
+      } catch(e){
+        alert(describeSaveConflictError(e, 'job')+'\n\nThe due date was NOT saved.');
+      }
+      return;
+    }
+    setJobs(prev=>prev.map(j=>j.id===job.id?{...j,dueDate:val}:j));
+  }
+
   const [jobTab,       setJobTab]       = useState('active'); // 'active' | 'completed'
   const [statusFilter, setStatusFilter] = useState('all');
   const [search,       setSearch]       = useState('');
@@ -14327,7 +15161,16 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
 
   return (
     <div className="p-4 space-y-4">
-      {showAdd&&<AddJobModal companies={addableCompanies} onClose={()=>setShowAdd(false)} onAdd={job=>setJobs(prev=>[...prev,job])}/>}
+      {showAdd&&<AddJobModal companies={addableCompanies} onClose={()=>setShowAdd(false)} onAdd={job=>{
+        // POST-MIGRATION STABILIZATION (2026-08-24): baseline sync added
+        // alongside the relational create — without it the 800ms autosave diff
+        // sees 'jobs' as locally changed against a stale baseline and trips
+        // assertNoUnwiredRelationalSections for a job that was in fact already
+        // safely persisted relationally.
+        const jobsUpdater = prev=>[...prev, job];
+        setJobs(jobsUpdater);
+        if(isRelationalAuthoritative('jobs')) syncRelationalBaseline('jobs', jobsUpdater);
+      }}/>}
 
       {/* ── Active / Completed tab switcher ── */}
       <div className="flex gap-2">
@@ -14471,6 +15314,17 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
           const co=companies.find(c=>c.id===job.co)||companies[0];
           const tc=breakdownTotal(job.breakdown);
           const mg=isAdmin&&tc>0?((job.value-tc)/job.value*100).toFixed(0):null;
+          // ── POST-MIGRATION STABILIZATION (2026-08-24) — FRONTEND AUDIT ────
+          // The due-date <input> on this card called `updateJobDueDate`, which
+          // is defined ONLY inside JobDetail — a different component. In this
+          // scope the identifier did not exist, so every change threw
+          // ReferenceError: the date snapped back on the next render and
+          // nothing was saved, with no message the user could see (the throw
+          // landed in React's event handler, not in any catch this app owns).
+          // Bound here to JobsPage's own handler (setJobDueDateFromList, which
+          // persists relationally like JobDetail's does), keeping the call
+          // shape the card already used.
+          const updateJobDueDate = val => setJobDueDateFromList(job, val);
           return(
             <div key={job.id} onClick={()=>setDetail(job.id)}
               className={`bg-white rounded-2xl border hover:shadow-md transition-all cursor-pointer p-4
@@ -16097,15 +16951,28 @@ function CalculatorsPage({ savedCalcs, setSavedCalcs, completeProducts, setCompl
    SUPPLIERS
 ═══════════════════════════════════════════ */
 function AddEditSupplierModal({ supplier, onClose, onSave }) {
+  // 2026-08-24 CONCURRENCY: in-flight flag for this modal's Save button — see
+  // handleSave below for why the shared guardAction key cannot cover a create.
+  const [busy, setBusy] = useState(false);
   const isEdit = !!supplier;
   const blank = { id:null, name:'', contactPerson:'', phone:'', email:'', address:'', city:'', postalCode:'', vatNumber:'', accountNumber:'', paymentTerms:'30 days', notes:'' };
   const [f, setF] = useState(isEdit ? {...supplier} : blank);
   const upd = k => e => setF(p=>({...p,[k]:e.target.value}));
   const iCls = "w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400";
   const lCls = "block text-xs font-medium text-gray-600 mb-1";
-  function handleSave() {
+  async function handleSave() {
     if(!f.name.trim()) return alert('Supplier name is required.');
-    onSave({ ...f, id: f.id||Date.now() });
+    // 2026-08-24 CONCURRENCY: a modal-local in-flight flag, because the shared
+    // guardAction key is derived from the record's id and a NEW record's id is
+    // generated fresh on every click (`f.id||Date.now()`) — two clicks a
+    // millisecond apart produced two different keys, so the guard never fired
+    // and two records were created. This flag is per-modal and therefore covers
+    // the create case the guard could not.
+    if (busy) return;
+    setBusy(true);
+    try {
+      await onSave({ ...f, id: f.id||Date.now() });
+    } finally { setBusy(false); }
   }
   return (
     <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-end pr-4 py-4" onClick={e=>e.target===e.currentTarget&&onClose()}>
@@ -16146,7 +17013,7 @@ function AddEditSupplierModal({ supplier, onClose, onSave }) {
         </div>
         <div className="flex justify-end gap-3 px-6 py-4 border-t bg-gray-50 sticky bottom-0">
           <button onClick={onClose} className="px-4 py-2 rounded-lg border text-sm text-gray-600 hover:bg-gray-100">Cancel</button>
-          <button onClick={handleSave} className="px-6 py-2 rounded-lg bg-brand-500 text-white text-sm font-semibold hover:bg-brand-600">Save Supplier</button>
+          <button onClick={handleSave} disabled={busy} className="px-6 py-2 rounded-lg bg-brand-500 text-white text-sm font-semibold hover:bg-brand-600 disabled:opacity-50 disabled:cursor-not-allowed">{busy?'Saving…':'Save Supplier'}</button>
         </div>
       </div>
     </div>
@@ -16161,7 +17028,14 @@ function SuppliersPage({ suppliers, setSuppliers }) {
   // Stage 3 Phase 8: supplier create/edit/delete wired to the relational
   // REST API when "suppliers" is relational-authoritative — plain CRUD,
   // matching services.ts's createSupplier/updateSupplier/deleteSupplier.
-  async function saveSup(s) {
+  // POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY / DUPLICATE
+  // SUBMISSION. This action's button had no in-flight protection, so a
+  // double-click fired the request twice. Wrapped in the shared keyed
+  // guard (see guardAction near the top of this file): the second call is
+  // dropped before it leaves the browser, while the server keeps its own
+  // transactional/row-version protection as the authoritative backstop.
+  async function saveSup(s) { return guardAction('saveSup:'+relKey(s), () => saveSup__impl(s)); }  // 2026-08-24 concurrency guard — see guardAction
+  async function saveSup__impl(s) {
     if(isRelationalAuthoritative('suppliers')){
       try {
         const isNew = !suppliers.find(x=>x.id===s.id);
@@ -16191,7 +17065,14 @@ function SuppliersPage({ suppliers, setSuppliers }) {
     setSuppliers(prev => prev.find(x=>x.id===s.id) ? prev.map(x=>x.id===s.id?s:x) : [s,...prev]);
     setShowAdd(false); setEditSup(null);
   }
-  async function delSup(id) {
+  // POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY / DUPLICATE
+  // SUBMISSION. This action's button had no in-flight protection, so a
+  // double-click fired the request twice. Wrapped in the shared keyed
+  // guard (see guardAction near the top of this file): the second call is
+  // dropped before it leaves the browser, while the server keeps its own
+  // transactional/row-version protection as the authoritative backstop.
+  async function delSup(id) { return guardAction('delSup:'+id, () => delSup__impl(id)); }  // 2026-08-24 concurrency guard — see guardAction
+  async function delSup__impl(id) {
     if(!window.confirm('Delete this supplier?')) return;
     const existing = suppliers.find(s=>s.id===id);
     // services.ts's deleteSupplier refuses (BusinessRuleError, from the DB
@@ -16786,7 +17667,14 @@ function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user
   // updatePurchaseOrder never touches items post-creation (matches
   // PODetailModal, which never edits items either — see
   // relational.stage3.stress.ts).
-  async function updatePO(updated) {
+  // POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY / DUPLICATE
+  // SUBMISSION. This action's button had no in-flight protection, so a
+  // double-click fired the request twice. Wrapped in the shared keyed
+  // guard (see guardAction near the top of this file): the second call is
+  // dropped before it leaves the browser, while the server keeps its own
+  // transactional/row-version protection as the authoritative backstop.
+  async function updatePO(updated) { return guardAction('updatePO:'+relKey(updated), () => updatePO__impl(updated)); }  // 2026-08-24 concurrency guard — see guardAction
+  async function updatePO__impl(updated) {
     if(isRelationalAuthoritative('purchaseOrders') && updated._relId!=null){
       try {
         const result = await relationalApi.updatePurchaseOrder(updated._relId, updated._relRowVersion, { supplierId: updated.supplierId, status: updated.status, notes: updated.notes });
@@ -16936,6 +17824,9 @@ function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user
    INVENTORY — ADD / EDIT ITEM MODAL
 ═══════════════════════════════════════════ */
 function AddEditInventoryItemModal({ item, suppliers, onClose, onSave, allCats }) {
+  // 2026-08-24 CONCURRENCY: in-flight flag for this modal's Save button — see
+  // handleSave below for why the shared guardAction key cannot cover a create.
+  const [busy, setBusy] = useState(false);
   const isEdit = !!(item && item.id);
   const isCopy = !!(item && !item.id);
   const blank = { id:null, sku:'', name:'', cat:'', stock:0, reorder:5, unit:'unit', cost:0, sell:0, supplierId:'' };
@@ -16943,9 +17834,19 @@ function AddEditInventoryItemModal({ item, suppliers, onClose, onSave, allCats }
   const upd = k => e => setF(p=>({...p,[k]:e.target.value}));
   const iCls = "w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400";
   const lCls = "block text-xs font-medium text-gray-600 mb-1";
-  function handleSave() {
+  async function handleSave() {
     if(!f.name.trim()||!f.sku.trim()) return alert('SKU and item name are required.');
-    const {_catNew:_cn, ...clean} = f; onSave({ ...clean, id:f.id||Date.now(), stock:Number(f.stock), reorder:Number(f.reorder), cost:Number(f.cost), sell:Number(f.sell), supplierId:f.supplierId||null });
+    // 2026-08-24 CONCURRENCY: a modal-local in-flight flag, because the shared
+    // guardAction key is derived from the record's id and a NEW record's id is
+    // generated fresh on every click (`f.id||Date.now()`) — two clicks a
+    // millisecond apart produced two different keys, so the guard never fired
+    // and two records were created. This flag is per-modal and therefore covers
+    // the create case the guard could not.
+    if (busy) return;
+    setBusy(true);
+    try {
+      const {_catNew:_cn, ...clean} = f; await onSave({ ...clean, id:f.id||Date.now(), stock:Number(f.stock), reorder:Number(f.reorder), cost:Number(f.cost), sell:Number(f.sell), supplierId:f.supplierId||null });
+    } finally { setBusy(false); }
   }
   return (
     <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-end pr-4 py-4" onClick={e=>e.target===e.currentTarget&&onClose()}>
@@ -16995,7 +17896,7 @@ function AddEditInventoryItemModal({ item, suppliers, onClose, onSave, allCats }
         </div>
         <div className="flex justify-end gap-3 px-6 py-4 border-t bg-gray-50">
           <button onClick={onClose} className="px-4 py-2 rounded-lg border text-sm text-gray-600 hover:bg-gray-100">Cancel</button>
-          <button onClick={handleSave} className="px-6 py-2 rounded-lg bg-brand-500 text-white text-sm font-semibold hover:bg-brand-600">Save Item</button>
+          <button onClick={handleSave} disabled={busy} className="px-6 py-2 rounded-lg bg-brand-500 text-white text-sm font-semibold hover:bg-brand-600 disabled:opacity-50 disabled:cursor-not-allowed">{busy?'Saving…':'Save Item'}</button>
         </div>
       </div>
     </div>
@@ -17942,7 +18843,8 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
   // discontinued-but-preserved" distinction is a server-side concern this
   // UI does not need to represent differently. Falls through to the plain
   // JSON filter for a non-relational item/section, unchanged from before.
-  async function removeItem(id) {
+  async function removeItem(id) { return guardAction('removeInventoryItem:'+id, () => removeItem__impl(id)); }  // 2026-08-24 concurrency guard — see guardAction
+  async function removeItem__impl(id) {
     if(!window.confirm('Remove this stock item?')) return;
     const item = inventory.find(i=>i.id===id);
     if(item && item._relId!=null && isRelationalAuthoritative('inventory')){
@@ -17961,7 +18863,14 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
   // Stage 3 Phase 10: create/edit wired to the relational REST API when
   // "inventory" is relational-authoritative. JSON's `cat` field maps to
   // services.ts's `category` (createInventoryItem/updateInventoryItem).
-  async function saveItem(item) {
+  // POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY / DUPLICATE
+  // SUBMISSION. This action's button had no in-flight protection, so a
+  // double-click fired the request twice. Wrapped in the shared keyed
+  // guard (see guardAction near the top of this file): the second call is
+  // dropped before it leaves the browser, while the server keeps its own
+  // transactional/row-version protection as the authoritative backstop.
+  async function saveItem(item) { return guardAction('saveItem:'+relKey(item), () => saveItem__impl(item)); }  // 2026-08-24 concurrency guard — see guardAction
+  async function saveItem__impl(item) {
     if(isRelationalAuthoritative('inventory')){
       try {
         const isNew = !inventory.find(x=>x.id===item.id);
@@ -19465,7 +20374,7 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
   }
 
   // ── Payment History Modal (manual/accounting invoice payments) ──
-  function PaymentHistoryModal({ inv, onClose, accInvoices, setAccInvoices, forceSaveSections, creditNotes, setCreditNotes, isAdmin, quotes, jobs, customers, onOpenJob, onOpenCustomer, onViewInvoice, onSaved, fmtAmt, fmtDate }) {
+  function PaymentHistoryModal({ inv, onClose, accInvoices, setAccInvoices, forceSaveSections, creditNotes, setCreditNotes, isAdmin, user, quotes, jobs, customers, onOpenJob, onOpenCustomer, onViewInvoice, onSaved, fmtAmt, fmtDate }) {
     const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
     const [payments, setPayments] = useState(()=>ensurePaymentIds(inv.payments||[]));
     const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
@@ -19561,7 +20470,8 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 
     async function deletePayment(pid) {
       if(saving) return;
-      if(!isAdmin){alert('Only admins can delete payments.');return;}
+      // 2026-08-24 BUG 7: one rule everywhere; refusals explain themselves.
+      { const _b = paymentDeleteBlockReason(payments.find(x=>x.id===pid), user, 'accInvoices'); if(_b){ alert(_b); return; } }
       if(!window.confirm('Delete this payment? This may change the invoice status.'))return;
       const removed = payments.find(p=>p.id===pid);
       if(isRelationalAuthoritative('accInvoices') && removed && removed._relPaymentId!=null){
@@ -19591,7 +20501,7 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 
     async function editPayment(pid) {
       if(saving) return;
-      if(!isAdmin){alert('Only admins can edit payments.');return;}
+      { const _b = paymentDeleteBlockReason(payments.find(x=>x.id===pid), user, 'accInvoices'); if(_b){ alert(_b); return; } }
       const p = payments.find(x=>x.id===pid);
       const patch = promptEditPayment(p);
       if(!patch) return;
@@ -19698,13 +20608,24 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
                           <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold text-xs">{p.method}</span></td>
                           <td className="px-3 py-2 text-right font-bold text-green-700">{fmtAmt(p.amount)}</td>
                           <td className="px-3 py-2 text-gray-400">{p.notes||'—'}</td>
-                          <td className="px-1 text-center">
-                            {isAdmin
-                              ? <span className="flex gap-1 justify-center">
-                                  <button onClick={()=>editPayment(p.id)} disabled={saving} className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
-                                  <button onClick={()=>deletePayment(p.id)} disabled={saving} className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
+                        <td className="px-1 text-center">
+                            {(() => {
+                              // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 7.
+                              // Previously this cell had NO permission check at all
+                              // (quote payments were deletable by every role,
+                              // including factory), while the two sibling tables
+                              // showed an unlabelled padlock driven by a per-page
+                              // definition of "admin". One rule now, and every
+                              // refusal states its reason.
+                              const blockReason = paymentDeleteBlockReason(p, user, 'accInvoices');
+                              if (blockReason) return <PaymentLockedBadge reason={blockReason}/>;
+                              return (
+                                <span className="flex gap-1 justify-center">
+                                  <button onClick={()=>editPayment(p.id)} disabled={saving} title="Edit this payment" className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
+                                  <button onClick={()=>deletePayment(p.id)} disabled={saving} title="Delete this payment" className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
                                 </span>
-                              : <span className="text-gray-200 text-xs">🔒</span>}
+                              );
+                            })()}
                           </td>
                         </tr>
                       ))}
@@ -20207,6 +21128,12 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   // gap (create/read relational, delete silently JSON-only). Now routes
   // through relationalApi.deleteInvoice (services.ts's deleteInvoice) when
   // "accInvoices" is relational-authoritative.
+  // POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY / DUPLICATE
+  // SUBMISSION. This action's button had no in-flight protection, so a
+  // double-click fired the request twice. Wrapped in the shared keyed
+  // guard (see guardAction near the top of this file): the second call is
+  // dropped before it leaves the browser, while the server keeps its own
+  // transactional/row-version protection as the authoritative backstop.
   async function deleteInvoice(id){
     // Warn clearly if this invoice has payment history attached — deleting
     // it discards that history too. Delete logic itself is unchanged.
@@ -20240,6 +21167,12 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   // (services.ts's recomputeOwnerPaymentStatus) — the local state update
   // below is a best-effort mirror only, matching the pattern already used
   // elsewhere in this file; the next platform-state read is authoritative.
+  // POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY / DUPLICATE
+  // SUBMISSION. This action's button had no in-flight protection, so a
+  // double-click fired the request twice. Wrapped in the shared keyed
+  // guard (see guardAction near the top of this file): the second call is
+  // dropped before it leaves the browser, while the server keeps its own
+  // transactional/row-version protection as the authoritative backstop.
   async function markInvPaid(inv){
     const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
     const alreadyPaid=(inv.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
@@ -20278,7 +21211,14 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
   // strict `===` comparison. Falls back to the logged-in user's own company
   // (`user.co`) instead, the same "current company context" fix applied to
   // saveManualInvoice/handleCreateCustomPO.
-  async function saveCreditNote(cn){
+  // POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY / DUPLICATE
+  // SUBMISSION. This action's button had no in-flight protection, so a
+  // double-click fired the request twice. Wrapped in the shared keyed
+  // guard (see guardAction near the top of this file): the second call is
+  // dropped before it leaves the browser, while the server keeps its own
+  // transactional/row-version protection as the authoritative backstop.
+  async function saveCreditNote(cn){ return guardAction('saveCreditNote:'+relKey(cn), () => saveCreditNote__impl(cn)); }  // 2026-08-24 concurrency guard — see guardAction
+  async function saveCreditNote__impl(cn){
     // 2026-08-23 (credit note company-isolation repair): fallbackCo now
     // defaults to 2 (Original Signacore), not null, matching the SAME
     // "current company context" fix already applied to saveManualInvoice's
@@ -20338,7 +21278,14 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     setCreditNotes(prev => prev.find(c=>c.id===tagged.id) ? prev.map(c=>c.id===tagged.id?tagged:c) : [tagged,...prev]);
     setShowCnModal(false); setEditCn(null);
   }
-  async function deleteCreditNote(id){
+  // POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY / DUPLICATE
+  // SUBMISSION. This action's button had no in-flight protection, so a
+  // double-click fired the request twice. Wrapped in the shared keyed
+  // guard (see guardAction near the top of this file): the second call is
+  // dropped before it leaves the browser, while the server keeps its own
+  // transactional/row-version protection as the authoritative backstop.
+  async function deleteCreditNote(id){ return guardAction('deleteCreditNote:'+id, () => deleteCreditNote__impl(id)); }  // 2026-08-24 concurrency guard — see guardAction
+  async function deleteCreditNote__impl(id){
     if(!isAdmin){alert('Only admins can delete credit notes.');return;}
     if(!window.confirm('Delete this credit note?')) return;
     // Stage 3 Phase 7: routes relationally only for a genuine relational row
@@ -21014,6 +21961,46 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
     });
     if(Object.keys(invoiceExtra).length===0) return;
     const today = new Date().toISOString().slice(0,10);
+    // ── 2026-08-24 FRONTEND AUDIT ─────────────────────────────────────────
+    // This effect creates real money movements (a 'Credit' payment on the
+    // invoice, and a matching increase in the credit note's `used`). It had no
+    // relational branch, so once accInvoices/creditNotes were cut over the
+    // follow-up autosave was refused by the write-authority guard — and because
+    // this is an EFFECT rather than a button, merely opening Accounting re-fired
+    // it, the next authoritative refresh restored the server copy, and the whole
+    // cycle repeated: a permanent failing-save loop that also made the same
+    // payment appear and disappear.
+    //
+    // Under cutover it now goes through relationalApi.recordPayment with method
+    // 'Credit' — exactly what the manual "Payments -> Credit" flow uses, and the
+    // same server transaction that deducts the funding credit notes atomically.
+    // Because that one call covers BOTH sides, nothing is patched locally here;
+    // the refresh relationalFetch schedules brings back the server's own version
+    // of the invoice and the credit note together, so they can never disagree.
+    if(isRelationalAuthoritative('accInvoices')){
+      if(!isRelationalAuthoritative('creditNotes')) return; // cross-authority write — the server refuses it too
+      (async () => {
+        for(const invId of Object.keys(invoiceExtra)){
+          const inv = (accInvoices||[]).find(i=>String(i.id)===String(invId));
+          if(!inv || inv._relId == null) continue;
+          const cnForInv = Object.keys(links).find(cnId=>(links[cnId].invoices||[]).some(t=>String(t.id)===String(invId)));
+          const noteNum = cnForInv ? (cnotes.find(c=>String(c.id)===String(cnForInv))||{}).number : '';
+          try {
+            await relationalApi.recordPayment('invoice', inv._relId, invoiceExtra[invId], {
+              date: today, method: 'Credit',
+              notes: `Auto-applied from ${noteNum||'available customer credit'}`,
+            });
+          } catch(e){
+            // Never loop or alert on this — it runs unattended on render. The
+            // server refusing (e.g. insufficient available credit, a stale view)
+            // is a legitimate outcome; the next authoritative read corrects the
+            // inputs and the effect simply does not re-fire.
+            console.warn('[auto-credit] could not auto-apply credit to invoice ' + invId + ':', e);
+          }
+        }
+      })();
+      return;
+    }
     setAccInvoices(prev=>prev.map(inv=>{
       const extra = invoiceExtra[inv.id];
       if(!extra) return inv;
@@ -21097,7 +22084,7 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
       {showBillModal&&<BillModal bill={editBill} onSave={saveBill} onClose={()=>{setShowBillModal(false);setEditBill(null);}}/>}
       {showPayModal&&payModalInv&&<PaymentHistoryModal inv={payModalInv} onClose={()=>{setShowPayModal(false);setPayModalInv(null);}}
         accInvoices={accInvoices} setAccInvoices={setAccInvoices} forceSaveSections={forceSaveSections}
-        creditNotes={creditNotes} setCreditNotes={setCreditNotes} isAdmin={isAdmin} quotes={quotes} jobs={jobs} customers={customers}
+        creditNotes={creditNotes} setCreditNotes={setCreditNotes} isAdmin={isAdmin} user={user} quotes={quotes} jobs={jobs} customers={customers}
         onOpenJob={onOpenJob} onOpenCustomer={onOpenCustomer} onViewInvoice={inv=>setViewInv(inv)} onSaved={setPayModalInv}
         fmtAmt={fmtAmt} fmtDate={fmtDate}/>}
 
@@ -21440,8 +22427,8 @@ function AccountingPage({ jobs:jobsAll, quotes, bankTxns:bankTxnsAll, setBankTxn
                               <button onClick={()=>{setEditInv(inv);setShowInvModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#e6e6ff',color:'#06065c'}}>Edit</button>
                               <button onClick={()=>printManualInvoice(inv,companies,logoDataUrl)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f3f4f6',color:'#1f2937'}}>🧾 Print</button>
                               <button onClick={()=>emailManualInvoiceViaOutlook(inv,companies)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dbeafe',color:'#1e40af'}}>📧 Email</button>
-                              {inv.status!=='paid'&&<button onClick={()=>markInvPaid(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dcfce7',color:'#059669'}}>✓ Paid</button>}
-                              {isAdmin&&<button onClick={()=>deleteInvoice(inv.id)} className="text-xs text-gray-300 hover:text-red-400">✕</button>}
+                              {inv.status!=='paid'&&<button onClick={()=>guardAction('markInvPaid:'+relKey(inv), ()=>markInvPaid(inv))} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dcfce7',color:'#059669'}}>✓ Paid</button>}
+                              {isAdmin&&<button onClick={()=>guardAction('deleteInvoice:'+inv.id, ()=>deleteInvoice(inv.id))} className="text-xs text-gray-300 hover:text-red-400">✕</button>}
                             </div>
                           )}
                         </td>
@@ -22620,6 +23607,9 @@ function App() {
   // users editing different sections (e.g. admin → Jobs, assistant → HR) never
   // overwrite each other's work.  A 30-second poll keeps all open browsers in sync.
   const apiReadyRef      = useRef(false);  // true once initial GET succeeded
+  // 2026-08-24: monotonic ticket for refreshRelationalSectionsNow — see its own
+  // note. Guarantees an older in-flight snapshot can never overwrite a newer one.
+  const relationalRefreshSeqRef = useRef(0);
   const apiSaveTimerRef  = useRef(null);
   // serverBaselineRef itself now lives at module scope (see its
   // declaration and full doc comment near isRelationalAuthoritative,
@@ -22638,7 +23628,48 @@ function App() {
   // Re-entrancy lock for exportFullBackup below — blocks a rapid
   // double-click from firing two overlapping /api/full-backup downloads.
   const fullBackupInFlightRef = useRef(false);
-  const [apiMsg, setApiMsg] = useState('');
+  // ── POST-MIGRATION STABILIZATION (2026-08-24) — ERROR VISIBILITY ─────────
+  // `apiNotice` replaces the old bare `apiMsg` string: { text, tone } where
+  // tone is 'success' | 'warn' | 'error', stated explicitly by the caller
+  // rather than guessed from the message wording. `setApiMsg` is kept as a
+  // compatibility shim so every existing call site keeps working unchanged and
+  // automatically gets the corrected behaviour:
+  //   - success notices auto-clear after 2.5s, exactly as before;
+  //   - error notices stay on screen until dismissed, so a failure can actually
+  //     be READ (and quoted in a bug report) instead of flashing past. This is
+  //     the "must remain visible long enough to read" requirement, taken to its
+  //     safest end for critical failures rather than to a slightly longer timer.
+  // A pending auto-clear is cancelled whenever a new notice arrives, so an
+  // older save's timer can no longer wipe a newer, more important message.
+  const [apiNotice, setApiNotice] = useState(null);
+  const apiNoticeTimerRef = useRef(null);
+  const showNotice = React.useCallback((text, tone) => {
+    if (apiNoticeTimerRef.current) { clearTimeout(apiNoticeTimerRef.current); apiNoticeTimerRef.current = null; }
+    if (!text) { setApiNotice(null); return; }
+    const resolvedTone = tone || (/\bfail|failed|error|offline|could not|not saved\b/i.test(text) ? 'error' : 'success');
+    setApiNotice({ text: text, tone: resolvedTone });
+    // Errors linger long enough to read and write down (the reported problem was
+    // a ~2.5s flash), then clear themselves so a transient blip cannot pin a red
+    // panel over the header controls for the rest of the session. Critical
+    // save failures are surfaced separately, by classifySaveError, in a modal
+    // banner or a blocking alert — those stay until the user acts on them.
+    apiNoticeTimerRef.current = setTimeout(
+      () => { apiNoticeTimerRef.current = null; setApiNotice(null); },
+      resolvedTone === 'error' ? 12000 : 2500
+    );
+  }, []);
+  // Compatibility shim: existing `setApiMsg('...')` / `setApiMsg('')` calls, and
+  // their trailing `setTimeout(() => setApiMsg(''), 2500)` clears, all still
+  // behave correctly — the timeout clear is a no-op for an error notice that is
+  // already waiting on the user's dismiss, and still clears a success early.
+  const setApiMsg = React.useCallback((text) => {
+    if (!text) {
+      setApiNotice(prev => (prev && prev.tone === 'error') ? prev : null);
+      return;
+    }
+    showNotice(text);
+  }, [showNotice]);
+  useEffect(() => () => { if (apiNoticeTimerRef.current) clearTimeout(apiNoticeTimerRef.current); }, []);
 
   // ── Hydration gate (2026-08-18 hydration-reliability fix) ───────────────
   // Root cause this closes: `jobs`/`quotes`/`accInvoices`/etc. above are
@@ -22860,6 +23891,65 @@ function App() {
     if (dbData.sigOTSmit)                       setSigOTSmit(dbData.sigOTSmit);
     if (dbData.savedAt)                         setLastSaved(dbData.savedAt);
   }
+
+  // ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 1 ────────────────────
+  // The implementation behind requestRelationalRefresh() (module scope, near
+  // syncRelationalBaseline). Registered into relationalRefreshRef by the effect
+  // below so components declared earlier in this file can trigger it.
+  //
+  // Re-reads the authoritative state and applies ONLY the sections the server
+  // says are relational-authoritative. Three deliberate properties:
+  //
+  //  1. NARROW. A JSON-owned section (customers, quickRates, employees, ...)
+  //     is never touched, because this refresh has no authority over it and the
+  //     user may have unsaved edits pending there. A relational section, by
+  //     contrast, is server-owned by definition: replacing it wholesale is
+  //     always correct.
+  //  2. BASELINE-SYNCED. serverBaselineRef is updated for exactly the sections
+  //     applied, so the 800ms autosave diff does not then see them as "locally
+  //     changed" and trip assertNoUnwiredRelationalSections. The guard stays
+  //     fully armed for genuinely unwired JSON paths — only its INPUT is kept
+  //     honest, exactly as syncRelationalBaseline already does.
+  //  3. STAMP-INDEPENDENT. Unlike the 30s poll it does NOT gate on
+  //     stateStamp(): a relational write never moves `_autoSavedAt`, which is
+  //     precisely why the poll could never surface one.
+  async function refreshRelationalSectionsNow(reason) {
+    if (!apiReadyRef.current) return;
+    // Ordering guard. Two refreshes can be in flight at once (a slow one from
+    // mutation A, a fast one from mutation B), and fetch responses arrive in
+    // completion order, not request order. Applying the older snapshot second
+    // would revert B on screen AND roll every _relRowVersion in the relational
+    // sections back to a value the server has already superseded — so the next
+    // save would 409, which is precisely the failure this refresh exists to
+    // eliminate. Each request takes a monotonic ticket; only the newest one is
+    // allowed to apply.
+    const seq = ++relationalRefreshSeqRef.current;
+    const dbData = await fetchFromServer();
+    if (!dbData) return;
+    if (seq !== relationalRefreshSeqRef.current) {
+      console.debug('[relational-refresh] discarding a stale snapshot (superseded by a newer refresh)');
+      return;
+    }
+    if (Array.isArray(dbData._relationalAuthoritativeSections)) {
+      relationalAuthoritativeSectionsRef.current = dbData._relationalAuthoritativeSections;
+    }
+    const sections = relationalAuthoritativeSectionsRef.current || [];
+    if (!sections.length) return;
+    const selective = {};
+    for (const key of sections) {
+      if (Array.isArray(dbData[key])) selective[key] = dbData[key];
+    }
+    if (!Object.keys(selective).length) return;
+    applyServerData(selective);
+    if (serverBaselineRef.current) {
+      serverBaselineRef.current = { ...serverBaselineRef.current, ...selective };
+    }
+    if (reason) console.debug('[relational-refresh] re-read ' + Object.keys(selective).join(', ') + ' after ' + reason);
+  }
+  useEffect(() => {
+    relationalRefreshRef.current = refreshRelationalSectionsNow;
+    return () => { if (relationalRefreshRef.current === refreshRelationalSectionsNow) relationalRefreshRef.current = null; };
+  });
 
   // Return which sections of `local` differ from `baseline`
   function locallyChangedSections(local, baseline) {
@@ -23868,14 +24958,47 @@ function App() {
   return (
     <div className="flex h-screen overflow-hidden">
       <Sidebar companies={companies} page={safePage} setPage={setPage} open={sidebarOpen} setOpen={setSidebarOpen} user={user} entityFilter={entityFilter} onEntitySelect={handleEntitySelect} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter}/>
-      {apiMsg && (
-        <div style={{
-          position:'fixed', top:'14px', right:'14px', zIndex:1000,
-          padding:'8px 14px', borderRadius:'8px',
-          background: /fail|offline/i.test(apiMsg) ? '#fee2e2' : '#dcfce7',
-          color:      /fail|offline/i.test(apiMsg) ? '#991b1b' : '#166534',
-          fontSize:'0.82rem', fontWeight:600, boxShadow:'0 4px 12px rgba(0,0,0,0.08)'
-        }}>{apiMsg}</div>
+      {/* ── POST-MIGRATION STABILIZATION (2026-08-24) — ERROR VISIBILITY ────
+          The old notice was a single fixed-size chip whose colour was decided
+          by running /fail|offline/i over the message TEXT, and which every
+          caller cleared with a 2500ms setTimeout. Three concrete problems, all
+          reported from production:
+            - a critical failure vanished in ~2.5s, far too fast to read (let
+              alone write down), which is exactly why "Internal error" could
+              never be diagnosed from the floor;
+            - any error whose wording happened not to contain "fail" or
+              "offline" rendered GREEN, i.e. as a success;
+            - there was no way to keep a message on screen, and a later save's
+              timer could clear an earlier, more important message early.
+          Now: severity is passed explicitly (never sniffed from the text),
+          errors persist until dismissed, successes still auto-clear quickly and
+          unobtrusively, and multi-line server detail is preserved. */}
+      {apiNotice && (
+        <div
+          role={apiNotice.tone === 'error' ? 'alert' : 'status'}
+          aria-live={apiNotice.tone === 'error' ? 'assertive' : 'polite'}
+          style={{
+            position:'fixed', top:'14px', right:'14px', zIndex:1000,
+            maxWidth:'min(420px, calc(100vw - 28px))',
+            padding: apiNotice.tone === 'error' ? '12px 14px' : '8px 14px',
+            borderRadius:'10px',
+            background: apiNotice.tone === 'error' ? '#fee2e2' : apiNotice.tone === 'warn' ? '#fef3c7' : '#dcfce7',
+            color:      apiNotice.tone === 'error' ? '#991b1b' : apiNotice.tone === 'warn' ? '#92400e' : '#166534',
+            border: '1px solid ' + (apiNotice.tone === 'error' ? '#fca5a5' : apiNotice.tone === 'warn' ? '#fcd34d' : '#bbf7d0'),
+            fontSize:'0.82rem', fontWeight:600, boxShadow:'0 4px 14px rgba(0,0,0,0.12)',
+            whiteSpace:'pre-wrap', lineHeight:1.45,
+          }}>
+          <div style={{display:'flex', alignItems:'flex-start', gap:'10px'}}>
+            <span style={{flex:1, minWidth:0}}>{apiNotice.text}</span>
+            {apiNotice.tone === 'error' && (
+              <button
+                onClick={()=>setApiNotice(null)}
+                title="Dismiss"
+                style={{background:'transparent', border:'none', color:'inherit', cursor:'pointer',
+                        fontSize:'1rem', fontWeight:900, lineHeight:1, padding:'0 2px', opacity:0.65}}>✕</button>
+            )}
+          </div>
+        </div>
       )}
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
         <Header page={safePage} onMenu={()=>setSidebarOpen(true)} onLogout={handleLogout} user={user} onSave={saveFile} saveMsg={saveMsg} onShare={()=>setShowShare(true)} lastSaved={lastSaved} logoDataUrl={brandingLogo} onExportBackup={exportFullBackup}/>

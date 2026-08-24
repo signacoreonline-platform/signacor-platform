@@ -42,7 +42,7 @@ import {
   ConcurrencyConflictError, BusinessRuleError, LegacyInvoiceConflictError,
   createCustomer, updateCustomer,
   createQuote, convertQuoteToJob, updateQuote, updateQuoteWithJobSync,
-  createInvoiceForJob, finalizeProformaToInvoice,
+  createInvoiceForJob, finalizeProformaToInvoice, createJob,
   recordPayment, updateJob, deleteJob, updatePayment, deletePayment, getPaymentMethod,
   createCreditNote, updateCreditNote, deleteCreditNote,
   createPurchaseOrder, updatePurchaseOrder,
@@ -125,11 +125,24 @@ router.put('/customers/:id', async (req: AuthRequest, res: Response): Promise<vo
 router.post('/quotes', async (req: AuthRequest, res: Response): Promise<void> => {
   if (!(await requireCutOver('quotes', res))) return;
   try {
-    const { companyCode, customerId, customerNameRaw, lines, discountPct, setupFee, notes } = req.body || {};
+    // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 2. This handler used to
+    // destructure only seven fields, silently discarding every contact/identity
+    // field the Quote form collects even though rel_quotes has a column for
+    // each. Widened to the full createQuote input; all the added fields are
+    // optional, so existing callers are unaffected.
+    const {
+      companyCode, customerId, customerNameRaw, lines, discountPct, setupFee, notes,
+      contactPerson, email, phone, address, vatNumber, terms, salesperson, preparedBy,
+      poRef, reference, quoteDate, validUntil, status,
+    } = req.body || {};
     if (!companyCode || !customerNameRaw || !Array.isArray(lines) || lines.length === 0) {
       res.status(400).json({ error: '"companyCode", "customerNameRaw" and a non-empty "lines" array are required' }); return;
     }
-    const result = await createQuote({ companyCode, customerId, customerNameRaw, lines, discountPct, setupFee, notes });
+    const result = await createQuote({
+      companyCode, customerId, customerNameRaw, lines, discountPct, setupFee, notes,
+      contactPerson, email, phone, address, vatNumber, terms, salesperson, preparedBy,
+      poRef, reference, quoteDate, validUntil, status,
+    });
     res.status(201).json({ success: true, id: result.id, quoteNumber: result.quoteNumber, rowVersion: result.rowVersion });
   } catch (err) { handleServiceError(err, res); }
 });
@@ -192,7 +205,11 @@ router.post('/quotes/:id/convert-to-job', async (req: AuthRequest, res: Response
     const quoteId = Number(req.params.id);
     if (!Number.isFinite(quoteId)) { res.status(400).json({ error: '"id" must be a number' }); return; }
     const result = await convertQuoteToJob(quoteId);
-    res.status(201).json({ success: true, jobId: result.jobId, jobNumber: result.jobNumber, jobRowVersion: result.jobRowVersion });
+    // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 3. `quoteRowVersion` is
+    // new: converting bumps the QUOTE's row_version too, and without reporting
+    // it the client kept a stale expectedVersion and 409'd on its very next
+    // edit of that quote. Purely additive to the response shape.
+    res.status(201).json({ success: true, jobId: result.jobId, jobNumber: result.jobNumber, jobRowVersion: result.jobRowVersion, quoteRowVersion: result.quoteRowVersion });
   } catch (err) { handleServiceError(err, res); }
 });
 
@@ -207,6 +224,31 @@ router.post('/quotes/:id/finalize-proforma', async (req: AuthRequest, res: Respo
 });
 
 // ── JOBS ─────────────────────────────────────────────────────────────────
+// POST-MIGRATION STABILIZATION (2026-08-24) — FRONTEND AUDIT (BUG 8). The Jobs
+// page's "➕ Add New Job" action (a job that never came from a quote) had no
+// relational endpoint at all, so once "jobs" cut over it silently lost every
+// job created that way. See services.ts's createJob for the full rationale.
+router.post('/jobs', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireCutOver('jobs', res))) return;
+  try {
+    const {
+      companyCode, customerId, customerNameRaw, description, status, stage, value, notes,
+      contactPerson, email, phone, address, vatNumber, reference, salesperson, dueDate,
+    } = req.body || {};
+    if (!companyCode || typeof companyCode !== 'string') {
+      res.status(400).json({ error: '"companyCode" is required' }); return;
+    }
+    if (!customerNameRaw || typeof customerNameRaw !== 'string' || !customerNameRaw.trim()) {
+      res.status(400).json({ error: '"customerNameRaw" (the client) is required' }); return;
+    }
+    const result = await createJob({
+      companyCode, customerId, customerNameRaw, description, status, stage, value, notes,
+      contactPerson, email, phone, address, vatNumber, reference, salesperson, dueDate,
+    });
+    res.status(201).json({ success: true, id: result.id, jobNumber: result.jobNumber, rowVersion: result.rowVersion });
+  } catch (err) { handleServiceError(err, res); }
+});
+
 router.put('/jobs/:id', async (req: AuthRequest, res: Response): Promise<void> => {
   if (!(await requireCutOver('jobs', res))) return;
   try {
@@ -215,7 +257,17 @@ router.put('/jobs/:id', async (req: AuthRequest, res: Response): Promise<void> =
     if (!Number.isFinite(id) || !Number.isFinite(expectedVersion)) {
       res.status(400).json({ error: '"id" (path) and "expectedVersion" (body) must be numbers' }); return;
     }
-    const { expectedVersion: _ev, ...patch } = req.body || {};
+    const { expectedVersion: _ev, depositWaivedBy: _ignoredActor, ...patch } = req.body || {};
+    // POST-MIGRATION STABILIZATION (2026-08-24): the deposit-waiver actor is
+    // taken from the AUTHENTICATED session and the body's value is discarded.
+    // Leaving it caller-supplied would have made attribution for a
+    // financial-control override forgeable by any client, and — since the UI
+    // never sent it — would have left deposit_waived_by permanently NULL, so the
+    // audit record migration 012 exists to create was never actually written.
+    if ((patch as any).depositWaived !== undefined) {
+      const actor = req.user as any;
+      (patch as any).depositWaivedBy = (actor && (actor.email || actor.id)) || null;
+    }
     const result = await updateJob(id, expectedVersion, patch);
     res.json({ success: true, rowVersion: result.rowVersion });
   } catch (err) { handleServiceError(err, res); }
@@ -254,7 +306,10 @@ router.delete('/jobs/:id', async (req: AuthRequest, res: Response): Promise<void
       res.status(400).json({ error: '"id" (path) and "expectedVersion" (body) must be numbers' }); return;
     }
     const result = await deleteJob(id, expectedVersion);
-    res.json({ success: true, deleted: result.deleted });
+    // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 3, same stale-version
+    // class as convert-to-job: unlinking a converted quote bumps its
+    // row_version. Reported back so the client can stay in step. Additive.
+    res.json({ success: true, deleted: result.deleted, unlinkedQuotes: result.unlinkedQuotes });
   } catch (err) { handleServiceError(err, res); }
 });
 

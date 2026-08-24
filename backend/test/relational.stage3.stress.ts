@@ -49,7 +49,24 @@ async function testJobEditing() {
   ok(!!jobBefore, 'job renders via read.ts right after conversion');
   ok(jobBefore.lines && Array.isArray(jobBefore.lines) && jobBefore.lines.length === 1, 'read.ts renders job line items under "lines" (not "items")', jobBefore.lines);
   ok(jobBefore.lines[0].desc === 'Banner', 'job line item uses "desc" (not "description")', jobBefore.lines[0]);
-  ok(jobBefore.desc === 'From Quote SQ-00001', 'job top-level description key is "desc" (not "description")', jobBefore.desc);
+  // 2026-08-24 POST-MIGRATION STABILIZATION (BUG 2): this used to assert the
+  // exact string 'From Quote SQ-00001'. convertQuoteToJob now derives the job's
+  // description from the quote's own line items when it has them —
+  // 'From Quote <num> - <first two line descriptions>' — which is precisely what
+  // the pre-cutover JSON conversion path always produced (index.html's newJob
+  // literal). The relational path was the odd one out, discarding what the
+  // quote actually described in favour of a bare label. Tightened rather than
+  // relaxed: it still pins the KEY (`desc`, never `description`), still pins the
+  // quote-number prefix, and now ALSO pins that the line description carried
+  // through — which is the field-carry regression this assertion exists to catch.
+  ok(
+    typeof jobBefore.desc === 'string'
+      && (jobBefore as any).description === undefined
+      && jobBefore.desc.startsWith('From Quote SQ-00001')
+      && jobBefore.desc.includes('Banner'),
+    'job top-level description key is "desc" (not "description") and carries the quote line description',
+    jobBefore.desc
+  );
 
   const patch1 = await services.updateJob(jobId, jobBefore._relRowVersion, { notes: 'Called client, confirmed spec', stage: 5 });
   ok(patch1.rowVersion === jobBefore._relRowVersion + 1, 'notes+stage edit bumps row_version by 1');

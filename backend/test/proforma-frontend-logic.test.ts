@@ -140,6 +140,21 @@ async function main() {
     },
     window: { SIGNACORE_API_URL: `${BASE}/api` },
     SGR_TOKEN_KEY: 'sgr_token_test',
+    // 2026-08-24: ensureProformaNumber now has a relational branch (it was
+    // JSON-only, and therefore dead, once "quotes" was cut over — both Proforma
+    // actions aborted after burning a reserved number). These three
+    // collaborators are what that branch uses; `relationalCutOver` below lets a
+    // test flip authority on and exercise it.
+    relationalCutOver: { quotes: false },
+    isRelationalAuthoritative: (section: string) => sandbox.relationalCutOver[section] === true,
+    syncRelationalBaseline: () => undefined,
+    relationalUpdateCalls: [] as any[],
+    relationalApi: {
+      updateQuote: async (id: any, expectedVersion: any, patch: any) => {
+        sandbox.relationalUpdateCalls.push({ id, expectedVersion, patch });
+        return { rowVersion: (expectedVersion || 0) + 1 };
+      },
+    },
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
@@ -230,6 +245,34 @@ async function main() {
     const secondNum = await api.ensureProformaNumber(updatedQuote, [updatedQuote], fakeForceSaveSections, fakeOnUpdate);
     ok(secondNum === firstNum, 'clicking again (Proforma Invoice or Email Proforma) reuses the SAME PRO number — no second reservation', { firstNum, secondNum });
     ok(savedCalls.length === 1 && updateCalls.length === 1, 'no additional forceSaveSections/onUpdate call happened on the second click', { saves: savedCalls.length, updates: updateCalls.length });
+  }
+
+  console.log('\n[7b] ensureProformaNumber() — relational branch persists proformaNum through the quote API');
+  {
+    // 2026-08-24: with "quotes" relational-authoritative, the JSON save this
+    // function used to perform is refused by the systemic write-authority guard,
+    // so BOTH Proforma actions aborted — each attempt having already consumed a
+    // number from the atomic pool. It now persists through PUT /quotes/:id
+    // (services.ts's updateQuote exposes proforma_num for exactly this).
+    sandbox.relationalCutOver.quotes = true;
+    sandbox.relationalUpdateCalls.length = 0;
+    let jsonSaves = 0;
+    const failIfJsonSaved = async () => { jsonSaves++; throw new Error('the JSON save path must not be used once quotes are cut over'); };
+    const relUpdates: any[] = [];
+    const relQuote = { id: 'Q-REL-1', num: 'SQ-REL-1', co: '1', _relId: 4242, _relRowVersion: 7 };
+    const relNum = await api.ensureProformaNumber(relQuote, [relQuote], failIfJsonSaved, (q: any) => relUpdates.push(q));
+    ok(!!relNum && /^PRO-\d{5,}$/.test(relNum), 'relational branch reserves and returns a PRO-##### number', relNum);
+    ok(jsonSaves === 0, 'the JSON forceSaveSections path is NOT used when quotes are relational-authoritative', jsonSaves);
+    ok(sandbox.relationalUpdateCalls.length === 1
+       && sandbox.relationalUpdateCalls[0].id === 4242
+       && sandbox.relationalUpdateCalls[0].expectedVersion === 7
+       && sandbox.relationalUpdateCalls[0].patch.proformaNum === relNum,
+      'the reservation is persisted via relationalApi.updateQuote with the quote\'s real _relId/_relRowVersion and a proformaNum patch',
+      sandbox.relationalUpdateCalls);
+    ok(relUpdates.length === 1 && relUpdates[0].proformaNum === relNum && relUpdates[0]._relRowVersion === 8,
+      'onUpdate receives the quote with the new proformaNum AND the refreshed row version, so an immediate second click cannot 409',
+      relUpdates);
+    sandbox.relationalCutOver.quotes = false;
   }
 
   console.log('\n[8] ensureProformaNumber() — legacy proformaNum is reused as-is, never re-reserved');

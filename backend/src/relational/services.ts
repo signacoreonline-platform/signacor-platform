@@ -64,6 +64,26 @@ export class LegacyInvoiceConflictError extends Error {
   }
 }
 
+// ── POST-MIGRATION STABILIZATION (2026-08-24) — SHARED PATCH-VALUE NORMALISER ─
+// Several colMap-driven updates below map a frontend field onto a DATE column
+// (rel_jobs.due_date, rel_invoices.issue_date/due_date, rel_quotes.quote_date/
+// valid_until). A cleared date input sends '' — which PostgreSQL rejects with
+// 22007 invalid_datetime_format. That is neither a ConcurrencyConflictError nor
+// a BusinessRuleError, so api.ts's handleServiceError mapped it to a bare
+// `500 {error:'Internal error'}` — the SAME opaque failure users reported for
+// quote saves, arriving on a different screen with no way to tell the two
+// apart. Normalised at the one shared point every colMap loop already passes
+// through, so clearing a date means NULL (what the UI implies) instead of a
+// server error, and so no future colMap entry can reintroduce the same class of
+// 500 by forgetting the coercion at its own call site.
+const DATE_COLUMNS = new Set([
+  'due_date', 'issue_date', 'invoice_date', 'invoice_due', 'quote_date', 'valid_until', 'payment_date', 'note_date', 'order_date',
+]);
+function normalizeColumnValue(col: string, value: any): any {
+  if (DATE_COLUMNS.has(col) && (value === '' || value === undefined)) return null;
+  return value;
+}
+
 // ── CUSTOMERS — simplest full CRUD, demonstrates row-level optimistic
 //    concurrency end to end. ──────────────────────────────────────────────
 export interface CustomerInput {
@@ -150,7 +170,7 @@ export async function updateCustomer(
 // ── CREATE QUOTE ───────────────────────────────────────────────────────────
 // BEGIN; reserve/validate document number; insert quote; insert quote
 // items; COMMIT — exactly the shape described in the migration brief.
-export interface QuoteLineInput { description: string; qty: number; unitPrice: number; inventoryItemId?: number | null }
+export interface QuoteLineInput { description: string; qty: number; unitPrice: number; unit?: string | null; inventoryItemId?: number | null }
 export interface CreateQuoteInput {
   companyCode: string;
   customerId?: number | null;
@@ -159,6 +179,31 @@ export interface CreateQuoteInput {
   discountPct?: number;
   setupFee?: number;
   notes?: string | null;
+  // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 2 (quote information does
+  // not carry through). Every field below already had a real rel_quotes column
+  // (007_relational_core.sql) or gets one in migration 012 (quoteDate /
+  // validUntil), and every one of them is captured by the Quote form — but
+  // createQuote accepted NONE of them, so a quote created after cutover
+  // persisted only company/customer/lines/discount/setupFee/notes. Contact
+  // person, email, phone, address, VAT number, salesperson, reference, PO ref,
+  // quote date and validity existed in the browser until the next reload and
+  // then vanished — and, because convertQuoteToJob copies FROM these columns,
+  // whatever was missing here was missing on the Job and Job Card too. Accepted
+  // here (all optional, so existing callers are unaffected) rather than patched
+  // in later by an edit, so the very first save is already complete.
+  contactPerson?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  address?: string | null;
+  vatNumber?: string | null;
+  terms?: string | null;
+  salesperson?: string | null;
+  preparedBy?: string | null;
+  poRef?: string | null;
+  reference?: string | null;
+  quoteDate?: string | null;
+  validUntil?: string | null;
+  status?: string | null;
 }
 
 export async function createQuote(input: CreateQuoteInput): Promise<{ id: number; quoteNumber: string; rowVersion: number }> {
@@ -167,7 +212,7 @@ export async function createQuote(input: CreateQuoteInput): Promise<{ id: number
     await client.query('BEGIN');
     const quoteNumber = await reserveDocumentNumberWithClient(client, input.companyCode, 'quote');
 
-    const subtotal = input.lines.reduce((s, l) => s + l.qty * l.unitPrice, 0);
+    const subtotal = input.lines.reduce((s, l) => s + (Number(l.qty) || 0) * (Number(l.unitPrice) || 0), 0);
     const discountPct = input.discountPct || 0;
     const discAmt = subtotal * (discountPct / 100);
     const setupFee = input.setupFee || 0;
@@ -177,20 +222,34 @@ export async function createQuote(input: CreateQuoteInput): Promise<{ id: number
 
     const insertRes = await client.query(
       `WITH new_id AS (SELECT nextval('rel_quotes_id_seq') AS id)
-       INSERT INTO rel_quotes (id, source_id, quote_number, company_code, customer_id, customer_name_raw, notes, setup_fee, discount_pct, subtotal, vat_amount, total, status, legacy_data)
-       SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft', '{}'::jsonb FROM new_id
+       INSERT INTO rel_quotes (id, source_id, quote_number, company_code, customer_id, customer_name_raw,
+         contact_person, email, phone, address, vat_number, terms, salesperson, prepared_by, po_ref, reference,
+         quote_date, valid_until, notes, setup_fee, discount_pct, subtotal, vat_amount, total, status, legacy_data)
+       SELECT new_id.id, new_id.id::text, $1, $2, $3, $4,
+         $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+         $15::date, $16::date, $17, $18, $19, $20, $21, $22, COALESCE($23, 'draft'), '{}'::jsonb FROM new_id
        RETURNING id, row_version`,
-      [quoteNumber, input.companyCode, input.customerId ?? null, input.customerNameRaw, input.notes ?? null, setupFee, discountPct, subtotal, vatAmount, total]
+      [quoteNumber, input.companyCode, input.customerId ?? null, input.customerNameRaw,
+       input.contactPerson ?? null, input.email ?? null, input.phone ?? null, input.address ?? null,
+       input.vatNumber ?? null, input.terms ?? null, input.salesperson ?? null, input.preparedBy ?? null,
+       input.poRef ?? null, input.reference ?? null,
+       input.quoteDate || null, input.validUntil || null,
+       input.notes ?? null, setupFee, discountPct, subtotal, vatAmount, total, input.status || null]
     );
     const quoteId = insertRes.rows[0].id;
     const quoteRowVersion = insertRes.rows[0].row_version;
 
     for (let i = 0; i < input.lines.length; i++) {
       const l = input.lines[i];
+      const qty = Number(l.qty) || 0;
+      const unitPrice = Number(l.unitPrice) || 0;
+      // Same resolveInventoryRef() fix as replaceQuoteLinesTx — createQuote had
+      // the identical raw-itemId-into-a-FK-column defect (BUG 3 root cause #1).
+      const inv = await resolveInventoryRef(client, l.inventoryItemId);
       await client.query(
-        `INSERT INTO rel_quote_line_items (quote_id, line_index, description, qty, unit_price, subtotal, inventory_item_id, legacy_data)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, '{}'::jsonb)`,
-        [quoteId, i, l.description, l.qty, l.unitPrice, l.qty * l.unitPrice, l.inventoryItemId ?? null]
+        `INSERT INTO rel_quote_line_items (quote_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, inventory_source_id, legacy_data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{}'::jsonb)`,
+        [quoteId, i, l.description ?? null, qty, unitPrice, l.unit ?? null, qty * unitPrice, inv.fk, inv.sourceId]
       );
     }
 
@@ -238,6 +297,7 @@ export async function convertQuoteToJob(quoteId: number): Promise<{
   jobId: number;
   jobNumber: string;
   jobRowVersion: number;
+  quoteRowVersion: number;
   inventoryAdjustments: InventoryAdjustment[];
 }> {
   const client = await pool.connect();
@@ -268,13 +328,54 @@ export async function convertQuoteToJob(quoteId: number): Promise<{
 
     const lineItemsRes = await client.query('SELECT * FROM rel_quote_line_items WHERE quote_id = $1 ORDER BY line_index', [quoteId]);
 
+    // ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 2 ROOT CAUSE ─────────
+    // "Quote information does not fully carry to the Job / Job Card."
+    //
+    // This INSERT used to copy only company/customer/description/value/
+    // setup_fee/discount_pct/notes. Every OTHER quote identity field —
+    // contact_person, email, phone, address, vat_number, salesperson,
+    // prepared_by, po_ref, reference — was dropped, even though rel_jobs has
+    // had a real column for each of them since 007_relational_core.sql. Because
+    // a converted job's legacy_data is '{}', read.ts's `?? legacyBase(r).x`
+    // fallbacks had nothing to fall back TO, so those fields hydrated as null
+    // forever. The frontend masked this on the Job detail screen (which reads
+    // contact/email/tel/address/vatNum live off the SOURCE QUOTE, not the job),
+    // which is exactly why it went unnoticed — but the Job Card, the invoice
+    // builders, and anything reading job.contact/email/address got blanks.
+    //
+    // `description` is now the quote's own description-bearing text when it has
+    // one, and only falls back to the historic "From Quote <num>" label when it
+    // does not — the label was previously unconditional, discarding whatever
+    // the quote actually described.
+    //
+    // Nothing about numbering, the conversion guard, inventory deduction or the
+    // no-auto-PO policy changes here — this adds columns to one INSERT.
+    const derivedDesc = (() => {
+      const lineDescs = lineItemsRes.rows
+        .map((l: any) => (l.description == null ? '' : String(l.description).trim()))
+        .filter(Boolean)
+        .slice(0, 2)
+        .join(', ');
+      return lineDescs
+        ? `From Quote ${quote.quote_number} — ${lineDescs}`
+        : `From Quote ${quote.quote_number}`;
+    })();
+
     const jobRes = await client.query(
       `WITH new_id AS (SELECT nextval('rel_jobs_id_seq') AS id)
-       INSERT INTO rel_jobs (id, source_id, job_number, company_code, customer_id, customer_name_raw, description, status, stage, value, quote_id, quote_number_raw, setup_fee, discount_pct, notes, legacy_data)
-       SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, 'quote_approved', 4, $6, $7, $8, $9, $10, $11, '{}'::jsonb FROM new_id
+       INSERT INTO rel_jobs (id, source_id, job_number, company_code, customer_id, customer_name_raw,
+         contact_person, email, phone, address, vat_number,
+         salesperson, prepared_by, po_ref, reference,
+         description, status, stage, value, quote_id, quote_number_raw, setup_fee, discount_pct, notes, legacy_data)
+       SELECT new_id.id, new_id.id::text, $1, $2, $3, $4,
+         $5, $6, $7, $8, $9,
+         $10, $11, $12, $13,
+         $14, 'quote_approved', 4, $15, $16, $17, $18, $19, $20, '{}'::jsonb FROM new_id
        RETURNING id, row_version`,
       [jobNumber, quote.company_code, quote.customer_id, quote.customer_name_raw,
-       `From Quote ${quote.quote_number}`, quote.total, quoteId, quote.quote_number,
+       quote.contact_person, quote.email, quote.phone, quote.address, quote.vat_number,
+       quote.salesperson, quote.prepared_by, quote.po_ref, quote.reference,
+       derivedDesc, quote.total, quoteId, quote.quote_number,
        quote.setup_fee, quote.discount_pct, quote.notes]
     );
     const jobId = jobRes.rows[0].id;
@@ -282,9 +383,26 @@ export async function convertQuoteToJob(quoteId: number): Promise<{
 
     for (const l of lineItemsRes.rows) {
       await client.query(
-        `INSERT INTO rel_job_line_items (job_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, legacy_data)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '{}'::jsonb)`,
-        [jobId, l.line_index, l.description, l.qty, l.unit_price, l.unit, l.subtotal, l.inventory_item_id]
+        `INSERT INTO rel_job_line_items (job_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, inventory_source_id, legacy_data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [jobId, l.line_index, l.description, l.qty, l.unit_price, l.unit, l.subtotal,
+         l.inventory_item_id, l.inventory_source_id,
+         // Carry the QUOTE line's legacy_data across verbatim so per-line
+         // extras the relational schema does not model (sqmL/sqmW/pQty/
+         // sizeText/cpLinked — the sizing fields the printed Job Card reads via
+         // lineSizeText()) survive conversion instead of being replaced with an
+         // empty object, which is what silently blanked the Job Card's
+         // dimension line for every relationally-converted job.
+         (() => {
+           // Carry the quote line's legacy extras (sqmL/sqmW/pQty/sizeText/
+           // cpLinked — what the printed Job Card's lineSizeText() reads) but
+           // NEVER its `id`: read.ts spreads legacyBase(l) before overlaying the
+           // modelled columns, so an inherited id would surface on the job line
+           // as an identity it never had.
+           const src = l.legacy_data && typeof l.legacy_data === 'object' && !Array.isArray(l.legacy_data) ? { ...l.legacy_data } : {};
+           delete (src as any).id;
+           return src;
+         })()]
       );
     }
 
@@ -325,13 +443,116 @@ export async function convertQuoteToJob(quoteId: number): Promise<{
     // legacyBase(r).convertedJobId, also null for a non-backfilled quote).
     // Fresh jobs always have source_id === their own id as text (the
     // Stage 2 id-consistency convention), so jobId::text is exactly right.
-    await client.query(
-      `UPDATE rel_quotes SET status = 'converted', converted_job_id = $1::bigint, converted_job_source_id = $1::text, row_version = row_version + 1, updated_at = NOW() WHERE id = $2`,
+    // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 3 ROOT CAUSE #2: this
+    // UPDATE bumps the QUOTE's row_version, but the function (and therefore
+    // POST /quotes/:id/convert-to-job) never told the caller the new value. The
+    // frontend consequently kept the pre-conversion `_relRowVersion` on that
+    // quote, so the NEXT edit or status change on it sent a stale
+    // expectedVersion and came back 409 stale_record — for a conflict the user
+    // had caused entirely by themselves, one action earlier. And because a
+    // purely relational write never bumps platform_state's `_autoSavedAt`, the
+    // 30s poll's staleness check can't heal it either: the quote stays
+    // unsaveable for the rest of the session. Returned now, and applied by the
+    // frontend, so the client's version tracks the server's.
+    const quoteUpdRes = await client.query(
+      `UPDATE rel_quotes SET status = 'converted', converted_job_id = $1::bigint, converted_job_source_id = $1::text, row_version = row_version + 1, updated_at = NOW() WHERE id = $2 RETURNING row_version`,
       [jobId, quoteId]
+    );
+    const quoteRowVersion = quoteUpdRes.rows[0].row_version;
+
+    // ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 6, second vector ─────
+    // The JSON conversion path always relinked a pre-existing quote invoice
+    // onto the new job (index.html: `{...i, reference:jobNum, jobId, jobNum}`),
+    // but the relational path never did — convertQuoteToJob touched
+    // rel_invoices nowhere. So a quote that had already been finalised to an
+    // invoice (finalizeProformaToInvoice) produced, after conversion, an
+    // invoice with no job link and no `reference`: invisible to
+    // getJobManualInvoice(), which is the lookup the "reuse the existing manual
+    // invoice instead of creating a second one" rule depends on. The job would
+    // later mint a SECOND invoice number for work already invoiced — the same
+    // duplicate class as INV-00099, arriving by a different route. Relinked
+    // here, in the same transaction as the conversion, matching the JSON path's
+    // long-standing behavior. COALESCE/NULLIF so a manually-typed reference is
+    // never overwritten.
+    await client.query(
+      `UPDATE rel_invoices
+         SET job_id = $1, job_number_raw = $2, reference = COALESCE(NULLIF(reference, ''), $2)
+       WHERE quote_id = $3 AND job_id IS NULL AND COALESCE(status, '') <> 'void'`,
+      [jobId, jobNumber, quoteId]
     );
 
     await client.query('COMMIT');
-    return { jobId, jobNumber, jobRowVersion, inventoryAdjustments };
+    return { jobId, jobNumber, jobRowVersion, quoteRowVersion, inventoryAdjustments };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// ── CREATE JOB (standalone, not from a quote) ───────────────────────────────
+// POST-MIGRATION STABILIZATION (2026-08-24) — FRONTEND AUDIT (BUG 8), JOBS /
+// CREATE. Until now the ONLY way a rel_jobs row could come into existence was
+// convertQuoteToJob. But the Jobs page has always had its own "➕ Add New Job"
+// action for work that never went through a quote (a walk-in, a callout, an
+// internal job), and that path was never wired relationally — it pushed a job
+// into local state and left the debounced JSON autosave to persist it. With
+// "jobs" cut over, platformState.ts strips the section from every JSON save, so
+// the job appeared in the list, survived until the next reload, and then was
+// simply gone. No error, no record, nothing to recover: the exact silent-loss
+// class this migration exists to eliminate, and the last one still open.
+//
+// Deliberately minimal and consistent with every sibling create in this file:
+// the SNS-##### number comes from the same atomic reservation
+// (reserveDocumentNumberWithClient, docType 'job') convertQuoteToJob already
+// uses — never a client-side max()+1 — and the row is written in one
+// transaction with legacy_data '{}'. It creates no quote link, no invoice, no
+// inventory movement and no purchase order: a standalone job is exactly that.
+export interface CreateJobInput {
+  companyCode: string;
+  customerId?: number | null;
+  customerNameRaw: string;
+  description?: string | null;
+  status?: string | null;
+  stage?: number | null;
+  value?: number;
+  notes?: string | null;
+  contactPerson?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  address?: string | null;
+  vatNumber?: string | null;
+  reference?: string | null;
+  salesperson?: string | null;
+  dueDate?: string | null;
+}
+export async function createJob(input: CreateJobInput): Promise<{ id: number; jobNumber: string; rowVersion: number }> {
+  if (!input.customerNameRaw || !String(input.customerNameRaw).trim()) {
+    throw new BusinessRuleError('"customerNameRaw" (the client) is required to create a job');
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const jobNumber = await reserveDocumentNumberWithClient(client, 'ALL', 'job');
+    const res = await client.query(
+      `WITH new_id AS (SELECT nextval('rel_jobs_id_seq') AS id)
+       INSERT INTO rel_jobs (id, source_id, job_number, company_code, customer_id, customer_name_raw,
+         contact_person, email, phone, address, vat_number, reference, salesperson,
+         description, status, stage, value, notes, due_date, legacy_data)
+       SELECT new_id.id, new_id.id::text, $1, $2, $3, $4,
+         $5, $6, $7, $8, $9, $10, $11,
+         $12, COALESCE($13, 'lead'), COALESCE($14, 0), $15, $16, $17::date, '{}'::jsonb FROM new_id
+       RETURNING id, row_version`,
+      [jobNumber, input.companyCode, input.customerId ?? null, String(input.customerNameRaw).trim(),
+       input.contactPerson ?? null, input.email ?? null, input.phone ?? null, input.address ?? null,
+       input.vatNumber ?? null, input.reference ?? null, input.salesperson ?? null,
+       input.description ?? null, input.status || null,
+       Number.isFinite(Number(input.stage)) ? Number(input.stage) : null,
+       Number(input.value) || 0, input.notes ?? null, input.dueDate || null]
+    );
+    await client.query('COMMIT');
+    return { id: res.rows[0].id, jobNumber, rowVersion: res.rows[0].row_version };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw err;
@@ -388,6 +609,47 @@ export async function convertQuoteToJob(quoteId: number): Promise<{
 // (skipping a separate manual "Completed" click was already, and remains,
 // the deliberate design — see BASE_LOCKED_STAGES in index.html, which locks
 // stage 9 from ever being reached via the manual "Advance" button at all).
+// POST-MIGRATION STABILIZATION (2026-08-24): shared writer for an invoice's
+// lines derived from a job.
+//
+// A job converted from a quote always has rel_job_line_items. A job created
+// DIRECTLY (createJob — the Jobs page's "Add New Job", which has no line-item
+// editor) has none, and its invoice was therefore written with zero lines and
+// rendered as R0.00 on every screen: the same "invoice with no value" symptom
+// the duplicate-INV report was about, arriving through a different path.
+//
+// When the job has no lines, one line is synthesised from the job's own
+// description and value so the invoice states the amount the job actually
+// carries. rel_jobs.value is VAT-INCLUSIVE (convertQuoteToJob stores the
+// quote's total, and updateQuoteWithJobSync computes afterDisc * 1.15), while
+// an invoice line's unit_amount is VAT-EXCLUSIVE and the '15%' tax_type adds
+// the VAT back — so the value is divided by 1.15 here to avoid charging VAT
+// twice. A zero-value job still produces no line, exactly as before.
+async function writeInvoiceLinesFromJobTx(
+  client: PoolClient,
+  invoiceId: number,
+  jobLines: any[],
+  job: any
+): Promise<void> {
+  if (jobLines.length > 0) {
+    for (const l of jobLines) {
+      await client.query(
+        `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
+         VALUES ($1, $2, $3, $4, $5, '4000', '15%', '{}'::jsonb)`,
+        [invoiceId, l.line_index, l.description, l.qty, l.unit_price]
+      );
+    }
+    return;
+  }
+  const vatInclusiveValue = Number(job.value) || 0;
+  if (vatInclusiveValue <= 0) return;
+  await client.query(
+    `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
+     VALUES ($1, 0, $2, 1, $3, '4000', '15%', '{}'::jsonb)`,
+    [invoiceId, job.description || `Job ${job.job_number}`, vatInclusiveValue / 1.15]
+  );
+}
+
 const INSTALL_STAGE = 7;
 export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: number; invoiceNumber: string; legacyMapped?: boolean; jobRowVersion: number; jobStage: number; jobStatus: string }> {
   const client = await pool.connect();
@@ -416,7 +678,15 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
           );
         }
         if (existingInv.job_id === null) {
-          await client.query(`UPDATE rel_invoices SET job_id = $1, job_number_raw = $2 WHERE id = $3`, [jobId, job.job_number, existingInv.id]);
+          // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 6, see the block
+          // above the fresh-invoice INSERT below: `reference` is the ONLY key
+          // the frontend's job-invoice de-duplication uses, so it must be set
+          // on every branch that links an invoice to a job, not just the fresh
+          // one. COALESCE so a manually-entered reference is never overwritten.
+          await client.query(
+            `UPDATE rel_invoices SET job_id = $1, job_number_raw = $2, reference = COALESCE(NULLIF(reference, ''), $2) WHERE id = $3`,
+            [jobId, job.job_number, existingInv.id]
+          );
         }
         const jobUpdRes1 = await client.query(
           `UPDATE rel_jobs SET invoice_created = true, invoice_date = COALESCE(invoice_date, CURRENT_DATE), invoice_status = COALESCE(invoice_status, 'pending'),
@@ -436,19 +706,14 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
       const legacyLineItemsRes = await client.query('SELECT * FROM rel_job_line_items WHERE job_id = $1 ORDER BY line_index', [jobId]);
       const legacyInvRes = await client.query(
         `WITH new_id AS (SELECT nextval('rel_invoices_id_seq') AS id)
-         INSERT INTO rel_invoices (id, source_id, invoice_number, company_code, customer_id, contact_name, job_id, job_number_raw, quote_id, quote_number_raw, status, issue_date, legacy_data)
-         SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, $6, $7, $8, 'sent', COALESCE($9::date, CURRENT_DATE), '{}'::jsonb FROM new_id
+         INSERT INTO rel_invoices (id, source_id, invoice_number, company_code, customer_id, contact_name, contact_email, contact_address, reference, job_id, job_number_raw, quote_id, quote_number_raw, status, issue_date, legacy_data)
+         SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $10, $11, $6, $5, $6, $7, $8, 'sent', COALESCE($9::date, CURRENT_DATE), '{}'::jsonb FROM new_id
          RETURNING id`,
-        [job.invoice_num, job.company_code, job.customer_id, job.customer_name_raw, jobId, job.job_number, job.quote_id, job.quote_number_raw, job.invoice_date]
+        [job.invoice_num, job.company_code, job.customer_id, job.customer_name_raw, jobId, job.job_number, job.quote_id, job.quote_number_raw, job.invoice_date,
+         job.email, job.address]
       );
       const legacyInvoiceId = legacyInvRes.rows[0].id;
-      for (const l of legacyLineItemsRes.rows) {
-        await client.query(
-          `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
-           VALUES ($1, $2, $3, $4, $5, '4000', '15%', '{}'::jsonb)`,
-          [legacyInvoiceId, l.line_index, l.description, l.qty, l.unit_price]
-        );
-      }
+      await writeInvoiceLinesFromJobTx(client, legacyInvoiceId, legacyLineItemsRes.rows, job);
       const jobUpdRes2 = await client.query(
         `UPDATE rel_jobs SET invoice_created = true, invoice_date = COALESCE(invoice_date, CURRENT_DATE), invoice_status = COALESCE(invoice_status, 'pending'),
            status = CASE WHEN stage >= $2 THEN 'invoiced' ELSE status END,
@@ -460,26 +725,96 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
       return { invoiceId: legacyInvoiceId, invoiceNumber: job.invoice_num, legacyMapped: true, jobRowVersion: jobUpdRes2.rows[0].row_version, jobStage: jobUpdRes2.rows[0].stage, jobStatus: jobUpdRes2.rows[0].status };
     }
 
+    // ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 6, IDEMPOTENCY ───────
+    // REQUIRED INVARIANT: "invoice creation is idempotent; repeated clicks/
+    // retries do not create duplicates; existing invoice is reused; document
+    // number reserved once."
+    //
+    // Repeated clicks were already safe by accident — the `SELECT ... FOR
+    // UPDATE` on the job at the top of this function serialises them, and the
+    // second one hits the `already has invoice` refusal. What was NOT safe is
+    // the case where an invoice for this job's work already exists but the JOB
+    // row doesn't know about it: an invoice created from the quote
+    // (finalizeProformaToInvoice) before the job existed, or a manual invoice
+    // referencing this job number. In both cases job.invoice_num is NULL, so
+    // control reached the reservation below and minted a SECOND number for work
+    // already invoiced — a genuinely duplicate document, and one that burns a
+    // number from the atomic pool permanently.
+    //
+    // Checked BEFORE any reservation, so the number pool is never touched on
+    // the reuse path. Adoption is deliberately narrow: only an invoice already
+    // pointing at this job, or one linked to this job's source quote / carrying
+    // this job's number as its reference and not yet claimed by any other job.
+    // Anything ambiguous falls through to a fresh reservation exactly as before.
+    const reusableInvRes = await client.query(
+      `SELECT id, invoice_number FROM rel_invoices
+        WHERE company_code = $1
+          AND COALESCE(status, '') <> 'void'
+          AND ( job_id = $2
+                OR ( job_id IS NULL
+                     AND $3::bigint IS NOT NULL
+                     AND quote_id = $3::bigint ) )
+        ORDER BY (job_id IS NOT DISTINCT FROM $2::bigint) DESC, id ASC
+        LIMIT 1
+        FOR UPDATE`,
+      [job.company_code, jobId, job.quote_id ?? null]
+    );
+    if ((reusableInvRes.rowCount ?? 0) > 0) {
+      const reusable = reusableInvRes.rows[0];
+      await client.query(
+        `UPDATE rel_invoices SET job_id = $1, job_number_raw = $2, reference = COALESCE(NULLIF(reference, ''), $2) WHERE id = $3`,
+        [jobId, job.job_number, reusable.id]
+      );
+      const jobUpdReuse = await client.query(
+        `UPDATE rel_jobs SET invoice_num = $1, invoice_date = COALESCE(invoice_date, CURRENT_DATE), invoice_created = true,
+           invoice_status = COALESCE(invoice_status, 'pending'),
+           status = CASE WHEN stage >= $3 THEN 'invoiced' ELSE status END,
+           stage  = CASE WHEN stage >= $3 THEN 9 ELSE stage END,
+           row_version = row_version + 1, updated_at = NOW() WHERE id = $2 RETURNING row_version, stage, status`,
+        [reusable.invoice_number, jobId, INSTALL_STAGE]
+      );
+      await client.query('COMMIT');
+      return {
+        invoiceId: reusable.id, invoiceNumber: reusable.invoice_number, legacyMapped: true,
+        jobRowVersion: jobUpdReuse.rows[0].row_version, jobStage: jobUpdReuse.rows[0].stage, jobStatus: jobUpdReuse.rows[0].status,
+      };
+    }
+
     const invoiceNumber = await reserveDocumentNumberWithClient(client, job.company_code, 'invoice');
 
     const lineItemsRes = await client.query('SELECT * FROM rel_job_line_items WHERE job_id = $1 ORDER BY line_index', [jobId]);
 
+    // ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 6 ROOT CAUSE ─────────
+    // "INV-00099 appeared twice — one with the correct value, one at R0.00."
+    //
+    // There are NOT two invoice rows: rel_invoices carries
+    // UNIQUE (company_code, invoice_number) (007_relational_core.sql), so the
+    // database cannot hold a duplicate. The duplicate is produced client-side,
+    // by getAllInvoicesUnified()'s merge of (a) invoices derived from
+    // jobs[].invoiceNum and (b) the accInvoices array. That merge de-duplicates
+    // on exactly ONE key — the invoice's `reference` matching the job's number
+    // (getManualInvoiceJobRefs) — and createInvoiceForJob never wrote
+    // `reference` at all. With reference NULL the job-derived row and the real
+    // relational row both survived the merge: the same INV number twice, the
+    // job-derived one showing the job's value and the relational one showing
+    // R0.00 (the second half of this bug, fixed in read.ts, which emitted the
+    // line array as `items` while every consumer reads `lineItems`).
+    //
+    // Setting reference = the job number on creation restores the de-dup key
+    // for every invoice created from here on. contact_email/contact_address are
+    // filled from the job at the same time — they were left NULL before, so a
+    // job invoice opened in Accounting showed no contact details.
     const invRes = await client.query(
       `WITH new_id AS (SELECT nextval('rel_invoices_id_seq') AS id)
-       INSERT INTO rel_invoices (id, source_id, invoice_number, company_code, customer_id, contact_name, job_id, job_number_raw, quote_id, quote_number_raw, status, issue_date, legacy_data)
-       SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, $6, $7, $8, 'sent', CURRENT_DATE, '{}'::jsonb FROM new_id
+       INSERT INTO rel_invoices (id, source_id, invoice_number, company_code, customer_id, contact_name, contact_email, contact_address, reference, job_id, job_number_raw, quote_id, quote_number_raw, status, issue_date, legacy_data)
+       SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $9, $10, $6, $5, $6, $7, $8, 'sent', CURRENT_DATE, '{}'::jsonb FROM new_id
        RETURNING id`,
-      [invoiceNumber, job.company_code, job.customer_id, job.customer_name_raw, jobId, job.job_number, job.quote_id, job.quote_number_raw]
+      [invoiceNumber, job.company_code, job.customer_id, job.customer_name_raw, jobId, job.job_number, job.quote_id, job.quote_number_raw,
+       job.email, job.address]
     );
     const invoiceId = invRes.rows[0].id;
 
-    for (const l of lineItemsRes.rows) {
-      await client.query(
-        `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
-         VALUES ($1, $2, $3, $4, $5, '4000', '15%', '{}'::jsonb)`,
-        [invoiceId, l.line_index, l.description, l.qty, l.unit_price]
-      );
-    }
+    await writeInvoiceLinesFromJobTx(client, invoiceId, lineItemsRes.rows, job);
 
     const jobUpdRes3 = await client.query(
       `UPDATE rel_jobs SET invoice_num = $1, invoice_date = CURRENT_DATE, invoice_created = true, invoice_status = 'pending',
@@ -543,8 +878,10 @@ export async function createManualInvoice(input: CreateManualInvoiceInput): Prom
        INSERT INTO rel_invoices (id, source_id, invoice_number, company_code, customer_id, contact_name, contact_email, contact_address, reference, status, issue_date, due_date, legacy_data)
        SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9::date, CURRENT_DATE), $10::date, '{}'::jsonb FROM new_id
        RETURNING id, row_version`,
+      // `|| null` rather than `?? null` on the two DATE params: an empty-string
+      // date from the form must become NULL, not '' — see updateInvoice's note.
       [invoiceNumber, input.companyCode, input.customerId ?? null, input.contactName.trim(), input.contactEmail ?? null,
-       input.contactAddress ?? null, input.reference ?? null, input.status ?? 'sent', input.issueDate ?? null, input.dueDate ?? null]
+       input.contactAddress ?? null, input.reference ?? null, input.status ?? 'sent', input.issueDate || null, input.dueDate || null]
     );
     const invoiceId = invRes.rows[0].id;
     await replaceInvoiceLinesTx(client, invoiceId, input.lines || []);
@@ -577,7 +914,7 @@ export async function updateInvoice(id: number, expectedVersion: number, patch: 
     };
     const sets: string[] = []; const vals: any[] = [];
     for (const [k, col] of Object.entries(colMap)) {
-      if ((patch as any)[k] !== undefined) { vals.push((patch as any)[k]); sets.push(`${col} = $${vals.length}`); }
+      if ((patch as any)[k] !== undefined) { vals.push(normalizeColumnValue(col, (patch as any)[k])); sets.push(`${col} = $${vals.length}`); }
     }
     const linesChanged = Array.isArray(patch.lines);
     if (linesChanged) {
@@ -857,7 +1194,7 @@ export async function updatePayment(
     const colMap: Record<string, string> = { amount: 'amount', date: 'payment_date', method: 'method', reference: 'reference', notes: 'notes' };
     const sets: string[] = []; const vals: any[] = [];
     for (const [k, col] of Object.entries(colMap)) {
-      if ((patch as any)[k] !== undefined) { vals.push((patch as any)[k]); sets.push(`${col} = $${vals.length}`); }
+      if ((patch as any)[k] !== undefined) { vals.push(normalizeColumnValue(col, (patch as any)[k])); sets.push(`${col} = $${vals.length}`); }
     }
     if (sets.length === 0) {
       await client.query('COMMIT');
@@ -978,6 +1315,75 @@ export interface LineItemPatch {
   itemId?: number | null;
 }
 
+// ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 3 ROOT CAUSE #1 ──────────
+// "Saving a Quote frequently fails with Internal error."
+//
+// Every line-item write below used to push the caller's `itemId` STRAIGHT into
+// `inventory_item_id`, which is `BIGINT REFERENCES rel_inventory_items(id)`
+// (007_relational_core.sql). But `itemId` is NOT that PK — read.ts renders an
+// inventory item's frontend-facing id from `restoreId(source_id)` (its ORIGINAL
+// historical JSON id) and exposes the real PK separately as `_relId`. For every
+// BACKFILLED inventory item those two values differ, so a quote line linked to
+// such an item produced:
+//   - PostgreSQL 23503 foreign_key_violation  (numeric source_id that is not a PK), or
+//   - PostgreSQL 22P02 invalid_text_representation ("abc" into BIGINT)
+// neither of which is a ConcurrencyConflictError / BusinessRuleError, so api.ts's
+// handleServiceError fell through to `500 {error:'Internal error'}` — the exact
+// message users reported, on the exact operation they reported it on (quote
+// save / quote edit / the complete-product cascade), and ONLY for quotes whose
+// lines were linked to pre-migration inventory items. Fresh post-cutover items
+// happened to work because createInventoryItem sets source_id = id::text, making
+// the two ids coincidentally identical — which is why this never showed up in
+// testing against newly-created data.
+//
+// SECOND (silent) HALF OF THE SAME DEFECT: these inserts never populated
+// `inventory_source_id`, yet read.ts reads a line's `itemId` FROM
+// `inventory_source_id` first. So even when the FK happened to be valid, every
+// successfully-saved line came back with `itemId: null` — the inventory link was
+// dropped on every quote/job edit.
+//
+// Both halves are fixed at this ONE shared point (rather than at each call site
+// or with a frontend workaround) by resolving the caller-supplied id to the real
+// row: match on `source_id` first (the id the frontend actually holds, correct
+// for backfilled AND fresh rows), fall back to the PK, and store BOTH the FK and
+// the source id. An id that matches nothing resolves to NULL — a line whose
+// inventory item was deleted still saves, exactly like convertQuoteToJob's own
+// forgiving "referenced item no longer exists" skip, instead of 500ing the whole
+// quote.
+async function resolveInventoryRef(
+  client: PoolClient,
+  itemId: unknown
+): Promise<{ fk: number | null; sourceId: string | null }> {
+  if (itemId === null || itemId === undefined || itemId === '') return { fk: null, sourceId: null };
+  const asText = String(itemId).trim();
+  if (!asText) return { fk: null, sourceId: null };
+
+  const bySource = await client.query(
+    'SELECT id, source_id FROM rel_inventory_items WHERE source_id = $1 LIMIT 1',
+    [asText]
+  );
+  if (bySource.rowCount) return { fk: Number(bySource.rows[0].id), sourceId: bySource.rows[0].source_id };
+
+  // Only worth a PK probe when the value could actually BE a bigint PK. The
+  // length bound matters: /^\d+$/ constrains the SHAPE but not the MAGNITUDE, and
+  // a 20+ digit id (historical JS ids are timestamp-derived and long) cast to
+  // bigint raises 22003 numeric_value_out_of_range — another opaque 500 from the
+  // very helper written to stop them. 18 digits is comfortably inside bigint's
+  // range and far beyond any real PK this schema will issue.
+  if (/^\d{1,18}$/.test(asText)) {
+    const byPk = await client.query(
+      'SELECT id, source_id FROM rel_inventory_items WHERE id = $1::bigint LIMIT 1',
+      [asText]
+    );
+    if (byPk.rowCount) return { fk: Number(byPk.rows[0].id), sourceId: byPk.rows[0].source_id };
+  }
+
+  // Unknown/removed item: keep the caller's id as a breadcrumb in
+  // inventory_source_id (so nothing is silently lost and a later re-link is
+  // possible) but never risk a FK violation.
+  return { fk: null, sourceId: asText };
+}
+
 async function replaceQuoteLinesTx(client: PoolClient, quoteId: number, lines: LineItemPatch[]): Promise<number> {
   await client.query('DELETE FROM rel_quote_line_items WHERE quote_id = $1', [quoteId]);
   let subtotal = 0;
@@ -987,10 +1393,11 @@ async function replaceQuoteLinesTx(client: PoolClient, quoteId: number, lines: L
     const unitPrice = Number(l.unitPrice) || 0;
     const lineSubtotal = qty * unitPrice;
     subtotal += lineSubtotal;
+    const inv = await resolveInventoryRef(client, l.itemId);
     await client.query(
-      `INSERT INTO rel_quote_line_items (quote_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, legacy_data)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'{}'::jsonb)`,
-      [quoteId, i, l.desc, qty, unitPrice, l.unit ?? null, lineSubtotal, l.itemId ?? null]
+      `INSERT INTO rel_quote_line_items (quote_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, inventory_source_id, legacy_data)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'{}'::jsonb)`,
+      [quoteId, i, l.desc ?? null, qty, unitPrice, l.unit ?? null, lineSubtotal, inv.fk, inv.sourceId]
     );
   }
   return subtotal;
@@ -1002,10 +1409,11 @@ async function replaceJobLinesTx(client: PoolClient, jobId: number, lines: LineI
     const l = lines[i];
     const qty = Number(l.qty) || 0;
     const unitPrice = Number(l.unitPrice) || 0;
+    const inv = await resolveInventoryRef(client, l.itemId);
     await client.query(
-      `INSERT INTO rel_job_line_items (job_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, legacy_data)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'{}'::jsonb)`,
-      [jobId, i, l.desc, qty, unitPrice, l.unit ?? null, qty * unitPrice, l.itemId ?? null]
+      `INSERT INTO rel_job_line_items (job_id, line_index, description, qty, unit_price, unit, subtotal, inventory_item_id, inventory_source_id, legacy_data)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'{}'::jsonb)`,
+      [jobId, i, l.desc ?? null, qty, unitPrice, l.unit ?? null, qty * unitPrice, inv.fk, inv.sourceId]
     );
   }
 }
@@ -1047,6 +1455,11 @@ export interface QuotePatchInput {
   status?: string | null; notes?: string | null; terms?: string | null;
   salesperson?: string | null; preparedBy?: string | null; poRef?: string | null;
   reference?: string | null; setupFee?: number; discountPct?: number;
+  proformaNum?: string | null;
+  // migration 012 (2026-08-24) — "Quote Date" / "Valid Until" are captured by
+  // the Quote form but had no relational column, so they were lost on every
+  // post-cutover quote. See 012_post_migration_stabilization.sql.
+  quoteDate?: string | null; validUntil?: string | null;
   lines?: LineItemPatch[];
 }
 export async function updateQuote(id: number, expectedVersion: number, patch: Partial<QuotePatchInput>): Promise<{ rowVersion: number }> {
@@ -1063,10 +1476,21 @@ export async function updateQuote(id: number, expectedVersion: number, patch: Pa
       phone: 'phone', address: 'address', vatNumber: 'vat_number', status: 'status',
       notes: 'notes', terms: 'terms', salesperson: 'salesperson', preparedBy: 'prepared_by',
       poRef: 'po_ref', reference: 'reference', setupFee: 'setup_fee', discountPct: 'discount_pct',
+      // migration 012 (2026-08-24) — see 012_post_migration_stabilization.sql.
+      quoteDate: 'quote_date', validUntil: 'valid_until',
+      // 2026-08-24: the Print/Email Proforma actions reserve a PRO-##### number
+      // and must persist it on the quote. rel_quotes.proforma_num has existed
+      // since 007, but no relational write path exposed it — so once "quotes"
+      // was cut over, ensureProformaNumber's JSON save was refused by the
+      // write-authority guard and BOTH proforma actions became dead, burning a
+      // reserved number on every attempt. Only in updateQuote (the plain,
+      // non-cascading patch), never in updateQuoteWithJobSync: reserving a
+      // proforma number must not cascade anything onto a linked job.
+      proformaNum: 'proforma_num',
     };
     const sets: string[] = []; const vals: any[] = [];
     for (const [k, col] of Object.entries(colMap)) {
-      if ((patch as any)[k] !== undefined) { vals.push((patch as any)[k]); sets.push(`${col} = $${vals.length}`); }
+      if ((patch as any)[k] !== undefined) { vals.push(normalizeColumnValue(col, (patch as any)[k])); sets.push(`${col} = $${vals.length}`); }
     }
 
     let subtotal = Number(cur.subtotal);
@@ -1118,6 +1542,20 @@ export interface JobPatchInput {
   dueDate?: string | null;
   breakdown?: Record<string, number>;
   lines?: LineItemPatch[];
+  // ── migration 012 (2026-08-24) — BUG 5: JOB PROGRESSION WITHOUT PAYMENT ────
+  // BUSINESS RULE CORRECTION. A job may progress past "Deposit Received" even
+  // when no deposit has been received (clients pay upfront, during production,
+  // on completion, or after). Setting this to true records that a user
+  // explicitly chose "Continue without payment" for this job. It is a lifecycle
+  // decision ONLY: it creates no payment, changes no value/total, never marks
+  // an invoice paid, and deliberately does NOT touch invoice_status — which
+  // keeps reporting the true payment position ('pending' while nothing has been
+  // received). Deposit_waived_at/_by are stamped by the service, not the
+  // caller, so the record of WHEN and BY WHOM cannot be back-dated by a client.
+  depositWaived?: boolean;
+  // Set by api.ts from the AUTHENTICATED session, never from the request body —
+  // attribution for a financial-control override must not be client-supplied.
+  depositWaivedBy?: string | null;
 }
 export async function updateJob(id: number, expectedVersion: number, patch: Partial<JobPatchInput>): Promise<{ rowVersion: number }> {
   const client = await pool.connect();
@@ -1138,10 +1576,29 @@ export async function updateJob(id: number, expectedVersion: number, patch: Part
     };
     const sets: string[] = []; const vals: any[] = [];
     for (const [k, col] of Object.entries(colMap)) {
-      if ((patch as any)[k] !== undefined) { vals.push((patch as any)[k]); sets.push(`${col} = $${vals.length}`); }
+      if ((patch as any)[k] !== undefined) { vals.push(normalizeColumnValue(col, (patch as any)[k])); sets.push(`${col} = $${vals.length}`); }
     }
     if (patch.breakdown !== undefined) {
       vals.push(JSON.stringify(patch.breakdown)); sets.push(`breakdown = $${vals.length}::jsonb`);
+    }
+    // migration 012 — BUG 5. Kept out of colMap on purpose: the flag and its
+    // audit stamps must move together, and the stamps are server-generated.
+    if (patch.depositWaived !== undefined) {
+      const waived = patch.depositWaived === true;
+      vals.push(waived); sets.push(`deposit_waived = $${vals.length}`);
+      if (waived) {
+        // COALESCE so re-saving an already-waived job keeps the ORIGINAL
+        // decision time rather than sliding it forward on every later edit.
+        sets.push(`deposit_waived_at = COALESCE(deposit_waived_at, NOW())`);
+        vals.push(patch.depositWaivedBy ?? null);
+        sets.push(`deposit_waived_by = COALESCE(deposit_waived_by, $${vals.length})`);
+      } else {
+        // Clearing the override clears its audit stamps too — leaving a
+        // "waived by X at T" on a job that is no longer waived would be a
+        // false record.
+        sets.push(`deposit_waived_at = NULL`);
+        sets.push(`deposit_waived_by = NULL`);
+      }
     }
     // A lines-only save (JobDetail's saveLines(), no scalar column touched)
     // must STILL bump row_version — otherwise a caller has no way to detect
@@ -1188,7 +1645,10 @@ export async function updateJob(id: number, expectedVersion: number, patch: Part
 // a deliberate tightening vs. the JSON path (which allowed this silently),
 // consistent with how deleteSupplier/deleteInventoryItem already refuse
 // deletes that would orphan a real FK elsewhere in this codebase.
-export async function deleteJob(id: number, expectedVersion: number): Promise<{ deleted: true }> {
+export async function deleteJob(
+  id: number,
+  expectedVersion: number
+): Promise<{ deleted: true; unlinkedQuotes: Array<{ id: number; rowVersion: number; status: string }> }> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1196,15 +1656,23 @@ export async function deleteJob(id: number, expectedVersion: number): Promise<{ 
     if (curRes.rowCount === 0) throw new BusinessRuleError(`job ${id} not found`);
     if (curRes.rows[0].row_version !== expectedVersion) throw new ConcurrencyConflictError('rel_jobs', id);
 
+    // POST-MIGRATION STABILIZATION (2026-08-24) — same stale-version class as
+    // convertQuoteToJob above: unlinking bumps the QUOTE's row_version, but the
+    // caller was never told, so the reverted quote became unsaveable (409
+    // stale_record) until a full page reload. The affected quotes and their new
+    // versions/statuses are now reported back so the frontend can keep its
+    // `_relRowVersion` in step. Behavior of the unlink itself is unchanged.
+    const unlinkedQuotes: Array<{ id: number; rowVersion: number; status: string }> = [];
     const linkedQuoteRes = await client.query(`SELECT id FROM rel_quotes WHERE converted_job_id = $1 FOR UPDATE`, [id]);
     for (const q of linkedQuoteRes.rows) {
-      await client.query(
+      const upd = await client.query(
         `UPDATE rel_quotes SET converted_job_id = NULL, converted_job_source_id = NULL,
            status = CASE WHEN status = 'converted' THEN 'approved' ELSE status END,
            row_version = row_version + 1, updated_at = NOW()
-         WHERE id = $1`,
+         WHERE id = $1 RETURNING row_version, status`,
         [q.id]
       );
+      unlinkedQuotes.push({ id: Number(q.id), rowVersion: upd.rows[0].row_version, status: upd.rows[0].status });
       await client.query(`DELETE FROM quote_conversions WHERE quote_id = $1`, [`rel:${q.id}`]);
     }
 
@@ -1220,7 +1688,7 @@ export async function deleteJob(id: number, expectedVersion: number): Promise<{ 
     }
 
     await client.query('COMMIT');
-    return { deleted: true };
+    return { deleted: true, unlinkedQuotes };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw err;
@@ -1271,10 +1739,12 @@ export async function updateQuoteWithJobSync(
       phone: 'phone', address: 'address', vatNumber: 'vat_number',
       notes: 'notes', terms: 'terms', salesperson: 'salesperson', preparedBy: 'prepared_by',
       poRef: 'po_ref', reference: 'reference', setupFee: 'setup_fee', discountPct: 'discount_pct',
+      // migration 012 (2026-08-24) — see updateQuote's identical entry.
+      quoteDate: 'quote_date', validUntil: 'valid_until',
     };
     const sets: string[] = []; const vals: any[] = [];
     for (const [k, col] of Object.entries(colMap)) {
-      if ((patch as any)[k] !== undefined) { vals.push((patch as any)[k]); sets.push(`${col} = $${vals.length}`); }
+      if ((patch as any)[k] !== undefined) { vals.push(normalizeColumnValue(col, (patch as any)[k])); sets.push(`${col} = $${vals.length}`); }
     }
 
     let subtotal = Number(quote.subtotal);
@@ -1323,18 +1793,72 @@ export async function updateQuoteWithJobSync(
       const resultPhone = (patch.phone !== undefined ? patch.phone : quote.phone) || '';
       const resultAddress = (patch.address !== undefined ? patch.address : quote.address) || '';
       const resultVat = (patch.vatNumber !== undefined ? patch.vatNumber : quote.vat_number) || '';
-      const resultNotes = (patch.notes !== undefined ? patch.notes : quote.notes) || job.notes || '';
+
+      // ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 4 ROOT CAUSE ───────
+      // "Notes deleted at the top of the Job page come back after refresh."
+      //
+      // The old expression was
+      //     (patch.notes !== undefined ? patch.notes : quote.notes) || job.notes || ''
+      // and it was written UNCONDITIONALLY into rel_jobs.notes on every quote
+      // save. Two separate defects lived in that one line:
+      //
+      //   (a) The `|| job.notes` fallback made notes a one-way ratchet. Once a
+      //       job had a note, clearing the QUOTE's note could never clear the
+      //       job's — the job's own previous text was substituted straight back
+      //       in. Notes could only ever be added, never removed.
+      //   (b) Because it ran on EVERY quote save, editing something completely
+      //       unrelated (a line item, the discount, the reference) re-pushed the
+      //       quote's notes onto the job. That is the actual reported symptom:
+      //       the user clears Special Notes on the Job page — which persists
+      //       correctly, saveNotes() sends notes:'' and updateJob writes '' —
+      //       then anyone touches the source quote for any reason, and the old
+      //       text is written back over the cleared field. On the next refresh
+      //       the "deleted" note is there again, with no save of its own to
+      //       explain it.
+      //
+      // Corrected rule: the job's notes are part of the cascade ONLY when the
+      // quote's notes actually CHANGED in this save. An unchanged quote note
+      // never touches the job (so a job-side clear stays cleared), and a quote
+      // note cleared to '' now propagates as '' (so a quote-side clear works
+      // too). Nothing else about the cascade changes — the display fields below
+      // are still overwritten from the quote exactly as before, because those
+      // ARE quote-owned; `notes` is the one field the Job legitimately owns its
+      // own copy of, which is why it was the only one with a job-side fallback
+      // in the first place.
+      const quoteNotesBefore = quote.notes == null ? '' : String(quote.notes);
+      const quoteNotesAfter = patch.notes !== undefined
+        ? (patch.notes == null ? '' : String(patch.notes))
+        : quoteNotesBefore;
+      const quoteNotesChanged = quoteNotesAfter !== quoteNotesBefore;
+      const jobNotesCurrent = job.notes == null ? '' : String(job.notes);
+      const resultNotes = quoteNotesChanged ? quoteNotesAfter : jobNotesCurrent;
+
       const _afterDisc = totals.subtotal - totals.subtotal * ((discountPct || 0) / 100) + (setupFee || 0);
       const jobValue = _afterDisc * 1.15;
+
+      // BUG 2 (same root cause as convertQuoteToJob): the cascade kept the
+      // job's client/contact/email/tel/address/VAT in step with the quote but
+      // never propagated salesperson / preparedBy / poRef / reference, so a
+      // quote edit that changed those left the job showing the old values (or,
+      // for a job converted before this pass, no value at all). Added here so
+      // the conversion-time copy and the edit-time cascade agree on exactly the
+      // same field set — one contract, one place.
+      const resultSalesperson = (patch.salesperson !== undefined ? patch.salesperson : quote.salesperson) ?? null;
+      const resultPreparedBy = (patch.preparedBy !== undefined ? patch.preparedBy : quote.prepared_by) ?? null;
+      const resultPoRef = (patch.poRef !== undefined ? patch.poRef : quote.po_ref) ?? null;
+      const resultReference = (patch.reference !== undefined ? patch.reference : quote.reference) ?? null;
 
       const jobUpdateRes = await client.query(
         `UPDATE rel_jobs SET
            discount_pct = $1, setup_fee = $2, value = $3,
            customer_name_raw = $4, contact_person = $5, email = $6, phone = $7, address = $8, vat_number = $9,
-           notes = $10, row_version = row_version + 1, updated_at = NOW()
+           notes = $10,
+           salesperson = $12, prepared_by = $13, po_ref = $14, reference = $15,
+           row_version = row_version + 1, updated_at = NOW()
          WHERE id = $11
          RETURNING row_version`,
-        [discountPct || 0, setupFee || 0, jobValue, resultClient, resultContact, resultEmail, resultPhone, resultAddress, resultVat, resultNotes, jobId]
+        [discountPct || 0, setupFee || 0, jobValue, resultClient, resultContact, resultEmail, resultPhone, resultAddress, resultVat, resultNotes, jobId,
+         resultSalesperson, resultPreparedBy, resultPoRef, resultReference]
       );
       jobRowVersion = jobUpdateRes.rows[0].row_version;
     }
@@ -1423,7 +1947,7 @@ export async function updateCreditNote(id: number, expectedVersion: number, patc
     if (curRes.rows[0].row_version !== expectedVersion) throw new ConcurrencyConflictError('rel_credit_notes', id);
     const sets: string[] = []; const vals: any[] = [];
     for (const [k, col] of Object.entries(colMap)) {
-      if ((patch as any)[k] !== undefined) { vals.push((patch as any)[k]); sets.push(`${col} = $${vals.length}`); }
+      if ((patch as any)[k] !== undefined) { vals.push(normalizeColumnValue(col, (patch as any)[k])); sets.push(`${col} = $${vals.length}`); }
     }
     if (sets.length === 0) { await client.query('COMMIT'); return { rowVersion: curRes.rows[0].row_version }; }
     vals.push(id); const idIdx = vals.length;
