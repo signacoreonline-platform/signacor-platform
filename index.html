@@ -508,6 +508,16 @@ const relationalApi = {
   // CUTOVER BLOCKER COMPLETION — "job deletion" named blocker.
   deleteJob(id, expectedVersion) { return relationalFetch('/jobs/' + id, { method: 'DELETE', body: JSON.stringify({ expectedVersion: expectedVersion }) }); },
   createInvoiceForJob(jobId) { return relationalFetch('/jobs/' + jobId + '/create-invoice', { method: 'POST' }); },
+  // COMPLETED → AUTO-INVOICE (2026-08-25). "Make sure this job has exactly one
+  // valid invoice." Same backend writer as createInvoiceForJob above (see
+  // services.ts's jobInvoiceTx and its 'create' | 'ensure' modes) — the SAME
+  // atomic INV-##### pool, the SAME historical-pieces protection and the SAME
+  // job-total consistency guard — differing only in what it does when the job
+  // already has one: it resolves and reuses it instead of refusing. Resolves
+  // { invoiceId, invoiceNumber, created, reused, jobRowVersion, jobStage,
+  // jobStatus }; `created:false` means an existing invoice was reused and
+  // nothing new was raised.
+  ensureInvoiceForJob(jobId) { return relationalFetch('/jobs/' + jobId + '/ensure-invoice', { method: 'POST' }); },
   // CUTOVER BLOCKER COMPLETION — "manual invoicing" / "invoice deletion"
   // named blockers. Distinct from createInvoiceForJob above (derives an
   // invoice FROM a job); these are for a standalone/manual invoice and for
@@ -2015,6 +2025,86 @@ function sgrApplyPrintMargins(html, m){
     '</style>';
   return html.replace('</head>', style+'</head>');
 }
+
+/* ═══════════════════════════════════════════
+   PDF SAVE FILENAME (2026-08-25)
+
+   THE REGRESSION. Every document here is printed the same way: the generated
+   HTML is written into a `window.open('','_blank')` popup, which then calls
+   window.print(). The browser's "Save as PDF" dialog takes its SUGGESTED
+   FILENAME from that printed document's title — there is no download link and
+   no Blob involved anywhere in this path, so `a.download` is not, and never
+   was, what named these files. The popup's URL is `about:blank`, so the title
+   is the ONLY thing that can name the PDF; when it is missing or empty the
+   dialog opens with a blank filename and the number has to be typed by hand.
+
+   Each builder does emit a <title> (Quotation_/Invoice_/Proforma_/Job Card),
+   but relying on a <title> that is only ever seen by the HTML parser during
+   document.write is exactly what proved unreliable: nothing downstream
+   verified it survived, and nothing set it if it had not. These two helpers
+   make the filename an EXPLICIT, checked property of the print call:
+
+     sgrDocFileName()  — turns a document number into a safe filename stem.
+                         Only characters a filesystem actually rejects are
+                         removed (\ / : * ? " < > | plus any run of whitespace,
+                         which is collapsed); everything else — hyphens
+                         included, so the document number survives intact — is
+                         preserved, so SQ-00150 stays SQ-00150. A blank or
+                         unusable value falls back to the document-type label
+                         rather than producing an empty name.
+     sgrWithDocTitle() — rewrites (or inserts) the document's own <title> so
+                         the written HTML always carries the right one.
+
+   The print call then ALSO assigns w.document.title after document.close(),
+   belt-and-braces: a title set on the live document is what the print dialog
+   reads, whether or not the parsed tag registered.
+
+   Nothing about the PDF's content, layout, margins or CSS changes — only what
+   the file is called. The main application title is never touched, so there is
+   nothing to restore.
+═══════════════════════════════════════════ */
+function sgrDocFileName(raw, fallback){
+  // Only strip what a filesystem genuinely cannot store. This is deliberately
+  // NOT a whitelist: a whitelist would quietly mangle legitimate document
+  // numbers (and any future prefix), which is worse than a rejected save.
+  // The FALLBACK goes through exactly the same cleaning as the value itself —
+  // a fallback label like 'Quotation ' would otherwise reach the Save dialog
+  // with its trailing space intact, which Windows rejects.
+  const clean = function(v){
+    return String(v == null ? '' : v)
+      .replace(/[\\/:*?"<>|]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 120)
+      .replace(/[. ]+$/, '');   // Windows rejects a trailing dot or space
+  };
+  return clean(raw) || clean(fallback) || 'Document';
+}
+function sgrWithDocTitle(html, title){
+  const safe = String(title).replace(/[<>&]/g, '');
+  if (/<title>[\s\S]*?<\/title>/i.test(html)) {
+    return html.replace(/<title>[\s\S]*?<\/title>/i, '<title>'+safe+'</title>');
+  }
+  if (/<head[^>]*>/i.test(html)) {
+    return html.replace(/<head[^>]*>/i, function(m){ return m+'<title>'+safe+'</title>'; });
+  }
+  return html;
+}
+/* Shared by buildInvoiceHtml and printInvoice so the printed document and the
+   filename it is saved under can never disagree about which number this job's
+   invoice carries. */
+function sgrJobInvoiceNumber(job){
+  return (job && job.invoiceNum) || ('INV-'+String((job&&job.num)||'').replace(/[^0-9]/g,'').padStart(5,'0'));
+}
+/* The one place a print popup is handed its document. Writes the HTML with the
+   filename already installed as its <title>, then sets the live document's
+   title too. */
+function sgrWritePrintWindow(w, html, fileName){
+  const titled = sgrWithDocTitle(html, fileName);
+  w.document.open(); w.document.write(titled); w.document.close();
+  try { w.document.title = fileName; } catch (e) { /* cross-document write blocked — the written <title> still stands */ }
+  return w;
+}
 function sgrMarginSliderHtml(key, label){
   return (
     '<div style="margin-bottom:16px;">'+
@@ -2029,7 +2119,11 @@ function sgrMarginSliderHtml(key, label){
 /* Opens an in-app preview overlay for a generated document (invoice / quote
    / proforma HTML string). Lets the margins be adjusted with a live preview
    before the real print window + window.print() is triggered. */
-function sgrOpenPrintPreview(rawHtml, docLabel){
+// `docFileName` (2026-08-25) is the name the browser's Save-as-PDF dialog will
+// suggest — see the PDF SAVE FILENAME block above. Every caller passes the
+// document's own number; it is sanitised here rather than at each call site so
+// no future caller can forget.
+function sgrOpenPrintPreview(rawHtml, docLabel, docFileName){
   const existing = document.getElementById('sgr-print-preview-overlay');
   if (existing) existing.remove();
 
@@ -2111,7 +2205,7 @@ function sgrOpenPrintPreview(rawHtml, docLabel){
       .replace('</body></html>', '<script>window.onload=function(){window.print();}<\/script></body></html>');
     const w = window.open('', '_blank', 'width=960,height=750');
     if (!w) { alert('Pop-up blocked! Please allow pop-ups for this page.'); return; }
-    w.document.open(); w.document.write(finalHtml); w.document.close();
+    sgrWritePrintWindow(w, finalHtml, sgrDocFileName(docFileName, docLabel));
     closeOverlay();
   });
 
@@ -2340,7 +2434,7 @@ ${q.notes?(`<div class="notes"><div class="lbl">Notes</div><p>${q.notes}</p></di
 
 function printQuoteWindow(q, companies, logoDataUrl) {
   const html = buildQuoteHtml(q, companies, logoDataUrl);
-  sgrOpenPrintPreview(html, 'Quotation '+(q.num||''));
+  sgrOpenPrintPreview(html, 'Quotation '+(q.num||''), q.num);
 }
 
 /* ═══════════════════════════════════════════
@@ -4306,7 +4400,11 @@ stageNames.map(function(s,i){
 
   const w = window.open('','_blank','width=860,height=720');
   if (!w) { alert('Pop-up blocked! Please allow pop-ups for this page.'); return; }
-  w.document.open(); w.document.write(html); w.document.close();
+  // 2026-08-25 (PDF SAVE FILENAME): the Job Card prints straight from its own
+  // popup rather than through the margin preview, so it gets the same explicit
+  // title treatment here — the browser's Save-as-PDF dialog reads the printed
+  // document's title, and 'SNS-00110' is the useful name for it.
+  sgrWritePrintWindow(w, html, sgrDocFileName(job.num, 'Job Card'));
 }
 
 /* ═══════════════════════════════════════════
@@ -4348,7 +4446,7 @@ function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
     '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+lineItemCount(l)+'</td>'+
     '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(l.subtotal||0)+'</td></tr>';
   }).join('');
-  const invNum = job.invoiceNum||('INV-'+job.num.replace(/[^0-9]/g,'').padStart(5,'0'));
+  const invNum = sgrJobInvoiceNumber(job);
   const invDate = job.invoiceDate||(new Date().toISOString().slice(0,10));
   const due = job.invoiceDue||(new Date(Date.now()+30*864e5).toISOString().slice(0,10));
 
@@ -4513,7 +4611,7 @@ function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
 
 function printInvoice(job, companies, logoDataUrl, customers) {
   const html = buildInvoiceHtml(job, companies, logoDataUrl, customers);
-  sgrOpenPrintPreview(html, 'Invoice '+(job.invoiceNum||job.num||''));
+  sgrOpenPrintPreview(html, 'Invoice '+(job.invoiceNum||job.num||''), sgrJobInvoiceNumber(job));
 }
 
 /* ═══════════════════════════════════════════
@@ -4638,7 +4736,7 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
 
 function printProformaWindow(quote, proformaNum, companies, logoDataUrl) {
   const html = buildProformaHtml(quote, proformaNum, companies, logoDataUrl);
-  sgrOpenPrintPreview(html, 'Proforma '+(proformaNum||quote.num||''));
+  sgrOpenPrintPreview(html, 'Proforma '+(proformaNum||quote.num||''), proformaNum||quote.num);
 }
 
 /* ═══════════════════════════════════════════
@@ -4829,7 +4927,7 @@ function buildManualInvoiceHtml(inv, companies, logoDataUrl) {
 
 function printManualInvoice(inv, companies, logoDataUrl) {
   const html = buildManualInvoiceHtml(inv, companies, logoDataUrl);
-  sgrOpenPrintPreview(html, 'Invoice '+(inv.number||''));
+  sgrOpenPrintPreview(html, 'Invoice '+(inv.number||''), inv.number);
 }
 
 // Simple mailto: composer for a manual invoice, mirroring emailInvoiceViaOutlook
@@ -14801,6 +14899,74 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   // now-stale _relRowVersion and came back 409 — reported to the user as "this
   // job was changed elsewhere" for a conflict they had caused with their own
   // second click.
+  /* ── COMPLETED → AUTO-INVOICE (2026-08-25) ────────────────────────────────
+     THE BUSINESS RULE. A Job that PROGRESSES INTO Completed must end up with
+     exactly one valid invoice, without anyone having to click Create Invoice
+     afterwards.
+
+     WHY THIS LIVES HERE, ON THE TRANSITION, AND NOT IN AN EFFECT OVER STATE.
+     "Has reached Completed" and "is sitting at Completed" are different facts,
+     and only the first one is an event. A useEffect that scanned the hydrated
+     jobs array for stage === Completed could not tell them apart: every job
+     that was ALREADY Completed before this feature existed would look
+     identical to one that just got there, so app startup, a login, a browser
+     refresh, an authoritative relationalFetch rehydration, a company switch,
+     or simply opening or editing an old Completed job would all have raised
+     invoices for historical work nobody asked to invoice. advanceStage() is
+     the ONE place a job actually crosses into Completed, it is driven by a
+     person's click, and it knows both the stage it came from and the stage it
+     is going to — so the transition owns the behaviour, and there is no
+     session flag, no "seen" set and no first-load heuristic to get wrong.
+
+     Historical jobs already at Completed are deliberately untouched: they keep
+     the existing explicit Create Invoice action, exactly as before.
+
+     Only ever runs AFTER the stage write is CONFIRMED by the server, so an
+     invoice can never be raised for a transition that did not actually happen.
+     Everything financial then belongs to the backend: relationalApi.
+     ensureInvoiceForJob → POST /jobs/:id/ensure-invoice → services.ts's
+     jobInvoiceTx in 'ensure' mode, the SAME writer, transaction, row locks,
+     atomic INV-##### reservation, historical-pieces protection and job-total
+     consistency guard the explicit Create Invoice button already uses. It
+     resolves and reuses an existing valid invoice rather than duplicating it,
+     and refuses safely on ambiguous linkage. The stage/status/row_version
+     applied below are the server's own values, never assumed. */
+  const COMPLETED_STAGE = STATUS_TO_STAGE['completed'];
+  async function ensureInvoiceOnCompletedTransition(){
+    // Relational-only, and gated on BOTH sections — the server enforces the
+    // same double gate, so this is the client-side twin of it, not a second
+    // opinion. Under JSON authority nothing here runs.
+    if(!(isRelationalAuthoritative('jobs') && isRelationalAuthoritative('accInvoices'))) return;
+    if(job._relId==null) return;   // cannot be addressed relationally at all
+    try {
+      const result = await relationalApi.ensureInvoiceForJob(job._relId);
+      // ONE updater into local state AND the relational baseline, carrying the
+      // server's confirmed values — the convention every other relational job
+      // write here follows, and what keeps locallyChangedSections honest so no
+      // legacy platform_state "jobs" save is ever attempted for this change.
+      // The invoice itself arrives in accInvoices via the coalesced
+      // authoritative re-read relationalFetch already schedules.
+      const jobsUpdater = prev=>(prev||[]).map(x=>x.id===job.id
+        ? {...x, invoiceCreated:true, invoiceNum:result.invoiceNumber,
+           invoiceDate:(x.invoiceDate||new Date().toISOString().slice(0,10)),
+           stage:result.jobStage, status:result.jobStatus,
+           _relRowVersion:result.jobRowVersion}
+        : x);
+      setJobs(jobsUpdater);
+      syncRelationalBaseline('jobs', jobsUpdater);
+      // `created:false` means an existing valid invoice was resolved and
+      // reused — a correct, silent outcome, not something to announce as new.
+      if(result.created) setInvoiceCreatedInfo({ invoiceNum: result.invoiceNumber });
+    } catch(e){
+      // The stage advance itself already succeeded and stands. Only the
+      // invoice was refused, and the person is right here having just clicked,
+      // so they are told plainly rather than it failing silently.
+      alert('The job was moved to Completed, but its invoice could NOT be raised automatically.\n\n'
+        + describeSaveConflictError(e, 'job')
+        + '\n\nNothing was created and no invoice number was used. The job stays at Completed — use Create Invoice once this is resolved.');
+    }
+  }
+
   async function advanceStage(){
     if(isLast || advancing) return;
     const ns=job.stage+1;
@@ -14809,14 +14975,24 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     setAdvancing(true);
     try {
       if(isRelationalAuthoritative('jobs')){
+        let advanced = false;
         try {
           const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { stage: ns, status: nextStatus });
           const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j,stage:ns,status:nextStatus,_relRowVersion:result.rowVersion}:j);
           setJobs(jobsUpdater);
           syncRelationalBaseline('jobs', jobsUpdater);
+          advanced = true;
         } catch(e){
           alert(describeSaveConflictError(e, 'job')+'\n\nThe job stage was NOT advanced.');
         }
+        // The transition, and ONLY the transition, into Completed. `advanced`
+        // means the server confirmed it; `ns === COMPLETED_STAGE` means this
+        // click is what took the job there. A job already at Completed can
+        // never reach this line — stage 9 is system-controlled and locked, so
+        // advanceStage returns above for it. The in-flight `advancing` flag
+        // stays set until the ensure settles, so a double-click cannot start a
+        // second one (the backend's row lock is the authoritative backstop).
+        if(advanced && ns === COMPLETED_STAGE) await ensureInvoiceOnCompletedTransition();
         return;
       }
       setJobs(prev=>prev.map(j=>j.id===job.id?{...j,stage:ns,status:nextStatus}:j));

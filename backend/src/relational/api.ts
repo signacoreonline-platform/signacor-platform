@@ -42,7 +42,7 @@ import {
   ConcurrencyConflictError, BusinessRuleError, LegacyInvoiceConflictError,
   createCustomer, updateCustomer,
   createQuote, convertQuoteToJob, updateQuote, updateQuoteWithJobSync,
-  createInvoiceForJob, finalizeProformaToInvoice, createInvoiceFromQuote, createJob,
+  createInvoiceForJob, ensureInvoiceForJob, finalizeProformaToInvoice, createInvoiceFromQuote, createJob,
   recordPayment, updateJob, deleteJob, updatePayment, deletePayment, getPaymentMethod,
   createCreditNote, updateCreditNote, deleteCreditNote,
   createPurchaseOrder, updatePurchaseOrder,
@@ -321,7 +321,35 @@ router.post('/jobs/:id/create-invoice', async (req: AuthRequest, res: Response):
     // must reflect these exact values rather than assuming stage 9 —
     // duplicating that assumption client-side is exactly the kind of
     // same-root-cause drift this repair closes.
-    res.status(201).json({ success: true, invoiceId: result.invoiceId, invoiceNumber: result.invoiceNumber, jobRowVersion: result.jobRowVersion, jobStage: result.jobStage, jobStatus: result.jobStatus });
+    res.status(201).json({ success: true, invoiceId: result.invoiceId, invoiceNumber: result.invoiceNumber, created: result.created, reused: result.reused, jobRowVersion: result.jobRowVersion, jobStage: result.jobStage, jobStatus: result.jobStatus });
+  } catch (err) { handleServiceError(err, res); }
+});
+
+// ── COMPLETED → AUTO-INVOICE (2026-08-25) ──────────────────────────────────
+// "This job has reached Completed — make sure exactly one valid invoice exists
+// for it." Deliberately a SEPARATE endpoint from POST /jobs/:id/create-invoice
+// above rather than a flag on it, for the same reason PATCH /quotes/:id/status
+// is separate from PUT /quotes/:id: the two have different contracts on an
+// already-invoiced job (the explicit action refuses it and says so; this one
+// resolves and reuses), and a caller must choose that contract explicitly
+// rather than have it inferred. BOTH go through services.ts's single
+// jobInvoiceTx writer — same numbering pool, same historical-pieces
+// protection, same job-total consistency guard, same row locks.
+//
+// Gated on BOTH 'jobs' and 'accInvoices', identically to create-invoice: an
+// automatic step must never be able to write where the explicit one may not.
+// `created` tells the client whether a document was actually raised, so the UI
+// can say "Invoice INV-00112 created" versus silently reusing what was there.
+router.post('/jobs/:id/ensure-invoice', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireCutOver('jobs', res)) || !(await requireCutOver('accInvoices', res))) return;
+  try {
+    const jobId = Number(req.params.id);
+    if (!Number.isFinite(jobId)) { res.status(400).json({ error: '"id" must be a number' }); return; }
+    const result = await ensureInvoiceForJob(jobId);
+    // 200, not 201: this endpoint's success frequently means "nothing was
+    // created, the existing invoice was resolved" — the honest status for an
+    // idempotent ensure. `created` carries the distinction.
+    res.status(200).json({ success: true, invoiceId: result.invoiceId, invoiceNumber: result.invoiceNumber, created: result.created, reused: result.reused, jobRowVersion: result.jobRowVersion, jobStage: result.jobStage, jobStatus: result.jobStatus });
   } catch (err) { handleServiceError(err, res); }
 });
 

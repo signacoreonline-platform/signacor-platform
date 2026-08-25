@@ -983,7 +983,73 @@ async function assertJobInvoiceMatchesValueTx(
 }
 
 const INSTALL_STAGE = 7;
-export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: number; invoiceNumber: string; legacyMapped?: boolean; jobRowVersion: number; jobStage: number; jobStatus: string }> {
+
+// ── COMPLETED → AUTO-INVOICE (2026-08-25) ──────────────────────────────────
+// A Job reaching Completed must end up with EXACTLY ONE valid invoice, without
+// anyone having to click "Create Invoice". That is a different CONTRACT from
+// the explicit button — not a different implementation — so it is expressed
+// here as a `mode` on the ONE writer that already exists, exactly the way
+// createInvoiceFromQuoteTx's 'proforma-only' | 'direct' modes work a few
+// hundred lines below. There is deliberately no second financial writer, no
+// second numbering path, and no second set of historical/consistency guards:
+//
+//   'create' — the explicit "Create Invoice" contract, preserved byte-for-byte:
+//              a job already flagged invoice_created is REFUSED ("already has
+//              invoice ..."), because a person clicking that button on an
+//              already-invoiced job is asking for something that would be a
+//              duplicate, and telling them so is the honest answer.
+//   'ensure' — the automatic contract: "make sure exactly one valid invoice
+//              exists for this job". Reaching an already-invoiced job is the
+//              NORMAL case here (a repeated lifecycle tick, a retry, a second
+//              browser tab), so instead of refusing it RESOLVES the job's
+//              canonical invoice and reuses it — same id, same number, same
+//              lines, same payments — and creates nothing.
+//
+// What 'ensure' deliberately does NOT do is guess. Where the job's own linkage
+// fields disagree with what rel_invoices actually holds (a ghost invoice_num
+// with no accounting record behind it, a linked invoice carrying a different
+// number, a number held by a voided record) it STOPS with a controlled
+// business-rule error and changes nothing — the same posture read.ts's
+// `invoiceLinkState: 'ambiguous'|'orphaned'` already reports to the UI, and the
+// same posture backfill.ts takes on a duplicate source id. Silently minting a
+// second number, or silently adopting someone else's document, is exactly the
+// class of defect the invoice-canonicalisation work closed.
+export type JobInvoiceMode = 'create' | 'ensure';
+
+export interface JobInvoiceResult {
+  invoiceId: number;
+  invoiceNumber: string;
+  legacyMapped?: boolean;
+  jobRowVersion: number;
+  jobStage: number;
+  jobStatus: string;
+  /** True only when a NEW rel_invoices row was written by this call. */
+  created: boolean;
+  /** True when an invoice that already existed was resolved and linked instead. */
+  reused: boolean;
+}
+
+/** The explicit "Create Invoice" action. Behaviour unchanged. */
+export async function createInvoiceForJob(jobId: number): Promise<JobInvoiceResult> {
+  return jobInvoiceTx(jobId, 'create');
+}
+
+/**
+ * "This job is Completed — make sure it has exactly one valid invoice."
+ * Idempotent by contract: calling it twice, concurrently or after a retry,
+ * yields the same single invoice and consumes exactly one document number.
+ */
+export async function ensureInvoiceForJob(jobId: number): Promise<JobInvoiceResult> {
+  return jobInvoiceTx(jobId, 'ensure');
+}
+
+/** Case/whitespace-insensitive document-number comparison, matching the rule
+ *  read.ts's resolveJobInvoiceLinks and deleteInvoice already use. */
+function sameDocNumber(a: unknown, b: unknown): boolean {
+  return String(a ?? '').trim().toUpperCase() === String(b ?? '').trim().toUpperCase();
+}
+
+async function jobInvoiceTx(jobId: number, mode: JobInvoiceMode): Promise<JobInvoiceResult> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1001,17 +1067,56 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
     const jobPiecesMap = effectivePiecesByLineId(jobPieces);
 
     if (job.invoice_num) {
-      if (job.invoice_created) {
+      if (job.invoice_created && mode === 'create') {
         throw new BusinessRuleError(`job ${jobId} (${job.job_number}) already has invoice ${job.invoice_num}`);
       }
 
+      // 'ensure' only — GHOST / AMBIGUOUS LINKAGE, resolved before anything is
+      // read or written on the number itself. A job that already points at an
+      // invoice by job_id, under a DIFFERENT number from the one stamped on the
+      // job, is the state read.ts reports as 'ambiguous': two records disagree
+      // about which document this job's money lives on, and only a person can
+      // say which is right. The explicit 'create' path never reaches here for an
+      // already-invoiced job (it refused above) and is untouched.
+      if (mode === 'ensure') {
+        const linkedRes = await client.query(
+          `SELECT id, invoice_number FROM rel_invoices
+            WHERE job_id = $1 AND COALESCE(status, '') <> 'void' ORDER BY id`,
+          [jobId]
+        );
+        const mismatched = linkedRes.rows.filter((r) => !sameDocNumber(r.invoice_number, job.invoice_num));
+        if (mismatched.length > 0) {
+          throw new LegacyInvoiceConflictError(
+            `Job ${job.job_number} could not be invoiced automatically: it is recorded as invoice ${job.invoice_num}, ` +
+            `but the invoice actually linked to it is ${mismatched.map((r) => r.invoice_number).join(', ')}. ` +
+            `Two records disagree about which invoice this job's money belongs to, so nothing was created or changed and ` +
+            `no invoice number was used. Open the job and its invoice and confirm which one is correct.`,
+            { jobId, jobNumber: job.job_number, jobInvoiceNumber: job.invoice_num, linkedInvoices: mismatched.map((r) => ({ id: r.id, invoiceNumber: r.invoice_number })) }
+          );
+        }
+      }
+
       const existingInvRes = await client.query(
-        `SELECT id, job_id FROM rel_invoices WHERE company_code = $1 AND invoice_number = $2 FOR UPDATE`,
+        `SELECT id, job_id, status FROM rel_invoices WHERE company_code = $1 AND invoice_number = $2 FOR UPDATE`,
         [job.company_code, job.invoice_num]
       );
 
       if ((existingInvRes.rowCount ?? 0) > 0) {
         const existingInv = existingInvRes.rows[0];
+        // 'ensure' only — the number on the job is held by a VOIDED record. A
+        // voided invoice is not this job's invoice (read.ts excludes it
+        // everywhere), so it must not be adopted; and the number cannot be
+        // re-issued underneath it either, because rel_invoices is UNIQUE on
+        // (company_code, invoice_number). Automatic invoicing therefore stops
+        // and says exactly that, rather than guessing in either direction.
+        if (mode === 'ensure' && String(existingInv.status ?? '') === 'void') {
+          throw new BusinessRuleError(
+            `Job ${job.job_number} could not be invoiced automatically: it is recorded as invoice ${job.invoice_num}, ` +
+            `but that invoice has been voided. A voided document is not a valid invoice and its number cannot be re-issued, ` +
+            `so nothing was created and no invoice number was used. Clear the invoice number from the job (or restore the ` +
+            `voided invoice) and invoice it again.`
+          );
+        }
         if (existingInv.job_id !== null && Number(existingInv.job_id) !== jobId) {
           throw new LegacyInvoiceConflictError(
             `job ${jobId} (${job.job_number}) carries invoice number ${job.invoice_num}, but that number already belongs to a different invoice (rel_invoices id=${existingInv.id}, linked to job_id=${existingInv.job_id}). Refusing to reassign or duplicate — resolve this historical numbering collision manually before invoicing this job.`,
@@ -1037,7 +1142,25 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
           [jobId, INSTALL_STAGE]
         );
         await client.query('COMMIT');
-        return { invoiceId: existingInv.id, invoiceNumber: job.invoice_num, legacyMapped: true, jobRowVersion: jobUpdRes1.rows[0].row_version, jobStage: jobUpdRes1.rows[0].stage, jobStatus: jobUpdRes1.rows[0].status };
+        return { invoiceId: existingInv.id, invoiceNumber: job.invoice_num, legacyMapped: true, jobRowVersion: jobUpdRes1.rows[0].row_version, jobStage: jobUpdRes1.rows[0].stage, jobStatus: jobUpdRes1.rows[0].status, created: false, reused: true };
+      }
+
+      // 'ensure' only — GHOST LINKAGE. The job is FLAGGED as already invoiced
+      // (invoice_created = true) and names a number, but no accounting record
+      // for that number exists: read.ts reports this exact shape as
+      // `invoiceLinkState: 'orphaned'`. It is NOT safe for an automatic step to
+      // resolve: it cannot tell a genuine pre-cutover job invoice (which the
+      // explicit path below does reconstruct, deliberately, on a person's
+      // click) from linkage left behind by something that went wrong. So it
+      // stops, changes nothing, and says what a person needs to decide. The
+      // 'create' path is unchanged — it still reconstructs the record from the
+      // job's own lines under the same total-consistency guard.
+      if (mode === 'ensure' && job.invoice_created) {
+        throw new BusinessRuleError(
+          `Job ${job.job_number} could not be invoiced automatically: it is already marked as invoiced under ` +
+          `${job.invoice_num}, but no invoice record with that number exists. Nothing was created and no invoice ` +
+          `number was used. Open the job and confirm whether ${job.invoice_num} is a real invoice before it is raised again.`
+        );
       }
 
       // No rel_invoices row exists for this number yet at all — create
@@ -1064,7 +1187,7 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
         [jobId, INSTALL_STAGE]
       );
       await client.query('COMMIT');
-      return { invoiceId: legacyInvoiceId, invoiceNumber: job.invoice_num, legacyMapped: true, jobRowVersion: jobUpdRes2.rows[0].row_version, jobStage: jobUpdRes2.rows[0].stage, jobStatus: jobUpdRes2.rows[0].status };
+      return { invoiceId: legacyInvoiceId, invoiceNumber: job.invoice_num, legacyMapped: true, jobRowVersion: jobUpdRes2.rows[0].row_version, jobStage: jobUpdRes2.rows[0].stage, jobStatus: jobUpdRes2.rows[0].status, created: true, reused: false };
     }
 
     // ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 6, IDEMPOTENCY ───────
@@ -1129,6 +1252,7 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
       return {
         invoiceId: reusable.id, invoiceNumber: reusable.invoice_number, legacyMapped: true,
         jobRowVersion: jobUpdReuse.rows[0].row_version, jobStage: jobUpdReuse.rows[0].stage, jobStatus: jobUpdReuse.rows[0].status,
+        created: false, reused: true,
       };
     }
 
@@ -1178,7 +1302,7 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
     );
 
     await client.query('COMMIT');
-    return { invoiceId, invoiceNumber, jobRowVersion: jobUpdRes3.rows[0].row_version, jobStage: jobUpdRes3.rows[0].stage, jobStatus: jobUpdRes3.rows[0].status };
+    return { invoiceId, invoiceNumber, jobRowVersion: jobUpdRes3.rows[0].row_version, jobStage: jobUpdRes3.rows[0].stage, jobStatus: jobUpdRes3.rows[0].status, created: true, reused: false };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw err;
