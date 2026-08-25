@@ -42,7 +42,7 @@ import {
   ConcurrencyConflictError, BusinessRuleError, LegacyInvoiceConflictError,
   createCustomer, updateCustomer,
   createQuote, convertQuoteToJob, updateQuote, updateQuoteWithJobSync,
-  createInvoiceForJob, finalizeProformaToInvoice, createJob,
+  createInvoiceForJob, finalizeProformaToInvoice, createInvoiceFromQuote, createJob,
   recordPayment, updateJob, deleteJob, updatePayment, deletePayment, getPaymentMethod,
   createCreditNote, updateCreditNote, deleteCreditNote,
   createPurchaseOrder, updatePurchaseOrder,
@@ -227,6 +227,33 @@ router.post('/quotes/:id/finalize-proforma', async (req: AuthRequest, res: Respo
     if (!Number.isFinite(quoteId)) { res.status(400).json({ error: '"id" must be a number' }); return; }
     const result = await finalizeProformaToInvoice(quoteId);
     res.status(201).json({ success: true, invoiceId: result.invoiceId, invoiceNumber: result.invoiceNumber });
+  } catch (err) { handleServiceError(err, res); }
+});
+
+// DIRECT-INVOICE-FROM-QUOTE REPAIR (2026-08-25). index.html's "Create Invoice
+// from Quote" button used to POST to /finalize-proforma above, which exists
+// only to finalise an EXISTING PRO-##### reservation and therefore refused
+// every approved quote that had never had a proforma printed or emailed
+// (`quote 371 has no proforma reservation to finalise`). This is the direct
+// path that was missing: it finalises the reservation when there is one, and
+// otherwise reserves a fresh invoice number from the same atomic counter every
+// other invoice uses. Deliberately its OWN route rather than a flag on the one
+// above, so /finalize-proforma's strict "there must be a reservation" contract
+// — relied on by the proforma numbering suites — stays exactly as it is. See
+// services.ts's createInvoiceFromQuoteTx for the full rationale.
+router.post('/quotes/:id/create-invoice', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireCutOver('quotes', res)) || !(await requireCutOver('accInvoices', res))) return;
+  try {
+    const quoteId = Number(req.params.id);
+    if (!Number.isFinite(quoteId)) { res.status(400).json({ error: '"id" must be a number' }); return; }
+    const result = await createInvoiceFromQuote(quoteId);
+    // `reused` tells the client this quote ALREADY had an invoice and none was
+    // created — it must then open that one rather than adding a second record
+    // to its local accInvoices, which would show as a duplicate until the next
+    // authoritative refresh. 200 (not 201) says the same thing in HTTP terms.
+    res.status(result.reused ? 200 : 201).json({
+      success: true, invoiceId: result.invoiceId, invoiceNumber: result.invoiceNumber, reused: result.reused,
+    });
   } catch (err) { handleServiceError(err, res); }
 });
 

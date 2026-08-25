@@ -60,8 +60,16 @@ function main() {
   ok(!/relationalApi\.createInvoiceForJob\(job\.id\)/.test(src),
     'the old buggy pattern relationalApi.createInvoiceForJob(job.id) is gone');
 
-  ok(src.includes('relationalApi.finalizeProforma(quote._relId)'),
-    'proforma finalize: relationalApi.finalizeProforma() is called with quote._relId');
+  // DIRECT-INVOICE-FROM-QUOTE REPAIR (2026-08-25): "Create Invoice from Quote"
+  // now calls relationalApi.createInvoiceFromQuote instead of
+  // relationalApi.finalizeProforma (which refused every quote carrying no PRO
+  // reservation — see services.ts's createInvoiceFromQuoteTx). The _relId
+  // invariant THIS suite exists to pin is unchanged; only the method name
+  // moved, so the pin follows it.
+  ok(src.includes('relationalApi.createInvoiceFromQuote(quote._relId)'),
+    'create invoice from quote: relationalApi.createInvoiceFromQuote() is called with quote._relId');
+  ok(!/relationalApi\.createInvoiceFromQuote\(quote\.id\)/.test(src),
+    'the old buggy pattern relationalApi.createInvoiceFromQuote(quote.id) is gone');
   ok(!/relationalApi\.finalizeProforma\(quote\.id\)/.test(src),
     'the old buggy pattern relationalApi.finalizeProforma(quote.id) is gone');
 

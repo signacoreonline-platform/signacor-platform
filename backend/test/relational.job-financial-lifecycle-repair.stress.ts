@@ -162,14 +162,26 @@ function checkFrontendSource(src: string) {
   // Issue 2 — the global auto-lifecycle effect: invoiceCreated (not
   // invoiceNum) gates the Invoiced auto-bump, and both bumps are now
   // actually persisted
-  ok(src.includes('if(st===8 && j.invoiceCreated){'),
+  // 2026-08-25 (LEGACY-AUTOSAVE REPAIR): the pins below follow the effect's
+  // current shape. The invariants they guard are IDENTICAL to before —
+  // invoiceCreated (never a bare invoiceNum) gates the Invoiced bump, every
+  // bump is persisted relationally, and the baseline is kept in step so the
+  // 800ms autosave never tries a platform_state "jobs" save. What changed is
+  // that the local/baseline patch is now applied AFTER the server confirms
+  // (and carries the returned row_version) instead of optimistically before
+  // it, which is what removed the live "Cannot save jobs here" toast. Full
+  // BEFORE/AFTER coverage lives in
+  // relational.jobs-autosave-and-quote-invoice-repair.stress.ts.
+  ok(src.includes('if(st===8 && j.invoiceCreated) due.push({job:j, stage:9, status:STAGE_STATUSES[9]});'),
     'the auto-lifecycle effect\'s Invoiced bump now requires j.invoiceCreated (a confirmed created invoice), not merely j.invoiceNum (a bare number that could be reserved without an invoice ever being created)');
   ok(!/if\(st===8 && j\.invoiceNum\)/.test(src),
     'the old invoiceNum-only gate for the Invoiced auto-bump is gone');
-  ok(src.includes('relationalApi.updateJob(p.relId, p.relRowVersion, { stage:p.stage, status:p.status })'),
-    'the auto-lifecycle effect now actually persists each stage bump via relationalApi.updateJob — previously a pure local setJobs() with no backend call at all, silently rejected by the systemic guard 800ms later in production');
-  ok(src.includes(`syncRelationalBaseline('jobs', () => next);`),
-    'the auto-lifecycle effect keeps serverBaselineRef in sync so the next autosave diff does not misreport this as an unsaved local change');
+  ok(src.includes('relationalApi.updateJob(j._relId, j._relRowVersion, { stage:d.stage, status:d.status })'),
+    'the auto-lifecycle effect actually persists each stage bump via relationalApi.updateJob — never a pure local setJobs() with no backend call, which the systemic guard would reject 800ms later in production');
+  ok(/\.then\(result=>\{[\s\S]{0,900}?syncRelationalBaseline\('jobs', jobsUpdater\);/.test(src),
+    'the auto-lifecycle effect keeps serverBaselineRef in sync with the SAME updater it applies to local state, on the confirmed-write path, so the next autosave diff does not misreport this as an unsaved local change');
+  ok(!/syncRelationalBaseline\('jobs', \(\) => next\);/.test(src),
+    'the old optimistic baseline sync (applied before the server confirmed anything, and never updated with the returned row_version) is gone');
 
   // Test I — confirm the Task 6 Notes/autosave repair call site is untouched
   ok(src.includes(`relationalApi.updateJob(job._relId, job._relRowVersion, { notes: nextNotes })`),

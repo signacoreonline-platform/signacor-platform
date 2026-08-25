@@ -488,6 +488,17 @@ const relationalApi = {
   updateQuoteStatus(id, expectedVersion, status) { return relationalFetch('/quotes/' + id + '/status', { method: 'PATCH', body: JSON.stringify({ expectedVersion: expectedVersion, status: status }) }); },
   convertQuoteToJob(quoteId) { return relationalFetch('/quotes/' + quoteId + '/convert-to-job', { method: 'POST' }); },
   finalizeProforma(quoteId) { return relationalFetch('/quotes/' + quoteId + '/finalize-proforma', { method: 'POST' }); },
+  // DIRECT-INVOICE-FROM-QUOTE REPAIR (2026-08-25). "Create Invoice from Quote"
+  // used to call finalizeProforma above, which exists only to finalise an
+  // EXISTING PRO-##### reservation — so it refused every approved quote that
+  // had never had a proforma printed or emailed ("quote NNN has no proforma
+  // reservation to finalise"), even though the JSON branch of the same button
+  // has always handled that case. This endpoint covers BOTH: it consumes the
+  // reservation when there is one (identical behaviour to finalizeProforma),
+  // and otherwise reserves a fresh invoice number from the same atomic
+  // counter. Resolves { invoiceId, invoiceNumber, reused } — `reused: true`
+  // means this quote already had an invoice and none was created.
+  createInvoiceFromQuote(quoteId) { return relationalFetch('/quotes/' + quoteId + '/create-invoice', { method: 'POST' }); },
   // POST-MIGRATION STABILIZATION (2026-08-24) — the Jobs page's "Add New Job"
   // action (a job with no source quote) had no relational path at all; see
   // services.ts's createJob. The SNS-##### number is reserved server-side from
@@ -10075,25 +10086,58 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // the Stage 2 brief — there is deliberately no separate "Reserve
     // Proforma Number" button anywhere in this file, before or after this
     // change). When both 'quotes' and 'accInvoices' are cut over, it goes
-    // entirely through relationalApi.finalizeProforma(), which maps
+    // entirely through relationalApi.createInvoiceFromQuote(), which maps
     // directly onto backend/src/relational/services.ts's
-    // finalizeProformaToInvoice — the exact same proforma-reuse /
+    // createInvoiceFromQuote — the exact same proforma-reuse /
     // atomic-numbering rule this JSON path implements below, just enforced
     // server-side instead.
+    //
+    // ── DIRECT-INVOICE-FROM-QUOTE REPAIR (2026-08-25) ──────────────────────
+    // THE LIVE DEFECT: this branch used to call relationalApi.finalizeProforma
+    // unconditionally. That endpoint's ONLY job is to finalise an EXISTING
+    // PRO-##### reservation, so services.ts's finalizeProformaToInvoice refuses
+    // outright when rel_quotes.proforma_num is NULL —
+    //     "quote 371 has no proforma reservation to finalise"
+    // surfaced by the catch below as "Invoice could NOT be created." Most
+    // approved quotes never have a proforma printed or emailed, so they carry
+    // no reservation, and the button was unusable for them. The JSON branch
+    // directly below has ALWAYS supported that case (reserve a fresh number
+    // when there is no proforma to reuse) — the relational fork simply never
+    // grew the direct-invoice half. It is NOT a business rule that a proforma
+    // must be created first, and nothing here fabricates a reservation to
+    // satisfy the older endpoint.
+    //
+    // The new endpoint covers both workflows with one shared writer:
+    //   - quote HAS a reservation  -> the exact reserved suffix is consumed
+    //                                 (PRO-00123 -> INV-00123), unchanged;
+    //   - quote has NO reservation -> a fresh number from the same atomic
+    //                                 counter every other invoice uses.
+    // It is also idempotent: if this quote already has an invoice it returns
+    // that one with `reused: true` instead of creating a second, which is the
+    // server-side twin of the getQuoteInvoice guard a few lines above.
     if(isRelationalAuthoritative('quotes') && isRelationalAuthoritative('accInvoices')){
       try {
         // BUGFIX (Stage 3): quote._relId is the real rel_quotes PK —
         // quote.id is the restored legacy JSON id, which only matches the
         // PK for a quote created after cutover. Any BACKFILLED historical
         // quote has a legacy id that differs from its relational PK.
-        const result = await relationalApi.finalizeProforma(quote._relId);
+        const result = await relationalApi.createInvoiceFromQuote(quote._relId);
+        // The server found an existing invoice for this quote and created
+        // nothing. Open it — never prepend a stub, which would show as a
+        // duplicate row until the authoritative refresh landed.
+        if(result.reused){
+          alert(`An invoice already exists for quote ${quote.num||''} (${result.invoiceNumber}). Opening it instead of creating another.`);
+          setViewQuote(null);
+          revealJobInvoice({id: result.invoiceId});
+          return;
+        }
         // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 6, same defect class
         // as the duplicate INV-00099 report. This optimistic stub carried the
         // server's REAL invoice number with `lineItems: []`, so until the next
         // full reload the freshly-created invoice displayed as R0.00 everywhere
         // — a genuine invoice showing no value, which is exactly the "R0.00
         // twin" users saw and could not distinguish from a duplicate. The
-        // backend (finalizeProformaToInvoice) does copy the quote's lines, so
+        // backend (createInvoiceFromQuote) does copy the quote's lines, so
         // the stub was the only thing claiming zero. It now mirrors those same
         // lines in the accInvoices shape (`description`/`qty`/`unitAmount`),
         // and the authoritative refresh scheduled by relationalFetch replaces
@@ -24330,40 +24374,114 @@ function App() {
   //     definition everywhere else in this file, e.g. JobDetail's own
   //     `invoiceCreated` derivation). Invoice existence must never be
   //     inferred from a bare number.
+  // ── LEGACY-AUTOSAVE REPAIR (2026-08-25) ──────────────────────────────────
+  // THE LIVE DEFECT THIS CLOSES, and why it looked like a Jobs-page failure:
+  //
+  //     Save failed — Cannot save "jobs" here — the autosave path is not yet
+  //     wired to relational persistence, and this section is now
+  //     relational-authoritative. Your edit was NOT saved.
+  //
+  // That message is assertNoUnwiredRelationalSections firing from INSIDE
+  // mergeAndSave — the generic 800ms debounced autosave — because
+  // locallyChangedSections() found `jobs` differing from serverBaselineRef.
+  // The guard is correct and is not touched here; what was wrong was its
+  // INPUT. This effect was the only remaining relational Job mutation in the
+  // file that left the baseline behind, and it did it TWICE:
+  //
+  //   1. It applied the stage bump to LOCAL state and to the baseline
+  //      OPTIMISTICALLY, before the server had confirmed anything. If the
+  //      relationalApi.updateJob call then failed, the (silent) catch left the
+  //      baseline asserting a stage the server had never accepted — an unsaved
+  //      change that looked saved, the exact failure mode the
+  //      "confirmed-save-before-success" convention exists to prevent.
+  //   2. On SUCCESS its `.then` did
+  //          setJobs(prev=>prev.map(... _relRowVersion: result.rowVersion ...))
+  //      with NO matching syncRelationalBaseline. locallyChangedSections
+  //      compares with JSON.stringify, so a changed `_relRowVersion` alone is a
+  //      diff: `jobs` immediately read as locally-changed against a baseline
+  //      that would never catch up, the 800ms autosave fired, and the guard
+  //      threw. The relational write HAD succeeded — the toast was reporting a
+  //      legacy whole-section save that should never have been attempted at all.
+  //
+  // Triggered by the ordinary Jobs-page lifecycle progressions this effect
+  // owns: recording a deposit/partial payment on a job at Deposit Requested
+  // (stage 4 -> 5), and a completed job (stage 8) gaining a created invoice
+  // (-> Invoiced, 9).
+  //
+  // THE REPAIR — one authoritative relational write per progression, and the
+  // returned row_version applied to local state and the baseline TOGETHER, by
+  // the same updater, exactly as advanceStage/saveNotes/saveLines already do.
+  // No second write is introduced, no platform_state jobs save is attempted,
+  // and the guard stays fully armed for any genuinely unwired write.
+  //
+  // The in-flight ref makes repeated ticks safe: this effect re-runs on every
+  // `jobs`/`quotes` change, and until the confirmed patch lands the job still
+  // reads as stage 4/8, so without it a burst of unrelated edits could fire
+  // several updateJob calls for the SAME progression (the second carrying a
+  // now-stale row_version, coming back 409). Keyed by relational id + target
+  // stage, cleared when the request settles.
+  const autoStageInFlightRef = useRef(null);
   useEffect(()=>{
-    let changed=false;
     const relationalJobs = isRelationalAuthoritative('jobs');
-    const toPersist=[];
-    const next=(jobs||[]).map(j=>{
+    // Which jobs are due an automatic progression right now. Read-only — this
+    // pass decides, nothing is applied until the branch below.
+    const due=[];
+    (jobs||[]).forEach(j=>{
       const st=j.stage||0;
       if(st===4){
         const rec=reconcileJobInvoice(j,quotes);
-        if(rec.totalPaid>0){
-          changed=true;
-          if(relationalJobs && j._relId!=null) toPersist.push({id:j.id, relId:j._relId, relRowVersion:j._relRowVersion, stage:5, status:STAGE_STATUSES[5]});
-          return {...j,stage:5,status:STAGE_STATUSES[5]};
-        }
+        if(rec.totalPaid>0) due.push({job:j, stage:5, status:STAGE_STATUSES[5]});
+        return;
       }
-      if(st===8 && j.invoiceCreated){
-        changed=true;
-        if(relationalJobs && j._relId!=null) toPersist.push({id:j.id, relId:j._relId, relRowVersion:j._relRowVersion, stage:9, status:STAGE_STATUSES[9]});
-        return {...j,stage:9,status:STAGE_STATUSES[9]};
-      }
-      return j;
+      if(st===8 && j.invoiceCreated) due.push({job:j, stage:9, status:STAGE_STATUSES[9]});
     });
-    if(changed){
-      setJobs(next);
-      syncRelationalBaseline('jobs', () => next);
-      toPersist.forEach(p=>{
-        relationalApi.updateJob(p.relId, p.relRowVersion, { stage:p.stage, status:p.status }).then(result=>{
-          setJobs(prev=>prev.map(j=>j.id===p.id?{...j,_relRowVersion:result.rowVersion}:j));
-        }).catch(()=>{ /* best-effort background reconciliation — silent,
-          same convention as the 30s poll's network-error handling; a
-          stale/conflicting row_version here just means someone else
-          already changed this job, and the next poll/refresh reconciles
-          to the authoritative state. */ });
-      });
+    if(!due.length) return;
+
+    // JSON authority (local dev, or a future rollback) — byte-for-byte the
+    // behaviour this effect has always had: patch local state and let the
+    // debounced JSON autosave persist it, which is legitimate there.
+    if(!relationalJobs){
+      const byId = new Map(due.map(d=>[d.job.id, d]));
+      setJobs(prev=>(prev||[]).map(j=>{
+        const d=byId.get(j.id);
+        return d ? {...j, stage:d.stage, status:d.status} : j;
+      }));
+      return;
     }
+
+    if(!autoStageInFlightRef.current) autoStageInFlightRef.current = new Set();
+    const inFlight = autoStageInFlightRef.current;
+    due.forEach(d=>{
+      const j = d.job;
+      // No relational id means this job cannot be persisted relationally, and
+      // a local-only stage bump on a relational-authoritative section is
+      // precisely the unwired write the guard exists to refuse. Leave it
+      // alone rather than showing a progression that could never be saved —
+      // the authoritative refresh/poll reconciles it either way.
+      if(j._relId==null) return;
+      const key = String(j._relId)+':'+d.stage;
+      if(inFlight.has(key)) return;
+      inFlight.add(key);
+      relationalApi.updateJob(j._relId, j._relRowVersion, { stage:d.stage, status:d.status })
+        .then(result=>{
+          // ONE updater, applied to local state AND to the baseline, carrying
+          // the server's own row_version. This is what keeps
+          // locallyChangedSections honest, so no platform_state save for
+          // "jobs" is ever attempted for this change.
+          const jobsUpdater = prev=>(prev||[]).map(x=>x.id===j.id
+            ? {...x, stage:d.stage, status:d.status, _relRowVersion:result.rowVersion}
+            : x);
+          setJobs(jobsUpdater);
+          syncRelationalBaseline('jobs', jobsUpdater);
+        })
+        .catch(()=>{ /* best-effort background reconciliation — silent, same
+          convention as the 30s poll's network-error handling; a stale/
+          conflicting row_version here just means someone else already changed
+          this job, and the next poll/refresh reconciles to the authoritative
+          state. Local state is deliberately left UNCHANGED so nothing shows a
+          progression the server never accepted. */ })
+        .then(()=>{ inFlight.delete(key); });
+    });
   },[jobs,quotes]);
 
   // All array/object sections stored in platform_state

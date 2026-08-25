@@ -1320,52 +1320,187 @@ export async function deleteInvoice(id: number, expectedVersion: number): Promis
   }
 }
 
+// ── QUOTE -> INVOICE (shared writer for BOTH quote-invoicing workflows) ────
+// 2026-08-25 — DIRECT-INVOICE-FROM-QUOTE REPAIR.
+//
+// THE DEFECT THIS CLOSES. index.html's "Create Invoice from Quote" button
+// (QuotesPage.createInvoiceFromQuote) had exactly ONE relational path:
+// relationalApi.finalizeProforma -> finalizeProformaToInvoice. That function
+// exists to FINALISE AN EXISTING PRO-##### RESERVATION and therefore refuses
+// outright when the quote has none — `quote 371 has no proforma reservation to
+// finalise`. But the majority of approved quotes never had a proforma printed
+// or emailed, so they carry no reservation, and the button was unusable for
+// them. The JSON branch directly below it in index.html has ALWAYS supported
+// the no-proforma case (it reserves a fresh INV number from the atomic
+// counter), so this was a genuine cutover gap, not a business rule: the
+// relational fork simply never grew the direct-invoice half.
+//
+// TWO WORKFLOWS, ONE WRITER, NO CONFLICT.
+//   A. quote HAS a proforma reservation -> the reserved suffix is consumed
+//      verbatim (PRO-00123 -> INV-00123); no second number is ever allocated.
+//      This is the established behaviour and is byte-for-byte unchanged.
+//   B. quote has NO proforma reservation -> a fresh invoice number is reserved
+//      from the SAME atomic counter every other invoice uses
+//      (reserveDocumentNumberWithClient, docType 'invoice') — exactly what the
+//      JSON branch and createInvoiceForJob already do.
+// Nothing fabricates a proforma reservation to satisfy the older function, and
+// neither workflow can pre-empt the other: which branch runs is decided solely
+// by whether rel_quotes.proforma_num is set.
+//
+// `mode` is what keeps the two entry points honest:
+//   'proforma-only' — finalizeProformaToInvoice's contract, preserved exactly:
+//                     refuse if there is no reservation, and refuse if the
+//                     derived number already exists.
+//   'direct'        — the button's contract: reuse this quote's existing
+//                     invoice if it already has one (idempotent, per the
+//                     established invoice-canonicalisation rules), otherwise
+//                     create exactly one.
+//
+// Financially both paths go through writeInvoiceLinesFromSourceTx +
+// writeInvoiceAdjustmentLinesTx — the same shared writers createInvoiceForJob
+// uses — so pieces x qty x unit price, the discount line and the setup-fee line
+// are all reproduced and the invoice total equals the quote total. There is
+// deliberately no second implementation of that arithmetic here.
+//
+// `reference` is deliberately left NULL, matching both the pre-existing
+// relational proforma path and index.html's JSON branch (`reference: ''`, "set
+// once this quote converts to a job"): it is the de-dup key job linkage uses
+// (createInvoiceForJob's COALESCE(NULLIF(reference,''), job_number)), so
+// stamping the quote number here would block that link later.
+type QuoteInvoiceMode = 'proforma-only' | 'direct';
+
+async function createInvoiceFromQuoteTx(
+  client: PoolClient,
+  quoteId: number,
+  mode: QuoteInvoiceMode
+): Promise<{ invoiceId: number; invoiceNumber: string; reused: boolean }> {
+  const quoteRes = await client.query('SELECT * FROM rel_quotes WHERE id = $1 FOR UPDATE', [quoteId]);
+  if (quoteRes.rowCount === 0) throw new BusinessRuleError(`quote ${quoteId} not found`);
+  const quote = quoteRes.rows[0];
+  if (mode === 'proforma-only' && !quote.proforma_num) {
+    throw new BusinessRuleError(`quote ${quoteId} has no proforma reservation to finalise`);
+  }
+
+  // ── IDEMPOTENCY (direct path only) ──────────────────────────────────────
+  // A quote may only ever have ONE invoice — index.html enforces that in the
+  // UI (getQuoteInvoice hides the button and offers "View Invoice" instead),
+  // but a stale tab, a double-click that outruns the client-side guard, or a
+  // second session can all still reach this. Reusing the existing record here
+  // means a repeated click can never mint a second document or burn a number
+  // from the atomic pool — checked BEFORE any reservation, exactly as
+  // createInvoiceForJob's own reuse branch is. Void invoices are ignored so a
+  // deliberately voided document does not permanently block re-invoicing.
+  // Deliberately NOT applied to 'proforma-only': finalizeProformaToInvoice's
+  // established contract is to REFUSE a second finalisation loudly, and that
+  // refusal is asserted by the existing suites.
+  if (mode === 'direct') {
+    const reusable = await client.query(
+      `SELECT id, invoice_number FROM rel_invoices
+        WHERE quote_id = $1 AND COALESCE(status, '') <> 'void'
+        ORDER BY id ASC LIMIT 1
+        FOR UPDATE`,
+      [quoteId]
+    );
+    if ((reusable.rowCount ?? 0) > 0) {
+      return {
+        invoiceId: Number(reusable.rows[0].id),
+        invoiceNumber: String(reusable.rows[0].invoice_number),
+        reused: true,
+      };
+    }
+  }
+
+  let invoiceNumber: string;
+  if (quote.proforma_num) {
+    // Consume the EXACT reserved suffix (same derivation rule as
+    // documentNumbers.ts deriveReservedInvoiceNumber) — never allocate a second.
+    const m = /^PRO-(\d+)$/i.exec(String(quote.proforma_num).trim());
+    invoiceNumber = m ? `INV-${m[1]}` : String(quote.proforma_num).trim().toUpperCase();
+    const existing = await client.query(
+      'SELECT id FROM rel_invoices WHERE company_code = $1 AND invoice_number = $2',
+      [quote.company_code, invoiceNumber]
+    );
+    if (existing.rowCount && existing.rowCount > 0) {
+      throw new BusinessRuleError(`invoice ${invoiceNumber} already exists for company ${quote.company_code} — this reservation was already finalised, refusing to create a second invoice`);
+    }
+  } else {
+    invoiceNumber = await reserveDocumentNumberWithClient(client, quote.company_code, 'invoice');
+  }
+
+  const lineItemsRes = await client.query('SELECT * FROM rel_quote_line_items WHERE quote_id = $1 ORDER BY line_index', [quoteId]);
+  // contact_email / contact_address are new here (2026-08-25) and purely
+  // additive — they were left NULL before, so a quote invoice opened in
+  // Accounting showed no contact details at all, the same defect BUG 6 fixed
+  // for job invoices. company_code comes from the quote, so an Original (co=2)
+  // quote can never produce a Holdings (co=1) invoice or vice versa.
+  const invRes = await client.query(
+    `WITH new_id AS (SELECT nextval('rel_invoices_id_seq') AS id)
+     INSERT INTO rel_invoices (id, source_id, invoice_number, company_code, customer_id, contact_name, contact_email, contact_address, quote_id, quote_number_raw, status, issue_date, legacy_data)
+     SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $7, $8, $5, $6, 'sent', CURRENT_DATE, '{}'::jsonb FROM new_id
+     RETURNING id`,
+    [invoiceNumber, quote.company_code, quote.customer_id, quote.customer_name_raw, quoteId, quote.quote_number,
+     quote.email, quote.address]
+  );
+  const invoiceId = Number(invRes.rows[0].id);
+  // JOB/QUOTE -> INVOICE FINANCIAL CONSISTENCY REPAIR (2026-08-25): this
+  // loop carried the SAME defect as writeInvoiceLinesFromJobTx — a plain
+  // qty x unit_price copy that dropped `pieces`, the setup fee and the
+  // discount, so a proforma finalised relationally did not add up to its own
+  // quote. It now goes through the shared writers, which is also what makes
+  // Quote -> Invoice and Job -> Invoice produce the identical document for
+  // the identical commercial content.
+  const { nextIndex, linesSubtotal } = await writeInvoiceLinesFromSourceTx(
+    client, invoiceId, 'rel_quote_line_items', lineItemsRes.rows
+  );
+  await writeInvoiceAdjustmentLinesTx(
+    client, invoiceId, nextIndex, linesSubtotal, quote.setup_fee, quote.discount_pct
+  );
+  return { invoiceId, invoiceNumber, reused: false };
+}
+
 // ── PRO -> INV finalisation ──────────────────────────────────────────────
 // Verifies the PRO reservation belongs to this quote, verifies the matching
 // INV reservation (same derivation rule as documentNumbers.ts
 // deriveReservedInvoiceNumber), consumes the EXACT reserved suffix — never
 // allocates a second number.
+//
+// 2026-08-25: the body moved into createInvoiceFromQuoteTx above so the direct
+// path cannot drift from it. The contract of THIS function is unchanged: it
+// still refuses a quote with no proforma reservation, and still refuses a
+// second finalisation of the same reservation.
 export async function finalizeProformaToInvoice(quoteId: number): Promise<{ invoiceId: number; invoiceNumber: string }> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const quoteRes = await client.query('SELECT * FROM rel_quotes WHERE id = $1 FOR UPDATE', [quoteId]);
-    if (quoteRes.rowCount === 0) throw new BusinessRuleError(`quote ${quoteId} not found`);
-    const quote = quoteRes.rows[0];
-    if (!quote.proforma_num) throw new BusinessRuleError(`quote ${quoteId} has no proforma reservation to finalise`);
-
-    const m = /^PRO-(\d+)$/i.exec(String(quote.proforma_num).trim());
-    const invoiceNumber = m ? `INV-${m[1]}` : String(quote.proforma_num).trim().toUpperCase();
-
-    const existing = await client.query('SELECT id FROM rel_invoices WHERE company_code = $1 AND invoice_number = $2', [quote.company_code, invoiceNumber]);
-    if (existing.rowCount && existing.rowCount > 0) {
-      throw new BusinessRuleError(`invoice ${invoiceNumber} already exists for company ${quote.company_code} — this reservation was already finalised, refusing to create a second invoice`);
-    }
-
-    const lineItemsRes = await client.query('SELECT * FROM rel_quote_line_items WHERE quote_id = $1 ORDER BY line_index', [quoteId]);
-    const invRes = await client.query(
-      `WITH new_id AS (SELECT nextval('rel_invoices_id_seq') AS id)
-       INSERT INTO rel_invoices (id, source_id, invoice_number, company_code, customer_id, contact_name, quote_id, quote_number_raw, status, issue_date, legacy_data)
-       SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, $6, 'sent', CURRENT_DATE, '{}'::jsonb FROM new_id
-       RETURNING id`,
-      [invoiceNumber, quote.company_code, quote.customer_id, quote.customer_name_raw, quoteId, quote.quote_number]
-    );
-    const invoiceId = invRes.rows[0].id;
-    // JOB/QUOTE -> INVOICE FINANCIAL CONSISTENCY REPAIR (2026-08-25): this
-    // loop carried the SAME defect as writeInvoiceLinesFromJobTx — a plain
-    // qty x unit_price copy that dropped `pieces`, the setup fee and the
-    // discount, so a proforma finalised relationally did not add up to its own
-    // quote. It now goes through the shared writers, which is also what makes
-    // Quote -> Invoice and Job -> Invoice produce the identical document for
-    // the identical commercial content.
-    const { nextIndex, linesSubtotal } = await writeInvoiceLinesFromSourceTx(
-      client, invoiceId, 'rel_quote_line_items', lineItemsRes.rows
-    );
-    await writeInvoiceAdjustmentLinesTx(
-      client, invoiceId, nextIndex, linesSubtotal, quote.setup_fee, quote.discount_pct
-    );
+    const { invoiceId, invoiceNumber } = await createInvoiceFromQuoteTx(client, quoteId, 'proforma-only');
     await client.query('COMMIT');
     return { invoiceId, invoiceNumber };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// ── DIRECT QUOTE -> TAX INVOICE ──────────────────────────────────────────
+// The relational counterpart of index.html's "Create Invoice from Quote"
+// (QuotesPage.createInvoiceFromQuote) — a standalone tax invoice raised
+// against an approved quote BEFORE any job exists, so the client can pay
+// immediately. See createInvoiceFromQuoteTx above for the full rationale and
+// for how this coexists with finalizeProformaToInvoice without either
+// workflow pre-empting the other.
+//
+// Returns `reused: true` when this quote already had an invoice — the caller
+// opens that one instead of creating a duplicate, which is the same rule the
+// UI's own getQuoteInvoice guard applies one layer earlier.
+export async function createInvoiceFromQuote(quoteId: number): Promise<{ invoiceId: number; invoiceNumber: string; reused: boolean }> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await createInvoiceFromQuoteTx(client, quoteId, 'direct');
+    await client.query('COMMIT');
+    return result;
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw err;
@@ -1404,7 +1539,12 @@ export async function finalizeProformaToInvoice(quoteId: number): Promise<{ invo
 // Called for every recordPayment/updatePayment/deletePayment, inside the
 // SAME transaction, so the status update can never land without the
 // payment change (or vice versa).
-async function recomputeOwnerPaymentStatus(client: PoolClient, ownerType: 'job' | 'invoice' | 'quote', ownerId: number): Promise<void> {
+// EXPORTED (2026-08-25) so a one-off, narrowly-scoped payment repair can
+// derive an owner's status with THIS function — the deployed one — rather than
+// re-implementing the paid/partial rule in a script. See
+// src/scripts/repair-audio-access-payment-dedup.ts. Behaviour is unchanged:
+// the only difference is the `export` keyword.
+export async function recomputeOwnerPaymentStatus(client: PoolClient, ownerType: 'job' | 'invoice' | 'quote', ownerId: number): Promise<void> {
   // Quotes' own `status` (draft/converted/...) is a business-workflow field,
   // never payment-derived — matches the JSON path, where quote.payments[]
   // never touches quote.status either.
@@ -1618,7 +1758,12 @@ export async function getPaymentMethod(id: number): Promise<string | null> {
 // payments without ever releasing what they had consumed. Extracted verbatim
 // (same oldest-releasable-first selection, same FOR UPDATE, same row_version
 // bump) so both callers apply one identical rule and cannot drift.
-async function releaseCreditForPaymentTx(
+// EXPORTED (2026-08-25) alongside recomputeOwnerPaymentStatus, for the same
+// reason: a repair that deletes a payment must reverse its credit-note effect
+// EXACTLY as deletePayment does. Re-implementing LIFO credit release in a
+// script would be a second source of truth. A non-Credit payment returns 0 and
+// touches nothing. Behaviour is unchanged: only the `export` keyword is new.
+export async function releaseCreditForPaymentTx(
   client: PoolClient,
   payment: { method?: string | null; owner_type: 'job' | 'invoice' | 'quote'; owner_id: number; amount: number | string }
 ): Promise<number> {
