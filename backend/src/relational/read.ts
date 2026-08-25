@@ -112,6 +112,49 @@ function num(v: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+// ── LINE IDENTITY (2026-08-25 — QUOTE EDIT LINE-LINKING REGRESSION) ─────────
+//
+// THE DEFECT THIS CLOSES. Every line control in index.html's CreateQuoteModal
+// (and JobDetail's line editor, and the job-invoice modal) addresses its row by
+// `line.id`: `updateLine(line.id, …)` targets with `if (l.id !== id) return l`,
+// `removeLine(id)` filters on it, `moveLine`/`copyLine` find on it, and the
+// React key is it. But the line mappers below never emitted an `id` at all. A
+// line whose legacy_data is '{}' — which is EVERY line created or re-saved
+// since cutover, because relational writes set legacy_data to '{}' — therefore
+// hydrated with `id === undefined`, and the guard became
+// `undefined !== undefined`, i.e. FALSE for every row. One keystroke in one
+// description rewrote all of them; one click on Remove deleted all of them.
+//
+// The identity emitted here is NOT a new database id invented for the
+// frontend. `rel_quote_line_items.id` / `rel_job_line_items.id` are existing
+// BIGSERIAL primary keys — already unique, already stable across reads, and
+// already the row's real identity. They are used only as a FALLBACK, so that:
+//
+//   * a BACKFILLED line, whose original JSON `id` is preserved verbatim in
+//     legacy_data, keeps rendering with exactly the identity it has today —
+//     zero behavioural change for historical records; and
+//   * a line with no preserved id, or one belonging to a document whose
+//     preserved ids are not all present and distinct, gets the primary key,
+//     which cannot collide.
+//
+// The all-or-nothing rule matters: mixing preserved ids and primary keys inside
+// one document could in principle collide (a small legacy id equal to a small
+// PK), so a document either uses its own complete, distinct set of preserved
+// ids or the primary keys throughout. Line `id` is never persisted — the save
+// path (index.html handleSave -> services.ts LineItemPatch) sends description,
+// qty, unitPrice, unit, inventoryItemId and the migration-013 fields, and
+// nothing else — so this is purely a rendering/editing identity.
+function lineIdentities(rows: any[]): Array<number | string> {
+  const legacyIds = rows.map((l) => {
+    const v = legacyBase(l).id;
+    return v === null || v === undefined || v === '' ? null : v;
+  });
+  const allPresent = legacyIds.every((v) => v !== null);
+  const allDistinct = new Set(legacyIds.map((v) => String(v))).size === legacyIds.length;
+  if (allPresent && allDistinct) return legacyIds as Array<number | string>;
+  return rows.map((l) => restoreId(String(l.id)));
+}
+
 // 2026-08-23 (production cutover repair — HOLDINGS ZERO-DATA / COMPANY-
 // SCOPING REPAIR): `company_code` is stored as TEXT in every rel_* table
 // (it has always doubled as a free-form code, not strictly a company id),
@@ -274,8 +317,12 @@ export async function buildQuotesJson(): Promise<any[]> {
     const linesRes = await pool.query(
       'SELECT * FROM rel_quote_line_items WHERE quote_id = $1 ORDER BY line_index', [r.id]
     );
-    const items = linesRes.rows.map((l) => ({
+    const quoteLineIds = lineIdentities(linesRes.rows);
+    const items = linesRes.rows.map((l, i) => ({
       ...legacyBase(l),
+      // See lineIdentities() above — without this every line hydrated with
+      // `id === undefined` and editing one line edited all of them.
+      id: quoteLineIds[i],
       desc: l.description,
       qty: num(l.qty),
       unitPrice: num(l.unit_price),
@@ -423,8 +470,12 @@ export async function buildJobsJson(): Promise<any[]> {
     const linesRes = await pool.query(
       'SELECT * FROM rel_job_line_items WHERE job_id = $1 ORDER BY line_index', [r.id]
     );
-    const items = linesRes.rows.map((l) => ({
+    const jobLineIds = lineIdentities(linesRes.rows);
+    const items = linesRes.rows.map((l, i) => ({
       ...legacyBase(l),
+      // Same identity guarantee as the quote lines above — JobDetail's line
+      // editor and the job-invoice modal address their rows by `line.id` too.
+      id: jobLineIds[i],
       desc: l.description,
       qty: num(l.qty),
       unitPrice: num(l.unit_price),

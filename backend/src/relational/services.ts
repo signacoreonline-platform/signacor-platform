@@ -804,7 +804,14 @@ async function writeInvoiceAdjustmentLinesTx(
   return lineIndex;
 }
 
-async function writeInvoiceLinesFromJobTx(
+// EXPORTED (2026-08-25) so a one-off, narrowly-scoped repair of a single
+// historical invoice can rebuild that invoice's lines with THIS function —
+// the deployed writer itself — rather than a copy of it. A repair that
+// re-implements the financial logic it is repairing towards is a second
+// source of truth waiting to drift; see
+// src/scripts/repair-audio-access-inv-00103.ts. Behaviour is unchanged: the
+// only difference is the `export` keyword.
+export async function writeInvoiceLinesFromJobTx(
   client: PoolClient,
   invoiceId: number,
   jobLines: any[],
