@@ -62,8 +62,22 @@ function checkSourceWiring(src: string) {
     'saveLines checks isRelationalAuthoritative(\'jobs\') before deciding how to persist');
   ok(src.includes(`relationalApi.updateJob(job._relId, job._relRowVersion, { lines: patchLines })`),
     'saveLines calls relationalApi.updateJob with job._relId/job._relRowVersion and a lines patch');
-  ok(src.includes(`const patchLines = cleanLines.map(l=>({ desc: l.desc, qty: l.qty, unitPrice: l.unitPrice, unit: l.unit, itemId: l.itemId }));`),
+  // 2026-08-25: this assertion pinned the PRE-migration-013 patch shape as one
+  // exact string, and went red the moment the Quote Reliability Repair added
+  // the five 013 fields to saveLines — which it had to, because
+  // replaceJobLinesTx recomputes every subtotal as pieces x qty x unitPrice, so
+  // a wholesale line replacement that omitted `pieces` would reprice every
+  // multi-piece line to 1/pQty (013's own header says exactly that). It is
+  // restored to its real intent — every field services.ts's LineItemPatch
+  // expects is present and correctly named — instead of a frozen snapshot of
+  // one historical line of source that no longer exists.
+  ok(/const patchLines = cleanLines\.map\(l=>\(\{ desc: l\.desc, qty: l\.qty, unitPrice: l\.unitPrice, unit: l\.unit, itemId: l\.itemId,/.test(src),
     'saveLines maps to the EXACT LineItemPatch shape services.ts expects (desc/qty/unitPrice/unit/itemId) — no renamed/missing fields');
+  ok(/pieces: l\.pQty===''\|\|l\.pQty===undefined\?null:l\.pQty/.test(src) &&
+     /sqmL: l\.sqmL===''\|\|l\.sqmL===undefined\?null:l\.sqmL/.test(src) &&
+     /sqmW: l\.sqmW===''\|\|l\.sqmW===undefined\?null:l\.sqmW/.test(src) &&
+     /cpId: l\.cpId\?\?null/.test(src) && /cpLinked: l\.cpLinked\?\?null/.test(src),
+    'and carries all five migration-013 fields too (pieces from pQty, sqmL/sqmW, cpId/cpLinked) — omitting pieces would silently reprice every multi-piece line');
 
   ok(/async function advanceStage\(\)\{[\s\S]{0,300}isRelationalAuthoritative\('jobs'\)/.test(src),
     'advanceStage checks isRelationalAuthoritative(\'jobs\') before deciding how to persist');

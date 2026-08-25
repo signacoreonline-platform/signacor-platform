@@ -3504,6 +3504,50 @@ function getManualInvoiceJobRefs(accInvoices, jobs) {
 }
 
 /* ═══════════════════════════════════════════
+   INVOICE ADJUSTMENT LINES (2026-08-25 — JOB/QUOTE → INVOICE FINANCIAL
+   CONSISTENCY REPAIR)
+   An accInvoices record has no setupFee/discount fields of its own — it is a
+   flat list of lineItems, each qty × unitAmount, taxed at 15%. The ONLY way a
+   quote's or job's document-level setup fee and discount can survive onto an
+   invoice is therefore as their own adjustment LINES. That convention is not
+   new: createInvoiceFromQuote's JSON branch has always written exactly these
+   two lines, in this order, with these descriptions. It is now shared, so the
+   optimistic stub, the JSON branch and the backend (services.ts's
+   writeInvoiceAdjustmentLinesTx) can never disagree about what an invoice for
+   the same commercial content should come to.
+
+   Discount is a NEGATIVE qty-1 line rather than a reduction spread across the
+   item lines: every item line keeps its true unit price, the discount is
+   stated explicitly on the customer's document, and buildManualInvoiceHtml
+   already renders negative lines in red. Both lines carry taxType '15%', so
+   VAT lands on (subtotal − discount + setupFee) — the quote's own flat VAT
+   calculation.
+
+   `sub` is the PIECE-AWARE line total (pQty × qty × unitPrice — the form's own
+   formula, and lineSubtotal()'s on the server), never a bare qty × unitPrice,
+   so the discount is always a percentage of the real line value.
+═══════════════════════════════════════════ */
+function docLinesSubtotal(lines){
+  return (lines||[]).reduce((s,l)=>{
+    if(!l) return s;
+    const rawP = parseFloat(l.pQty);
+    const p = (Number.isFinite(rawP) && rawP > 0) ? rawP : 1;
+    return s + p*(parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
+  },0);
+}
+function stubAdjustmentLines(doc){
+  if(!doc) return [];
+  const sub     = docLinesSubtotal(doc.lines);
+  const discPct = parseFloat(doc.discount)||0;
+  const discAmt = sub*(discPct/100);
+  const setupFee= parseFloat(doc.setupFee)||0;
+  const out = [];
+  if(discAmt>0.005) out.push({ description:`Discount (${discPct}%)`, qty:1, unitAmount:-discAmt, accountCode:'4000', taxType:'15%' });
+  if(setupFee>0.005) out.push({ description:'Design & Setup Fee', qty:1, unitAmount:setupFee, accountCode:'4000', taxType:'15%' });
+  return out;
+}
+
+/* ═══════════════════════════════════════════
    INVOICE-FROM-QUOTE LINKING HELPERS (2026-08-05)
    A quote can be invoiced directly, before any job exists (see
    QuotesPage.createInvoiceFromQuote). That invoice lives in accInvoices —
@@ -10020,10 +10064,20 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           reference: quote.num||'', jobId:null, jobNum:'',
           quoteId: quote.id, quoteNum: quote.num,
           status:'sent',
+          // JOB/QUOTE -> INVOICE FINANCIAL CONSISTENCY REPAIR (2026-08-25).
+          // This stub used to price each line as qty x unitPrice and stop
+          // there — no piece count, no discount line, no setup-fee line — so
+          // it displayed a LOWER total than the invoice the server had just
+          // written, until the authoritative refresh landed. It now mirrors
+          // services.ts's writeInvoiceLinesFromSourceTx /
+          // writeInvoiceAdjustmentLinesTx exactly: the piece count folded into
+          // the billed qty (pQty here, `pieces` on the wire, NULL/<=0 read as
+          // 1), then the discount and setup-fee adjustment lines in that
+          // order — the same convention the JSON branch below already used.
           lineItems: (quote.lines||[]).map(l=>({
-            description: l.desc||'', qty: parseFloat(l.qty)||0,
+            description: l.desc||'', qty: (((parseFloat(l.pQty)||0)>0?parseFloat(l.pQty):1)*(parseFloat(l.qty)||0)),
             unitAmount: parseFloat(l.unitPrice)||0, accountCode:'4000', taxType:'15%',
-          })),
+          })).concat(stubAdjustmentLines(quote)),
           payments: (quote.payments||[]).map(p=>({...p})),
         };
         const accInvoicesUpdater = prev=>[stubInvoice, ...prev];
@@ -10038,7 +10092,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     }
     const today = new Date().toISOString().slice(0,10);
     const due   = new Date(Date.now()+30*864e5).toISOString().slice(0,10);
-    const sub      = (quote.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
+    // 2026-08-25 (JOB/QUOTE → INVOICE FINANCIAL CONSISTENCY REPAIR): `sub` is
+    // now the piece-aware line total via the shared docLinesSubtotal(), rather
+    // than a sum of each line's stored `subtotal`. Same number for a healthy
+    // quote — l.subtotal IS pQty × qty × unitPrice — but it no longer silently
+    // trusts a stale/absent stored subtotal, and it is the identical formula
+    // the adjustment lines and the backend both use.
+    const sub      = docLinesSubtotal(quote.lines);
     const discPct  = parseFloat(quote.discount)||0;
     const discAmt  = sub*(discPct/100);
     const setupFee = parseFloat(quote.setupFee)||0;
@@ -10047,12 +10107,19 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // as the quote's own flat VAT calc), with discount/setup fee reproduced
     // as their own adjustment lines so the invoice subtotal, VAT and total
     // match the quote precisely (subtotal - discAmt + setupFee, then *1.15).
+    // 2026-08-25: the PIECE COUNT is folded into each line's billed qty here
+    // too. Without it this branch emitted qty × unitPrice and every
+    // multi-piece quote produced an invoice worth 1/pQty of the quote — the
+    // JSON-side twin of the confirmed SNS-00110 / INV-00103 defect. An
+    // invoice line is an accounting line with no inventory or dimension
+    // fields, so pieces × qty is the honest billed quantity; unitAmount stays
+    // the true unit price. NULL/0/absent pQty reads as 1, so every historical
+    // quote prices exactly as it does today.
     const lineItems = (quote.lines||[]).map(l=>({
-      description: l.desc||'', qty: parseFloat(l.qty)||1, unitAmount: parseFloat(l.unitPrice)||0,
+      description: l.desc||'', qty: (((parseFloat(l.pQty)||0)>0?parseFloat(l.pQty):1)*(parseFloat(l.qty)||1)),
+      unitAmount: parseFloat(l.unitPrice)||0,
       accountCode:'4000', taxType:'15%'
-    }));
-    if(discAmt>0.005) lineItems.push({ description:`Discount (${discPct}%)`, qty:1, unitAmount:-discAmt, accountCode:'4000', taxType:'15%' });
-    if(setupFee>0.005) lineItems.push({ description:'Design & Setup Fee', qty:1, unitAmount:setupFee, accountCode:'4000', taxType:'15%' });
+    })).concat(stubAdjustmentLines(quote));
 
     // Deposits/partials already recorded on the quote travel with it onto
     // this new invoice, so payment tracking picks up where the quote left

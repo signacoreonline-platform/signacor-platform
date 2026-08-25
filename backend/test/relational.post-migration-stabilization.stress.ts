@@ -697,15 +697,30 @@ async function main() {
 
   // F2 — the R0.00 half.
   const inv9json = (await buildInvoicesJson()).find((x) => x._relId === inv9.invoiceId);
-  ok(Array.isArray(inv9json.lineItems) && inv9json.lineItems.length === 2,
+  // 2026-08-25 (JOB/QUOTE → INVOICE FINANCIAL CONSISTENCY REPAIR): this count
+  // was 2 — one invoice line per quote line — because the writer copied only
+  // the item lines. makeFullQuote carries setupFee 750 and discountPct 10, and
+  // BOTH were being silently dropped from the invoice. The repaired writer adds
+  // them as the two adjustment lines index.html's own Quote → Invoice action
+  // has always used, so the correct count for this fixture is 4. The assertion
+  // still pins exactly what F2 was written to pin (the lines land under
+  // `lineItems`, not only under `items`) — it now pins the right number of them.
+  ok(Array.isArray(inv9json.lineItems) && inv9json.lineItems.length === 4,
     'F2: read.ts emits the invoice lines under `lineItems` — the key EVERY frontend consumer actually reads. Emitting only `items` is what made every relationally-hydrated invoice render as R0.00',
     inv9json.lineItems && inv9json.lineItems.length);
+  const inv9Descs = inv9json.lineItems.map((l: any) => l.description);
+  ok(inv9Descs.includes('Discount (10%)') && inv9Descs.includes('Design & Setup Fee'),
+    'F2: and they include the quote\'s discount and setup fee, which used to vanish between a quote and its invoice', inv9Descs);
   const inv9Total = inv9json.lineItems.reduce((s: number, l: any) => {
     const sub = Number(l.qty) * Number(l.unitAmount);
     return s + sub + (l.taxType === '15%' ? sub * 0.15 : 0);
   }, 0);
   ok(inv9Total > 0,
     'F2: computing the invoice total exactly the way the UI does now yields a real amount, not zero', inv9Total);
+  const q9Total = Number((await pool.query(`SELECT total FROM rel_quotes WHERE id = $1`, [q9.id])).rows[0].total);
+  ok(Math.abs(inv9Total - q9Total) < 0.005,
+    'F2: and it equals the quote it came from, to the cent — the invoice no longer under-states the work it bills for',
+    { invoice: inv9Total, quote: q9Total });
   ok(Array.isArray(inv9json.items) && inv9json.items.length === inv9json.lineItems.length,
     'F2: `items` is still emitted alongside it, so existing consumers (fullBackupV2, reconcile, backups) are unaffected');
 
@@ -753,8 +768,17 @@ async function main() {
   // F6 — the client-side merge key.
   ok(src.includes('if (i.reference) refs.add(i.reference);') && src.includes('if (i.jobNum) refs.add(i.jobNum);'),
     'F6 [frontend]: the invoice de-duplication key is widened to reference OR jobNum, which self-heals every invoice created BEFORE the reference fix — including the live INV-00099 — with no data repair');
-  ok(/const stubInvoice = \{[\s\S]{0,900}lineItems: \(quote\.lines\|\|\[\]\)\.map/.test(src),
+  // 2026-08-25: the 900-character window was measured against the stub as it
+  // stood in August; the financial-consistency repair documents the piece-count
+  // and adjustment-line change inline, which pushes `lineItems:` further from
+  // the opening brace. Widened, and paired with a check that the stub now
+  // mirrors the backend's own adjustment lines — a stub that shows a smaller
+  // total than the invoice the server just wrote is the same R0.00-class defect
+  // F6 exists to prevent, one order of magnitude quieter.
+  ok(/const stubInvoice = \{[\s\S]{0,2000}lineItems: \(quote\.lines\|\|\[\]\)\.map/.test(src),
     'F6 [frontend]: the optimistic invoice stub carries the quote\'s real lines instead of an empty array that displayed as R0.00');
+  ok(src.includes('.concat(stubAdjustmentLines(quote))'),
+    'F6 [frontend]: and it carries the quote\'s discount / setup-fee adjustment lines too, so the stub totals what the server actually wrote');
 
   // ══════════════════════════════════════════════════════════════════════════
   // BUG 7 — PAYMENT DELETE SHOWS LOCK ICON

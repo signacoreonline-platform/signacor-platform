@@ -651,6 +651,159 @@ export async function createJob(input: CreateJobInput): Promise<{ id: number; jo
 // an invoice line's unit_amount is VAT-EXCLUSIVE and the '15%' tax_type adds
 // the VAT back — so the value is divided by 1.15 here to avoid charging VAT
 // twice. A zero-value job still produces no line, exactly as before.
+
+// ── JOB/QUOTE -> INVOICE FINANCIAL CONSISTENCY REPAIR (2026-08-25) ──────────
+//
+// CONFIRMED PRODUCTION DEFECT (Audio Access — SQ-00108 / SNS-00110 /
+// INV-00103). An invoice derived from a job or a quote used to be written as
+// a plain `qty x unit_price` copy of the source lines. That silently dropped
+// EVERY other component of the document's commercial value:
+//
+//   * `pieces` (migration 013)  — the piece count. `lineSubtotal()` below is
+//     THE line formula for quotes and jobs: pieces x qty x unitPrice. Copying
+//     only qty x unit_price under-billed every multi-piece line by a factor of
+//     `pieces`. On SNS-00110 (5 lines, pieces=2) that turned a R7,300.27 job
+//     into a R3,506.39 invoice.
+//   * `setup_fee`   — the job/quote carries it as a document-level column and
+//     it was never represented on the invoice at all.
+//   * `discount_pct`— likewise; an invoice for a discounted job was billed at
+//     the UNDISCOUNTED line total, i.e. the customer was over-charged.
+//
+// The representation used here is NOT invented: it is the convention
+// index.html's own Quote -> Invoice action (createInvoiceFromQuote) has always
+// used on the JSON side — "discount/setup fee reproduced as their own
+// adjustment lines so the invoice subtotal, VAT and total match the quote
+// precisely (subtotal - discAmt + setupFee, then *1.15)". This makes the
+// relational path agree with the JSON path instead of diverging from it.
+//
+// WHY `pieces` IS FOLDED INTO THE INVOICE LINE'S qty AND NEEDS NO MIGRATION
+//   rel_invoice_line_items is an ACCOUNTING line, not a production or
+//   inventory row. It has no inventory_item_id, no unit, no dimensions — by
+//   design (007_relational_core.sql). Nothing derives stock consumption,
+//   payments, job data or quote data from it:
+//     - inventory is consumed once, at convertQuoteToJob, from
+//       rel_job_line_items (which keeps pieces and qty separate, exactly as
+//       lineSubtotal's contract requires);
+//     - payments are their own rel_payments rows with their own amounts;
+//     - the printed/emailed invoice (index.html buildManualInvoiceHtml) and
+//       every total in the app read qty x unitAmount and nothing else;
+//     - invoice editing (replaceInvoiceLinesTx) round-trips {qty, unitAmount}
+//       verbatim, so an edited line stays exactly what it displays.
+//   Folding pieces into qty therefore changes no other subsystem, keeps
+//   unit_amount the TRUE unit price (so the invoice still reads honestly as
+//   "N @ R x"), and makes qty x unit_amount identical to
+//   lineSubtotal(pieces, qty, unitPrice) by construction. A NULL or
+//   non-positive `pieces` reads as 1 — the same rule lineSubtotal applies —
+//   so every historical line prices EXACTLY as it does today.
+//   Note this is deliberately the opposite decision to rel_job_line_items /
+//   rel_quote_line_items, where pieces and qty MUST stay separate because the
+//   spec line and inventory consumption both depend on them individually.
+
+/** Effective billed quantity for one source line: pieces x qty, NULL/<=0 pieces read as 1.
+ *  Expressed in SQL so the multiplication happens in exact NUMERIC, never JS float. */
+const EFFECTIVE_QTY_SQL = '(CASE WHEN sl.pieces IS NULL OR sl.pieces <= 0 THEN 1 ELSE sl.pieces END) * sl.qty';
+
+/** Money rounded to the 4 decimal places rel_invoice_line_items.unit_amount stores,
+ *  so what this function computes and what the database keeps can never disagree. */
+function roundMoney4(n: number): number {
+  return Math.round((Number(n) || 0) * 10000) / 10000;
+}
+
+/** "10.000" -> "10", "12.500" -> "12.5" — the discount line reads the way a
+ *  person wrote it, matching index.html's `parseFloat(quote.discount)`. */
+function formatDiscountPct(pct: number): string {
+  return String(Number(pct));
+}
+
+/** Below this, an adjustment is not worth a line — the same 0.005 threshold
+ *  index.html's createInvoiceFromQuote uses for both adjustments. */
+const ADJUSTMENT_LINE_THRESHOLD = 0.005;
+
+/**
+ * Copies a document's own line items onto an invoice, folding `pieces` into
+ * the billed quantity (see the block comment above), and returns both the next
+ * free line_index and the VAT-EXCLUSIVE subtotal those lines came to.
+ *
+ * `sourceTable` is the table the rows came from — the rows are re-read by id so
+ * the arithmetic is done by Postgres in exact NUMERIC rather than by JS on
+ * values that have already been through a float.
+ */
+async function writeInvoiceLinesFromSourceTx(
+  client: PoolClient,
+  invoiceId: number,
+  sourceTable: 'rel_job_line_items' | 'rel_quote_line_items',
+  sourceLines: any[]
+): Promise<{ nextIndex: number; linesSubtotal: number }> {
+  let nextIndex = 0;
+  for (const l of sourceLines) {
+    await client.query(
+      `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
+       SELECT $1, $2, sl.description, ${EFFECTIVE_QTY_SQL}, sl.unit_price, '4000', '15%', '{}'::jsonb
+         FROM ${sourceTable} sl
+        WHERE sl.id = $3`,
+      [invoiceId, nextIndex, l.id]
+    );
+    nextIndex++;
+  }
+  // The subtotal is read back from what was actually written, so it can never
+  // drift from the lines the customer will see on the invoice.
+  const sumRes = await client.query(
+    `SELECT COALESCE(SUM(qty * unit_amount), 0) AS subtotal
+       FROM rel_invoice_line_items WHERE invoice_id = $1`,
+    [invoiceId]
+  );
+  return { nextIndex, linesSubtotal: Number(sumRes.rows[0].subtotal) || 0 };
+}
+
+/**
+ * Writes the discount and setup-fee adjustment lines for an invoice derived
+ * from a quote or a job, in the SAME order and with the SAME descriptions
+ * index.html's createInvoiceFromQuote uses (discount first, then setup fee),
+ * so a relationally-created invoice is indistinguishable from a JSON-created
+ * one. Returns the next free line_index.
+ *
+ * Discount is a NEGATIVE unit_amount on a qty-1 line rather than a reduction
+ * spread across the item lines: that keeps every item line at its true unit
+ * price, states the discount explicitly on the customer's document, and is
+ * already what buildManualInvoiceHtml renders (it colours negative lines red).
+ * Both adjustment lines carry tax_type '15%', so VAT is computed on the
+ * discounted, setup-fee-inclusive amount — exactly (subtotal - discount +
+ * setupFee) * 0.15, which is the quote's own flat VAT calculation.
+ */
+async function writeInvoiceAdjustmentLinesTx(
+  client: PoolClient,
+  invoiceId: number,
+  startIndex: number,
+  linesSubtotal: number,
+  setupFee: unknown,
+  discountPct: unknown
+): Promise<number> {
+  let lineIndex = startIndex;
+
+  const pct = Number(discountPct) || 0;
+  const discountAmount = roundMoney4(linesSubtotal * (pct / 100));
+  if (discountAmount > ADJUSTMENT_LINE_THRESHOLD) {
+    await client.query(
+      `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
+       VALUES ($1, $2, $3, 1, $4, '4000', '15%', '{}'::jsonb)`,
+      [invoiceId, lineIndex, `Discount (${formatDiscountPct(pct)}%)`, -discountAmount]
+    );
+    lineIndex++;
+  }
+
+  const fee = roundMoney4(Number(setupFee) || 0);
+  if (fee > ADJUSTMENT_LINE_THRESHOLD) {
+    await client.query(
+      `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
+       VALUES ($1, $2, 'Design & Setup Fee', 1, $3, '4000', '15%', '{}'::jsonb)`,
+      [invoiceId, lineIndex, fee]
+    );
+    lineIndex++;
+  }
+
+  return lineIndex;
+}
+
 async function writeInvoiceLinesFromJobTx(
   client: PoolClient,
   invoiceId: number,
@@ -658,15 +811,19 @@ async function writeInvoiceLinesFromJobTx(
   job: any
 ): Promise<void> {
   if (jobLines.length > 0) {
-    for (const l of jobLines) {
-      await client.query(
-        `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
-         VALUES ($1, $2, $3, $4, $5, '4000', '15%', '{}'::jsonb)`,
-        [invoiceId, l.line_index, l.description, l.qty, l.unit_price]
-      );
-    }
+    const { nextIndex, linesSubtotal } = await writeInvoiceLinesFromSourceTx(
+      client, invoiceId, 'rel_job_line_items', jobLines
+    );
+    await writeInvoiceAdjustmentLinesTx(
+      client, invoiceId, nextIndex, linesSubtotal, job.setup_fee, job.discount_pct
+    );
     return;
   }
+  // NO-LINES FALLBACK — deliberately unchanged, and deliberately NOT given
+  // adjustment lines. rel_jobs.value is the job's FINAL VAT-inclusive figure,
+  // which already has the setup fee added and the discount taken off; adding
+  // them again here would charge the fee twice and discount an already-
+  // discounted amount.
   const vatInclusiveValue = Number(job.value) || 0;
   if (vatInclusiveValue <= 0) return;
   await client.query(
@@ -1187,13 +1344,19 @@ export async function finalizeProformaToInvoice(quoteId: number): Promise<{ invo
       [invoiceNumber, quote.company_code, quote.customer_id, quote.customer_name_raw, quoteId, quote.quote_number]
     );
     const invoiceId = invRes.rows[0].id;
-    for (const l of lineItemsRes.rows) {
-      await client.query(
-        `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
-         VALUES ($1, $2, $3, $4, $5, '4000', '15%', '{}'::jsonb)`,
-        [invoiceId, l.line_index, l.description, l.qty, l.unit_price]
-      );
-    }
+    // JOB/QUOTE -> INVOICE FINANCIAL CONSISTENCY REPAIR (2026-08-25): this
+    // loop carried the SAME defect as writeInvoiceLinesFromJobTx — a plain
+    // qty x unit_price copy that dropped `pieces`, the setup fee and the
+    // discount, so a proforma finalised relationally did not add up to its own
+    // quote. It now goes through the shared writers, which is also what makes
+    // Quote -> Invoice and Job -> Invoice produce the identical document for
+    // the identical commercial content.
+    const { nextIndex, linesSubtotal } = await writeInvoiceLinesFromSourceTx(
+      client, invoiceId, 'rel_quote_line_items', lineItemsRes.rows
+    );
+    await writeInvoiceAdjustmentLinesTx(
+      client, invoiceId, nextIndex, linesSubtotal, quote.setup_fee, quote.discount_pct
+    );
     await client.query('COMMIT');
     return { invoiceId, invoiceNumber };
   } catch (err) {
