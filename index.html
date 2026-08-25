@@ -21458,6 +21458,20 @@ async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll
   // flow that follows has no relational equivalent needed.
   if(isRelationalAuthoritative('accInvoices')){
     const relCo = isHoldingsUser(user) ? HOLDINGS_CO_ID : currentUserCo;
+    // ── MANUAL-INVOICE companyCode TYPE FIX (2026-08-25) ────────────────────
+    // `relCo` is a NUMBER: user.co comes from app_users.co (an INTEGER column,
+    // so pg hands it back as a number) and HOLDINGS_CO_ID is the literal 1.
+    // POST /api/relational/invoices validates `typeof companyCode !== 'string'`
+    // and rejected every one of these with HTTP 400 "companyCode is required",
+    // so the standalone/manual New Invoice action could not save at all once
+    // accInvoices was cut over — proven locally: companyCode 2 -> 400,
+    // companyCode "2" -> 201. rel_*.company_code is TEXT holding the
+    // stringified company id, and every other relational create already sends
+    // it as one (createJob: String(parseInt(co)); createCreditNote:
+    // String(tagged.co)). This call site was the only one that did not.
+    // The `co` kept on the local record below stays the NUMBER the rest of
+    // this file compares against — only the wire value is stringified.
+    const relCoCode = String(relCo);
     const lines = (inv.lineItems||[]).map(l=>({
       description: l.description||'', qty: parseFloat(l.qty)||0, unitAmount: parseFloat(l.unitAmount)||0,
       accountCode: l.accountCode||null, taxType: l.taxType||null,
@@ -21476,7 +21490,7 @@ async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll
         return true;
       } else {
         const result = await relationalApi.createInvoice({
-          companyCode: relCo, contactName: inv.contactName, contactEmail: inv.contactEmail||null, contactAddress: inv.contactAddress||null,
+          companyCode: relCoCode, contactName: inv.contactName, contactEmail: inv.contactEmail||null, contactAddress: inv.contactAddress||null,
           reference: inv.reference||null, status: inv.status||null,
           issueDate: inv.date||null, dueDate: inv.dueDate||null, lines,
         });

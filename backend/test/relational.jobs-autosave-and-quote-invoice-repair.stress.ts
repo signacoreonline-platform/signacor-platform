@@ -167,6 +167,14 @@ async function resetRelational() {
   `);
   await pool.query(`DELETE FROM document_number_counters`);
   await pool.query(`DELETE FROM quote_conversions`);
+  // 2026-08-25: platform_state must be cleared too. Invoice creation now
+  // consults migration013Recovery, which reads the frozen platform_state JSON
+  // looking for this document's historical lines — so a quote left behind by
+  // ANOTHER suite under the same number is a real (if artificial) identity
+  // collision, and the resolver correctly refuses to invoice against a source
+  // it cannot match with certainty. Owning this row makes each suite's
+  // fixtures answer only to themselves.
+  await pool.query(`UPDATE platform_state SET data = '{}'::jsonb WHERE id = 1`);
 }
 
 let PRIOR_CUTOVER: Array<{ section: string; enabled: boolean }> = [];

@@ -71,9 +71,19 @@ function checkFrontendWiring(src: string) {
     'relationalApi.updateQuoteStatus is a DISTINCT method/endpoint from relationalApi.updateQuote (never folded into the job-cascading PUT route)');
 
   console.log('\n  -- manual invoicing --');
-  ok(/if\(isRelationalAuthoritative\('accInvoices'\)\)\{[\s\S]{0,2000}relationalApi\.createInvoice\(/.test(src),
+  ok(/if\(isRelationalAuthoritative\('accInvoices'\)\)\{[\s\S]{0,4000}relationalApi\.createInvoice\(/.test(src),
     'saveManualInvoice() checks isRelationalAuthoritative(\'accInvoices\') and calls relationalApi.createInvoice for a new invoice');
-  ok(/if\(isRelationalAuthoritative\('accInvoices'\)\)\{[\s\S]{0,2000}relationalApi\.updateInvoice\(inv\._relId, inv\._relRowVersion,/.test(src),
+  // 2026-08-25 — MANUAL-INVOICE companyCode TYPE FIX. POST /invoices validates
+  // `typeof companyCode !== 'string'`; this call site sent the NUMBER user.co,
+  // so every manual invoice was rejected with HTTP 400 once accInvoices was cut
+  // over. Pinned here because this suite owns the "manual invoicing" cutover
+  // blocker — that blocker is only genuinely closed if the payload this call
+  // site sends is one the endpoint actually accepts.
+  ok(src.includes('const relCoCode = String(relCo);'),
+    'saveManualInvoice() stringifies the company id (rel_*.company_code is TEXT, and every other relational create already sends a string)');
+  ok(src.includes('companyCode: relCoCode, contactName: inv.contactName'),
+    'and createInvoice is called with that STRING companyCode, never the raw number');
+  ok(/if\(isRelationalAuthoritative\('accInvoices'\)\)\{[\s\S]{0,4000}relationalApi\.updateInvoice\(inv\._relId, inv\._relRowVersion,/.test(src),
     'saveManualInvoice() calls relationalApi.updateInvoice(inv._relId, inv._relRowVersion, ...) when editing an existing relational invoice');
 
   console.log('\n  -- invoice deletion --');

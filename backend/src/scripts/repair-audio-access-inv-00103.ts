@@ -91,6 +91,7 @@ import {
   classifyLineRecovery, findJsonDocument, findJsonLine,
   MIGRATION_013_FIELDS, MIGRATION_013_COLUMNS,
   RelationalLineSnapshot, RecoveryCandidate, Migration013Field,
+  resolveDocument013ForInvoicing, effectivePiecesByLineId,
 } from '../relational/migration013Recovery';
 
 // ── IDENTITY OF THE ONE CASE ────────────────────────────────────────────────
@@ -567,7 +568,16 @@ async function main(): Promise<void> {
     const jobLinesAfterRecovery = await jobLineRows(client, job.id);
     const jobRowAfterRecovery = (await client.query('SELECT * FROM rel_jobs WHERE id = $1', [job.id])).rows[0];
     await client.query('DELETE FROM rel_invoice_line_items WHERE invoice_id = $1', [inv.id]);
-    await writeInvoiceLinesFromJobTx(client, Number(inv.id), jobLinesAfterRecovery, jobRowAfterRecovery);
+    // 2026-08-25 (HISTORICAL PIECES PROTECTION): the writer no longer reads
+    // `pieces` off the source line — the effective count is resolved by
+    // migration013Recovery and passed in. Resolved HERE, after STEP 1 has
+    // filled the columns, so every line reports piecesSource 'column' and this
+    // rebuild uses the values this repair just recovered, not a second reading
+    // of the historical sources.
+    const piecesAfterRecovery = effectivePiecesByLineId(
+      await resolveDocument013ForInvoicing(client, 'job', Number(job.id))
+    );
+    await writeInvoiceLinesFromJobTx(client, Number(inv.id), jobLinesAfterRecovery, jobRowAfterRecovery, piecesAfterRecovery);
     log(`  STEP 2  ${INVOICE_NUMBER}'s line items rebuilt by services.ts writeInvoiceLinesFromJobTx.`);
 
     const invBump = await client.query(

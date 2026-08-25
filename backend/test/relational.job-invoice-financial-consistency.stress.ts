@@ -231,21 +231,53 @@ async function main() {
   }
 
   // ══ C — historical pieces = NULL ═════════════════════════════════════════
-  console.log('\n[C] historical job with pieces = NULL → compatibility default of 1');
+  //
+  // 2026-08-25 (HISTORICAL PIECES PROTECTION) — deliberately rewritten, because
+  // the behaviour this case used to assert is the behaviour that has now been
+  // fixed. It previously built a job whose value said R1,035 (pieces = 3),
+  // NULLed the piece count to simulate a pre-013 backfill, and asserted the
+  // resulting invoice "HONESTLY under-states the job... this is what Part 3
+  // recovery is for". Part 3 is now wired into invoicing, so an invoice 3x
+  // short of its own job is not issued at all — the financial consistency
+  // guard refuses it. That is precisely the SQ-00150 -> INV-00111 failure mode,
+  // and this is where it now dies.
+  //
+  // The compatibility default itself is unchanged and still asserted, below, on
+  // a job where a NULL piece count is genuinely all there ever was.
+  console.log('\n[C] pieces = NULL: still compatible when genuinely absent, REFUSED when the job says otherwise');
   await reset();
   {
-    const fx = await makeJob({ lines: [{ description: 'Legacy line', qty: 5, unitPrice: 60, pieces: 3 }], stage: 8 });
-    // Simulate a row backfilled BEFORE migration 013 existed.
-    await pool.query('UPDATE rel_job_line_items SET pieces = NULL WHERE job_id = $1', [fx.jobId]);
-    const inv = await services.createInvoiceForJob(fx.jobId);
-    const t = await invoiceTotals(inv.invoiceId);
-    ok(eqMoney(t.subtotal, 300), 'a NULL piece count prices as 1 — exactly as it does today', t.subtotal);
-    ok(!eqMoney(t.total, fx.jobValue),
-      'and the invoice HONESTLY under-states the job, because the data really is missing — this is what Part 3 recovery is for',
-      { invoice: t.total, job: fx.jobValue });
-    // pieces = 0 must behave the same as NULL (lineSubtotal's own rule) — on a
-    // separate job, so the assertion above stays untouched.
-    const fxZero = await makeJob({ lines: [{ description: 'Zero pieces', qty: 5, unitPrice: 60, pieces: 3 }], stage: 8 });
+    // C1 — genuinely no piece count, and the job's own value agrees with that.
+    // Nothing is recoverable (created relationally: legacy_data '{}',
+    // platform_state empty), so the documented NULL -> 1 default applies and
+    // the invoice is issued exactly as it always was.
+    const fxNone = await makeJob({ lines: [{ description: 'Never had pieces', qty: 5, unitPrice: 60, pieces: null }], stage: 8 });
+    const invNone = await services.createInvoiceForJob(fxNone.jobId);
+    const tNone = await invoiceTotals(invNone.invoiceId);
+    ok(eqMoney(tNone.subtotal, 300), 'a genuinely absent piece count still prices as 1 — exactly as it does today', tNone.subtotal);
+    ok(eqMoney(tNone.total, fxNone.jobValue),
+      'and the invoice matches the job value, because the job never claimed more', { invoice: tNone.total, job: fxNone.jobValue });
+
+    // C2 — the same NULL, but on a job whose value was set while the piece
+    // count still existed, and whose historical record is gone. There is
+    // nothing to recover from, so nothing is guessed — and because the document
+    // would come out 3x short of the job it is raised for, it is refused.
+    const fxLost = await makeJob({ lines: [{ description: 'Legacy line', qty: 5, unitPrice: 60, pieces: 3 }], stage: 8 });
+    await pool.query('UPDATE rel_job_line_items SET pieces = NULL WHERE job_id = $1', [fxLost.jobId]);
+    let refusal = '';
+    try { await services.createInvoiceForJob(fxLost.jobId); } catch (e: any) { refusal = String(e && e.message); }
+    ok(/does not add up to its source is never issued/.test(refusal),
+      'an invoice that would under-state its own job is REFUSED, not written — the SQ-00150 failure mode', refusal.slice(0, 140));
+    ok(/R345\.00/.test(refusal) && /R1035\.00/.test(refusal),
+      'and the refusal states both figures, so the person can see exactly what disagrees', refusal.slice(0, 220));
+    const noInv = await pool.query('SELECT COUNT(*)::int AS n FROM rel_invoices WHERE job_id = $1', [fxLost.jobId]);
+    ok(noInv.rows[0].n === 0, 'nothing was created', noInv.rows[0]);
+    const jobAfter = await pool.query('SELECT invoice_num, invoice_created FROM rel_jobs WHERE id = $1', [fxLost.jobId]);
+    ok(jobAfter.rows[0].invoice_num === null && jobAfter.rows[0].invoice_created === false,
+      'and the job was left untouched — no number stamped on it, not marked invoiced', jobAfter.rows[0]);
+
+    // pieces = 0 must behave the same as NULL (lineSubtotal's own rule).
+    const fxZero = await makeJob({ lines: [{ description: 'Zero pieces', qty: 5, unitPrice: 60, pieces: null }], stage: 8 });
     await pool.query('UPDATE rel_job_line_items SET pieces = 0 WHERE job_id = $1', [fxZero.jobId]);
     const invZero = await services.createInvoiceForJob(fxZero.jobId);
     ok(eqMoney((await invoiceTotals(invZero.invoiceId)).subtotal, 300), 'pieces = 0 is read as 1 too', null);

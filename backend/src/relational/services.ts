@@ -33,6 +33,14 @@ import { PoolClient } from 'pg';
 import pool from '../db/pool';
 import { reserveDocumentNumberWithClient } from '../routes/documentNumbers';
 import { restoreId } from './read';
+// HISTORICAL PIECES PROTECTION (2026-08-25). The invoice writers below no
+// longer read `pieces` straight off a source line — see EFFECTIVE_QTY_SQL.
+// migration013Recovery owns the ONE algorithm that decides what a NULL piece
+// count really means for a given line, and these are its two entry points for
+// invoicing. Nothing in this file re-implements that matching.
+import {
+  resolveDocument013ForInvoicing, effectivePiecesByLineId, Document013Resolution,
+} from './migration013Recovery';
 
 export class ConcurrencyConflictError extends Error {
   constructor(public table: string, public id: number) {
@@ -699,9 +707,20 @@ export async function createJob(input: CreateJobInput): Promise<{ id: number; jo
 //   rel_quote_line_items, where pieces and qty MUST stay separate because the
 //   spec line and inventory consumption both depend on them individually.
 
-/** Effective billed quantity for one source line: pieces x qty, NULL/<=0 pieces read as 1.
- *  Expressed in SQL so the multiplication happens in exact NUMERIC, never JS float. */
-const EFFECTIVE_QTY_SQL = '(CASE WHEN sl.pieces IS NULL OR sl.pieces <= 0 THEN 1 ELSE sl.pieces END) * sl.qty';
+// 2026-08-25 — HISTORICAL PIECES PROTECTION. The billed quantity is no longer
+// read from `sl.pieces` alone. A NULL there means one of two completely
+// different things: "this line never had a piece count" (1 is correct) or "this
+// line's piece count predates migration 013's column" (1 is a factor-of-N
+// under-charge, and the real value is still recoverable). Only
+// migration013Recovery can tell those apart, so the effective piece count is
+// now RESOLVED by that module and passed in per line — see
+// resolveDocument013ForInvoicing. The multiplication still happens in SQL, in
+// exact NUMERIC, never in JS float: the resolved count arrives as a ::numeric
+// parameter and Postgres multiplies it by the source line's own qty.
+//
+// The confirmed production case this closes is SQ-00150 -> INV-00111: a line of
+// 4 pieces x qty 2 x R1,600 stored with pieces NULL, invoiced as 1 x 2 x R1,600.
+const EFFECTIVE_QTY_SQL = '($4::numeric * sl.qty)';
 
 /** Money rounded to the 4 decimal places rel_invoice_line_items.unit_amount stores,
  *  so what this function computes and what the database keeps can never disagree. */
@@ -727,21 +746,35 @@ const ADJUSTMENT_LINE_THRESHOLD = 0.005;
  * `sourceTable` is the table the rows came from — the rows are re-read by id so
  * the arithmetic is done by Postgres in exact NUMERIC rather than by JS on
  * values that have already been through a float.
+ *
+ * `effectivePieces` maps source line id -> the piece count to bill, as resolved
+ * by migration013Recovery (column value, deterministically recovered historical
+ * value, or the documented default of 1). A line missing from the map is a
+ * programming error, not a data condition, and is refused rather than silently
+ * defaulted — silently defaulting is precisely the bug this parameter exists to
+ * remove.
  */
 async function writeInvoiceLinesFromSourceTx(
   client: PoolClient,
   invoiceId: number,
   sourceTable: 'rel_job_line_items' | 'rel_quote_line_items',
-  sourceLines: any[]
+  sourceLines: any[],
+  effectivePieces: Map<number, number>
 ): Promise<{ nextIndex: number; linesSubtotal: number }> {
   let nextIndex = 0;
   for (const l of sourceLines) {
+    const pieces = effectivePieces.get(Number(l.id));
+    if (pieces === undefined || !Number.isFinite(pieces) || pieces <= 0) {
+      throw new BusinessRuleError(
+        `internal: no resolved piece count for ${sourceTable} line ${l.id} — refusing to write an invoice line on a guessed quantity`
+      );
+    }
     await client.query(
       `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
        SELECT $1, $2, sl.description, ${EFFECTIVE_QTY_SQL}, sl.unit_price, '4000', '15%', '{}'::jsonb
          FROM ${sourceTable} sl
         WHERE sl.id = $3`,
-      [invoiceId, nextIndex, l.id]
+      [invoiceId, nextIndex, l.id, pieces]
     );
     nextIndex++;
   }
@@ -804,22 +837,102 @@ async function writeInvoiceAdjustmentLinesTx(
   return lineIndex;
 }
 
+// ── HISTORICAL-PIECES REFUSAL + FINANCIAL CONSISTENCY GUARD (2026-08-25) ────
+// Two protections that every source-derived invoice now passes through, in
+// this order:
+//
+//   1. REFUSE ON UNRESOLVED HISTORY. If a source line has no piece count of its
+//      own AND its preserved historical source is MISMATCH or AMBIGUOUS, the
+//      line's value cannot be known. Invoicing is refused rather than billed on
+//      a guess. Deliberately narrow: a MISMATCH/AMBIGUOUS verdict about a
+//      DIMENSION (sqmL/sqmW) or a complete-product link on a line whose pieces
+//      are already set changes nothing financial and must not obstruct
+//      invoicing — see resolveDocument013ForInvoicing's own note.
+//
+//   2. REFUSE ON A MATERIAL TOTAL MISMATCH. The invoice this system writes must
+//      add up to the document it was raised for. Checked from what was
+//      ACTUALLY written to rel_invoice_line_items, after the lines land and
+//      before the transaction commits, so any disagreement rolls the whole
+//      thing back — including the document number that was reserved inside the
+//      same transaction (reserveDocumentNumberWithClient runs on this client,
+//      so a ROLLBACK restores the counter and no number is consumed). A quote's
+//      PRO-##### reservation is never touched by any of this: it is read, never
+//      written, so a rollback leaves it available exactly as it was.
+//
+// This guard is what would have stopped SQ-00150 (R15,582.50) producing
+// INV-00111 (R4,542.50): the invoice was 71% short of its own quote.
+
+/** Rounding headroom for the comparison. Line amounts are stored at 4 dp and a
+ *  document's own total at 2 dp, so a few cents of legitimate rounding can
+ *  separate them across many lines. 5c is far below anything a person would
+ *  call a discrepancy and far above anything rounding can produce. */
+const SOURCE_TOTAL_TOLERANCE = 0.05;
+
+/** Refuses invoicing when a line's money depends on an unresolvable historical
+ *  piece count. Runs BEFORE any document number is reserved. */
+function assertNo013Blockers(res: Document013Resolution): void {
+  if (res.blocked.length === 0) return;
+  const detail = res.blocked.map((l) => l.blockingReason).join('; ');
+  throw new BusinessRuleError(
+    `${res.kind === 'quote' ? 'Quote' : 'Job'} ${res.documentNumber} cannot be invoiced yet: ` +
+    `${res.blocked.length} line(s) carry no piece count, and their preserved historical records ` +
+    `cannot be matched to them with certainty, so the correct amount cannot be determined. ` +
+    `Nothing was created. Open ${res.documentNumber}, confirm the piece count on each line and save it — ` +
+    `that records the value explicitly and this invoice can then be raised. (${detail})`
+  );
+}
+
+/** The invoice's own total, derived the one way this system derives it: from
+ *  its lines, in exact NUMERIC. */
+async function invoiceTotalTx(client: PoolClient, invoiceId: number): Promise<number> {
+  const r = await client.query(
+    `SELECT COALESCE(SUM(qty * unit_amount), 0)
+              + COALESCE(SUM(CASE WHEN tax_type = '15%' THEN qty * unit_amount * 0.15 ELSE 0 END), 0) AS total
+       FROM rel_invoice_line_items WHERE invoice_id = $1`,
+    [invoiceId]
+  );
+  return Number(r.rows[0].total) || 0;
+}
+
+/** Throws (→ ROLLBACK) when the invoice just written does not add up to the
+ *  document it was raised for. */
+async function assertInvoiceMatchesSourceTx(
+  client: PoolClient, invoiceId: number,
+  sourceLabel: string, sourceTotalLabel: string, sourceTotal: number
+): Promise<void> {
+  const invoiceTotal = await invoiceTotalTx(client, invoiceId);
+  if (Math.abs(invoiceTotal - sourceTotal) <= SOURCE_TOTAL_TOLERANCE) return;
+  throw new BusinessRuleError(
+    `Invoice not created: the invoice this would produce comes to ` +
+    `R${invoiceTotal.toFixed(2)}, but ${sourceLabel}'s own ${sourceTotalLabel} is ` +
+    `R${sourceTotal.toFixed(2)} — a difference of R${Math.abs(sourceTotal - invoiceTotal).toFixed(2)}. ` +
+    `A document that does not add up to its source is never issued, so nothing was created and no ` +
+    `invoice number was used. Open ${sourceLabel}, check its line items, piece counts, discount and ` +
+    `setup fee, save it, and try again.`
+  );
+}
+
 // EXPORTED (2026-08-25) so a one-off, narrowly-scoped repair of a single
 // historical invoice can rebuild that invoice's lines with THIS function —
 // the deployed writer itself — rather than a copy of it. A repair that
 // re-implements the financial logic it is repairing towards is a second
 // source of truth waiting to drift; see
-// src/scripts/repair-audio-access-inv-00103.ts. Behaviour is unchanged: the
-// only difference is the `export` keyword.
+// src/scripts/repair-audio-access-inv-00103.ts.
+//
+// 2026-08-25: `effectivePieces` is new and REQUIRED — see the
+// HISTORICAL PIECES PROTECTION note on EFFECTIVE_QTY_SQL. Callers obtain it
+// from resolveDocument013ForInvoicing; it is never derived here, so this writer
+// cannot silently fall back to reading a NULL as 1.
 export async function writeInvoiceLinesFromJobTx(
   client: PoolClient,
   invoiceId: number,
   jobLines: any[],
-  job: any
+  job: any,
+  effectivePieces: Map<number, number>
 ): Promise<void> {
   if (jobLines.length > 0) {
     const { nextIndex, linesSubtotal } = await writeInvoiceLinesFromSourceTx(
-      client, invoiceId, 'rel_job_line_items', jobLines
+      client, invoiceId, 'rel_job_line_items', jobLines, effectivePieces
     );
     await writeInvoiceAdjustmentLinesTx(
       client, invoiceId, nextIndex, linesSubtotal, job.setup_fee, job.discount_pct
@@ -840,6 +953,35 @@ export async function writeInvoiceLinesFromJobTx(
   );
 }
 
+/**
+ * The Job→Invoice half of the financial consistency guard.
+ *
+ * THE DOCUMENTED EXCEPTION, and why it is the ONLY one. rel_jobs.value is the
+ * job's declared VAT-inclusive figure — set from the quote's total at
+ * conversion and patchable directly — and it is what the Jobs list, the
+ * dashboard revenue tile, the deposit rule and the payment status all read. An
+ * invoice derived from the job's LINES must therefore agree with it, and the
+ * existing job/quote → invoice consistency suite already asserts exactly that
+ * invariant ("invoice total == job value").
+ *
+ * The exception is the NO-LINES FALLBACK: for a job with no line items,
+ * writeInvoiceLinesFromJobTx builds the single invoice line FROM `value`
+ * itself, so comparing the result back to `value` is tautological rather than a
+ * check — and a job whose value is 0 legitimately produces no line at all
+ * (there is nothing to bill). Both are recognised here and skipped, so this
+ * guard never refuses a document it did not actually verify.
+ */
+async function assertJobInvoiceMatchesValueTx(
+  client: PoolClient, invoiceId: number, job: any, sourceLineCount: number
+): Promise<void> {
+  if (sourceLineCount === 0) return;               // no-lines fallback — see above
+  const jobValue = Number(job.value) || 0;
+  if (jobValue <= 0) return;                       // nothing declared to check against
+  await assertInvoiceMatchesSourceTx(
+    client, invoiceId, `job ${job.job_number}`, 'value', jobValue
+  );
+}
+
 const INSTALL_STAGE = 7;
 export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: number; invoiceNumber: string; legacyMapped?: boolean; jobRowVersion: number; jobStage: number; jobStatus: string }> {
   const client = await pool.connect();
@@ -848,6 +990,15 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
     const jobRes = await client.query('SELECT * FROM rel_jobs WHERE id = $1 FOR UPDATE', [jobId]);
     if (jobRes.rowCount === 0) throw new BusinessRuleError(`job ${jobId} not found`);
     const job = jobRes.rows[0];
+
+    // HISTORICAL PIECES PROTECTION (2026-08-25). Resolved ONCE, on this
+    // client so it sees the row this transaction has locked, and BEFORE any
+    // branch below reserves a document number — a refusal must never consume a
+    // number from the atomic pool. Cheap for the common case: a modern job
+    // whose lines all carry a piece count resolves straight off the column.
+    const jobPieces = await resolveDocument013ForInvoicing(client, 'job', jobId);
+    assertNo013Blockers(jobPieces);
+    const jobPiecesMap = effectivePiecesByLineId(jobPieces);
 
     if (job.invoice_num) {
       if (job.invoice_created) {
@@ -903,7 +1054,8 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
          job.email, job.address]
       );
       const legacyInvoiceId = legacyInvRes.rows[0].id;
-      await writeInvoiceLinesFromJobTx(client, legacyInvoiceId, legacyLineItemsRes.rows, job);
+      await writeInvoiceLinesFromJobTx(client, legacyInvoiceId, legacyLineItemsRes.rows, job, jobPiecesMap);
+      await assertJobInvoiceMatchesValueTx(client, legacyInvoiceId, job, legacyLineItemsRes.rows.length);
       const jobUpdRes2 = await client.query(
         `UPDATE rel_jobs SET invoice_created = true, invoice_date = COALESCE(invoice_date, CURRENT_DATE), invoice_status = COALESCE(invoice_status, 'pending'),
            status = CASE WHEN stage >= $2 THEN 'invoiced' ELSE status END,
@@ -1014,7 +1166,8 @@ export async function createInvoiceForJob(jobId: number): Promise<{ invoiceId: n
     );
     const invoiceId = invRes.rows[0].id;
 
-    await writeInvoiceLinesFromJobTx(client, invoiceId, lineItemsRes.rows, job);
+    await writeInvoiceLinesFromJobTx(client, invoiceId, lineItemsRes.rows, job, jobPiecesMap);
+    await assertJobInvoiceMatchesValueTx(client, invoiceId, job, lineItemsRes.rows.length);
 
     const jobUpdRes3 = await client.query(
       `UPDATE rel_jobs SET invoice_num = $1, invoice_date = CURRENT_DATE, invoice_created = true, invoice_status = 'pending',
@@ -1410,6 +1563,16 @@ async function createInvoiceFromQuoteTx(
     }
   }
 
+  // HISTORICAL PIECES PROTECTION (2026-08-25). Resolved BEFORE a number is
+  // reserved or the PRO reservation is consumed, so a refusal never touches
+  // either. This is the check that turns SQ-00150 from "invoiced at R4,542.50"
+  // into "invoiced at its own R15,582.50" — its line's piece count of 4 is
+  // recovered deterministically from the preserved historical record instead of
+  // a NULL column being read as 1.
+  const quotePieces = await resolveDocument013ForInvoicing(client, 'quote', quoteId);
+  assertNo013Blockers(quotePieces);
+  const quotePiecesMap = effectivePiecesByLineId(quotePieces);
+
   let invoiceNumber: string;
   if (quote.proforma_num) {
     // Consume the EXACT reserved suffix (same derivation rule as
@@ -1449,13 +1612,45 @@ async function createInvoiceFromQuoteTx(
   // quote. It now goes through the shared writers, which is also what makes
   // Quote -> Invoice and Job -> Invoice produce the identical document for
   // the identical commercial content.
+  await writeQuoteInvoiceLinesTx(client, invoiceId, lineItemsRes.rows, quote, quotePiecesMap);
+
+  // FINANCIAL CONSISTENCY GUARD — the quote's own stored total is the
+  // authority, and rel_quotes.subtotal/vat_amount/total are recomputed from its
+  // lines by createQuote/updateQuote, so they track it. An invoice that does
+  // not add up to it is never issued: this throws, the transaction rolls back,
+  // and with it any invoice number reserved above (the reservation ran on this
+  // same client) — while a PRO reservation, which is only ever read here, is
+  // left untouched and still available.
+  await assertInvoiceMatchesSourceTx(
+    client, invoiceId, `quote ${quote.quote_number}`, 'total', Number(quote.total) || 0
+  );
+  return { invoiceId, invoiceNumber, reused: false };
+}
+
+// EXPORTED (2026-08-25) for the same reason writeInvoiceLinesFromJobTx is: a
+// one-off, narrowly-scoped repair of a single historical invoice must rebuild
+// that invoice's lines with THE DEPLOYED WRITER, never a copy of it. See
+// src/scripts/repair-sq-00150-inv-00111.ts.
+export async function writeQuoteInvoiceLinesTx(
+  client: PoolClient,
+  invoiceId: number,
+  quoteLines: any[],
+  quote: any,
+  effectivePieces: Map<number, number>
+): Promise<void> {
+  // JOB/QUOTE -> INVOICE FINANCIAL CONSISTENCY REPAIR (2026-08-25): this
+  // loop carried the SAME defect as writeInvoiceLinesFromJobTx — a plain
+  // qty x unit_price copy that dropped `pieces`, the setup fee and the
+  // discount, so a proforma finalised relationally did not add up to its own
+  // quote. It now goes through the shared writers, which is also what makes
+  // Quote -> Invoice and Job -> Invoice produce the identical document for
+  // the identical commercial content.
   const { nextIndex, linesSubtotal } = await writeInvoiceLinesFromSourceTx(
-    client, invoiceId, 'rel_quote_line_items', lineItemsRes.rows
+    client, invoiceId, 'rel_quote_line_items', quoteLines, effectivePieces
   );
   await writeInvoiceAdjustmentLinesTx(
     client, invoiceId, nextIndex, linesSubtotal, quote.setup_fee, quote.discount_pct
   );
-  return { invoiceId, invoiceNumber, reused: false };
 }
 
 // ── PRO -> INV finalisation ──────────────────────────────────────────────

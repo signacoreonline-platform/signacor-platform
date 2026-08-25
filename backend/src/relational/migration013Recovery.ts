@@ -462,6 +462,248 @@ export function lineValue(pieces: number | null | undefined, qty: number, unitPr
   return p * (Number(qty) || 0) * (Number(unitPrice) || 0);
 }
 
+// ── THE ONE MATCHING ALGORITHM ──────────────────────────────────────────────
+// Three things now need to know "what was this line's historical piece count?":
+// the whole-database analysis report below, the per-document resolver invoice
+// creation consults (resolveDocument013ForInvoicing), and the one-record repair
+// script. All three go through the helpers in this block. There is deliberately
+// no second implementation anywhere — a repair that matches differently from
+// the analysis that authorised it, or an invoice writer that matches
+// differently from either, is a second source of truth waiting to drift.
+
+/** The document-level half of the identity: which JSON record (if any) is this
+ *  relational document, and was that resolvable deterministically? */
+export interface JsonDocumentMatch {
+  record: any | null; identity: string; ambiguous: boolean; reason: string; jsonLines: any[];
+}
+export function matchJsonDocument(
+  jsonRecords: any[], sourceId: string | null, documentNumber: string, companyCode: string, jsonNumberKey: string
+): JsonDocumentMatch {
+  const found = findJsonDocument(jsonRecords, sourceId, documentNumber, companyCode, jsonNumberKey);
+  return {
+    ...found,
+    jsonLines: found.record && Array.isArray(found.record.lines) ? found.record.lines : [],
+  };
+}
+
+/** The line-level half: assemble S1 (the row's own legacy_data) and S2 (the
+ *  located JSON record's line) into the candidate list classifyLineRecovery
+ *  consumes. `lineTableLabel` only ever appears in the audit trail. */
+export function buildLineCandidates(
+  rel: RelationalLineSnapshot, legacyData: unknown, doc: JsonDocumentMatch, lineTableLabel: string
+): RecoveryCandidate[] {
+  const candidates: RecoveryCandidate[] = [];
+
+  // S1 — the row's own preserved JSON line.
+  const legacyUsable = legacyData && typeof legacyData === 'object' && !Array.isArray(legacyData)
+    && Object.keys(legacyData as object).length > 0;
+  if (legacyUsable) {
+    candidates.push({
+      origin: 'legacy_data',
+      identity: `${lineTableLabel}.legacy_data (line id ${rel.lineId})`,
+      line: legacyData as Record<string, unknown>,
+    });
+  }
+
+  // S2 — platform_state JSON, only when the document itself resolved.
+  if (doc.ambiguous) {
+    candidates.push({
+      origin: 'platform_state_json', identity: doc.identity, line: null,
+      ambiguous: true, ambiguityReason: doc.reason,
+    });
+  } else if (doc.record) {
+    const jl = findJsonLine(doc.jsonLines, rel);
+    if (jl.ambiguous) {
+      candidates.push({
+        origin: 'platform_state_json', identity: `${doc.identity} / ${jl.identity}`, line: null,
+        ambiguous: true, ambiguityReason: jl.reason,
+      });
+    } else if (jl.line) {
+      candidates.push({ origin: 'platform_state_json', identity: `${doc.identity} / ${jl.identity}`, line: jl.line });
+    }
+  }
+  return candidates;
+}
+
+/** Turn a line row (as SELECTed by LINE_SELECT_013) into the snapshot shape
+ *  every classification function takes. One place, so column-to-field naming
+ *  cannot drift between the analysis, the invoicing resolver and the repair. */
+export function toLineSnapshot(row: any): RelationalLineSnapshot {
+  return {
+    lineId: Number(row.id),
+    lineIndex: Number(row.line_index),
+    description: row.description,
+    qty: Number(row.qty),
+    unitPrice: Number(row.unit_price),
+    inventorySourceId: row.inventory_source_id ?? null,
+    pieces: row.pieces === null || row.pieces === undefined ? null : Number(row.pieces),
+    sqmL: row.sqm_l === null || row.sqm_l === undefined ? null : Number(row.sqm_l),
+    sqmW: row.sqm_w === null || row.sqm_w === undefined ? null : Number(row.sqm_w),
+    cpId: row.complete_product_source_id ?? null,
+    cpLinked: row.complete_product_linked ?? null,
+  };
+}
+
+/** The columns every 013 consumer needs off a line row. */
+export const LINE_SELECT_013 =
+  `id, line_index, description, qty, unit_price, inventory_source_id,
+   pieces, sqm_l, sqm_w, complete_product_source_id, complete_product_linked, legacy_data`;
+
+// ── PER-DOCUMENT RESOLUTION FOR INVOICE CREATION ────────────────────────────
+// 2026-08-25 — HISTORICAL PIECES PROTECTION.
+//
+// THE DEFECT THIS EXISTS TO CLOSE, confirmed in production as SQ-00150 ->
+// INV-00111. The invoice writers price a source line as pieces x qty x
+// unitPrice and read a NULL `pieces` as 1 — which is correct for a line that
+// genuinely never had a piece count, and WRONG for a line that had one before
+// 013 added the column. SQ-00150's line really was 4 x 2 x R1,600 = R12,800;
+// its relational `pieces` is NULL, so the invoice was written as 1 x 2 x R1,600
+// = R3,200, and INV-00111 came out at R4,542.50 against a R15,582.50 quote.
+//
+// The historical value was not destroyed — it survives in legacy_data and in
+// the frozen platform_state JSON, which is exactly what this module already
+// knows how to match deterministically. This resolver puts that knowledge in
+// front of the invoice writers.
+//
+// APPROACH B — RESOLVE AT INVOICE TIME, NEVER MUTATE THE SOURCE. The
+// alternative (write the recovered value back onto the quote/job line first,
+// then invoice normally) was rejected: it turns invoicing into an incremental
+// historical backfill, bumps the source document's row_version so every open
+// editor 409s, and — where a quote's stored header total was itself computed on
+// the old basis — would leave the header and its own lines disagreeing with no
+// one having asked for that. Resolving at invoice time changes exactly one
+// thing, the document being created, and leaves every historical record byte
+// for byte as it was. The separately-approved one-record repair script is the
+// only thing that ever writes a recovered value back.
+export interface LineResolution013 {
+  lineId: number;
+  lineIndex: number;
+  description: string | null;
+  qty: number;
+  unitPrice: number;
+  /** What the column says today — null means the column is empty. */
+  currentPieces: number | null;
+  /** The piece count invoicing MUST use for this line. */
+  effectivePieces: number;
+  /** Where effectivePieces came from. */
+  piecesSource: 'column' | 'recovered' | 'default-1';
+  verdict: LineRecoveryVerdict;
+  /** True when this line's VALUE depends on a historical piece count that could
+   *  not be resolved deterministically — the only case that refuses invoicing. */
+  blocking: boolean;
+  blockingReason: string | null;
+}
+
+export interface Document013Resolution {
+  kind: 'quote' | 'job';
+  documentId: number;
+  documentNumber: string;
+  companyCode: string;
+  lines: LineResolution013[];
+  /** Lines that refuse invoicing (MISMATCH / AMBIGUOUS with pieces still NULL). */
+  blocked: LineResolution013[];
+  /** Lines whose piece count came from a recovered historical value. */
+  recovered: LineResolution013[];
+}
+
+const COLLECTION_META = {
+  quote: { docTable: 'rel_quotes', lineTable: 'rel_quote_line_items', numberCol: 'quote_number', fk: 'quote_id', jsonKey: 'quotes' },
+  job: { docTable: 'rel_jobs', lineTable: 'rel_job_line_items', numberCol: 'job_number', fk: 'job_id', jsonKey: 'jobs' },
+} as const;
+
+/**
+ * Resolve ONE document's lines, on the caller's own client so it participates
+ * in the caller's transaction and sees the rows the caller has locked. SELECTs
+ * only — this function never writes, in any mode.
+ */
+export async function resolveDocument013ForInvoicing(
+  client: { query: (sql: string, params?: any[]) => Promise<any> },
+  kind: 'quote' | 'job',
+  documentId: number
+): Promise<Document013Resolution> {
+  const meta = COLLECTION_META[kind];
+  const docRes = await client.query(
+    `SELECT id, source_id, ${meta.numberCol} AS document_number, company_code FROM ${meta.docTable} WHERE id = $1`,
+    [documentId]
+  );
+  if (docRes.rowCount === 0) {
+    throw new Error(`${kind} ${documentId} not found while resolving migration-013 fields`);
+  }
+  const doc = docRes.rows[0];
+
+  const linesRes = await client.query(
+    `SELECT ${LINE_SELECT_013} FROM ${meta.lineTable} WHERE ${meta.fk} = $1 ORDER BY line_index`,
+    [documentId]
+  );
+
+  const stateRes = await client.query('SELECT data FROM platform_state WHERE id = 1');
+  const data = stateRes.rowCount ? stateRes.rows[0].data : {};
+  const jsonMatch = matchJsonDocument(
+    jsonArray(data, meta.jsonKey), doc.source_id, doc.document_number, String(doc.company_code), 'num'
+  );
+
+  const lines: LineResolution013[] = [];
+  for (const row of linesRes.rows) {
+    const rel = toLineSnapshot(row);
+    const candidates = buildLineCandidates(rel, row.legacy_data, jsonMatch, meta.lineTable);
+    const verdict = classifyLineRecovery(rel, candidates);
+
+    let effectivePieces: number;
+    let piecesSource: LineResolution013['piecesSource'];
+    if (rel.pieces !== null && rel.pieces > 0) {
+      // ALREADY_SET for the purposes that matter here: a non-NULL column value
+      // is authoritative and is never second-guessed by a historical source.
+      effectivePieces = rel.pieces;
+      piecesSource = 'column';
+    } else {
+      const proposed = optionalNum(verdict.proposed.pieces);
+      if (verdict.classification === 'SAFE_TO_RECOVER' && proposed !== null && proposed > 0) {
+        effectivePieces = proposed;
+        piecesSource = 'recovered';
+      } else {
+        // NO_SOURCE_VALUE, or a source that records no piece count: the
+        // documented compatibility default. This is the ONLY case in which
+        // NULL still reads as 1, and it is correct — there is no evidence a
+        // piece count was ever recorded for this line.
+        effectivePieces = 1;
+        piecesSource = 'default-1';
+      }
+    }
+
+    // A MISMATCH or AMBIGUOUS verdict only REFUSES invoicing when the line's
+    // money actually depends on the unresolved value — i.e. `pieces` is still
+    // NULL. If pieces is already set, the unresolved field is a dimension or a
+    // complete-product link, which changes nothing financial, and refusing to
+    // invoice over it would be an obstruction rather than a protection.
+    const unresolvedFinancial = rel.pieces === null
+      && (verdict.classification === 'MISMATCH' || verdict.classification === 'AMBIGUOUS');
+
+    lines.push({
+      lineId: rel.lineId, lineIndex: rel.lineIndex, description: rel.description,
+      qty: rel.qty, unitPrice: rel.unitPrice,
+      currentPieces: rel.pieces, effectivePieces, piecesSource, verdict,
+      blocking: unresolvedFinancial,
+      blockingReason: unresolvedFinancial
+        ? `line ${rel.lineIndex} ("${rel.description ?? ''}") has no piece count of its own and its preserved historical source is ${verdict.classification}: ${verdict.reason}`
+        : null,
+    });
+  }
+
+  return {
+    kind, documentId: Number(doc.id), documentNumber: String(doc.document_number),
+    companyCode: String(doc.company_code), lines,
+    blocked: lines.filter((l) => l.blocking),
+    recovered: lines.filter((l) => l.piecesSource === 'recovered'),
+  };
+}
+
+/** Convenience for the writers: lineId -> effective pieces. */
+export function effectivePiecesByLineId(res: Document013Resolution): Map<number, number> {
+  const m = new Map<number, number>();
+  for (const l of res.lines) m.set(l.lineId, l.effectivePieces);
+  return m;
+}
+
 export async function analyzeMigration013Recovery(): Promise<Migration013RecoveryReport> {
   const stateRes = await pool.query('SELECT data FROM platform_state WHERE id = 1');
   const data = stateRes.rowCount ? stateRes.rows[0].data : {};
@@ -488,63 +730,23 @@ export async function analyzeMigration013Recovery(): Promise<Migration013Recover
     );
     for (const doc of docsRes.rows) {
       const linesRes = await pool.query(
-        `SELECT id, line_index, description, qty, unit_price, inventory_source_id,
-                pieces, sqm_l, sqm_w, complete_product_source_id, complete_product_linked, legacy_data
-           FROM ${c.lineTable} WHERE ${c.fk} = $1 ORDER BY line_index`,
+        `SELECT ${LINE_SELECT_013} FROM ${c.lineTable} WHERE ${c.fk} = $1 ORDER BY line_index`,
         [doc.id]
       );
       if (linesRes.rowCount === 0) continue;
 
-      const found = findJsonDocument(
+      // The SAME document/line matching the invoicing resolver and the repair
+      // script use — see "THE ONE MATCHING ALGORITHM" above.
+      const found = matchJsonDocument(
         c.jsonRecords, doc.source_id, doc.document_number, String(doc.company_code), c.jsonNumberKey
       );
       if (found.ambiguous) {
         documentAmbiguities.push(`${c.kind} ${doc.document_number} (rel id ${doc.id}): ${found.reason}`);
       }
-      const jsonLines = found.record ? (Array.isArray(found.record.lines) ? found.record.lines : []) : [];
 
       for (const row of linesRes.rows) {
-        const rel: RelationalLineSnapshot = {
-          lineId: Number(row.id),
-          lineIndex: Number(row.line_index),
-          description: row.description,
-          qty: Number(row.qty),
-          unitPrice: Number(row.unit_price),
-          inventorySourceId: row.inventory_source_id,
-          pieces: row.pieces === null ? null : Number(row.pieces),
-          sqmL: row.sqm_l === null ? null : Number(row.sqm_l),
-          sqmW: row.sqm_w === null ? null : Number(row.sqm_w),
-          cpId: row.complete_product_source_id,
-          cpLinked: row.complete_product_linked,
-        };
-
-        const candidates: RecoveryCandidate[] = [];
-
-        // S1 — the row's own preserved JSON line.
-        const legacy = row.legacy_data;
-        const legacyUsable = legacy && typeof legacy === 'object' && !Array.isArray(legacy) && Object.keys(legacy).length > 0;
-        if (legacyUsable) {
-          candidates.push({ origin: 'legacy_data', identity: `${c.lineTable}.legacy_data (line id ${rel.lineId})`, line: legacy });
-        }
-
-        // S2 — platform_state JSON, only when the document resolved.
-        if (found.ambiguous) {
-          candidates.push({
-            origin: 'platform_state_json', identity: found.identity, line: null,
-            ambiguous: true, ambiguityReason: found.reason,
-          });
-        } else if (found.record) {
-          const jl = findJsonLine(jsonLines, rel);
-          if (jl.ambiguous) {
-            candidates.push({
-              origin: 'platform_state_json', identity: `${found.identity} / ${jl.identity}`, line: null,
-              ambiguous: true, ambiguityReason: jl.reason,
-            });
-          } else if (jl.line) {
-            candidates.push({ origin: 'platform_state_json', identity: `${found.identity} / ${jl.identity}`, line: jl.line });
-          }
-        }
-
+        const rel = toLineSnapshot(row);
+        const candidates = buildLineCandidates(rel, row.legacy_data, found, c.lineTable);
         const verdict = classifyLineRecovery(rel, candidates);
         summary[verdict.classification]++;
 
