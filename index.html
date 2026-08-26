@@ -3320,7 +3320,7 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
                 className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
             )}
             {!isJob&&(
-              <button onClick={()=>printManualInvoice(inv,companies,logoDataUrl)}
+              <button onClick={()=>printManualInvoice(inv,companies,logoDataUrl,{quotes,jobs,accInvoices,customers})}
                 className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
             )}
             {!isJob&&(
@@ -4426,12 +4426,25 @@ function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
   const co = companies.find(c=>c.id===job.co)||{name:'Signacore',short:'SGR'};
   const legal = sgrCompanyLegal(co);
   const lines = job.lines||[];
-  const sub = lines.reduce((s,l)=>s+(l.subtotal||0),0);
-  const discPct = parseFloat(job.discount)||0;
-  const discAmt = sub*(discPct/100);
-  const setupFeeAmt = parseFloat(job.setupFee)||0;
-  const afterDisc = sub - discAmt + setupFeeAmt;
-  const vat = afterDisc*0.15; const total = afterDisc+vat;
+  /* ESTABLISHED-LAYOUT RESTORE (2026-08-26) - PRE-COMPUTED TOTALS OVERRIDE.
+     A job carries its money as document-level fields (lines + setupFee +
+     discount%) and this builder derives everything from them, exactly as it
+     always has. An accInvoices/rel_invoices record does NOT: its setup fee and
+     discount are stored as their own adjustment LINE ITEMS, and its VAT is
+     per-line taxType-aware rather than a flat 15% (a manual accounting invoice
+     may legitimately carry 0% / Exempt lines). Recomputing either here would
+     RESTATE the invoice, so sgrInvoiceRecordToPrintable() hands the already-
+     canonical figures down on `_sgrTotals` and this builder simply renders
+     them. Nothing else about the document changes, and a real job never
+     carries this key, so every existing caller is bit-for-bit unaffected - the
+     `: ` branch of each line below is the original expression verbatim. */
+  const _ovr = job._sgrTotals || null;
+  const sub = _ovr ? _ovr.sub : lines.reduce((s,l)=>s+(l.subtotal||0),0);
+  const discPct = _ovr ? _ovr.discPct : (parseFloat(job.discount)||0);
+  const discAmt = _ovr ? _ovr.discAmt : sub*(discPct/100);
+  const setupFeeAmt = _ovr ? _ovr.setupFeeAmt : (parseFloat(job.setupFee)||0);
+  const afterDisc = _ovr ? _ovr.afterDisc : sub - discAmt + setupFeeAmt;
+  const vat = _ovr ? _ovr.vat : afterDisc*0.15; const total = _ovr ? _ovr.total : afterDisc+vat;
   const payments = Array.isArray(job.payments) ? job.payments : [];
   const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
   const balanceDue = Math.max(0, total-totalPaid);
@@ -4527,7 +4540,7 @@ function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
 '<tr><td>Due Date:</td><td><strong>'+due+'</strong></td></tr>'+
 (job.quoteNum?'<tr><td>Quote Ref:</td><td>'+job.quoteNum+'</td></tr>':'')+
 (job.reference?'<tr><td>Reference:</td><td><strong>'+job.reference+'</strong></td></tr>':'')+
-'<tr><td>Job No:</td><td>'+job.num+'</td></tr>'+
+(job.num?'<tr><td>Job No:</td><td>'+job.num+'</td></tr>':'')+
 '</tbody></table>'+
 '</div>'+
 '</div>'+
@@ -4767,6 +4780,15 @@ function emailInvoiceViaOutlook(job, companies) {
    manual invoice prints/emails identically regardless of which page it was
    opened from.
 ═══════════════════════════════════════════ */
+/* SUPERSEDED (2026-08-26) - NOT the customer-facing Tax Invoice.
+   This template diverges from the established Signacore invoice: it carries a
+   Unit Price column the established document never had, and it renders
+   inv.lineItems verbatim, so the stored synthetic adjustment lines ("Design &
+   Setup Fee", "Discount (x%)") print as ordinary product/service items. That
+   is the 2026-08-24 regression. Nothing routes here any more -
+   printManualInvoice() below now draws every invoice through
+   buildInvoiceHtml(). Left in place rather than deleted so this repair stays a
+   small, reversible presentation change; do NOT re-wire a print path to it. */
 function buildManualInvoiceHtml(inv, companies, logoDataUrl) {
   const co = companies.find(c=>c.id===inv.co)||{name:'Signacore',short:'SGR'};
   const legal = sgrCompanyLegal(co);
@@ -4925,8 +4947,242 @@ function buildManualInvoiceHtml(inv, companies, logoDataUrl) {
   return html;
 }
 
-function printManualInvoice(inv, companies, logoDataUrl) {
-  const html = buildManualInvoiceHtml(inv, companies, logoDataUrl);
+/* ═══════════════════════════════════════════
+   ESTABLISHED INVOICE PRESENTATION ADAPTER (2026-08-26)
+
+   THE REGRESSION THIS CLOSES. Until 2026-08-24 there was exactly ONE
+   customer-facing Tax Invoice document in this file — buildInvoiceHtml() —
+   and every print button in the app reached it through printInvoice(job,…).
+   buildManualInvoiceHtml() below was added on 2026-08-11 for genuinely manual
+   accounting invoices, which until then had no print template at all (the
+   View-Invoice modal said so in as many words: "Manual invoices don't have an
+   equivalent print template yet, so no button is shown for them in this
+   phase"). The 2026-08-24 invoice-list consistency pass then stamped
+   `_isManual: true` on EVERY non-void accInvoices record — job-sourced and
+   quote-sourced ones included — so from that point every invoice that had an
+   accounting record printed through the manual template instead of the
+   established one.
+
+   Two visible consequences, both presentation-only:
+     * the manual template carries a Unit Price column the established Tax
+       Invoice never had; and
+     * it renders inv.lineItems verbatim, so the SYNTHETIC financial
+       adjustment lines the invoice writers store (services.ts's
+       writeInvoiceAdjustmentLinesTx server-side, stubAdjustmentLines above on
+       this side) reached the customer as ordinary product/service items —
+       "Design & Setup Fee" and "Discount (x%)" sitting among the goods.
+
+   WHAT THIS ADAPTER IS. It maps an accInvoices record onto the shape
+   buildInvoiceHtml() already consumes, so every invoice — Job → Invoice,
+   direct Quote → Invoice, or a genuinely manual Accounting invoice — is drawn
+   by the ESTABLISHED template. It is a presentation adapter and nothing else:
+
+     * it never writes, edits, relinks or deletes an invoice, job, quote,
+       line item or payment — every lookup it makes is read-only;
+     * the stored adjustment lines stay exactly where the financial system
+       puts them. This only decides where they are DRAWN;
+     * every figure it hands the template is the invoice's OWN canonical
+       figure, computed the same way the Sales list, the Accounting list, the
+       statements, the dashboard and markCanonicalInvoicePaid already compute
+       it — Σ qty × unitAmount over all lines, VAT on the 15% lines only. It
+       re-arranges presentation; it never restates money.
+═══════════════════════════════════════════ */
+
+/* The EXACT descriptions the current invoice writers emit for the two
+   adjustment lines. Deliberately a closed, whole-string match and never a
+   substring or keyword test — a genuine line a person typed as "Setup and
+   design of vehicle wrap" or "Discount agreed on site" must keep its place in
+   the item table.
+     server  backend/src/relational/services.ts → writeInvoiceAdjustmentLinesTx
+             'Design & Setup Fee'   and   `Discount (${formatDiscountPct(pct)}%)`
+     client  stubAdjustmentLines() above
+             'Design & Setup Fee'   and   `Discount (${discPct}%)`
+   formatDiscountPct is String(Number(pct)), so the percentage is always a
+   plain decimal — that, and nothing else, is what the pattern accepts.
+   AccountingPage.getJobInvoices()'s display-only 'Setup Fee' / 6303 rows are
+   deliberately NOT recognised: they are synthesised for jobs that have no
+   accInvoices record at all, are never stored, never reach this adapter, and
+   "Setup Fee" is an ordinary thing for a person to type on a real invoice. */
+const SGR_INV_SETUP_FEE_DESC = 'Design & Setup Fee';
+const SGR_INV_DISCOUNT_RE    = /^Discount \((\d+(?:\.\d+)?)%\)$/;
+/* Same 0.005 threshold the writers themselves use to decide an adjustment is
+   worth a line (services.ts ADJUSTMENT_LINE_THRESHOLD / stubAdjustmentLines). */
+const SGR_INV_ADJ_EPSILON    = 0.005;
+/* services.ts SOURCE_TOTAL_TOLERANCE — the financial tolerance already in use. */
+const SGR_INV_MONEY_TOLERANCE = 0.05;
+
+function sgrInvoiceLineAmount(l){
+  return (parseFloat(l && l.qty==null ? 1 : l.qty)||0) * (parseFloat(l && l.unitAmount)||0);
+}
+
+/* 'setupFee' | 'discount' | null — null means "an ordinary customer line",
+   which is the answer for everything this does not recognise with certainty. */
+function sgrInvoiceAdjustmentKind(l){
+  if(!l) return null;
+  const amt = parseFloat(l.unitAmount);
+  if(!Number.isFinite(amt)) return null;
+  const qty = parseFloat(l.qty==null ? 1 : l.qty);
+  if(!Number.isFinite(qty) || Math.abs(qty-1) > 1e-9) return null;  // writers always emit qty 1
+  const desc = String(l.description==null ? '' : l.description).trim();
+  if(desc === SGR_INV_SETUP_FEE_DESC && amt >  SGR_INV_ADJ_EPSILON) return 'setupFee';
+  if(SGR_INV_DISCOUNT_RE.test(desc)   && amt < -SGR_INV_ADJ_EPSILON) return 'discount';
+  return null;
+}
+
+/* Splits a stored invoice's line items into the genuine customer lines and the
+   recognised adjustments, and returns the invoice's canonical money alongside.
+   `separated:false` means this invoice's shape was not understood with
+   certainty — in that case EVERY line stays in the item table and no
+   adjustment rows are drawn, which is safe: the totals below are computed over
+   all lines either way, so the printed document still adds up exactly. */
+function sgrSplitInvoiceLineItems(lineItems){
+  const all = Array.isArray(lineItems) ? lineItems.filter(Boolean) : [];
+  // Canonical money — over ALL lines, adjustments included. Identical
+  // arithmetic to buildManualInvoiceHtml / the invoice lists / statements.
+  const allSubtotal = all.reduce((s,l)=>s+sgrInvoiceLineAmount(l), 0);
+  const vat         = all.reduce((s,l)=>l.taxType==='15%' ? s+sgrInvoiceLineAmount(l)*0.15 : s, 0);
+  const total       = allSubtotal + vat;
+
+  const setupLines = all.filter(l=>sgrInvoiceAdjustmentKind(l)==='setupFee');
+  const discLines  = all.filter(l=>sgrInvoiceAdjustmentKind(l)==='discount');
+  // The writers produce at most one of each. More than one of either is a
+  // shape this does not understand, so it separates nothing rather than
+  // guessing which is the real adjustment.
+  const separated = setupLines.length<=1 && discLines.length<=1
+                    && (setupLines.length + discLines.length) > 0;
+  if(!separated){
+    return { items: all, separated:false, setupFeeAmt:0, discAmt:0, discPct:0,
+             itemsSubtotal: allSubtotal, allSubtotal, vat, total };
+  }
+  const items       = all.filter(l=>sgrInvoiceAdjustmentKind(l)===null);
+  const setupFeeAmt = setupLines.length ? sgrInvoiceLineAmount(setupLines[0]) : 0;
+  const discAmt     = discLines.length  ? Math.abs(sgrInvoiceLineAmount(discLines[0])) : 0;
+  const pctMatch    = discLines.length
+    ? SGR_INV_DISCOUNT_RE.exec(String(discLines[0].description).trim()) : null;
+  const discPct     = pctMatch ? Number(pctMatch[1]) : 0;
+  // itemsSubtotal - discAmt + setupFeeAmt === allSubtotal by construction: the
+  // three parts are the same numbers the sum above ran over, just partitioned.
+  const itemsSubtotal = items.reduce((s,l)=>s+sgrInvoiceLineAmount(l), 0);
+  return { items, separated:true, setupFeeAmt, discAmt, discPct,
+           itemsSubtotal, allSubtotal, vat, total };
+}
+
+/* An accInvoices record, expressed in the shape buildInvoiceHtml() consumes.
+   `ctx` carries the arrays this page already holds — { quotes, jobs,
+   accInvoices, customers } — and every one of them is optional: with none of
+   them the invoice still prints, using only what it stores itself. */
+function sgrInvoiceRecordToPrintable(inv, ctx){
+  ctx = ctx || {};
+  const split = sgrSplitInvoiceLineItems(inv && inv.lineItems);
+
+  // Read-only linkage through the SAME resolver the View-Invoice modal and its
+  // link panel already use. `warnings` is non-empty exactly when the linkage is
+  // ambiguous (more than one candidate job), and nothing is borrowed in that
+  // case — an ambiguous link is not a fact.
+  const links = findLinkedRecords(
+    { invoice: { ...(inv||{}), jobNum: (inv && (inv.jobNum || inv.reference)) || '' } },
+    { quotes: ctx.quotes||[], jobs: ctx.jobs||[],
+      accInvoices: ctx.accInvoices||[], customers: ctx.customers||[] }
+  );
+  const unambiguous = !(links.warnings && links.warnings.length);
+  const srcJob   = unambiguous ? (links.job   || null) : null;
+  const srcQuote = unambiguous ? (links.quote || null) : null;
+  const src      = srcJob || srcQuote || null;
+  const jobNo    = (inv && inv.jobNum) || (srcJob ? srcJob.num : '') || '';
+
+  /* PRESENTATION-ONLY LINE ENRICHMENT. The established Tax Invoice prints a
+     dimension / pieces sub-line beneath each description and an "Item Qty"
+     that is the PIECE count — both of which live on the SOURCE document's
+     lines, never on a stored invoice line (an invoice line is an accounting
+     line: description, qty, unitAmount, account code, tax type). They are
+     borrowed only when the source's lines provably ARE these invoice lines:
+     the same number of them, the same description on each, and the same money
+     on each to within the existing financial tolerance. If any of that fails,
+     nothing is borrowed and the lines print exactly as they are stored.
+     No AMOUNT is ever taken from the source — a printed line total is always
+     the invoice's own qty × unitAmount. */
+  const srcLines = src && Array.isArray(src.lines) ? src.lines.filter(Boolean) : [];
+  let enrich = null;
+  if(srcLines.length && srcLines.length === split.items.length){
+    const everyLineMatches = split.items.every(function(l, i){
+      const sl = srcLines[i];
+      const sameDesc = String(sl.desc==null ? '' : sl.desc).trim()
+                    === String(l.description==null ? '' : l.description).trim();
+      // docLinesSubtotal() is the shared piece-aware formula (pQty × qty ×
+      // unitPrice) the quote form, the writers and the backend all use.
+      return sameDesc &&
+        Math.abs(sgrInvoiceLineAmount(l) - docLinesSubtotal([sl])) <= SGR_INV_MONEY_TOLERANCE;
+    });
+    if(everyLineMatches) enrich = srcLines;
+  }
+
+  const lines = split.items.map(function(l, i){
+    const e = enrich ? enrich[i] : null;
+    return {
+      desc: (l && l.description) || '',
+      subtotal: sgrInvoiceLineAmount(l),          // always the INVOICE's own money
+      qty:  e ? e.qty : (l && l.qty==null ? '' : l.qty),
+      unit: e ? (e.unit || null) : null,
+      sqmL: e ? (e.sqmL || null) : null,
+      sqmW: e ? (e.sqmW || null) : null,
+      pQty: e ? (e.pQty || null) : null,
+    };
+  });
+
+  // A job-sourced invoice stores the JOB number in `reference` (that is the
+  // linkage invoiceBelongsToJob matches on), while the established document's
+  // "Reference" row is the customer's own reference. Prefer the source
+  // document's reference; fall back to the record's only when it is not just
+  // the job number repeated, so the row is never a duplicate of "Job No".
+  const reference = (src && src.reference)
+    || ((inv && inv.reference && inv.reference !== jobNo) ? inv.reference : '')
+    || '';
+
+  return {
+    co: inv && inv.co,
+    num: jobNo,                                             // "Job No" row — absent when ''
+    quoteNum: (inv && inv.quoteNum) || (srcJob ? srcJob.quoteNum : '')
+              || (srcQuote ? srcQuote.num : '') || '',      // "Quote Ref" row — absent when ''
+    reference: reference,
+    invoiceNum: (inv && inv.number) || '',
+    invoiceDate: (inv && (inv.date || inv.issueDate)) || '',
+    invoiceDue: (inv && inv.dueDate) || '',
+    client: (inv && inv.contactName) || (src ? src.client : '') || '',
+    contact: (src && src.contact) || '',                    // "Attn" — absent when unavailable
+    email: (inv && inv.contactEmail) || (src ? src.email : '') || '',
+    tel: (src && src.tel) || '',
+    // buildInvoiceHtml already falls back to the saved Customer record's VAT
+    // number when the document carries none, so a manual invoice still shows
+    // one when the customer is on file — and shows nothing when it is not.
+    vatNum: (src && src.vatNum) || '',
+    notes: (src && src.notes) || '',
+    lines: lines,
+    payments: (inv && Array.isArray(inv.payments)) ? inv.payments : [],
+    // See the PRE-COMPUTED TOTALS OVERRIDE note in buildInvoiceHtml.
+    _sgrTotals: {
+      sub: split.itemsSubtotal,      // genuine items, before the separated adjustments
+      discPct: split.discPct,
+      discAmt: split.discAmt,
+      setupFeeAmt: split.setupFeeAmt,
+      afterDisc: split.allSubtotal,  // === itemsSubtotal - discAmt + setupFeeAmt
+      vat: split.vat,                // canonical, per-line taxType
+      total: split.total,            // canonical, unchanged from the record
+    },
+  };
+}
+
+/* THE one customer-facing invoice print entry point. Still named
+   printManualInvoice for continuity with its three existing call sites (Sales
+   -> Invoices, Accounting -> Invoices, and the View-Invoice modal), but it is
+   no longer "the manual template": it renders EVERY accInvoices record -
+   job-sourced, quote-sourced or genuinely manual - through the ESTABLISHED
+   buildInvoiceHtml() document, via the presentation adapter above.
+   `ctx` is an optional { quotes, jobs, accInvoices, customers }; without it the
+   invoice still prints, from what the record stores itself.
+   The suggested-PDF-filename argument is unchanged: inv.number -> INV-#####.pdf. */
+function printManualInvoice(inv, companies, logoDataUrl, ctx) {
+  const printable = sgrInvoiceRecordToPrintable(inv, ctx);
+  const html = buildInvoiceHtml(printable, companies, logoDataUrl, (ctx && ctx.customers) || []);
   sgrOpenPrintPreview(html, 'Invoice '+(inv.number||''), inv.number);
 }
 
@@ -11223,7 +11479,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                             className="text-xs bg-amber-500 hover:bg-amber-600 text-white font-bold px-3 py-1.5 rounded-xl">
                             ✏️ Edit
                           </button>
-                          <button onClick={()=>printManualInvoice(manualRec,companies,logoDataUrl)}
+                          <button onClick={()=>printManualInvoice(manualRec,companies,logoDataUrl,{quotes:myQuotes,jobs:myJobs,accInvoices:myAccInvoices,customers})}
                             className="text-xs bg-gray-800 hover:bg-gray-900 text-white font-bold px-3 py-1.5 rounded-xl">
                             🧾 Print
                           </button>
@@ -23253,7 +23509,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                               <button onClick={()=>setViewInv(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f0f4ff',color:'#4338ca'}}>👁 View</button>
                               <button onClick={()=>{setPayModalInv(inv);setShowPayModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#ecfdf5',color:'#059669'}}>💳 Payments</button>
                               <button onClick={()=>{setEditInv(inv);setShowInvModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#e6e6ff',color:'#06065c'}}>Edit</button>
-                              <button onClick={()=>printManualInvoice(inv,companies,logoDataUrl)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f3f4f6',color:'#1f2937'}}>🧾 Print</button>
+                              <button onClick={()=>printManualInvoice(inv,companies,logoDataUrl,{quotes,jobs,accInvoices,customers})} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f3f4f6',color:'#1f2937'}}>🧾 Print</button>
                               <button onClick={()=>emailManualInvoiceViaOutlook(inv,companies)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dbeafe',color:'#1e40af'}}>📧 Email</button>
                               {inv.status!=='paid'&&<button onClick={()=>guardAction('markInvPaid:'+relKey(inv), ()=>markInvPaid(inv))} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dcfce7',color:'#059669'}}>✓ Paid</button>}
                               {isAdmin&&<button onClick={()=>guardAction('deleteInvoice:'+inv.id, ()=>deleteInvoice(inv.id))} className="text-xs text-gray-300 hover:text-red-400">✕</button>}
