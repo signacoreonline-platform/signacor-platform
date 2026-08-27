@@ -18,6 +18,9 @@ import documentNumbersRoutes from './routes/documentNumbers';
 import quoteConversionsRoutes from './routes/quoteConversions';
 import relationalApiRoutes from './relational/api';
 import fullBackupRoutes from './routes/fullBackup';
+// RELIABILITY PHASE 1 (2026-08-26): metadata-only change detection for
+// relational sections — see backend/src/routes/freshness.ts.
+import freshnessRoutes from './routes/freshness';
 import { errorHandler, notFound } from './middleware/errorHandler';
 import { ALL_SECTIONS, isSectionCutOver } from './relational/cutover';
 
@@ -95,6 +98,7 @@ app.use('/api/document-numbers', documentNumbersRoutes);
 app.use('/api/quote-conversions', quoteConversionsRoutes);
 app.use('/api/relational', relationalApiRoutes);
 app.use('/api/full-backup', fullBackupRoutes);
+app.use('/api/freshness', freshnessRoutes);
 
 // ── Error handling ────────────────────────────────────────────
 app.use(notFound);
@@ -108,6 +112,48 @@ app.listen(PORT, () => {
   ║   Env:  ${process.env.NODE_ENV || 'development'}                    ║
   ╚══════════════════════════════════════════╝
   `);
+  warnIfCutoverRowsWithoutMasterSwitch();
 });
+
+/**
+ * RELIABILITY PHASE 1 (2026-08-26) — LOUD, NON-FATAL MISMATCH WARNING.
+ *
+ * Authority requires BOTH the env master switch AND the per-section DB row
+ * (see relational/cutover.ts). If the DB says sections are cut over but
+ * RELATIONAL_AUTHORITY_ENABLED is not "true", every one of those sections
+ * silently reverts to its FROZEN platform_state copy — users see pre-cutover
+ * data and, worse, JSON saves start writing that copy again. Today that
+ * situation is completely silent in the logs.
+ *
+ * This ONLY logs. It does not change authority, does not alter /health, does
+ * not retry, and never prevents the server from starting — hard-failing on
+ * this is deliberately left to a later phase, as instructed. Any error while
+ * checking is swallowed: a startup diagnostic must never be able to take the
+ * service down.
+ */
+async function warnIfCutoverRowsWithoutMasterSwitch(): Promise<void> {
+  try {
+    if (process.env.RELATIONAL_AUTHORITY_ENABLED === 'true') return;
+    const { query } = await import('./db/pool');
+    const res = await query('SELECT section FROM relational_cutover WHERE enabled = true ORDER BY section');
+    const rows = res.rows.map((r: { section: string }) => r.section);
+    if (rows.length === 0) return;
+    console.error('');
+    console.error('  ####################################################################');
+    console.error('  #  WARNING — RELATIONAL AUTHORITY IS OFF BUT CUTOVER ROWS EXIST    #');
+    console.error('  ####################################################################');
+    console.error(`  #  RELATIONAL_AUTHORITY_ENABLED is "${process.env.RELATIONAL_AUTHORITY_ENABLED ?? '(unset)'}" — not "true".`);
+    console.error(`  #  ${rows.length} section(s) are marked cut over in the database:`);
+    console.error(`  #    ${rows.join(', ')}`);
+    console.error('  #  Those sections are being served from their FROZEN platform_state');
+    console.error('  #  JSON copy, which is OLDER than the relational tables, and JSON');
+    console.error('  #  saves are no longer being stripped for them. If this environment');
+    console.error('  #  is production, set RELATIONAL_AUTHORITY_ENABLED=true before use.');
+    console.error('  ####################################################################');
+    console.error('');
+  } catch {
+    /* A startup diagnostic must never affect startup. */
+  }
+}
 
 export default app;

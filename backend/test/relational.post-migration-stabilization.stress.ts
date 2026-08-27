@@ -197,13 +197,40 @@ async function main() {
   // authoritative re-read. This is browser-only behaviour, hence source-text.
   ok(/if \(method !== 'GET' && method !== 'HEAD'\) \{\s*requestRelationalRefresh\(/.test(src),
     'A6 [frontend]: relationalFetch schedules an authoritative refresh after EVERY successful relational mutation — the one choke point every write passes through');
+  // ── PIN MOVED, INTENT UNCHANGED (RELIABILITY PHASE 1, 2026-08-26) ─────────
+  // These assertions used to pin the EXACT lines of the original post-write
+  // refresh: `relationalRefreshRef.current = refreshRelationalSectionsNow`, a
+  // literal `applyServerData(selective)` right after the section list, and a
+  // literal `serverBaselineRef.current = { ...serverBaselineRef.current,
+  // ...selective }`.
+  //
+  // Phase 1 keeps every one of those behaviours and changes only WHERE they
+  // happen. The post-write refresh now runs through the same freshness check
+  // the poll uses, so a mutation refetches ONLY the section that actually
+  // changed instead of the entire platform state; and "apply the sections +
+  // sync the baseline" moved into one shared function, applyRefreshedSections(),
+  // which every refresh path must now go through so dirty-record pinning cannot
+  // be bypassed by a future caller.
+  //
+  // The assertions below pin the SAME three guarantees against the new
+  // structure. Nothing is deleted or loosened — each still fails if the
+  // guarantee it protects is removed.
   ok(src.includes('async function refreshRelationalSectionsNow(reason)') &&
-     src.includes('relationalRefreshRef.current = refreshRelationalSectionsNow'),
+     /relationalRefreshRef\.current = postMutationRefresh/.test(src) &&
+     /const postMutationRefresh = \(reason\) => freshnessCheckNow\(/.test(src),
     'A6 [frontend]: App registers the refresh implementation, so components declared earlier in the file can trigger it without prop-drilling');
-  ok(/const sections = relationalAuthoritativeSectionsRef\.current \|\| \[\];[\s\S]{0,400}applyServerData\(selective\)/.test(src),
+  ok(/const sections = relationalAuthoritativeSectionsRef\.current \|\| \[\];[\s\S]{0,400}applyRefreshedSections\(selective, reason\)/.test(src)
+     && /function applyRefreshedSections\(selective, reason\)[\s\S]{0,800}applyServerData\(merged\)/.test(src),
     'A6 [frontend]: the refresh applies ONLY relational-authoritative sections — a JSON-owned section the user may be editing is never overwritten');
-  ok(/serverBaselineRef\.current = \{ \.\.\.serverBaselineRef\.current, \.\.\.selective \}/.test(src),
+  ok(/serverBaselineRef\.current = \{ \.\.\.serverBaselineRef\.current, \.\.\.merged \}/.test(src),
     'A6 [frontend]: the refresh syncs serverBaselineRef too, so the autosave diff cannot then trip the relational-authority guard for data that is already saved');
+  // NEW in Phase 1, asserted here beside the three above because it is the
+  // reason they moved: an automatic refresh must never be able to advance an
+  // open editor's expected row_version.
+  ok(/function mergeRefreshedSection\(sectionKey, incoming\)/.test(src)
+     && /const pinned = _pinnedIdsForSection\(sectionKey\);/.test(src)
+     && /if \(pinned\.size === 0\) return incoming;/.test(src),
+    'A6 [frontend]: an automatic refresh preserves a pinned (open-editor) record exactly, so its expected row_version cannot drift underneath the user');
 
   // A7 — rel_payments is the SOLE authority for a cut-over record's payments.
   //

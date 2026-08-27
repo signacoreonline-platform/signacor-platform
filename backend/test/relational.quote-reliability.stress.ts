@@ -889,10 +889,18 @@ async function main() {
       (HTML.match(/pieces: l\.pQty===''\|\|l\.pQty===undefined\?null:l\.pQty/g) || []).length);
     ok(HTML.indexOf("u.subtotal=(parseFloat(u.pQty)||1)*(parseFloat(u.qty)||0)*(parseFloat(u.unitPrice)||0);") !== -1,
       'P3 the FORM\'s own line-subtotal rule (pQty x qty x unitPrice) is pinned — this is what the customer is shown');
-    ok(HTML.indexOf("const hasDim = l.sqmL && (l.unit==='m²'||l.unit==='m (linear)');") !== -1,
+    // STEP A (2026-08-27): the rule these two pinned INLINE is now the shared
+    // helper pair sgrLineHasDimensions()/sgrLinePieceCount(), used by the Quote,
+    // Job Card, Proforma, Invoice and jsPDF document alike. The FACTS pinned are
+    // unchanged, and P5b pins the correction itself.
+    ok(HTML.indexOf("return !!(l && l.sqmL && (l.unit==='m²' || l.unit==='m (linear)'));") !== -1
+      && HTML.indexOf("if(sgrLineHasDimensions(l)){") !== -1,
       'P4 the printed quote\'s spec line still depends on sqmL/unit');
-    ok(HTML.indexOf("if(hasDim) return parseFloat(l.pQty)||1;") !== -1,
-      'P5 the item COUNT for a dimensioned line still comes from pQty');
+    ok(HTML.indexOf("if(sgrLineHasDimensions(l)) return p === null ? 1 : p;") !== -1,
+      'P5 the item COUNT for a dimensioned line still comes from pQty (absent/malformed reads as 1)');
+    ok(HTML.indexOf("return (p !== null && p > 1) ? p : null;") !== -1,
+      'P5b …and a piece count above 1 is now honoured on a line that has LOST its dimensions, '
+      + 'while the form-default pQty 1 on an ordinary line still leaves qty as the count');
     // Scan EVERY migration, not just 007 — a column added by 008/012 would
     // otherwise be missed and this conclusion would be unfounded.
     const migDir = path.resolve(__dirname, '..', '..', 'database', 'migrations');

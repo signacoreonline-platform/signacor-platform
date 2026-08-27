@@ -148,6 +148,14 @@ const API_DOC_NUMBER_CHECK_URL = (window.SIGNACORE_API_URL || 'https://signacore
 // 2026-08-20 Stage 2 hotfix: Full Backup V2 — the authenticated endpoint
 // backend/src/routes/fullBackup.ts mounts (see exportFullBackup below).
 const API_FULL_BACKUP_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/full-backup';
+// ── RELIABILITY PHASE 1 (2026-08-26) ──────────────────────────────────────
+// Metadata-only change detection (backend/src/routes/freshness.ts) and the
+// targeted authoritative read (GET /api/relational/sections). Together these
+// replace "poll, then download the entire platform state to find out whether
+// anything moved" with "ask for a few hundred bytes, and only fetch the
+// sections whose SERVER token actually changed".
+const API_FRESHNESS_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/freshness';
+const API_RELATIONAL_SECTIONS_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/relational/sections';
 // ── Authentication (added 2026-08-06, audit finding B1) ────────────────────
 // API_STATE_URL and API_DOC_NUMBER_RESERVE_URL above now both require a
 // valid backend-issued JWT. Login used to be a purely local comparison
@@ -254,6 +262,103 @@ function syncRelationalBaseline(sectionKey, updater) {
   if (serverBaselineRef.current && Array.isArray(serverBaselineRef.current[sectionKey])) {
     serverBaselineRef.current = { ...serverBaselineRef.current, [sectionKey]: updater(serverBaselineRef.current[sectionKey]) };
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   RELIABILITY PHASE 1 (2026-08-26) — DIRTY-RECORD PIN REGISTRY
+
+   THE HAZARD THIS EXISTS FOR, stated precisely, because it is the one way an
+   automatic refresh can DESTROY data rather than merely annoy someone.
+
+   Two editors read a record's `_relRowVersion` from the LIVE array at SAVE
+   time rather than from a snapshot taken when editing began:
+
+     * JobDetail — `const job = jobs.find(j => j.id === jobId)` is re-derived on
+       every render, and saveNotes/saveCosts/saveLines all send
+       `job._relRowVersion`.
+     * CreateQuoteModal's save — the quote's OWN version is safely frozen (it
+       comes from the payload the modal built at open time), but the LINKED JOB's
+       version is looked up live and sent as `expectedJobVersion`.
+
+   If a background refresh replaces the jobs array while one of those editors is
+   open, the expected version silently advances from the value the user started
+   from to whatever the server now holds. The subsequent save then asserts the
+   NEWER version, the backend sees no conflict, and the other user's committed
+   change is overwritten with no 409 and no warning. More refreshing makes that
+   more likely — so freshness cannot ship without this.
+
+   Every OTHER relational editor is already safe by construction and is
+   deliberately NOT pinned: AddEditSupplierModal, InvoiceModal, CreditNoteModal
+   and the inventory editor all receive their record from a component STATE
+   variable captured at click time (`editSup`, `editInv`, `editCn`, ...), so a
+   refresh of the list cannot reach into them. Their saves keep asserting the
+   version they opened with and are correctly rejected with a 409 if someone
+   else got there first — which is the outcome we want, not a bug.
+
+   THE RULE. While a record is pinned, an automatic refresh leaves THAT record's
+   local object exactly as it is — same object identity, same field values, same
+   `_relRowVersion` — and refreshes every other record in the section normally.
+   Nothing here weakens concurrency: it PRESERVES the expected version so the
+   server's existing row_version check can do its job.
+
+   Pins are keyed by section + record id, are held only while an editor is
+   genuinely open/dirty, and are always released in the same effect's cleanup,
+   so a crash or an unmount can never leave a record pinned forever.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const pinnedRecordsRef = { current: new Map() }; // "section:id" -> refcount
+// Sections where an automatic refresh found a genuinely newer server copy for a
+// record that was pinned. Purely informational — it never changes what is
+// saved, and never blocks a save.
+const pinnedStaleRef = { current: new Set() };
+
+function _pinKey(section, id) { return String(section) + ':' + String(id); }
+
+function pinRecord(section, id) {
+  if (section == null || id == null) return;
+  const k = _pinKey(section, id);
+  pinnedRecordsRef.current.set(k, (pinnedRecordsRef.current.get(k) || 0) + 1);
+}
+function unpinRecord(section, id) {
+  if (section == null || id == null) return;
+  const k = _pinKey(section, id);
+  const n = (pinnedRecordsRef.current.get(k) || 0) - 1;
+  if (n > 0) pinnedRecordsRef.current.set(k, n);
+  else {
+    pinnedRecordsRef.current.delete(k);
+    pinnedStaleRef.current.delete(k);
+  }
+}
+function isRecordPinned(section, id) {
+  return pinnedRecordsRef.current.has(_pinKey(section, id));
+}
+/** True when an automatic refresh has seen a newer server copy of this exact
+ *  record while it was pinned. Editors may use this to tell the user their
+ *  view is behind; it is never used to change or block a save. */
+function pinnedRecordIsStale(section, id) {
+  return pinnedStaleRef.current.has(_pinKey(section, id));
+}
+function _notePinnedStale(section, id) {
+  pinnedStaleRef.current.add(_pinKey(section, id));
+}
+/** Any pin currently held for this section, as a Set of stringified ids. */
+function _pinnedIdsForSection(section) {
+  const prefix = String(section) + ':';
+  const out = new Set();
+  for (const key of pinnedRecordsRef.current.keys()) {
+    if (key.indexOf(prefix) === 0) out.add(key.slice(prefix.length));
+  }
+  return out;
+}
+
+/* A tiny convenience for components: hold a pin for exactly as long as
+   `active` is true. Written as a plain helper taking React's useEffect so it
+   can live at module scope alongside everything else here. */
+function usePinnedRecord(section, id, active) {
+  useEffect(() => {
+    if (!active || id == null) return undefined;
+    pinRecord(section, id);
+    return () => unpinRecord(section, id);
+  }, [section, id, active]);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -382,6 +487,57 @@ async function relationalFetch(path, options) {
     requestRelationalRefresh(method + ' ' + path);
   }
   return body;
+}
+
+/* ── RELIABILITY PHASE 1 (2026-08-26) — FRESHNESS + TARGETED READ ──────────
+   fetchFreshnessTokens() returns a few hundred bytes of metadata:
+     { platformState, sections: { quotes: "<token>", ... }, cutOver: [...] }
+   The tokens are SERVER AUTHORITY. This client only ever compares two strings
+   for equality — it never constructs, increments, parses or predicts one, so
+   it can never mark itself fresh on the strength of its own guess. A failure
+   here is treated as "unknown", never as "nothing changed": the next check
+   simply runs again.
+
+   fetchRelationalSectionsNow() reads ONLY the named sections, through the same
+   getAuthoritativeJson() the platform-state overlay uses, so the shape is
+   identical to what a full reload would have produced for those keys. */
+async function fetchFreshnessTokens() {
+  const res = await fetch(API_FRESHNESS_URL, { headers: { ...authHeaders() } });
+  if (res.status === 401) { forceLogoutExpiredSession(); throw new Error('Session expired — please log in again.'); }
+  if (!res.ok) throw new Error('freshness HTTP ' + res.status);
+  return res.json();
+}
+
+async function fetchRelationalSectionsNow(sectionNames) {
+  const qs = encodeURIComponent((sectionNames || []).join(','));
+  const res = await fetch(API_RELATIONAL_SECTIONS_URL + '?names=' + qs, { headers: { ...authHeaders() } });
+  if (res.status === 401) { forceLogoutExpiredSession(); throw new Error('Session expired — please log in again.'); }
+  if (!res.ok) throw new Error('targeted read HTTP ' + res.status);
+  return res.json();
+}
+
+/* Sections this client is allowed to refresh through the targeted relational
+   path. purchaseOrders is deliberately EXCLUDED for Phase 1: it is flagged cut
+   over in production, but the historical collection was never migrated
+   (backfill.ts's LEGACY_PURCHASE_ORDERS_SKIPPED_BY_POLICY), so its authority
+   state needs a person's decision before anything about it changes. Leaving it
+   out means PO behaviour is byte-for-byte what it is today. */
+const FRESHNESS_REFRESHABLE_SECTIONS = ['suppliers', 'inventory', 'quotes', 'jobs', 'accInvoices', 'creditNotes'];
+
+/* `payments` has no standalone frontend array — rel_payments is embedded into
+   whichever of quotes/jobs/accInvoices owns it (read.ts's paymentsFor). A
+   payment against a JOB or an INVOICE also updates its owner row, so the
+   owner's own token already moves; a payment against a QUOTE does NOT
+   (recomputeOwnerPaymentStatus returns immediately for owner_type 'quote'), so
+   without this mapping a quote deposit recorded by one user would never reach
+   another. Mapping it to all three owners is the safe, cheap answer. */
+function expandFreshnessSections(changedSections) {
+  const out = new Set();
+  for (const s of changedSections) {
+    if (s === 'payments') { out.add('quotes'); out.add('jobs'); out.add('accInvoices'); continue; }
+    out.add(s);
+  }
+  return Array.from(out).filter((s) => FRESHNESS_REFRESHABLE_SECTIONS.indexOf(s) !== -1);
 }
 
 // ── Reusable save-conflict message helper (Stage 3 follow-up — record-
@@ -2227,24 +2383,15 @@ function buildQuoteHtml(q, companies, logoDataUrl) {
   const dep = total*depRate;
   const fmt = n=>'R\u00a0'+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const rows = q.lines.map((l,i)=>{
-    const hasDim = l.sqmL && (l.unit==='m²'||l.unit==='m (linear)');
-    // Build a specs line: dimensions + qty info shown beneath the description
-    let specsLine = '';
-    if (hasDim) {
-      const dimStr = l.unit==='m²'&&l.sqmW
-        ? `${l.sqmL} × ${l.sqmW} mm`
-        : `${l.sqmL} mm`;
-      const pQty = l.pQty||1;
-      const qtyM = parseFloat(l.qty)||0;
-      specsLine = pQty>1
-        ? `${dimStr} &nbsp;·&nbsp; ${pQty} items &nbsp;·&nbsp; ${qtyM.toFixed(4)} ${l.unit} each`
-        : `${dimStr} &nbsp;·&nbsp; ${qtyM.toFixed(4)} ${l.unit}`;
-    } else if (l.qty || l.unit) {
-      specsLine = `${l.qty||''}${l.unit?' '+l.unit:''}`;
-    }
-    const qtyDisplay = hasDim
-      ? `${(parseFloat(l.pQty)||1)} item${(parseFloat(l.pQty)||1)!==1?'s':''}<br/><span style="font-size:9px;color:#888">${(parseFloat(l.qty)||0).toFixed(4)} ${l.unit}</span>`
-      : `${l.qty||''}${l.unit?'<br/><span style="font-size:9px;color:#888">'+l.unit+'</span>':''}`;
+    /* CONVERGED (2026-08-27). This builder's own inline wording WAS the
+       established Signacore specification line; it now lives in the shared
+       helpers so the Job Card, Proforma, Invoice and jsPDF document state the
+       same line the same way. Output for existing quotes is unchanged — the
+       HTML separator preserves this layout's non-breaking spaces. */
+    const specsLine = lineSizeText(l, { sep: ' &nbsp;·&nbsp; ' });
+    const qtyDetail = lineItemQtyDetail(l);
+    const qtyDisplay = lineItemCountText(l)
+      + (qtyDetail ? `<br/><span style="font-size:9px;color:#888">${qtyDetail}</span>` : '');
     return `
     <tr>
       <td style="width:24px;color:#4b5563;font-size:10px;vertical-align:top;padding-top:9px;">${i+1}</td>
@@ -4248,29 +4395,103 @@ function ConsistencyPanel({ quotes, jobs, accInvoices }) {
   );
 }
 
-/* Build a human-readable "size" string for a line item, shown beneath the
-   description on invoices / proformas. Derived from the L×W (mm) calculator
-   fields and the unit, plus a custom size field if present. */
-function lineSizeText(l){
-  if(!l) return '';
-  if(l.sizeText) return String(l.sizeText);
-  let s='';
-  if(l.unit==='m²' && l.sqmL && l.sqmW) s = l.sqmL+' × '+l.sqmW+' mm';
-  else if(l.unit==='m (linear)' && l.sqmL)   s = l.sqmL+' mm';
-  if(s && l.pQty && Number(l.pQty)>1) s += '  ·  '+l.pQty+' off';
-  return s;
+/* ═══ SHARED DOCUMENT LINE PRESENTATION — STEP A (2026-08-27) ═══
+   ONE implementation of how a commercial line is STATED, used by the Quote,
+   the Job Card, the Proforma, the Invoice and the jsPDF document, so the same
+   line can never read differently on two documents. Presentation only: not one
+   of these functions is used to compute money. The three quantities a line can
+   carry are kept strictly apart:
+
+     PIECES               the customer-facing physical item count (pQty)
+     PER-PIECE QTY/AREA   the descriptive measurement (qty, on a dimensioned line)
+     EFFECTIVE BILLABLE   the internal financial quantity (pieces x qty), which
+                          lives on the invoice line and is NEVER shown as a count
+
+   WHY THE PIECE COUNT IS NOT SIMPLY `pQty`. Both line editors seed every new
+   line with pQty: 1 (QuoteForm/JobForm useState + addLine), so a bare 1 on an
+   ORDINARY line is the form's default, not a statement about the goods — there
+   the line's own qty is the count, exactly as before. On a DIMENSIONED line qty
+   is an area or a length and can never be a count, so pQty is the only possible
+   answer and 1 is meaningful. A piece count above 1 is always a statement, and
+   is now honoured whether or not dimensions survive on the line: that is the
+   INV-00117 case, where pQty = 25 was present and was being discarded because
+   the source Job line had lost its sqmL/sqmW/unit. */
+
+/* A line is DIMENSIONED when it stores a length AND a unit that gives that
+   length meaning. On such a line `qty` is an area / a length, never a count. */
+function sgrLineHasDimensions(l){
+  return !!(l && l.sqmL && (l.unit==='m²' || l.unit==='m (linear)'));
 }
 
-/* Number of physical items for a line, shown in the "Qty" column of printed
-   quotes / proformas / invoices. For dimensioned items (m² or linear metre) the
-   stored qty is an area/length, so the item count is the "pieces" value (pQty).
-   For plain units the qty itself is the count. */
+/* The line's PIECE COUNT as a number, or null when it does not carry a
+   meaningful one (see the note above). Never returns 0 or NaN. */
+function sgrLinePieceCount(l){
+  if(!l) return null;
+  const raw = parseFloat(l.pQty);
+  const p = (Number.isFinite(raw) && raw > 0) ? raw : null;
+  // Dimensioned: qty is an area/length, so an absent or malformed piece count
+  // reads as the documented default of 1 — unchanged from the previous helper.
+  if(sgrLineHasDimensions(l)) return p === null ? 1 : p;
+  return (p !== null && p > 1) ? p : null;
+}
+
+/* The SPECIFICATION sub-line printed beneath a description, e.g.
+     1300 × 295 mm  ·  25 items  ·  0.3835 m² each
+   `opts.sep` lets a caller keep its own separator markup (buildQuoteHtml uses
+   non-breaking spaces); the default is plain text, safe for jsPDF's doc.text.
+   Dimensions are never invented: a line that has lost them gets no dimensional
+   sub-line at all. */
+function lineSizeText(l, opts){
+  if(!l) return '';
+  if(l.sizeText) return String(l.sizeText);
+  const sep = (opts && opts.sep) || '  ·  ';
+  if(sgrLineHasDimensions(l)){
+    const dimStr = (l.unit==='m²' && l.sqmW) ? (l.sqmL+' × '+l.sqmW+' mm') : (l.sqmL+' mm');
+    const per = (parseFloat(l.qty)||0).toFixed(4)+' '+l.unit;
+    const p = sgrLinePieceCount(l);
+    return p>1 ? dimStr+sep+p+' items'+sep+per+' each' : dimStr+sep+per;
+  }
+  // Not dimensioned. The line's own quantity and unit are stated only when there
+  // IS a unit to state — without one the sub-line would merely repeat the Item
+  // Qty cell, which is why an enriched-but-dimensionless invoice line (INV-00117)
+  // correctly prints no specification at all.
+  if(l.unit) return (l.qty===''||l.qty==null ? '' : String(l.qty)+' ')+String(l.unit);
+  return '';
+}
+
+/* Number of physical items for a line, as a NUMBER (or '' when the line has no
+   quantity at all). Kept as the numeric accessor; lineItemCountText() below is
+   what documents print. */
 function lineItemCount(l){
   if(!l) return '';
-  const hasDim = l.sqmL && (l.unit==='m²' || l.unit==='m (linear)');
-  if(hasDim) return parseFloat(l.pQty)||1;
+  const p = sgrLinePieceCount(l);
+  if(p !== null) return p;
   const q = l.qty;
   return (q===''||q==null) ? '' : q;
+}
+
+/* The customer-facing ITEM QTY cell: '25 items', '1 item', or the line's own
+   quantity when it carries no piece count. `opts.decimals` formats only that
+   bare-quantity fallback, so the jsPDF document keeps its existing 2-dp
+   rendering of fractional quantities. */
+function lineItemCountText(l, opts){
+  const p = sgrLinePieceCount(l);
+  if(p !== null) return p+(p===1 ? ' item' : ' items');
+  const q = l && l.qty;
+  if(q===''||q==null) return '';
+  const dp = opts && opts.decimals;
+  const n = Number(q);
+  if(dp!=null && Number.isFinite(n) && !Number.isInteger(n)) return n.toFixed(dp);
+  return String(q);
+}
+
+/* The small per-piece detail the Quote layout prints under its Item Qty cell
+   ('0.3835 m²'). Shared rather than inline so the Quote's established look is
+   preserved without re-implementing the rule. */
+function lineItemQtyDetail(l){
+  if(!l) return '';
+  if(sgrLineHasDimensions(l)) return (parseFloat(l.qty)||0).toFixed(4)+' '+l.unit;
+  return l.unit ? String(l.unit) : '';
 }
 
 /* ═══════════════════════════════════════════
@@ -4456,7 +4677,7 @@ function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
     const sz = lineSizeText(l);
     return '<tr><td style="width:42px;color:#4b5563;font-size:10px;vertical-align:top;">'+(i+1)+'</td>'+
     '<td style="font-size:11px;word-break:break-word;vertical-align:top;">'+(l.desc||'\u2014')+(sz?'<div style="font-size:9px;color:#777;margin-top:2px;">'+sz+'</div>':'')+'</td>'+
-    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+lineItemCount(l)+'</td>'+
+    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+lineItemCountText(l)+'</td>'+
     '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(l.subtotal||0)+'</td></tr>';
   }).join('');
   const invNum = sgrJobInvoiceNumber(job);
@@ -4648,7 +4869,7 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
     const sz = lineSizeText(l);
     return '<tr><td style="width:42px;color:#4b5563;font-size:10px;vertical-align:top;">'+(i+1)+'</td>'+
     '<td style="font-size:11px;word-break:break-word;vertical-align:top;">'+(l.desc||'—')+(sz?'<div style="font-size:9px;color:#777;margin-top:2px;">'+sz+'</div>':'')+'</td>'+
-    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+lineItemCount(l)+'</td>'+
+    '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+lineItemCountText(l)+'</td>'+
     '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(l.subtotal||0)+'</td></tr>';
   }).join('');
   const logoHtml = (logoDataUrl
@@ -5118,14 +5339,30 @@ function sgrInvoiceRecordToPrintable(inv, ctx){
 
   const lines = split.items.map(function(l, i){
     const e = enrich ? enrich[i] : null;
+    /* SNAPSHOT PREFERENCE (2026-08-27). An invoice line's OWN presentation
+       metadata — carried on its legacy_data and already spread onto the line by
+       the read layer — outranks anything borrowed from a linked Quote or Job, so
+       an invoice that has been issued with a snapshot renders from itself and
+       cannot be restated by a later edit upstream. Linked-source enrichment stays
+       as the fallback for the historical invoices that carry no snapshot, and no
+       NEW linkage is introduced here. Nothing is written: this is a read.
+       MONEY IS UNAFFECTED — `subtotal` remains the invoice's own qty × unitAmount
+       below, and no amount is ever taken from a source document. */
+    const own = l || {};
+    const has = function(v){ return v !== undefined && v !== null && v !== ''; };
+    const pick = function(ownV, srcV){ return has(ownV) ? ownV : (has(srcV) ? srcV : null); };
     return {
       desc: (l && l.description) || '',
       subtotal: sgrInvoiceLineAmount(l),          // always the INVOICE's own money
-      qty:  e ? e.qty : (l && l.qty==null ? '' : l.qty),
-      unit: e ? (e.unit || null) : null,
-      sqmL: e ? (e.sqmL || null) : null,
-      sqmW: e ? (e.sqmW || null) : null,
-      pQty: e ? (e.pQty || null) : null,
+      // Presentation-only per-piece quantity. `pieceQty` is the snapshot key; the
+      // accounting `qty` on the stored line is the EFFECTIVE BILLABLE quantity and
+      // is never overwritten — it is what `subtotal` above is computed from.
+      qty:  has(own.pieceQty) ? own.pieceQty : (e ? e.qty : (l && l.qty==null ? '' : l.qty)),
+      unit: pick(own.unit,     e && e.unit),
+      sqmL: pick(own.sqmL,     e && e.sqmL),
+      sqmW: pick(own.sqmW,     e && e.sqmW),
+      pQty: pick(own.pQty,     e && e.pQty),
+      sizeText: has(own.sizeText) ? String(own.sizeText) : null,
     };
   });
 
@@ -5584,8 +5821,9 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
     descLines.forEach(t=>{ doc.text(t, descX, ty); ty+=3.6; });
     if (szLines.length){ doc.setFontSize(6.5); sc(C_GREY); szLines.forEach(t=>{ doc.text(t, descX, ty); ty+=3.2; }); doc.setFontSize(7.5); sc(C_DARK); }
     // Qty
-    const q = lineItemCount(ln);
-    const qtyStr = (q===''||q==null) ? '' : (Number.isInteger(Number(q)) ? String(q) : Number(q).toFixed(2));
+    // Same semantics as every other document; `decimals` preserves this PDF's
+    // existing 2-dp rendering of a fractional bare quantity.
+    const qtyStr = lineItemCountText(ln, { decimals: 2 });
     doc.text(qtyStr, qtyX, y+5, {align:'center'});
     // Total
     doc.text(fmt(ln.subtotal||0).replace('R ',''), amtX, y+5, {align:'right'});
@@ -9246,6 +9484,29 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const [viewQuote,setViewQuote]=useState(null);
   const [editQuote, setEditQuote] = useState(null);   // quote open in edit modal
   const [copyQuote, setCopyQuote] = useState(null);   // quote being copied to new quote
+  /* ── RELIABILITY PHASE 1 (2026-08-26) — DIRTY-EDITOR PIN ────────────────
+     The quote's OWN `_relRowVersion` is safe: handleSave sends `q._relRowVersion`
+     from the payload CreateQuoteModal built when it opened, which no refresh can
+     reach. The LINKED JOB's version is not: handleSave looks that job up in the
+     live `jobs` array at save time and sends it as `expectedJobVersion`. If an
+     automatic refresh advanced it while the quote sat open, the save would
+     assert the NEWER version and quietly cascade over whatever another user had
+     just committed to that job — no 409, no warning.
+
+     Pinning the linked job for exactly as long as the quote editor is open
+     keeps that assertion equal to what the editor started from, so the server's
+     existing row_version check still catches the conflict. Every other record —
+     including every other job — keeps refreshing normally. */
+  const _editQuoteLinkedJobId = useMemo(() => {
+    if (!editQuote) return null;
+    const cj = editQuote.convertedJobId;
+    const linked = (cj != null
+        ? (jobs || []).find(j => Number(j._relId) === Number(cj) || j.id === cj)
+        : null)
+      || (jobs || []).find(j => j.quoteNum === editQuote.num);
+    return linked ? linked.id : null;
+  }, [editQuote, jobs]);
+  usePinnedRecord('jobs', _editQuoteLinkedJobId, !!editQuote);
   const [editInvoice, setEditInvoice] = useState(null); // job open in invoice edit modal
   const [emailInvoiceJob, setEmailInvoiceJob] = useState(null); // job for email flow modal
   // ── Manual/accounting invoice actions (2026-08-11) ──
@@ -15038,6 +15299,29 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   // and which, with no error boundary in this app, blanks the entire page.
   const [advancing, setAdvancing] = useState(false);
 
+  /* ── RELIABILITY PHASE 1 (2026-08-26) — DIRTY-EDITOR PIN ──────────────────
+     `job` is re-derived from the live `jobs` array on EVERY render, and
+     saveCosts/saveNotes/saveLines all send `job._relRowVersion` as their
+     expected version at SAVE time. An automatic refresh landing while one of
+     those inline editors is open would therefore advance the expected version
+     from the value the user started editing at to whatever the server now
+     holds — and the save would then overwrite another user's committed change
+     with no conflict raised at all.
+
+     Holding a pin for as long as any of the three inline editors is open keeps
+     this job's local record — and its `_relRowVersion` — exactly as it was when
+     editing began. The rest of the jobs list refreshes normally, and the
+     server's row_version check still rejects the save if someone else got there
+     first, which is the behaviour we want. Declared ABOVE the missing-job guard
+     for the same reason `advancing` is: a hook must never sit after an early
+     return.
+
+     Read-only viewing is deliberately NOT pinned — a job nobody is editing
+     should show the freshest data. */
+  const _jobEditorDirty = editingCosts || editingNotes || editingLines;
+  usePinnedRecord('jobs', jobId, _jobEditorDirty);
+  const _jobPinnedStale = _jobEditorDirty && pinnedRecordIsStale('jobs', jobId);
+
   if (!job) return <div className="p-4"><button onClick={onBack} className="text-brand-500 text-sm">← Back</button></div>;
 
   const isAdmin = user.role === 'admin';
@@ -15496,6 +15780,20 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
         <button onClick={onBack} className="flex items-center gap-1 text-brand-500 hover:text-brand-600 text-sm font-semibold">← Back to Jobs</button>
         {isAdmin&&<button onClick={()=>guardAction('deleteJob:'+relKey(job), deleteJob)} className="text-xs text-red-500 hover:text-red-600 border border-red-200 hover:border-red-300 rounded-xl px-3 py-1.5 transition-colors font-semibold">🗑 Delete Job</button>}
       </div>
+
+      {/* RELIABILITY PHASE 1 (2026-08-26): purely informational. Shown only
+          while an inline editor is open AND an automatic refresh has actually
+          seen a newer server copy of THIS job. It changes nothing, blocks
+          nothing, and discards nothing — the user's draft stays exactly as they
+          left it and the server's row_version check still decides the outcome
+          when they save. It exists so a conflict is not a surprise. */}
+      {_jobPinnedStale && (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-2.5 text-sm text-amber-900">
+          <span className="font-semibold">This job has changed elsewhere while you have been editing.</span>{' '}
+          Your unsaved changes are safe and still on screen. When you save, the system will check for a
+          conflict and tell you if someone else got there first. To see their version instead, cancel this edit.
+        </div>
+      )}
 
       {/* Linked records — read-only navigation, never edits/relinks/deletes anything */}
       <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
@@ -24695,6 +24993,20 @@ function App() {
   // note. Guarantees an older in-flight snapshot can never overwrite a newer one.
   const relationalRefreshSeqRef = useRef(0);
   const apiSaveTimerRef  = useRef(null);
+  // ── RELIABILITY PHASE 1 (2026-08-26) — freshness bookkeeping ─────────────
+  // The last set of SERVER tokens this session was told about, and the last
+  // platform_state revision. Both start as null meaning "not yet known": the
+  // first check ADOPTS whatever the server reports without refetching anything,
+  // because hydration has just loaded everything, and refetching it again would
+  // be pure waste.
+  const freshnessTokensRef = useRef(null);      // { quotes: '<token>', ... }
+  const platformStateTokenRef = useRef(null);   // platform_state.updated_at
+  // Coalescing for focus / visibilitychange / online / the interval tick.
+  // A focus event immediately followed by a visibilitychange must produce ONE
+  // check, not two — see scheduleFreshnessCheck below.
+  const freshnessTimerRef = useRef(null);
+  const freshnessBusyRef = useRef(false);
+  const freshnessAgainRef = useRef(false);
   // serverBaselineRef itself now lives at module scope (see its
   // declaration and full doc comment near isRelationalAuthoritative,
   // above `relationalAuthoritativeSectionsRef`) — 2026-08-23 save-authority
@@ -25071,6 +25383,71 @@ function App() {
   //  3. STAMP-INDEPENDENT. Unlike the 30s poll it does NOT gate on
   //     stateStamp(): a relational write never moves `_autoSavedAt`, which is
   //     precisely why the poll could never surface one.
+  /* ── RELIABILITY PHASE 1 (2026-08-26) — PINNED SECTION MERGE ──────────────
+     The ONE place a refreshed section array is turned into what actually goes
+     into React state. Every automatic refresh path — the targeted read, the
+     post-save re-read, and the platform_state poll — goes through here, so
+     dirty-editor protection cannot be bypassed by adding another caller later.
+
+     For a section with no pins (the overwhelmingly common case) this returns
+     the server's array unchanged and costs nothing. For a pinned record it
+     keeps the LOCAL object — same identity, same `_relRowVersion` — so an open
+     editor's expected version cannot move underneath it. See the pin registry's
+     own comment near syncRelationalBaseline for exactly which editors need this
+     and why the others do not. */
+  function mergeRefreshedSection(sectionKey, incoming) {
+    if (!Array.isArray(incoming)) return incoming;
+    const pinned = _pinnedIdsForSection(sectionKey);
+    if (pinned.size === 0) return incoming;
+    const snapshot = currentSnapshotRef.current;
+    const localList = snapshot && Array.isArray(snapshot[sectionKey]) ? snapshot[sectionKey] : null;
+    if (!localList) return incoming;
+    const localById = new Map();
+    for (const rec of localList) { if (rec && rec.id !== undefined && rec.id !== null) localById.set(String(rec.id), rec); }
+
+    const merged = incoming.map((rec) => {
+      const id = rec && rec.id !== undefined && rec.id !== null ? String(rec.id) : null;
+      if (id === null || !pinned.has(id) || !localById.has(id)) return rec;
+      const localCopy = localById.get(id);
+      // Only report staleness when the server copy genuinely differs — a
+      // refresh that returns an identical record must not tell the user their
+      // view is behind.
+      if (JSON.stringify(localCopy) !== JSON.stringify(rec)) _notePinnedStale(sectionKey, id);
+      return localCopy;
+    });
+
+    // A pinned record that has DISAPPEARED server-side (deleted by someone
+    // else) is kept locally rather than yanked out from under an open editor.
+    // Nothing is invented: the record is the copy this session already had, and
+    // the user's eventual save fails with the server's own message. Removing it
+    // mid-edit would blank the screen with no explanation.
+    const presentIds = new Set(merged.map((r) => (r && r.id !== undefined && r.id !== null ? String(r.id) : '')));
+    for (const id of pinned) {
+      if (!presentIds.has(id) && localById.has(id)) {
+        merged.push(localById.get(id));
+        _notePinnedStale(sectionKey, id);
+      }
+    }
+    return merged;
+  }
+
+  /* Applies a set of refreshed sections into React state AND into
+     serverBaselineRef, both through mergeRefreshedSection so the two can never
+     disagree. Keeping the baseline equal to what was actually applied is what
+     stops the 800ms JSON autosave from then seeing a relational section as
+     "locally changed" and tripping assertNoUnwiredRelationalSections. */
+  function applyRefreshedSections(selective, reason) {
+    const keys = Object.keys(selective || {});
+    if (keys.length === 0) return;
+    const merged = {};
+    for (const k of keys) merged[k] = mergeRefreshedSection(k, selective[k]);
+    applyServerData(merged);
+    if (serverBaselineRef.current) {
+      serverBaselineRef.current = { ...serverBaselineRef.current, ...merged };
+    }
+    if (reason) console.debug('[freshness] applied ' + keys.join(', ') + ' after ' + reason);
+  }
+
   async function refreshRelationalSectionsNow(reason) {
     if (!apiReadyRef.current) return;
     // Ordering guard. Two refreshes can be in flight at once (a slow one from
@@ -25098,15 +25475,136 @@ function App() {
       if (Array.isArray(dbData[key])) selective[key] = dbData[key];
     }
     if (!Object.keys(selective).length) return;
-    applyServerData(selective);
-    if (serverBaselineRef.current) {
-      serverBaselineRef.current = { ...serverBaselineRef.current, ...selective };
-    }
-    if (reason) console.debug('[relational-refresh] re-read ' + Object.keys(selective).join(', ') + ' after ' + reason);
+    applyRefreshedSections(selective, reason);
   }
+
+  /* ── TARGETED AUTHORITATIVE REFRESH (RELIABILITY PHASE 1) ─────────────────
+     Reads ONLY the named sections, via GET /api/relational/sections, which
+     assembles them with the very same getAuthoritativeJson() the full
+     platform-state overlay uses. Same ordering ticket as the full refresh
+     above, so a slow targeted read can never land on top of a newer one.
+
+     On ANY failure it falls back to the pre-Phase-1 full read rather than
+     leaving the session stale — a redundant expensive request is always
+     preferable to silently showing old data, which is the defect this whole
+     phase exists to remove. */
+  async function refreshRelationalSectionsTargeted(sectionNames, reason) {
+    if (!apiReadyRef.current) return;
+    const names = (sectionNames || []).filter(Boolean);
+    if (names.length === 0) return;
+    const seq = ++relationalRefreshSeqRef.current;
+    let body;
+    try {
+      body = await fetchRelationalSectionsNow(names);
+    } catch (e) {
+      console.warn('[freshness] targeted read of [' + names.join(', ') + '] failed — falling back to a full authoritative read:', e && e.message);
+      await refreshRelationalSectionsNow(reason + ' (targeted read failed)');
+      return;
+    }
+    if (seq !== relationalRefreshSeqRef.current) {
+      console.debug('[freshness] discarding a superseded targeted snapshot');
+      return;
+    }
+    const data = (body && body.data) || {};
+    const selective = {};
+    for (const k of Object.keys(data)) { if (Array.isArray(data[k])) selective[k] = data[k]; }
+    applyRefreshedSections(selective, reason);
+  }
+
+  /* ── THE ONE FRESHNESS CHECK ──────────────────────────────────────────────
+     Called by the interval, by window focus, by visibilitychange (returning to
+     visible only), by the online event, and immediately after every relational
+     mutation. It asks the server for a few hundred bytes of tokens and then
+     does the MINIMUM the answer requires:
+
+       nothing changed              -> nothing else is requested at all
+       a relational section changed -> that section only, via the targeted read
+       platform_state changed       -> the pre-existing JSON poll, unchanged
+
+     `afterMutation` marks the post-save call. A committed relational mutation
+     MUST move at least one token — that is the whole basis of the token design
+     — so if it somehow reports no change, that is a defect worth knowing
+     about: it logs and falls back to the full authoritative read rather than
+     quietly leaving the saver looking at their own optimistic copy. */
+  async function freshnessCheckNow(reason, afterMutation) {
+    if (!apiReadyRef.current) return;
+    let fresh;
+    try {
+      fresh = await fetchFreshnessTokens();
+    } catch (e) {
+      // Unknown, never "unchanged". The next tick tries again; a mutation
+      // falls back so the saver is never left showing unconfirmed state.
+      if (afterMutation) await refreshRelationalSectionsNow(reason + ' (freshness unavailable)');
+      return;
+    }
+    if (!fresh || typeof fresh !== 'object') return;
+
+    const nextTokens = (fresh.sections && typeof fresh.sections === 'object') ? fresh.sections : {};
+    const prevTokens = freshnessTokensRef.current;
+    const firstCheck = prevTokens === null;
+    const changed = [];
+    if (!firstCheck) {
+      for (const k of Object.keys(nextTokens)) {
+        if (prevTokens[k] !== nextTokens[k]) changed.push(k);
+      }
+      // A section that STOPS being reported (cutover turned off) is not a data
+      // change and must not trigger a relational read for a section that is no
+      // longer relational-authoritative.
+    }
+    freshnessTokensRef.current = nextTokens;
+
+    const nextPsToken = fresh.platformState ? String(fresh.platformState) : '';
+    const prevPsToken = platformStateTokenRef.current;
+    const psChanged = !firstCheck && prevPsToken !== null && nextPsToken !== prevPsToken;
+    platformStateTokenRef.current = nextPsToken;
+
+    // On the very first check this session has just hydrated everything, so
+    // adopting the tokens without refetching is correct and saves a full
+    // duplicate load right after login.
+    if (firstCheck) return;
+
+    const toRefresh = expandFreshnessSections(changed);
+    if (toRefresh.length > 0) {
+      await refreshRelationalSectionsTargeted(toRefresh, reason + ' [' + changed.join(',') + ']');
+    } else if (afterMutation) {
+      console.warn('[freshness] a relational mutation reported no token change — falling back to a full authoritative read. Please report this.');
+      await refreshRelationalSectionsNow(reason + ' (no token moved)');
+    }
+
+    if (psChanged) await runPlatformStatePoll(reason);
+  }
+
+  /* Coalesces every freshness trigger. focus and visibilitychange fire back to
+     back when a user returns to the tab; online can arrive alongside either.
+     One short debounce plus an in-flight guard turns any burst into exactly one
+     check, and remembers that another was requested so nothing is dropped. */
+  function scheduleFreshnessCheck(reason, afterMutation) {
+    if (freshnessTimerRef.current) clearTimeout(freshnessTimerRef.current);
+    freshnessTimerRef.current = setTimeout(async () => {
+      freshnessTimerRef.current = null;
+      if (freshnessBusyRef.current) { freshnessAgainRef.current = true; return; }
+      freshnessBusyRef.current = true;
+      try {
+        await freshnessCheckNow(reason, afterMutation);
+      } catch (e) {
+        console.warn('[freshness] check failed:', e && e.message);
+      } finally {
+        freshnessBusyRef.current = false;
+        if (freshnessAgainRef.current) {
+          freshnessAgainRef.current = false;
+          scheduleFreshnessCheck(reason + ' (coalesced follow-up)', false);
+        }
+      }
+    }, afterMutation ? 0 : 200);
+  }
+
   useEffect(() => {
-    relationalRefreshRef.current = refreshRelationalSectionsNow;
-    return () => { if (relationalRefreshRef.current === refreshRelationalSectionsNow) relationalRefreshRef.current = null; };
+    // Every relational mutation routes its post-write refresh through the SAME
+    // freshness machinery as the poll, so there is one code path, one set of
+    // pins, and one ordering ticket — not two that can drift.
+    const postMutationRefresh = (reason) => freshnessCheckNow('mutation ' + (reason || ''), true);
+    relationalRefreshRef.current = postMutationRefresh;
+    return () => { if (relationalRefreshRef.current === postMutationRefresh) relationalRefreshRef.current = null; };
   });
 
   // Return which sections of `local` differ from `baseline`
@@ -25839,6 +26337,32 @@ function App() {
               if (Array.isArray(dbData.creditNotes)) {
                 selective.creditNotes = mergeCreditNotes(current.creditNotes, dbData.creditNotes, startSnapshot.creditNotes);
               }
+              // RELIABILITY PHASE 1 (2026-08-26) — SAVE-ROUTING BLOCKER.
+              //
+              // `selective` is hand-built above from `dbData`'s SECTIONS only, so
+              // it carried none of the response's METADATA. applyServerData()
+              // populates relationalAuthoritativeSectionsRef from exactly one
+              // place — `dbData._relationalAuthoritativeSections` — so taking this
+              // branch left that ref EMPTY for the entire session.
+              //
+              // With it empty, isRelationalAuthoritative() answers false for every
+              // section, and every relational editor silently takes its LEGACY
+              // JSON branch: a quote edit never reaches PUT /api/relational/
+              // quotes/:id at all. The server then strips the cut-over section
+              // from that JSON write (correctly — JSON may not own it), so the
+              // edit is written nowhere and reverts on the next authoritative
+              // read. assertNoUnwiredRelationalSections cannot catch it either,
+              // because it asks the same empty ref.
+              //
+              // Carried over from the SAME response that produced `selective`, so
+              // the authority applied is always the authority the server declared
+              // for this exact read — never synthesised, never remembered from
+              // older local state, never inferred from /health. It is metadata,
+              // not a business section: it is absent from STATE_SECTIONS, so
+              // applyServerData never treats it as data, and it is not sent
+              // anywhere. serverBaselineRef is still assigned the FULL `dbData`
+              // below, exactly as before.
+              selective._relationalAuthoritativeSections = dbData._relationalAuthoritativeSections;
               applyServerData(selective);
             } else {
               applyServerData(dbData);
@@ -25907,46 +26431,93 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, hydrationRetryTick]);
 
-  // 2) Poll every 30 s — apply server changes for sections this user hasn't locally modified
-  //    This keeps admin and assistant in sync without requiring a page reload.
+  // 2a) THE JSON (platform_state) POLL — body unchanged from the 30s poll it
+  //     replaces, only extracted into a function and now called ONLY when the
+  //     server has actually reported a new platform_state revision. Every guard
+  //     it already had is kept: the stateStamp out-of-order check, the
+  //     locallyChangedSections skip so a section this user is editing is never
+  //     overwritten, and the creditNotes union merge.
+  //
+  //     The one addition is that the selective result now goes through
+  //     applyRefreshedSections, so the dirty-record pins apply here too. Without
+  //     that, a platform_state poll would still be able to move an open
+  //     editor's `_relRowVersion` (this response carries the relational overlay
+  //     as well) — the exact hazard the pins exist to close.
+  async function runPlatformStatePoll(reason) {
+    if (!apiReadyRef.current) return;
+    try {
+      const dbData = await fetchFromServer();
+      if (!dbData || typeof dbData !== 'object') return;
+      // Skip an older/out-of-order response (e.g. a slow request that resolves
+      // after a newer save already landed) — applying it would roll local
+      // state back to a copy missing whatever was just added elsewhere.
+      const serverAt  = stateStamp(dbData);
+      const baselineAt = stateStamp(serverBaselineRef.current);
+      if (serverAt && baselineAt && serverAt <= baselineAt) return;
+      // Determine which sections the current user has locally modified
+      const local    = currentSnapshotRef.current;
+      const baseline = serverBaselineRef.current || {};
+      const changed  = local ? locallyChangedSections(local, baseline) : {};
+      // Build a selective update: only sections we haven't touched locally
+      const selective = {};
+      for (const k of STATE_SECTIONS) { if (!changed[k] && Array.isArray(dbData[k])) selective[k] = dbData[k]; }
+      if (!changed.logo      && typeof dbData.logo === 'string')   selective.logo      = dbData.logo;
+      if (!changed.utLogo    && typeof dbData.utLogo === 'string')  selective.utLogo    = dbData.utLogo;
+      if (!changed.holdingsLogo && typeof dbData.holdingsLogo === 'string') selective.holdingsLogo = dbData.holdingsLogo;
+      if (!changed.sigOTSmit && dbData.sigOTSmit)                   selective.sigOTSmit = dbData.sigOTSmit;
+      // Credit notes are shared financial records any role can create at any
+      // time — never let a routine poll silently drop one this client already
+      // knows about just because this particular fetch happens to be missing
+      // it (e.g. a slightly stale/out-of-order response). Union instead of a
+      // raw overwrite, same non-destructive merge used by every save.
+      if (Array.isArray(dbData.creditNotes)) {
+        selective.creditNotes = mergeCreditNotes(local ? local.creditNotes : [], dbData.creditNotes, baseline.creditNotes);
+      }
+      // Baseline first (the full server view), then the pinned apply on top, so
+      // a pinned record's local copy wins in BOTH state and baseline.
+      serverBaselineRef.current = dbData;
+      applyRefreshedSections(selective, 'platform_state poll' + (reason ? ' via ' + reason : ''));
+    } catch(e) { /* silent — network unavailable; the next check retries */ }
+  }
+
+  // 2b) FRESHNESS — RELIABILITY PHASE 1 (2026-08-26)
+  //
+  //     WHAT THIS REPLACES. The previous 30s poll downloaded the ENTIRE
+  //     platform state on every tick and then decided whether to apply it by
+  //     comparing `_autoSavedAt`/`savedAt` — two fields that live INSIDE the
+  //     JSON blob and that a relational write never touches. So it paid the
+  //     full cost every 30 seconds AND still could not see a relational change
+  //     at all: one user's committed quote/job/invoice edit stayed invisible to
+  //     every other session indefinitely.
+  //
+  //     WHAT HAPPENS NOW. One 25-second tick asks GET /api/freshness for a few
+  //     hundred bytes of server-issued tokens. If nothing moved, that is the
+  //     entire cost of the tick — no platform-state download, no relational
+  //     assembly, no database read of any business row. If a relational
+  //     section's token moved, ONLY that section is refetched. If
+  //     platform_state's revision moved, the JSON poll above runs exactly as it
+  //     always did.
+  //
+  //     The same check also runs on window focus, on becoming visible again,
+  //     and on reconnect — all coalesced through scheduleFreshnessCheck, so a
+  //     focus event followed immediately by a visibilitychange produces ONE
+  //     check. Becoming HIDDEN deliberately triggers nothing.
   useEffect(() => {
-    const POLL_MS = 30000;
-    const timer = setInterval(async () => {
-      if (!apiReadyRef.current) return;
-      try {
-        const dbData = await fetchFromServer();
-        if (!dbData || typeof dbData !== 'object') return;
-        // Skip if server hasn't changed since our last load, AND skip an
-        // older/out-of-order response (e.g. a slow poll request that resolves
-        // after a newer save already landed) — applying it would roll local
-        // state back to a copy missing whatever was just added elsewhere.
-        const serverAt  = stateStamp(dbData);
-        const baselineAt = stateStamp(serverBaselineRef.current);
-        if (serverAt && baselineAt && serverAt <= baselineAt) return;
-        // Determine which sections the current user has locally modified
-        const local    = currentSnapshotRef.current;
-        const baseline = serverBaselineRef.current || {};
-        const changed  = local ? locallyChangedSections(local, baseline) : {};
-        // Build a selective update: only sections we haven't touched locally
-        const selective = {};
-        for (const k of STATE_SECTIONS) { if (!changed[k] && Array.isArray(dbData[k])) selective[k] = dbData[k]; }
-        if (!changed.logo      && typeof dbData.logo === 'string')   selective.logo      = dbData.logo;
-        if (!changed.utLogo    && typeof dbData.utLogo === 'string')  selective.utLogo    = dbData.utLogo;
-        if (!changed.holdingsLogo && typeof dbData.holdingsLogo === 'string') selective.holdingsLogo = dbData.holdingsLogo;
-        if (!changed.sigOTSmit && dbData.sigOTSmit)                   selective.sigOTSmit = dbData.sigOTSmit;
-        // Credit notes are shared financial records any role can create at any
-        // time — never let a routine poll silently drop one this client already
-        // knows about just because this particular fetch happens to be missing
-        // it (e.g. a slightly stale/out-of-order response). Union instead of a
-        // raw overwrite, same non-destructive merge used by every save.
-        if (Array.isArray(dbData.creditNotes)) {
-          selective.creditNotes = mergeCreditNotes(local ? local.creditNotes : [], dbData.creditNotes, baseline.creditNotes);
-        }
-        applyServerData(selective);
-        serverBaselineRef.current = dbData;
-      } catch(e) { /* silent — network unavailable */ }
-    }, POLL_MS);
-    return () => clearInterval(timer);
+    const POLL_MS = 25000;
+    const timer = setInterval(() => { scheduleFreshnessCheck('poll', false); }, POLL_MS);
+    const onFocus   = () => scheduleFreshnessCheck('focus', false);
+    const onVisible = () => { if (document.visibilityState === 'visible') scheduleFreshnessCheck('visible', false); };
+    const onOnline  = () => scheduleFreshnessCheck('online', false);
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('online', onOnline);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('online', onOnline);
+      if (freshnessTimerRef.current) { clearTimeout(freshnessTimerRef.current); freshnessTimerRef.current = null; }
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

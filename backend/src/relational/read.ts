@@ -209,12 +209,8 @@ function coNum(v: any): number | string | null {
 // resurrecting every deleted payment and restating money that is no longer in
 // the books. rel_payments is the sole authority for a cut-over record's
 // payments, and an empty array genuinely means "no payments".
-async function paymentsFor(ownerType: 'job' | 'quote' | 'invoice', ownerId: number): Promise<any[]> {
-  const res = await pool.query(
-    `SELECT * FROM rel_payments WHERE owner_type = $1 AND owner_id = $2 ORDER BY line_index`,
-    [ownerType, ownerId]
-  );
-  return res.rows.map((p) => ({
+function mapPaymentRow(p: any, ownerType: 'job' | 'quote' | 'invoice'): any {
+  return {
     ...legacyBase(p),
     id: restoreId(p.source_id) || `relpay-${p.id}`,
     amount: num(p.amount),
@@ -225,7 +221,79 @@ async function paymentsFor(ownerType: 'job' | 'quote' | 'invoice', ownerId: numb
     _relPaymentId: p.id,
     _relOwnerType: ownerType,
     _relRowVersion: p.row_version,
-  }));
+  };
+}
+
+async function paymentsFor(ownerType: 'job' | 'quote' | 'invoice', ownerId: number): Promise<any[]> {
+  const res = await pool.query(
+    `SELECT * FROM rel_payments WHERE owner_type = $1 AND owner_id = $2 ORDER BY line_index`,
+    [ownerType, ownerId]
+  );
+  return res.rows.map((p) => mapPaymentRow(p, ownerType));
+}
+
+// ── BATCHED CHILD-ROW LOADERS (2026-08-26, RELIABILITY PHASE 1) ─────────────
+//
+// THE DEFECT THESE CLOSE. Every builder below used to loop over its parent rows
+// and issue one query for that parent's line items and a second for its
+// payments. On the live dataset (186 quotes, 121 jobs, 23 invoices) one
+// authoritative read therefore cost roughly
+//     1 + (186 x 2) + 1 + (121 x 2) + 1 + (23 x 2) + ...  ≈ 670 round trips,
+// and that read runs on hydration, on every poll that decides to reload, inside
+// every mergeAndSave, and after every relational mutation. The cost is round
+// TRIPS, not rows — each of those queries returns a handful of records.
+//
+// The fix is the smallest one that removes the loop: fetch the parents, collect
+// their ids, fetch ALL of their children in ONE query per child table, and group
+// by parent id in JavaScript. Every mapper below is untouched — same field
+// names, same fallbacks, same restoreId/legacyBase/migration-013 semantics, same
+// ordering — so the assembled output is identical to what the per-parent version
+// produced. `ORDER BY <fk>, line_index` reproduces exactly the per-parent
+// `ORDER BY line_index` the loop relied on.
+//
+// The table and column names below are compile-time union types declared in this
+// file; nothing here is ever built from a request value.
+async function groupChildRows(
+  table: 'rel_quote_line_items' | 'rel_job_line_items' | 'rel_invoice_line_items',
+  fkColumn: 'quote_id' | 'job_id' | 'invoice_id',
+  parentIds: any[]
+): Promise<Map<string, any[]>> {
+  const map = new Map<string, any[]>();
+  if (parentIds.length === 0) return map;
+  const res = await pool.query(
+    `SELECT * FROM ${table} WHERE ${fkColumn} = ANY($1::bigint[]) ORDER BY ${fkColumn}, line_index`,
+    [parentIds]
+  );
+  for (const row of res.rows) {
+    const key = String(row[fkColumn]);
+    const bucket = map.get(key);
+    if (bucket) bucket.push(row);
+    else map.set(key, [row]);
+  }
+  return map;
+}
+
+/** One query for every owner's payments, grouped by owner id. Rows go through
+ *  the SAME mapPaymentRow() the single-owner paymentsFor() uses, so the batched
+ *  and per-record paths cannot drift. */
+async function paymentsForMany(
+  ownerType: 'job' | 'quote' | 'invoice',
+  ownerIds: any[]
+): Promise<Map<string, any[]>> {
+  const map = new Map<string, any[]>();
+  if (ownerIds.length === 0) return map;
+  const res = await pool.query(
+    `SELECT * FROM rel_payments WHERE owner_type = $1 AND owner_id = ANY($2::bigint[]) ORDER BY owner_id, line_index`,
+    [ownerType, ownerIds]
+  );
+  for (const p of res.rows) {
+    const key = String(p.owner_id);
+    const mapped = mapPaymentRow(p, ownerType);
+    const bucket = map.get(key);
+    if (bucket) bucket.push(mapped);
+    else map.set(key, [mapped]);
+  }
+  return map;
 }
 
 // ── CUSTOMERS ──────────────────────────────────────────────────────────────
@@ -312,13 +380,16 @@ export async function buildQuickRatesJson(): Promise<any[]> {
 // ── QUOTES (+ line items + payments) ───────────────────────────────────────
 export async function buildQuotesJson(): Promise<any[]> {
   const quotesRes = await pool.query('SELECT * FROM rel_quotes ORDER BY id');
+  // RELIABILITY PHASE 1: two batched queries replace 2-per-quote. See
+  // groupChildRows/paymentsForMany above.
+  const quoteIds = quotesRes.rows.map((r) => r.id);
+  const linesByQuote = await groupChildRows('rel_quote_line_items', 'quote_id', quoteIds);
+  const paymentsByQuote = await paymentsForMany('quote', quoteIds);
   const out: any[] = [];
   for (const r of quotesRes.rows) {
-    const linesRes = await pool.query(
-      'SELECT * FROM rel_quote_line_items WHERE quote_id = $1 ORDER BY line_index', [r.id]
-    );
-    const quoteLineIds = lineIdentities(linesRes.rows);
-    const items = linesRes.rows.map((l, i) => ({
+    const lineRows = linesByQuote.get(String(r.id)) || [];
+    const quoteLineIds = lineIdentities(lineRows);
+    const items = lineRows.map((l, i) => ({
       ...legacyBase(l),
       // See lineIdentities() above — without this every line hydrated with
       // `id === undefined` and editing one line edited all of them.
@@ -344,7 +415,7 @@ export async function buildQuotesJson(): Promise<any[]> {
       cpLinked: l.complete_product_linked !== null && l.complete_product_linked !== undefined
         ? l.complete_product_linked : (legacyBase(l).cpLinked ?? null),
     }));
-    const payments = await paymentsFor('quote', r.id);
+    const payments = paymentsByQuote.get(String(r.id)) || [];
     out.push({
       ...legacyBase(r),
       id: restoreId(r.source_id),
@@ -465,13 +536,15 @@ async function resolveJobInvoiceLinks(): Promise<Map<string, JobInvoiceLink>> {
 export async function buildJobsJson(): Promise<any[]> {
   const jobsRes = await pool.query('SELECT * FROM rel_jobs ORDER BY id');
   const invoiceLinks = await resolveJobInvoiceLinks();
+  // RELIABILITY PHASE 1: two batched queries replace 2-per-job.
+  const jobIds = jobsRes.rows.map((r) => r.id);
+  const linesByJob = await groupChildRows('rel_job_line_items', 'job_id', jobIds);
+  const paymentsByJob = await paymentsForMany('job', jobIds);
   const out: any[] = [];
   for (const r of jobsRes.rows) {
-    const linesRes = await pool.query(
-      'SELECT * FROM rel_job_line_items WHERE job_id = $1 ORDER BY line_index', [r.id]
-    );
-    const jobLineIds = lineIdentities(linesRes.rows);
-    const items = linesRes.rows.map((l, i) => ({
+    const lineRows = linesByJob.get(String(r.id)) || [];
+    const jobLineIds = lineIdentities(lineRows);
+    const items = lineRows.map((l, i) => ({
       ...legacyBase(l),
       // Same identity guarantee as the quote lines above — JobDetail's line
       // editor and the job-invoice modal address their rows by `line.id` too.
@@ -497,7 +570,7 @@ export async function buildJobsJson(): Promise<any[]> {
       cpLinked: l.complete_product_linked !== null && l.complete_product_linked !== undefined
         ? l.complete_product_linked : (legacyBase(l).cpLinked ?? null),
     }));
-    const payments = await paymentsFor('job', r.id);
+    const payments = paymentsByJob.get(String(r.id)) || [];
     out.push({
       ...legacyBase(r),
       id: restoreId(r.source_id),
@@ -583,12 +656,16 @@ export async function buildJobsJson(): Promise<any[]> {
 // ── INVOICES (accInvoices) (+ line items + payments) ───────────────────────
 export async function buildInvoicesJson(): Promise<any[]> {
   const invRes = await pool.query('SELECT * FROM rel_invoices ORDER BY id');
+  // RELIABILITY PHASE 1: the same 2-per-parent shape was present here and is
+  // batched identically. Invoices are the smallest of the three collections
+  // today, but this read runs on the same hot path as quotes and jobs.
+  const invoiceIds = invRes.rows.map((r) => r.id);
+  const linesByInvoice = await groupChildRows('rel_invoice_line_items', 'invoice_id', invoiceIds);
+  const paymentsByInvoice = await paymentsForMany('invoice', invoiceIds);
   const out: any[] = [];
   for (const r of invRes.rows) {
-    const linesRes = await pool.query(
-      'SELECT * FROM rel_invoice_line_items WHERE invoice_id = $1 ORDER BY line_index', [r.id]
-    );
-    const items = linesRes.rows.map((l) => ({
+    const lineRows = linesByInvoice.get(String(r.id)) || [];
+    const items = lineRows.map((l) => ({
       ...legacyBase(l),
       description: l.description,
       qty: num(l.qty),
@@ -596,7 +673,7 @@ export async function buildInvoicesJson(): Promise<any[]> {
       accountCode: l.account_code ?? null,
       taxType: l.tax_type ?? null,
     }));
-    const payments = await paymentsFor('invoice', r.id);
+    const payments = paymentsByInvoice.get(String(r.id)) || [];
     out.push({
       ...legacyBase(r),
       id: restoreId(r.source_id),

@@ -717,6 +717,75 @@ router.delete('/inventory/:id', async (req: AuthRequest, res: Response): Promise
   } catch (err) { handleServiceError(err, res); }
 });
 
+// ── TARGETED AUTHORITATIVE READ (RELIABILITY PHASE 1, 2026-08-26) ──────────
+// GET /api/relational/sections?names=quotes,jobs
+//
+// WHY THIS EXISTS. Until now the ONLY way to re-read authoritative relational
+// data was GET /api/platform-state, which assembles EVERY section (relational
+// and JSON alike) and ships the whole multi-megabyte blob. That endpoint was
+// therefore called after every single relational mutation, and by every poll
+// that decided to reload, in order to pick up — typically — one changed
+// section.
+//
+// This route answers the same question for just the sections asked for, using
+// getAuthoritativeJson() — the EXACT function the platform-state read overlay
+// calls (backend/src/relational/read.ts). There is deliberately no second
+// assembly path and no second shape: whatever /api/platform-state would have
+// returned under the key `quotes` is exactly what this returns under `quotes`.
+// If that ever stops being true it is because read.ts changed, and both callers
+// change together.
+//
+// It is a READ: it writes nothing, reserves no document number, and opens no
+// transaction of its own. It is gated by the SAME double gate every other route
+// here uses — a section that is not cut over is omitted from `data` and named
+// in `notCutOver`, never quietly served from the JSON copy. Mixing the two
+// authorities in one payload is how a caller ends up unable to tell which one
+// it is holding.
+//
+// purchaseOrders would be accepted here on the same terms as any other section,
+// but the frontend deliberately never asks for it in Phase 1 — see
+// backend/src/routes/freshness.ts for why its authority state needs a person's
+// decision first.
+router.get('/sections', async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const raw = typeof req.query.names === 'string' ? req.query.names : '';
+    const requested = raw.split(',').map((s) => s.trim()).filter(Boolean);
+    if (requested.length === 0) {
+      res.status(400).json({ error: '"names" is required, e.g. ?names=quotes,jobs' });
+      return;
+    }
+    if (requested.length > 20) {
+      res.status(400).json({ error: 'too many sections requested' });
+      return;
+    }
+    const { ALL_SECTIONS } = await import('./cutover');
+    const { getAuthoritativeJson, SECTION_JSON_KEY } = await import('./read');
+    const known = new Set<string>(ALL_SECTIONS as readonly string[]);
+
+    const data: Record<string, any[]> = {};
+    const notCutOver: string[] = [];
+    const unknown: string[] = [];
+    for (const name of requested) {
+      if (!known.has(name)) { unknown.push(name); continue; }
+      const section = name as CutoverSection;
+      if (!(await isSectionCutOver(section))) { notCutOver.push(name); continue; }
+      const jsonKey = SECTION_JSON_KEY[section];
+      // 'payments' has no standalone array — it is embedded in its owner's
+      // record by read.ts, so there is nothing to return for it here.
+      if (!jsonKey) { notCutOver.push(name); continue; }
+      data[jsonKey] = await getAuthoritativeJson(section);
+    }
+    res.json({
+      data,
+      ...(notCutOver.length ? { notCutOver } : {}),
+      ...(unknown.length ? { unknown } : {}),
+    });
+  } catch (err) {
+    console.error('GET /api/relational/sections failed:', err);
+    res.status(500).json({ error: 'Failed to read the requested sections' });
+  }
+});
+
 // ── STATUS — which sections are actually live right now (non-sensitive) ───
 router.get('/status', async (_req: AuthRequest, res: Response): Promise<void> => {
   const { ALL_SECTIONS } = await import('./cutover');

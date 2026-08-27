@@ -178,8 +178,15 @@ function main() {
     extractFunction(appSrc, 'sgrCompanyLegal'),
     extractFunction(appSrc, 'sgrCustomerVatLookup'),
     extractFunction(appSrc, 'sgrJobInvoiceNumber'),
+    // STEP A (2026-08-27) — the document line presentation helpers are now
+    // shared; buildQuoteHtml/buildInvoiceHtml call them instead of re-stating
+    // the rule inline, so the sandbox needs the whole set.
+    extractFunction(appSrc, 'sgrLineHasDimensions'),
+    extractFunction(appSrc, 'sgrLinePieceCount'),
     extractFunction(appSrc, 'lineSizeText'),
     extractFunction(appSrc, 'lineItemCount'),
+    extractFunction(appSrc, 'lineItemCountText'),
+    extractFunction(appSrc, 'lineItemQtyDetail'),
     extractFunction(appSrc, 'quoteTermsList'),
     extractFunction(appSrc, 'invoiceTermsList'),
     extractFunction(appSrc, 'docLinesSubtotal'),
@@ -433,8 +440,13 @@ function main() {
     ok(/Attn: Jan Botha/.test(job), '[13] Job-created: Attn from the unambiguously linked job');
     ok(/VAT Reg: 4990123456/.test(job), '[13] Job-created: VAT Reg present');
     ok(/Tel: 044 000 1111/.test(job), '[13] Job-created: telephone present');
-    ok(/2000 × 900 mm/.test(job) && /3 off/.test(job),
+    // STEP A (2026-08-27): the sub-line now uses the ESTABLISHED QUOTE wording
+    // ("N items · <per-piece> <unit> each") rather than the old "N off", because
+    // all five document builders share one helper. The fact being asserted is
+    // unchanged — dimensions and piece count are restored from the source lines.
+    ok(/2000 × 900 mm/.test(job) && /3 items/.test(job) && /1\.8000 m² each/.test(job),
       '[13] Job-created: the established dimension/pieces sub-line is restored from the matching source lines');
+    ok(/>3 items</.test(job), '[13] Job-created: Item Qty is the PIECE COUNT, not the per-piece area');
     ok(/Install after hours\./.test(job), '[13] Job-created: the Notes block is present');
     ok(/Payments Received To Date/.test(job), '[13] Job-created: payment history block present');
 
@@ -442,8 +454,9 @@ function main() {
     ok(/TAX INVOICE/.test(fromQuote), '[14] Quote-created: established TAX INVOICE badge');
     ok(!/<td>Job No:<\/td>/.test(fromQuote), '[14] Quote-created: no Job No row — there is no job, and none is invented');
     ok(/<td>Quote Ref:<\/td><td>SQ-00151<\/td>/.test(fromQuote), '[14] Quote-created: Quote Ref row present');
-    ok(/4000 mm/.test(fromQuote) && /2 off/.test(fromQuote),
+    ok(/4000 mm/.test(fromQuote) && /2 items/.test(fromQuote) && /4\.0000 m \(linear\) each/.test(fromQuote),
       '[14] Quote-created: dimension/pieces sub-line restored from the matching quote lines');
+    ok(/>2 items</.test(fromQuote), '[14] Quote-created: Item Qty is the PIECE COUNT, not the per-piece length');
 
     const man = render(INV_MANUAL);
     ok(/TAX INVOICE/.test(man) && /class="inv-badge"/.test(man), '[15] Manual: same established visual family');
