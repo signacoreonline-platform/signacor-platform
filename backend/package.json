@@ -53,6 +53,7 @@
     "test:completed-auto-invoice:compiled": "node dist/test/relational.completed-auto-invoice.stress.js",
     "test:invoice-layout-restore": "ts-node --transpile-only test/invoice-layout-restore.test.ts",
     "test:document-line-presentation": "ts-node --transpile-only test/document-line-presentation.test.ts",
+    "test:quote-invoice-sync": "ts-node --transpile-only test/relational.quote-invoice-sync.stress.ts",
     "test:invoice-layout-restore:compiled": "node dist/test/invoice-layout-restore.test.js",
     "test:pdf-filename": "ts-node --transpile-only test/pdf-filename.test.ts",
     "test:pdf-filename:compiled": "node dist/test/pdf-filename.test.js",

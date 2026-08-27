@@ -172,11 +172,31 @@ router.put('/quotes/:id', async (req: AuthRequest, res: Response): Promise<void>
     // HTTP surface exposes it, because no UI workflow asks for one; the shipped
     // edit patch resends `lines` unconditionally, so an exposed flag would be
     // one stray field away from deleting production lines again.
-    const { expectedVersion: _ev, expectedJobVersion, resyncJobLines: _rsjl, ...patch } = req.body || {};
+    //
+    // LINKED INVOICE (2026-08-27): `expectedInvoiceVersion` IS forwarded, and
+    // is the opposite kind of field — it can only ever make a save FAIL safely
+    // (a stale linked invoice is detected instead of overwritten), never make
+    // it write something extra. The synchronisation itself is not opt-in: an
+    // issued invoice describing a superseded version of the same sale is the
+    // defect, so keeping the linked invoice current is part of what saving a
+    // quote MEANS. What it may touch is bounded inside
+    // syncLinkedInvoiceFromQuoteTx, not by a client flag.
+    const {
+      expectedVersion: _ev, expectedJobVersion, resyncJobLines: _rsjl,
+      expectedInvoiceVersion, ...patch
+    } = req.body || {};
     const result = await updateQuoteWithJobSync(id, expectedVersion, patch, {
       expectedJobVersion: expectedJobVersion !== undefined ? Number(expectedJobVersion) : undefined,
+      expectedInvoiceVersion: expectedInvoiceVersion !== undefined ? Number(expectedInvoiceVersion) : undefined,
     });
-    res.json({ success: true, rowVersion: result.quoteRowVersion, jobId: result.jobId, jobRowVersion: result.jobRowVersion });
+    res.json({
+      success: true, rowVersion: result.quoteRowVersion, jobId: result.jobId, jobRowVersion: result.jobRowVersion,
+      // Reported so a caller can SEE what happened to the linked invoice —
+      // including the two anomalies that deliberately do not fail the save
+      // ('ambiguous', 'company-mismatch') and the two that mean there was
+      // nothing to do ('no-linked-invoice', 'unchanged').
+      invoiceSync: result.invoice,
+    });
   } catch (err) { handleServiceError(err, res); }
 });
 

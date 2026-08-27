@@ -795,9 +795,50 @@ async function writeInvoiceLinesFromSourceTx(
         `internal: no resolved piece count for ${sourceTable} line ${l.id} — refusing to write an invoice line on a guessed quantity`
       );
     }
+    // ── PRESENTATION SNAPSHOT (2026-08-27) ────────────────────────────────
+    // `qty` above is the EFFECTIVE BILLABLE quantity (pieces x per-piece), and
+    // that is all an accounting line needs to be correct. It is NOT enough for
+    // the line to be READ: the customer-facing document states a PIECE COUNT
+    // ("25 items") and a specification ("1300 x 295 mm  ·  25 items  ·  0.3835
+    // m² each"), and until now those lived only on the source document, so an
+    // invoice could only be rendered by reaching back into a Quote/Job that may
+    // since have changed — or, when the source had lost its dimensions, not at
+    // all. INV-00117 is exactly that: 25 pieces survived on the job, the
+    // dimensions did not, and the invoice carried neither.
+    //
+    // The three quantities stay strictly separate and are never substituted for
+    // one another:
+    //     pQty      the customer-facing PIECE COUNT (the resolved count this
+    //               very line was billed on — the same $4 the money uses)
+    //     pieceQty  the descriptive PER-PIECE quantity (sl.qty)
+    //     qty       the internal EFFECTIVE BILLABLE quantity — the column, not
+    //               a key in here, and the only one any money is computed from
+    //
+    // Presentation only: not one value written here is ever read back into an
+    // amount. `::float8` matches how read.ts already hands these to the client
+    // (numOrNull), so "1300" never becomes "1300.0000" on a document.
+    // jsonb_strip_nulls keeps an absent dimension ABSENT rather than storing a
+    // null that a renderer might print. No schema change: legacy_data is an
+    // existing NOT NULL DEFAULT '{}'::jsonb column on this table.
     await client.query(
       `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
-       SELECT $1, $2, sl.description, ${EFFECTIVE_QTY_SQL}, sl.unit_price, '4000', '15%', '{}'::jsonb
+       SELECT $1, $2, sl.description, ${EFFECTIVE_QTY_SQL}, sl.unit_price, '4000', '15%',
+              jsonb_strip_nulls(jsonb_build_object(
+                'pQty',      $4::numeric::float8,
+                'pieceQty',  sl.qty::float8,
+                'sqmL',      sl.sqm_l::float8,
+                'sqmW',      sl.sqm_w::float8,
+                'unit',      NULLIF(sl.unit, ''),
+                'sizeText',  NULLIF(sl.legacy_data->>'sizeText', ''),
+                -- Provenance: WHICH document this line's presentation came
+                -- from. Deliberately the table only, never the source row's
+                -- id: replaceQuoteLinesTx/replaceJobLinesTx delete and re-
+                -- insert their rows on every save, so a line id is recreated
+                -- constantly and recording one would (a) be meaningless as a
+                -- reference and (b) make every otherwise-identical resync look
+                -- like a change, churning row_version and the freshness token.
+                'srcTable',  '${sourceTable}'
+              ))
          FROM ${sourceTable} sl
         WHERE sl.id = $3`,
       [invoiceId, nextIndex, l.id, pieces]
@@ -2788,16 +2829,184 @@ export async function deleteJob(
 // quote patch + lines, recompute quote totals, cascade onto the job, commit.
 // A failure at any point rolls back both — "quote saved but job sync
 // failed" can never happen.
+/* ── LINKED INVOICE SYNCHRONISATION (2026-08-27) ───────────────────────────
+   WHY THIS EXISTS. A Quote, its Job and its Invoice are three representations
+   of ONE commercial transaction. Editing the quote already cascaded onto the
+   linked job's header fields and its `value`; it reached the linked INVOICE
+   nowhere at all. Nothing in this file looked an invoice up on a quote save,
+   so an invoice raised before a quote edit kept describing the pre-edit sale
+   indefinitely — wrong description, wrong piece count, and (once the quote's
+   money changed) a total that no longer agreed with the job's own `value`.
+
+   WHAT IS AND IS NOT SYNCHRONISED. Only the invoice's COMMERCIAL CONTENT — its
+   line items and the discount / setup-fee adjustment lines — is rebuilt, from
+   the quote, through THE SAME writers that created it (writeQuoteInvoiceLinesTx
+   → writeInvoiceLinesFromSourceTx + writeInvoiceAdjustmentLinesTx). Creation
+   and synchronisation therefore cannot compute a line differently, which is the
+   defect class this whole area keeps producing. Everything that identifies the
+   invoice as an accounting document is untouched: id, invoice_number,
+   issue_date, due_date, quote_id/job_id linkage, created_at, and every
+   rel_payments row (amount, date, method, reference, id). The only column
+   written on rel_invoices itself is row_version/updated_at, and only when the
+   rebuilt lines actually differ.
+
+   DIRECTION. Quote save is the commercial source event. Nothing here syncs
+   Invoice → Quote or Job → Quote; no such path exists in this codebase and none
+   is introduced.
+
+   JOB LINES ARE DELIBERATELY NOT INVOLVED. BLOCKER 2 (2026-08-24, see
+   updateQuoteWithJobSync below) made job line items production-owned after
+   conversion, and `resyncJobLines` is not exposed over HTTP. The invoice is
+   therefore rebuilt from the QUOTE's lines — which is also what keeps it equal
+   to the job's `value`, because that value is recomputed from the quote's own
+   totals two dozen lines below. Sourcing the invoice from job lines instead
+   would make the invoice disagree with the value the same transaction just
+   wrote. */
+export interface InvoiceSyncOutcome {
+  /** True only when rel_invoice_line_items were actually rewritten. */
+  synced: boolean;
+  invoiceId: number | null;
+  invoiceNumber: string | null;
+  invoiceRowVersion: number | null;
+  reason:
+    | 'not-requested'        // the save carried no commercial content
+    | 'no-linked-invoice'    // nothing to update
+    | 'ambiguous'            // more than one active linked invoice — never guess
+    | 'company-mismatch'     // company isolation — never cross it
+    | 'unresolved-history'   // a piece count cannot be known; never bill a guess
+    | 'unchanged'            // rebuilt identically — no row_version churn
+    | 'synced';
+  detail?: string;
+}
+
+/** Finds the ONE active invoice linked to this quote (directly, or through the
+ *  quote's linked job) and rebuilds its commercial content from the quote.
+ *  Runs inside the caller's transaction — never opens one of its own — so the
+ *  quote, the job and the invoice commit together or not at all. */
+async function syncLinkedInvoiceFromQuoteTx(
+  client: PoolClient,
+  quoteId: number,
+  quoteAfterSave: any,
+  linkedJobId: number | null,
+  expectedInvoiceVersion?: number
+): Promise<InvoiceSyncOutcome> {
+  const none = (reason: InvoiceSyncOutcome['reason'], detail?: string): InvoiceSyncOutcome =>
+    ({ synced: false, invoiceId: null, invoiceNumber: null, invoiceRowVersion: null, reason, detail });
+
+  // LOOKUP SAFETY. Proven linkage columns only — never a number/string guess.
+  // Void invoices are excluded exactly as every other reuse/relink lookup in
+  // this file excludes them (createInvoiceFromQuoteTx's `reusable` query,
+  // convertQuoteToJob's relink). A deliberately voided or superseded document
+  // is never rewritten.
+  const candRes = await client.query(
+    `SELECT id, invoice_number, company_code, status, row_version
+       FROM rel_invoices
+      WHERE COALESCE(status, '') <> 'void'
+        AND (quote_id = $1 OR ($2::bigint IS NOT NULL AND job_id = $2::bigint))
+      ORDER BY id ASC
+      FOR UPDATE`,
+    [quoteId, linkedJobId]
+  );
+  const rows = candRes.rows || [];
+  if (rows.length === 0) return none('no-linked-invoice');
+  if (rows.length > 1) {
+    // Never update an arbitrary invoice, and never create another as a
+    // fallback. The quote/job save still commits; the anomaly is reported.
+    const numbers = rows.map((r: any) => r.invoice_number).join(', ');
+    console.warn(`[invoice-sync] quote ${quoteId} resolves to ${rows.length} active linked invoices (${numbers}) — synchronisation aborted, nothing was changed.`);
+    return none('ambiguous', numbers);
+  }
+
+  const inv = rows[0];
+  const invoiceId = Number(inv.id);
+  const invoiceNumber = String(inv.invoice_number);
+  if (String(inv.company_code) !== String(quoteAfterSave.company_code)) {
+    console.warn(`[invoice-sync] invoice ${invoiceNumber} is company ${inv.company_code} but quote ${quoteId} is company ${quoteAfterSave.company_code} — synchronisation aborted.`);
+    return none('company-mismatch', `${inv.company_code} vs ${quoteAfterSave.company_code}`);
+  }
+  // Optimistic concurrency, same shape as the quote and job checks around it:
+  // asserted only when the caller supplied a version to assert.
+  if (expectedInvoiceVersion !== undefined && Number(inv.row_version) !== Number(expectedInvoiceVersion)) {
+    throw new ConcurrencyConflictError('rel_invoices', invoiceId);
+  }
+
+  // HISTORICAL PIECES PROTECTION, identical to the creation paths. A line whose
+  // piece count cannot be known must not be re-billed on a guess; the invoice
+  // is left exactly as it is and the anomaly reported, rather than the quote
+  // save failing over a historical data condition it did not create.
+  const resolution = await resolveDocument013ForInvoicing(client, 'quote', quoteId);
+  if (resolution.blocked.length > 0) {
+    console.warn(`[invoice-sync] quote ${quoteId} has ${resolution.blocked.length} line(s) whose historical piece count is unresolved — invoice ${invoiceNumber} left untouched.`);
+    return none('unresolved-history', String(resolution.blocked.length));
+  }
+  const piecesMap = effectivePiecesByLineId(resolution);
+
+  // What the invoice says now, so an identical rebuild costs no row_version.
+  const beforeRes = await client.query(
+    `SELECT line_index, description, qty, unit_amount, account_code, tax_type, legacy_data
+       FROM rel_invoice_line_items WHERE invoice_id = $1 ORDER BY line_index`,
+    [invoiceId]
+  );
+  const snapshot = (rs: any[]) => JSON.stringify(rs.map((r) => [
+    Number(r.line_index), r.description ?? null, String(r.qty), String(r.unit_amount),
+    r.account_code ?? null, r.tax_type ?? null, JSON.stringify(r.legacy_data ?? {}),
+  ]));
+  const before = snapshot(beforeRes.rows);
+
+  // Full replace — which is how a line ADDITION, DELETION and REORDER are all
+  // handled, with no chance of a duplicate or an orphan, exactly as
+  // replaceQuoteLinesTx/replaceInvoiceLinesTx already work. The adjustment
+  // lines are re-derived by the same writer, so a setup-fee or discount change
+  // (including one falling to zero, which removes its line) lands correctly.
+  const quoteLinesRes = await client.query(
+    'SELECT * FROM rel_quote_line_items WHERE quote_id = $1 ORDER BY line_index', [quoteId]
+  );
+  await client.query('DELETE FROM rel_invoice_line_items WHERE invoice_id = $1', [invoiceId]);
+  await writeQuoteInvoiceLinesTx(client, invoiceId, quoteLinesRes.rows, quoteAfterSave, piecesMap);
+
+  // The same guard creation uses: an invoice that does not add up to its source
+  // is never left in place. This throws, and because we are inside the caller's
+  // transaction the quote and job changes roll back with it — no half-updated
+  // chain (STEP 16).
+  await assertInvoiceMatchesSourceTx(
+    client, invoiceId, `quote ${quoteAfterSave.quote_number}`, 'total', Number(quoteAfterSave.total) || 0
+  );
+
+  const afterRes = await client.query(
+    `SELECT line_index, description, qty, unit_amount, account_code, tax_type, legacy_data
+       FROM rel_invoice_line_items WHERE invoice_id = $1 ORDER BY line_index`,
+    [invoiceId]
+  );
+  if (snapshot(afterRes.rows) === before) {
+    return { synced: false, invoiceId, invoiceNumber, invoiceRowVersion: Number(inv.row_version), reason: 'unchanged' };
+  }
+
+  const bumped = await client.query(
+    `UPDATE rel_invoices SET row_version = row_version + 1, updated_at = NOW() WHERE id = $1 RETURNING row_version`,
+    [invoiceId]
+  );
+
+  // The invoice's value may have moved, so its payment status is re-derived by
+  // the DEPLOYED rule — cent-precise, per-owner. No payment row is read for
+  // anything but its amount, and none is created, altered or deleted: an
+  // invoice that grows past its payment becomes 'partial' with a real balance,
+  // and one that shrinks to at or below it becomes 'paid'.
+  await recomputeOwnerPaymentStatus(client, 'invoice', invoiceId);
+
+  return { synced: true, invoiceId, invoiceNumber, invoiceRowVersion: Number(bumped.rows[0].row_version), reason: 'synced' };
+}
+
 export interface QuoteJobSyncResult {
   quoteRowVersion: number;
   jobId: number | null;
   jobRowVersion: number | null;
+  invoice: InvoiceSyncOutcome;
 }
 export async function updateQuoteWithJobSync(
   quoteId: number,
   expectedQuoteVersion: number,
   patch: Partial<QuotePatchInput>,
-  opts: { expectedJobVersion?: number; resyncJobLines?: boolean } = {}
+  opts: { expectedJobVersion?: number; resyncJobLines?: boolean; expectedInvoiceVersion?: number } = {}
 ): Promise<QuoteJobSyncResult> {
   validateQuoteHeader(patch, 'Quote');
   const client = await pool.connect();
@@ -2953,8 +3162,38 @@ export async function updateQuoteWithJobSync(
       jobRowVersion = jobUpdateRes.rows[0].row_version;
     }
 
+    // ── LINKED INVOICE (2026-08-27) — see syncLinkedInvoiceFromQuoteTx above.
+    // Attempted only when this save could actually have changed the commercial
+    // content: the line items, the setup fee or the discount. A header-only
+    // edit (phone number, salesperson, validity date) never touches an issued
+    // invoice's lines. Runs on THIS client, inside THIS transaction, after the
+    // quote and job are already written, so the invoice is rebuilt from the
+    // post-save quote and the whole chain commits or rolls back together.
+    const commercialContentTouched =
+      patch.lines !== undefined || patch.setupFee !== undefined || patch.discountPct !== undefined;
+    let invoice: InvoiceSyncOutcome = {
+      synced: false, invoiceId: null, invoiceNumber: null, invoiceRowVersion: null, reason: 'not-requested',
+    };
+    if (commercialContentTouched) {
+      invoice = await syncLinkedInvoiceFromQuoteTx(
+        client,
+        quoteId,
+        // The quote AS SAVED — the totals just recomputed above, not the row
+        // read at the top of the transaction.
+        {
+          company_code: quote.company_code,
+          quote_number: quote.quote_number,
+          setup_fee: setupFee,
+          discount_pct: discountPct,
+          total: totals.total,
+        },
+        jobId,
+        opts.expectedInvoiceVersion
+      );
+    }
+
     await client.query('COMMIT');
-    return { quoteRowVersion, jobId, jobRowVersion };
+    return { quoteRowVersion, jobId, jobRowVersion, invoice };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw err;
