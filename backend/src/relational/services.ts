@@ -728,6 +728,32 @@ function roundMoney4(n: number): number {
   return Math.round((Number(n) || 0) * 10000) / 10000;
 }
 
+/**
+ * Money rounded to CENTS — the precision a document is actually issued and paid
+ * at. `Math.round(n * 100) / 100` is already this codebase's cent convention
+ * (src/db/fixDiazStatementJuly2026.ts's `round2`, and the `money()` helper in
+ * each of the three src/scripts repairs); this names it once so a comparison
+ * cannot quietly use a different one.
+ *
+ * 2026-08-27 — WHY THIS EXISTS. A line total is stored at 4 dp and VAT is a
+ * multiplication, so a document's raw arithmetic can carry a fraction of a cent
+ * that the customer is never billed: INV-00117's lines come to
+ * 6351.59375, and the invoice issued to the customer says R6,351.59. Comparing
+ * a R6,351.59 payment against the RAW 6351.59375 makes a fully-settled invoice
+ * read 'partial' on a shortfall of R0.00375 — money that does not exist at any
+ * precision a bank can transfer. Both sides of a payment-status comparison are
+ * therefore reduced to cents first: the customer owes the cent figure, and pays
+ * a cent figure.
+ *
+ * This is deliberately NOT a tolerance. A tolerance of half a cent would also
+ * forgive a genuine one-cent shortfall whenever the raw total happens to round
+ * UP (raw 6351.595 -> billed R6,351.60, paid R6,351.59 is a real cent short,
+ * and must stay 'partial'). Rounding both sides keeps that case correct.
+ */
+function toCents(n: number): number {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+
 /** "10.000" -> "10", "12.500" -> "12.5" — the discount line reads the way a
  *  person wrote it, matching index.html's `parseFloat(quote.discount)`. */
 function formatDiscountPct(pct: number): string {
@@ -1873,12 +1899,12 @@ export async function recomputeOwnerPaymentStatus(client: PoolClient, ownerType:
     `SELECT COALESCE(SUM(amount), 0) AS total_paid FROM rel_payments WHERE owner_type = $1 AND owner_id = $2`,
     [ownerType, ownerId]
   );
-  const totalPaid = Number(sumRes.rows[0].total_paid);
+  const totalPaid = toCents(Number(sumRes.rows[0].total_paid));
 
   if (ownerType === 'job') {
     const jobRes = await client.query(`SELECT value FROM rel_jobs WHERE id = $1`, [ownerId]);
     if (jobRes.rowCount === 0) return; // owner row vanished mid-transaction elsewhere — nothing to update
-    const jobValue = Number(jobRes.rows[0].value) || 0;
+    const jobValue = toCents(Number(jobRes.rows[0].value) || 0);
     const newStatus = totalPaid >= jobValue && jobValue > 0 ? 'paid' : totalPaid > 0 ? 'partial' : 'pending';
     await client.query(`UPDATE rel_jobs SET invoice_status = $1 WHERE id = $2`, [newStatus, ownerId]);
   } else {
@@ -1886,10 +1912,10 @@ export async function recomputeOwnerPaymentStatus(client: PoolClient, ownerType:
       `SELECT qty, unit_amount, tax_type FROM rel_invoice_line_items WHERE invoice_id = $1`,
       [ownerId]
     );
-    const invTotal = linesRes.rows.reduce((s, l) => {
+    const invTotal = toCents(linesRes.rows.reduce((s, l) => {
       const sub = Number(l.qty) * Number(l.unit_amount);
       return s + sub + (l.tax_type === '15%' ? sub * 0.15 : 0);
-    }, 0);
+    }, 0));
     const curRes = await client.query(`SELECT status FROM rel_invoices WHERE id = $1`, [ownerId]);
     if (curRes.rowCount === 0) return;
     const curStatus = curRes.rows[0].status;
