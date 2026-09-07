@@ -54,9 +54,14 @@ function checkSourceWiring(src: string) {
 
   ok(src.includes(`if(isRelationalAuthoritative(relSection)){`) && src.includes(`if(method==='Credit' && amt > availableCredit + 0.005){`),
     'addPayment now covers EVERY method (including Credit) in its relational branch, not just non-Credit');
-  ok(src.includes(`const result = await relationalApi.recordPayment(ownerType, ownerId, amt, { date, method, notes: notes.trim() });`) &&
+  // 2026-09-07: the call now also carries clientRequestId (the submission
+  // idempotency key), and the optimistic row now takes the SERVER'S payment id
+  // rather than a local Date.now() — read.ts hydrates a relationally-created
+  // payment's `id` from its rel_payments primary key, so anything else made one
+  // payment appear under two ids until the next refresh landed.
+  ok(src.includes(`const result = await relationalApi.recordPayment(ownerType, ownerId, amt, { date, method, notes: notes.trim(), clientRequestId: paymentRequestIdRef.current });`) &&
      src.includes(`_relPaymentId:result.paymentId, _relRowVersion:result.rowVersion`),
-    'addPayment sets _relPaymentId/_relRowVersion on the new payment from the response');
+    'addPayment sets _relPaymentId/_relRowVersion on the new payment from the response, and sends the submission idempotency key');
 
   ok(src.includes(`if(removed && removed._relPaymentId!=null && isRelationalAuthoritative(relSection)){`),
     'deletePayment routes relationally only for a genuine relational payment row (_relPaymentId set)');

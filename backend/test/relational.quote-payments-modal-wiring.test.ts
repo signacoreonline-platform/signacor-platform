@@ -82,8 +82,11 @@ function checkSourceWiring(src: string) {
   ok(body.includes(`const addOwner = paySource.kind==='invoice' ? { ownerType:'invoice', relSection:'accInvoices', ownerId: paySource.record._relId }`) &&
      body.includes(`: paySource.kind==='quote' ? { ownerType:'quote', relSection:'quotes', ownerId: quote._relId }`),
     'addPayment resolves a brand-new payment\'s owner deterministically by paySource.kind (never ambiguous, unlike edit/delete)');
-  ok(body.includes('const result = await relationalApi.recordPayment(addOwner.ownerType, addOwner.ownerId, amt, { date, method, notes: notes.trim() });'),
-    'addPayment calls relationalApi.recordPayment for every method including Credit when the resolved owner section is cut over');
+  // 2026-09-07: the call now also carries clientRequestId — the idempotency key
+  // that makes a retried submission resolve to the payment already persisted
+  // instead of creating a second one. The rest of the wiring is unchanged.
+  ok(body.includes("const result = await relationalApi.recordPayment(addOwner.ownerType, addOwner.ownerId, amt, { date, method, notes: notes.trim(), clientRequestId: paymentRequestIdRef.current });"),
+    'addPayment calls relationalApi.recordPayment (with the submission idempotency key) for every method including Credit when the resolved owner section is cut over');
 
   ok(body.includes('const owner = p && p._relPaymentId!=null ? resolvePaymentOwner(pid) : null;') &&
      body.includes('const result = await relationalApi.updatePayment(p._relPaymentId, p._relRowVersion, owner.relSection, patch0);'),

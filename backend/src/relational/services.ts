@@ -515,6 +515,23 @@ export async function convertQuoteToJob(quoteId: number): Promise<{
       [jobId, jobNumber, quoteId]
     );
 
+    // ── CHAIN PAYMENT STATUS (2026-09-07) ──────────────────────────────────
+    // A new member of a transaction chain must be born knowing what has already
+    // been paid against that transaction. Without this a deposit taken on the
+    // quote BEFORE conversion/invoicing left the new job at invoice_status
+    // 'pending' and the new invoice at 'sent' — reported as wholly unpaid on
+    // the Jobs list and the Accounting list — while the very same invoice's
+    // detail view correctly showed the deposit and a reduced balance. The money
+    // was never wrong; only the two status columns were, and they are what
+    // those lists read.
+    //
+    // recomputeOwnerPaymentStatus is chain-aware, so this ONE call settles the
+    // job AND every invoice in its chain from the same total. It reads payments
+    // only for their amounts, creates and alters nothing, and deliberately does
+    // not bump row_version — so the jobRowVersion returned alongside stays valid
+    // and no open editor is handed a spurious 409.
+    await settleNewChainMemberPaymentStatusTx(client, 'job', jobId);
+
     await client.query('COMMIT');
     return { jobId, jobNumber, jobRowVersion, quoteRowVersion, inventoryAdjustments };
   } catch (err) {
@@ -1208,6 +1225,7 @@ async function jobInvoiceTx(jobId: number, mode: JobInvoiceMode): Promise<JobInv
              row_version = row_version + 1, updated_at = NOW() WHERE id = $1 RETURNING row_version, stage, status`,
           [jobId, INSTALL_STAGE]
         );
+        await settleNewChainMemberPaymentStatusTx(client, 'job', jobId);
         await client.query('COMMIT');
         return { invoiceId: existingInv.id, invoiceNumber: job.invoice_num, legacyMapped: true, jobRowVersion: jobUpdRes1.rows[0].row_version, jobStage: jobUpdRes1.rows[0].stage, jobStatus: jobUpdRes1.rows[0].status, created: false, reused: true };
       }
@@ -1253,6 +1271,7 @@ async function jobInvoiceTx(jobId: number, mode: JobInvoiceMode): Promise<JobInv
            row_version = row_version + 1, updated_at = NOW() WHERE id = $1 RETURNING row_version, stage, status`,
         [jobId, INSTALL_STAGE]
       );
+      await settleNewChainMemberPaymentStatusTx(client, 'job', jobId);
       await client.query('COMMIT');
       return { invoiceId: legacyInvoiceId, invoiceNumber: job.invoice_num, legacyMapped: true, jobRowVersion: jobUpdRes2.rows[0].row_version, jobStage: jobUpdRes2.rows[0].stage, jobStatus: jobUpdRes2.rows[0].status, created: true, reused: false };
     }
@@ -1315,6 +1334,7 @@ async function jobInvoiceTx(jobId: number, mode: JobInvoiceMode): Promise<JobInv
            row_version = row_version + 1, updated_at = NOW() WHERE id = $2 RETURNING row_version, stage, status`,
         [reusable.invoice_number, jobId, INSTALL_STAGE]
       );
+      await settleNewChainMemberPaymentStatusTx(client, 'job', jobId);
       await client.query('COMMIT');
       return {
         invoiceId: reusable.id, invoiceNumber: reusable.invoice_number, legacyMapped: true,
@@ -1367,6 +1387,10 @@ async function jobInvoiceTx(jobId: number, mode: JobInvoiceMode): Promise<JobInv
          row_version = row_version + 1, updated_at = NOW() WHERE id = $2 RETURNING row_version, stage, status`,
       [invoiceNumber, jobId, INSTALL_STAGE]
     );
+
+    // See the chain-payment-status note in convertQuoteToJob above: one
+    // chain-aware call settles this job AND the invoice just created for it.
+    await settleNewChainMemberPaymentStatusTx(client, 'job', jobId);
 
     await client.query('COMMIT');
     return { invoiceId, invoiceNumber, jobRowVersion: jobUpdRes3.rows[0].row_version, jobStage: jobUpdRes3.rows[0].stage, jobStatus: jobUpdRes3.rows[0].status, created: true, reused: false };
@@ -1746,6 +1770,11 @@ async function createInvoiceFromQuoteTx(
       [quoteId]
     );
     if ((reusable.rowCount ?? 0) > 0) {
+      // Same chain-payment-status settlement as the job paths — a quote that
+      // already carries a deposit must not resolve to an invoice reported as
+      // wholly unpaid. Runs on the caller's client, inside the caller's
+      // transaction.
+      await settleNewChainMemberPaymentStatusTx(client, 'invoice', Number(reusable.rows[0].id));
       return {
         invoiceId: Number(reusable.rows[0].id),
         invoiceNumber: String(reusable.rows[0].invoice_number),
@@ -1815,6 +1844,11 @@ async function createInvoiceFromQuoteTx(
   await assertInvoiceMatchesSourceTx(
     client, invoiceId, `quote ${quote.quote_number}`, 'total', Number(quote.total) || 0
   );
+  // A quote invoiced with a deposit already recorded against it must be born
+  // 'partial', not 'sent'. See the chain-payment-status note in
+  // convertQuoteToJob above.
+  await settleNewChainMemberPaymentStatusTx(client, 'invoice', invoiceId);
+
   return { invoiceId, invoiceNumber, reused: false };
 }
 
@@ -1930,38 +1964,279 @@ export async function createInvoiceFromQuote(quoteId: number): Promise<{ invoice
 // re-implementing the paid/partial rule in a script. See
 // src/scripts/repair-audio-access-payment-dedup.ts. Behaviour is unchanged:
 // the only difference is the `export` keyword.
-export async function recomputeOwnerPaymentStatus(client: PoolClient, ownerType: 'job' | 'invoice' | 'quote', ownerId: number): Promise<void> {
-  // Quotes' own `status` (draft/converted/...) is a business-workflow field,
-  // never payment-derived — matches the JSON path, where quote.payments[]
-  // never touches quote.status either.
-  if (ownerType === 'quote') return;
+/* ════════════════════════════════════════════════════════════════════════════
+   TRANSACTION CHAIN RESOLUTION (2026-09-07 — DISCOUNT / PAYMENT CONSISTENCY)
 
-  const sumRes = await client.query(
-    `SELECT COALESCE(SUM(amount), 0) AS total_paid FROM rel_payments WHERE owner_type = $1 AND owner_id = $2`,
-    [ownerType, ownerId]
-  );
-  const totalPaid = toCents(Number(sumRes.rows[0].total_paid));
+   A Quote, the Job it converts into and the Invoice raised for either are three
+   representations of ONE commercial transaction. rel_payments already stores
+   every payment exactly once, under exactly one owner, with one stable id —
+   that part was never wrong. What was missing was a single, shared answer to
+   "which rows belong to THIS transaction", so each surface answered it
+   differently, and two of those answers were wrong:
 
-  if (ownerType === 'job') {
-    const jobRes = await client.query(`SELECT value FROM rel_jobs WHERE id = $1`, [ownerId]);
-    if (jobRes.rowCount === 0) return; // owner row vanished mid-transaction elsewhere — nothing to update
-    const jobValue = toCents(Number(jobRes.rows[0].value) || 0);
-    const newStatus = totalPaid >= jobValue && jobValue > 0 ? 'paid' : totalPaid > 0 ? 'partial' : 'pending';
-    await client.query(`UPDATE rel_jobs SET invoice_status = $1 WHERE id = $2`, [newStatus, ownerId]);
+     * NO relational path ever carried, or re-owned, a quote's or job's existing
+       payments onto a newly created invoice. createInvoiceForJob and
+       createInvoiceFromQuoteTx both leave them exactly where they are — unlike
+       the old JSON path, which copied them across as `carriedPayments`. But
+       index.html's resolvePaymentSource()/resolveQuotePaymentSource() pick
+       exactly ONE payments array, and an invoice, once it exists, wins. A
+       deposit taken before invoicing therefore became UNREACHABLE the moment
+       the invoice was raised: still perfectly intact in rel_payments, but
+       absent from the payments modal, from the invoice balance and from the
+       statement. That is the confirmed cause of "the payment did not save" —
+       and of the duplicate the user then captured to compensate.
+
+     * recomputeOwnerPaymentStatus() summed only the owner's OWN payments, so a
+       job paid through its invoice reported invoice_status 'pending' while the
+       invoice itself reported 'paid'.
+
+   THE FIX IS RESOLUTION, NOT RELOCATION. Nothing is moved, copied, created or
+   deleted. Each payment keeps its own owner, its own id and its own
+   row_version — so deleteInvoice still removes only invoice-owned rows, a job
+   paid directly is still the job's own payment, and no historical record is
+   rewritten. All that changes is that every reader now asks the same question
+   and gets the same answer.
+
+   LINKAGE IS PROVEN COLUMNS ONLY — rel_jobs.quote_id, rel_quotes.converted_job_id,
+   rel_invoices.job_id / rel_invoices.quote_id. Never a number or string match:
+   that is the ambiguity class this codebase has repeatedly had to quarantine
+   (see resolveJobInvoiceRecord's collision handling and deleteInvoice's
+   `ambiguousJobs`). Where a link is ambiguous — two jobs claiming one quote —
+   nothing is guessed and the chain simply stops there.
+
+   COMPANY ISOLATION IS ENFORCED HERE, not assumed. Every member's company_code
+   is compared against the anchor's and a mismatch is DROPPED and reported, so a
+   chain can never reach across the two company contexts even if a historical
+   row is mislinked. Same convention syncLinkedInvoiceFromQuoteTx already uses.
+   ════════════════════════════════════════════════════════════════════════════ */
+export interface TransactionChain {
+  /** The anchor's company. Every member is guaranteed to share it. */
+  companyCode: string | null;
+  quoteId: number | null;
+  jobId: number | null;
+  /** Active (non-void) invoices for this chain, oldest first. */
+  invoiceIds: number[];
+  /** Every payment owner in this chain, anchor included. */
+  owners: Array<{ type: 'job' | 'quote' | 'invoice'; id: number }>;
+}
+
+/** An idempotency key is accepted only in a shape this system controls: a
+ *  non-empty, reasonably short opaque token. Anything else — an empty string,
+ *  whitespace, or something long enough to look like a payload rather than a
+ *  key — is treated as ABSENT rather than rejected, so a malformed key can
+ *  never block a real payment from being recorded. It simply falls back to the
+ *  pre-existing, unprotected behaviour for that one request. */
+export function normalizeClientRequestId(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 200) return null;
+  return trimmed;
+}
+
+const EMPTY_CHAIN: TransactionChain = { companyCode: null, quoteId: null, jobId: null, invoiceIds: [], owners: [] };
+
+function sameCompany(a: unknown, b: unknown): boolean {
+  return String(a == null ? '' : a) === String(b == null ? '' : b);
+}
+
+/** Resolves the full Quote ↔ Job ↔ Invoice chain that `ownerType`/`ownerId`
+ *  belongs to. Runs on the caller's client so it participates in the caller's
+ *  transaction and its locks; issues only indexed single-row / FK lookups. */
+export async function resolveTransactionChainTx(
+  client: PoolClient,
+  ownerType: 'job' | 'quote' | 'invoice',
+  ownerId: number
+): Promise<TransactionChain> {
+  let quoteId: number | null = null;
+  let jobId: number | null = null;
+  let companyCode: string | null = null;
+
+  if (ownerType === 'quote') {
+    const r = await client.query('SELECT id, company_code, converted_job_id FROM rel_quotes WHERE id = $1', [ownerId]);
+    if (r.rowCount === 0) return EMPTY_CHAIN;
+    quoteId = Number(r.rows[0].id);
+    companyCode = r.rows[0].company_code == null ? null : String(r.rows[0].company_code);
+    jobId = r.rows[0].converted_job_id == null ? null : Number(r.rows[0].converted_job_id);
+    if (jobId === null) {
+      // converted_job_id is the authoritative link; rel_jobs.quote_id is the
+      // fallback for a job created before that column was wired. EXACTLY one
+      // match is accepted — two jobs claiming one quote is the quarantined
+      // historical collision, never resolved by guessing.
+      const j = await client.query('SELECT id FROM rel_jobs WHERE quote_id = $1', [quoteId]);
+      if (j.rowCount === 1) jobId = Number(j.rows[0].id);
+      else if ((j.rowCount || 0) > 1) {
+        console.warn(`[chain] quote ${quoteId} is claimed by ${j.rowCount} jobs — chain stops at the quote, nothing guessed.`);
+      }
+    }
+  } else if (ownerType === 'job') {
+    const r = await client.query('SELECT id, company_code, quote_id FROM rel_jobs WHERE id = $1', [ownerId]);
+    if (r.rowCount === 0) return EMPTY_CHAIN;
+    jobId = Number(r.rows[0].id);
+    companyCode = r.rows[0].company_code == null ? null : String(r.rows[0].company_code);
+    quoteId = r.rows[0].quote_id == null ? null : Number(r.rows[0].quote_id);
   } else {
+    const r = await client.query('SELECT id, company_code, job_id, quote_id FROM rel_invoices WHERE id = $1', [ownerId]);
+    if (r.rowCount === 0) return EMPTY_CHAIN;
+    companyCode = r.rows[0].company_code == null ? null : String(r.rows[0].company_code);
+    jobId = r.rows[0].job_id == null ? null : Number(r.rows[0].job_id);
+    quoteId = r.rows[0].quote_id == null ? null : Number(r.rows[0].quote_id);
+    if (jobId !== null && quoteId === null) {
+      const j = await client.query('SELECT quote_id FROM rel_jobs WHERE id = $1', [jobId]);
+      if (j.rowCount === 1 && j.rows[0].quote_id != null) quoteId = Number(j.rows[0].quote_id);
+    } else if (quoteId !== null && jobId === null) {
+      const q = await client.query('SELECT converted_job_id FROM rel_quotes WHERE id = $1', [quoteId]);
+      if (q.rowCount === 1 && q.rows[0].converted_job_id != null) jobId = Number(q.rows[0].converted_job_id);
+    }
+  }
+
+  // ── COMPANY ISOLATION. Verify, never assume. ──
+  if (jobId !== null && ownerType !== 'job') {
+    const j = await client.query('SELECT company_code FROM rel_jobs WHERE id = $1', [jobId]);
+    if (j.rowCount === 0 || !sameCompany(j.rows[0].company_code, companyCode)) {
+      if (j.rowCount !== 0) console.warn(`[chain] job ${jobId} is company ${j.rows[0].company_code} but the chain anchor is company ${companyCode} — job dropped from the chain.`);
+      jobId = null;
+    }
+  }
+  if (quoteId !== null && ownerType !== 'quote') {
+    const q = await client.query('SELECT company_code FROM rel_quotes WHERE id = $1', [quoteId]);
+    if (q.rowCount === 0 || !sameCompany(q.rows[0].company_code, companyCode)) {
+      if (q.rowCount !== 0) console.warn(`[chain] quote ${quoteId} is company ${q.rows[0].company_code} but the chain anchor is company ${companyCode} — quote dropped from the chain.`);
+      quoteId = null;
+    }
+  }
+
+  // ── ACTIVE INVOICES FOR THIS CHAIN ──
+  // Void invoices are excluded exactly as every other reuse/relink/sync lookup
+  // in this file excludes them. The anchor itself is always a member, even if
+  // it has been voided, so a voided invoice's own payments still resolve to it.
+  const invoiceIds: number[] = [];
+  if (quoteId !== null || jobId !== null) {
+    const invRes = await client.query(
+      `SELECT id, company_code FROM rel_invoices
+        WHERE COALESCE(status, '') <> 'void'
+          AND (($1::bigint IS NOT NULL AND quote_id = $1::bigint)
+            OR ($2::bigint IS NOT NULL AND job_id  = $2::bigint))
+        ORDER BY id ASC`,
+      [quoteId, jobId]
+    );
+    for (const row of invRes.rows) {
+      if (!sameCompany(row.company_code, companyCode)) {
+        console.warn(`[chain] invoice ${row.id} is company ${row.company_code} but the chain anchor is company ${companyCode} — invoice dropped from the chain.`);
+        continue;
+      }
+      invoiceIds.push(Number(row.id));
+    }
+  }
+  if (ownerType === 'invoice' && !invoiceIds.includes(Number(ownerId))) invoiceIds.unshift(Number(ownerId));
+
+  const owners: TransactionChain['owners'] = [];
+  if (quoteId !== null) owners.push({ type: 'quote', id: quoteId });
+  if (jobId !== null) owners.push({ type: 'job', id: jobId });
+  for (const id of invoiceIds) owners.push({ type: 'invoice', id });
+  if (owners.length === 0) owners.push({ type: ownerType, id: Number(ownerId) });
+
+  return { companyCode, quoteId, jobId, invoiceIds, owners };
+}
+
+/** Total money received against a whole transaction chain, in exact NUMERIC.
+ *  One query over every owner in the chain. Each rel_payments row is counted
+ *  exactly ONCE — a row has exactly one owner, and an owner appears once. */
+export async function sumChainPaymentsTx(client: PoolClient, chain: TransactionChain): Promise<number> {
+  if (chain.owners.length === 0) return 0;
+  const types = chain.owners.map((o) => o.type);
+  const ids = chain.owners.map((o) => o.id);
+  const res = await client.query(
+    `SELECT COALESCE(SUM(p.amount), 0) AS total_paid
+       FROM rel_payments p
+       JOIN UNNEST($1::text[], $2::bigint[]) AS c(owner_type, owner_id)
+         ON p.owner_type = c.owner_type AND p.owner_id = c.owner_id`,
+    [types, ids]
+  );
+  return Number(res.rows[0].total_paid) || 0;
+}
+
+/** Settles a NEWLY CREATED chain member's payment status — but only when the
+ *  chain has actually received money.
+ *
+ *  WHY THE GUARD IS NOT OPTIONAL. rel_jobs.invoice_status being NULL is
+ *  load-bearing: deleteInvoice decides whether a job has any invoice-side
+ *  linkage to reverse with
+ *      (invoice_num IS NOT NULL OR invoice_created OR invoice_status IS NOT NULL
+ *       OR invoice_date IS NOT NULL OR invoice_due IS NOT NULL)
+ *  and its own contract is that a job with nothing to reverse is left entirely
+ *  alone — "no job's row_version is bumped (and no editor is given a spurious
+ *  409) for a no-op". Stamping invoice_status = 'pending' on every converted
+ *  job would quietly make that predicate true for jobs that have never been
+ *  invoiced, so deleting an unrelated quote-originated invoice would bump their
+ *  row_version and report them as cleared. Verified by
+ *  relational.invoice-delete-representation.stress's F3.
+ *
+ *  With the guard, the column is written only when there is a real payment for
+ *  it to describe — which is exactly the case this exists for (a deposit taken
+ *  on the quote before the job or invoice existed) — and is left untouched
+ *  otherwise. This mirrors deleteInvoice's own established rule a few hundred
+ *  lines above: recompute where payments survive, leave NULL where none do. */
+async function settleNewChainMemberPaymentStatusTx(
+  client: PoolClient,
+  ownerType: 'job' | 'quote' | 'invoice',
+  ownerId: number
+): Promise<void> {
+  const chain = await resolveTransactionChainTx(client, ownerType, ownerId);
+  if (chain.owners.length === 0) return;
+  const totalPaid = await sumChainPaymentsTx(client, chain);
+  if (totalPaid <= 0) return; // nothing received yet — every column stays exactly as created
+  await recomputeOwnerPaymentStatus(client, ownerType, ownerId);
+}
+
+export async function recomputeOwnerPaymentStatus(client: PoolClient, ownerType: 'job' | 'invoice' | 'quote', ownerId: number): Promise<void> {
+  // 2026-09-07 — CHAIN-AWARE. Previously this summed only the owner's OWN
+  // payments, which made the two representations of one transaction disagree:
+  // a job whose deposit was recorded against its invoice reported
+  // invoice_status 'pending' while the invoice reported 'paid', and the
+  // reverse for a job paid before it was invoiced. Money received against ANY
+  // member of a Quote → Job → Invoice chain is money received against that
+  // transaction, so every member's status is now derived from the SAME chain
+  // total, in the SAME transaction as the payment change that prompted it.
+  //
+  // UNCHANGED: the paid/partial rule itself, the cent-precision comparison
+  // (toCents on both sides), the deliberate absence of a paid_at column, and an
+  // invoice's fallback being its CURRENT status rather than a force-reset to
+  // 'sent'. Also unchanged, and important: a status recompute deliberately does
+  // NOT bump row_version — bumping it would hand every open editor a spurious
+  // 409 for a change it did not make.
+  //
+  // Quotes' own `status` (draft/converted/...) stays a business-workflow field,
+  // never payment-derived — matching the JSON path, where quote.payments[] never
+  // touched quote.status either. What changes is that a payment recorded against
+  // a QUOTE now updates its linked job/invoice, which is the whole point: it is
+  // the same transaction's money.
+  const chain = await resolveTransactionChainTx(client, ownerType, ownerId);
+  if (chain.owners.length === 0) return; // owner row vanished mid-transaction elsewhere
+  const totalPaid = toCents(await sumChainPaymentsTx(client, chain));
+
+  if (chain.jobId !== null) {
+    const jobRes = await client.query(`SELECT value FROM rel_jobs WHERE id = $1`, [chain.jobId]);
+    if ((jobRes.rowCount || 0) > 0) {
+      const jobValue = toCents(Number(jobRes.rows[0].value) || 0);
+      const newStatus = totalPaid >= jobValue && jobValue > 0 ? 'paid' : totalPaid > 0 ? 'partial' : 'pending';
+      await client.query(`UPDATE rel_jobs SET invoice_status = $1 WHERE id = $2`, [newStatus, chain.jobId]);
+    }
+  }
+
+  for (const invoiceId of chain.invoiceIds) {
     const linesRes = await client.query(
       `SELECT qty, unit_amount, tax_type FROM rel_invoice_line_items WHERE invoice_id = $1`,
-      [ownerId]
+      [invoiceId]
     );
     const invTotal = toCents(linesRes.rows.reduce((s, l) => {
       const sub = Number(l.qty) * Number(l.unit_amount);
       return s + sub + (l.tax_type === '15%' ? sub * 0.15 : 0);
     }, 0));
-    const curRes = await client.query(`SELECT status FROM rel_invoices WHERE id = $1`, [ownerId]);
-    if (curRes.rowCount === 0) return;
+    const curRes = await client.query(`SELECT status FROM rel_invoices WHERE id = $1`, [invoiceId]);
+    if (curRes.rowCount === 0) continue;
     const curStatus = curRes.rows[0].status;
     const newStatus = totalPaid >= invTotal && invTotal > 0 ? 'paid' : totalPaid > 0 ? 'partial' : curStatus;
-    await client.query(`UPDATE rel_invoices SET status = $1 WHERE id = $2`, [newStatus, ownerId]);
+    await client.query(`UPDATE rel_invoices SET status = $1 WHERE id = $2`, [newStatus, invoiceId]);
   }
 }
 
@@ -1975,11 +2250,46 @@ export async function recomputeOwnerPaymentStatus(client: PoolClient, ownerType:
 // transaction here, so either both succeed or neither does. If the matching
 // notes can't cover the full amount, the whole payment is refused (never a
 // partially-funded Credit payment silently recorded).
+// ── ACCIDENTAL DUPLICATE PROTECTION (2026-09-07) ────────────────────────────
+// `clientRequestId` is an idempotency key for ONE payment submission attempt.
+// The browser generates it once when the user submits, and repeats it verbatim
+// on every retry of THAT submission — so a retry after an apparent timeout, a
+// response lost on a flaky connection, or a double-click that outruns React's
+// `saving` flag all arrive carrying the same key and can only ever produce one
+// payment. A second, genuinely separate payment carries a fresh key, so two
+// legitimate R5,000 payments on the same day by the same method are still two
+// payments. Amount/date/method are NEVER compared to detect a duplicate: they
+// cannot distinguish a retry from a real second payment, and treating them as
+// if they could would silently lose real money.
+//
+// The protection is authoritative, not advisory: migration 014's partial UNIQUE
+// index on rel_payments(client_request_id) WHERE NOT NULL enforces it at the
+// database write boundary, so it holds against a duplicate arriving from a
+// retry, a second tab, or any future client — not only from the one code path
+// that happens to look first. Both the pre-check below and the 23505 catch
+// resolve to the SAME answer: the already-persisted payment's own id and row
+// version. The caller sees an ordinary success and exactly one payment exists.
+//
+// Omitting the key is fully supported and changes nothing (NULL is unconstrained),
+// so an older client, or any caller that has no submission identity to offer,
+// behaves exactly as before.
 export async function recordPayment(
   owner: { type: 'job' | 'invoice' | 'quote'; id: number },
   amount: number,
-  opts: { date?: string; method?: string; reference?: string; notes?: string } = {}
-): Promise<{ paymentId: number; rowVersion: number; creditApplied?: number }> {
+  opts: { date?: string; method?: string; reference?: string; notes?: string; clientRequestId?: string | null } = {}
+  // NOTE ON `paymentId`'s DECLARED TYPE. rel_payments.id is a BIGINT, which
+  // node-postgres renders as a STRING, so what actually crosses this boundary
+  // at runtime is a numeric string — and always has, on the create path, since
+  // this function was written. The annotation below says `number` and is
+  // deliberately LEFT that way: widening it to `number | string` is honest but
+  // ripples into existing suites that pass this value straight into
+  // number-typed helpers, which is churn well outside a discount/payment fix.
+  // What matters, and what is enforced here, is that every path — create,
+  // replay and race — returns the id in the SAME shape, because read.ts stamps
+  // that same raw value onto each hydrated payment as `_relPaymentId` and
+  // index.html compares the two with ===. Coercing one path and not another
+  // would split a single payment into two identities.
+): Promise<{ paymentId: number; rowVersion: number; creditApplied?: number; deduplicated?: boolean }> {
   const table = owner.type === 'job' ? 'rel_jobs' : owner.type === 'invoice' ? 'rel_invoices' : 'rel_quotes';
   const nameCol = owner.type === 'invoice' ? 'contact_name' : 'customer_name_raw';
   const client = await pool.connect();
@@ -1987,6 +2297,33 @@ export async function recordPayment(
     await client.query('BEGIN');
     const ownerRes = await client.query(`SELECT id, ${nameCol} AS contact_name FROM ${table} WHERE id = $1 FOR UPDATE`, [owner.id]);
     if (ownerRes.rowCount === 0) throw new BusinessRuleError(`${owner.type} ${owner.id} not found`);
+
+    // IDEMPOTENCY PRE-CHECK. Deliberately BEFORE the credit-note block below:
+    // a replayed submission must not consume the customer's credit a second
+    // time. Returning here leaves every credit note exactly as the original
+    // submission left it.
+    const requestKey = normalizeClientRequestId(opts.clientRequestId);
+    if (requestKey) {
+      const replay = await client.query(
+        'SELECT id, row_version FROM rel_payments WHERE client_request_id = $1',
+        [requestKey]
+      );
+      if ((replay.rowCount || 0) > 0) {
+        await client.query('COMMIT');
+        console.warn(`[payments] submission ${requestKey} was already recorded as payment ${replay.rows[0].id} — returning the existing payment instead of creating a second one.`);
+        // `id` is returned VERBATIM, exactly as the create path below returns
+        // it. rel_payments.id is a BIGINT, which node-postgres renders as a
+        // STRING, and read.ts stamps that same string onto every hydrated
+        // payment as `_relPaymentId`. Coercing it to a number here would make
+        // one payment answer to two different identities depending on whether
+        // the caller created it or replayed it — and every identity comparison
+        // in index.html (the merged job∪quote dedupe, applyIfOwned, the
+        // find-by-id in edit and delete) is a strict ===, so the two would not
+        // match. A duplicate-protection path that breaks payment identity is
+        // not protection.
+        return { paymentId: replay.rows[0].id, rowVersion: Number(replay.rows[0].row_version), deduplicated: true };
+      }
+    }
 
     let creditApplied: number | undefined;
     if (opts.method === 'Credit') {
@@ -2031,13 +2368,34 @@ export async function recordPayment(
     );
     const lineIndex = nextIdx.rows[0].idx;
 
-    const res = await client.query(
-      `WITH new_id AS (SELECT nextval('rel_payments_id_seq') AS id)
-       INSERT INTO rel_payments (id, source_id, owner_type, owner_id, line_index, amount, payment_date, method, reference, notes, legacy_data)
-       SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, $6, $7, $8, '{}'::jsonb FROM new_id
-       RETURNING id, row_version`,
-      [owner.type, owner.id, lineIndex, amount, opts.date || null, opts.method || null, opts.reference || null, opts.notes || null]
-    );
+    let res;
+    try {
+      res = await client.query(
+        `WITH new_id AS (SELECT nextval('rel_payments_id_seq') AS id)
+         INSERT INTO rel_payments (id, source_id, owner_type, owner_id, line_index, amount, payment_date, method, reference, notes, client_request_id, legacy_data)
+         SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, $6, $7, $8, $9, '{}'::jsonb FROM new_id
+         RETURNING id, row_version`,
+        [owner.type, owner.id, lineIndex, amount, opts.date || null, opts.method || null, opts.reference || null, opts.notes || null, requestKey]
+      );
+    } catch (err: any) {
+      // THE AUTHORITATIVE HALF of the duplicate protection. Two copies of one
+      // submission racing each other both pass the pre-check above (each in its
+      // own transaction, neither yet visible to the other); the unique index
+      // then lets exactly ONE commit. The loser lands here, rolls back — which
+      // also releases any credit note it had provisionally consumed — and
+      // reports the winner's payment, so the user sees one success and one
+      // payment exists. Any other error is re-thrown untouched.
+      if (err && err.code === '23505' && String(err.constraint || '').includes('client_request_id') && requestKey) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        const winner = await pool.query('SELECT id, row_version FROM rel_payments WHERE client_request_id = $1', [requestKey]);
+        if ((winner.rowCount || 0) > 0) {
+          console.warn(`[payments] submission ${requestKey} raced another copy of itself — returning the payment that committed (${winner.rows[0].id}); no second payment was created.`);
+          // Verbatim, for the same reason as the replay path above.
+          return { paymentId: winner.rows[0].id, rowVersion: Number(winner.rows[0].row_version), deduplicated: true };
+        }
+      }
+      throw err;
+    }
     await recomputeOwnerPaymentStatus(client, owner.type, owner.id);
     await client.query('COMMIT');
     return { paymentId: res.rows[0].id, rowVersion: res.rows[0].row_version, creditApplied };
@@ -2667,7 +3025,208 @@ export interface JobPatchInput {
   // attribution for a financial-control override must not be client-supplied.
   depositWaivedBy?: string | null;
 }
-export async function updateJob(id: number, expectedVersion: number, patch: Partial<JobPatchInput>): Promise<{ rowVersion: number }> {
+/* ═══════════════════════════════════════════════════════════════════════════
+   JOB → LINKED INVOICE SYNCHRONISATION + CANONICAL DISCOUNT WRITE-THROUGH
+   (2026-09-07 — DISCOUNT CONSISTENCY)
+
+   WHY THIS EXISTS. updateQuoteWithJobSync has cascaded quote → job → invoice
+   since 2026-08-27 (see syncLinkedInvoiceFromQuoteTx). updateJob never had the
+   equivalent: it wrote rel_jobs.discount_pct and stopped. So a discount changed
+   from the Edit Invoice screen — whose own field is labelled "Discount (any
+   stage)" — left the source quote on the OLD percentage and left the issued
+   invoice still carrying its old `Discount (x%)` adjustment line and its old
+   total. One transaction, three documents, three different discounts.
+
+   THE CANONICAL DISCOUNT. A discount belongs to the TRANSACTION, not to any one
+   document. The head of the chain holds it — the quote where there is one,
+   otherwise the job — and every other representation derives from it:
+
+     * rel_quotes.discount_pct  — canonical for a quote-headed chain
+     * rel_jobs.discount_pct    — canonical for a job-only chain; a
+                                  SYNCHRONISED PROJECTION otherwise (every read
+                                  path, the Job Card and the job's own value
+                                  need it, so it stays — it just stops being an
+                                  independent fact)
+     * the invoice              — owns NO discount field at all, by design. Its
+                                  `Discount (x%)` line is always regenerated
+                                  from the canonical holder by the same shared
+                                  writers that created it.
+
+   Percentage is authoritative; the money is always derived as
+   subtotal x pct/100 by writeInvoiceAdjustmentLinesTx / computeQuoteTotals, so
+   the two can never contradict each other.
+
+   NO NEW ARITHMETIC. Both helpers below rebuild through the DEPLOYED writers
+   (writeInvoiceLinesFromJobTx → writeInvoiceLinesFromSourceTx +
+   writeInvoiceAdjustmentLinesTx, and computeQuoteTotals). Creation and
+   synchronisation therefore cannot compute a discount differently, which is the
+   defect class this area keeps producing.
+
+   WHY THE INVOICE IS REBUILT FROM THE JOB, NOT THE QUOTE. BLOCKER 2
+   (2026-08-24) made job line items production-owned after conversion, so a
+   job's lines may legitimately have moved on from its quote's. Rebuilding this
+   invoice from the quote would silently replace what is actually being billed.
+   The job is what the invoice was raised for, so the job is what it is rebuilt
+   from — and assertJobInvoiceMatchesValueTx then holds it to the job's own
+   `value`, exactly as createInvoiceForJob does.
+
+   WHAT IS NEVER TOUCHED. The invoice's identity as an accounting document: id,
+   invoice_number, issue_date, due_date, job/quote linkage, created_at. And
+   every rel_payments row — amount, date, method, reference, id — is left
+   completely alone. A discount change is not a payment event: the payment is a
+   historical fact, and only the OUTSTANDING BALANCE moves, which it does
+   automatically because recomputeOwnerPaymentStatus re-derives status from the
+   chain total against the new invoice total.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/** Writes the canonical discount (and setup fee, when the same save changed it)
+ *  through to the chain's head quote and recomputes that quote's stored totals
+ *  from its OWN lines. Returns the quote's new row_version, or null when there
+ *  is no quote to write through to.
+ *
+ *  The quote's LINE ITEMS are deliberately never touched here — only the
+ *  document-level discount/setup fee the transaction shares. */
+async function syncQuoteDiscountFromJobTx(
+  client: PoolClient,
+  quoteId: number,
+  discountPct: number | undefined,
+  setupFee: number | undefined
+): Promise<{ quoteRowVersion: number; discountPct: number; setupFee: number; total: number } | null> {
+  const qRes = await client.query('SELECT * FROM rel_quotes WHERE id = $1 FOR UPDATE', [quoteId]);
+  if (qRes.rowCount === 0) return null;
+  const quote = qRes.rows[0];
+
+  const nextDiscount = discountPct !== undefined ? Number(discountPct) || 0 : Number(quote.discount_pct) || 0;
+  const nextSetupFee = setupFee !== undefined ? Number(setupFee) || 0 : Number(quote.setup_fee) || 0;
+
+  const linesRes = await client.query(
+    'SELECT COALESCE(SUM(subtotal), 0) AS subtotal FROM rel_quote_line_items WHERE quote_id = $1',
+    [quoteId]
+  );
+  const subtotal = Number(linesRes.rows[0].subtotal) || 0;
+  const totals = computeQuoteTotals(subtotal, nextDiscount, nextSetupFee);
+
+  // An identical write costs no row_version — an editor open on this quote must
+  // not be handed a spurious 409 because someone re-saved the same discount.
+  const unchanged =
+    Number(quote.discount_pct) === nextDiscount &&
+    Number(quote.setup_fee) === nextSetupFee &&
+    Number(quote.total) === Number(totals.total);
+  if (unchanged) return { quoteRowVersion: Number(quote.row_version), discountPct: nextDiscount, setupFee: nextSetupFee, total: Number(quote.total) };
+
+  const upd = await client.query(
+    `UPDATE rel_quotes
+        SET discount_pct = $1, setup_fee = $2, subtotal = $3, vat_amount = $4, total = $5,
+            row_version = row_version + 1, updated_at = NOW()
+      WHERE id = $6 RETURNING row_version`,
+    [nextDiscount, nextSetupFee, totals.subtotal, totals.vat, totals.total, quoteId]
+  );
+  return { quoteRowVersion: Number(upd.rows[0].row_version), discountPct: nextDiscount, setupFee: nextSetupFee, total: Number(totals.total) };
+}
+
+/** Rebuilds the commercial content of every active invoice linked to this job,
+ *  from the job as it stands AFTER this save, through the deployed writers.
+ *  Runs inside the caller's transaction — never opens one of its own — so the
+ *  job, the quote and the invoice commit together or not at all. */
+async function syncLinkedInvoicesFromJobTx(
+  client: PoolClient,
+  jobId: number,
+  invoiceIds: number[]
+): Promise<Array<{ invoiceId: number; invoiceNumber: string; invoiceRowVersion: number; synced: boolean; reason: string }>> {
+  const out: Array<{ invoiceId: number; invoiceNumber: string; invoiceRowVersion: number; synced: boolean; reason: string }> = [];
+  if (invoiceIds.length === 0) return out;
+
+  const jobRes = await client.query('SELECT * FROM rel_jobs WHERE id = $1', [jobId]);
+  if (jobRes.rowCount === 0) return out;
+  const job = jobRes.rows[0];
+
+  // HISTORICAL PIECES PROTECTION, identical to every creation path. A line whose
+  // piece count cannot be known must never be re-billed on a guess: the invoice
+  // is left exactly as it is and the anomaly is reported, rather than the job
+  // save failing over a historical data condition it did not create.
+  const resolution = await resolveDocument013ForInvoicing(client, 'job', jobId);
+  if (resolution.blocked.length > 0) {
+    console.warn(`[invoice-sync] job ${jobId} has ${resolution.blocked.length} line(s) whose historical piece count is unresolved — its invoice(s) left untouched.`);
+    for (const invoiceId of invoiceIds) {
+      out.push({ invoiceId, invoiceNumber: '', invoiceRowVersion: 0, synced: false, reason: 'unresolved-history' });
+    }
+    return out;
+  }
+  const piecesMap = effectivePiecesByLineId(resolution);
+  const jobLinesRes = await client.query('SELECT * FROM rel_job_line_items WHERE job_id = $1 ORDER BY line_index', [jobId]);
+
+  const snapshot = (rs: any[]) => JSON.stringify(rs.map((r) => [
+    Number(r.line_index), r.description == null ? null : r.description, String(r.qty), String(r.unit_amount),
+    r.account_code == null ? null : r.account_code, r.tax_type == null ? null : r.tax_type,
+    JSON.stringify(r.legacy_data == null ? {} : r.legacy_data),
+  ]));
+
+  for (const invoiceId of invoiceIds) {
+    const invRes = await client.query(
+      'SELECT id, invoice_number, company_code, row_version FROM rel_invoices WHERE id = $1 FOR UPDATE',
+      [invoiceId]
+    );
+    if (invRes.rowCount === 0) continue;
+    const inv = invRes.rows[0];
+    // COMPANY ISOLATION — never cross it, even though resolveTransactionChainTx
+    // has already filtered: this write is the one that would do the damage.
+    if (String(inv.company_code) !== String(job.company_code)) {
+      console.warn(`[invoice-sync] invoice ${inv.invoice_number} is company ${inv.company_code} but job ${jobId} is company ${job.company_code} — synchronisation aborted.`);
+      out.push({ invoiceId, invoiceNumber: String(inv.invoice_number), invoiceRowVersion: Number(inv.row_version), synced: false, reason: 'company-mismatch' });
+      continue;
+    }
+
+    const beforeRes = await client.query(
+      `SELECT line_index, description, qty, unit_amount, account_code, tax_type, legacy_data
+         FROM rel_invoice_line_items WHERE invoice_id = $1 ORDER BY line_index`,
+      [invoiceId]
+    );
+    const before = snapshot(beforeRes.rows);
+
+    // Full replace — how a line ADDITION, DELETION and REORDER are all handled
+    // with no chance of a duplicate or an orphan, exactly as
+    // syncLinkedInvoiceFromQuoteTx and replaceInvoiceLinesTx already work. The
+    // adjustment lines are re-derived by the same writer, so a discount change
+    // (including one falling to zero, which removes its line entirely) lands
+    // correctly.
+    await client.query('DELETE FROM rel_invoice_line_items WHERE invoice_id = $1', [invoiceId]);
+    await writeInvoiceLinesFromJobTx(client, invoiceId, jobLinesRes.rows, job, piecesMap);
+
+    // The same guard creation uses: an invoice that does not add up to the job
+    // it bills is never left in place. This throws, and because we are inside
+    // the caller's transaction the job and quote changes roll back with it — no
+    // half-updated chain.
+    await assertJobInvoiceMatchesValueTx(client, invoiceId, job, jobLinesRes.rowCount || 0);
+
+    const afterRes = await client.query(
+      `SELECT line_index, description, qty, unit_amount, account_code, tax_type, legacy_data
+         FROM rel_invoice_line_items WHERE invoice_id = $1 ORDER BY line_index`,
+      [invoiceId]
+    );
+    if (snapshot(afterRes.rows) === before) {
+      out.push({ invoiceId, invoiceNumber: String(inv.invoice_number), invoiceRowVersion: Number(inv.row_version), synced: false, reason: 'unchanged' });
+      continue;
+    }
+    const bumped = await client.query(
+      'UPDATE rel_invoices SET row_version = row_version + 1, updated_at = NOW() WHERE id = $1 RETURNING row_version',
+      [invoiceId]
+    );
+    out.push({ invoiceId, invoiceNumber: String(inv.invoice_number), invoiceRowVersion: Number(bumped.rows[0].row_version), synced: true, reason: 'synced' });
+  }
+  return out;
+}
+
+export interface JobUpdateResult {
+  rowVersion: number;
+  /** Present when this save wrote the canonical discount through to the chain's
+   *  head quote — so the caller can refresh that quote's expected version
+   *  instead of discovering it went stale on its next save. */
+  quoteId?: number;
+  quoteRowVersion?: number;
+  /** Every linked invoice this save rebuilt, with its new version. */
+  invoices?: Array<{ invoiceId: number; invoiceNumber: string; invoiceRowVersion: number; synced: boolean; reason: string }>;
+}
+export async function updateJob(id: number, expectedVersion: number, patch: Partial<JobPatchInput>): Promise<JobUpdateResult> {
   // 2026-08-24 — job lines carry the same dimensions/pieces columns quote
   // lines do (migration 013), so they need the same before-any-SQL validation:
   // an out-of-range piece count or price must reach the user as a sentence,
@@ -2676,6 +3235,27 @@ export async function updateJob(id: number, expectedVersion: number, patch: Part
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    // ── LOCK ORDER (2026-09-07) ───────────────────────────────────────────
+    // updateQuoteWithJobSync locks rel_quotes and THEN rel_jobs. When this save
+    // will cascade onto the chain's head quote (see the discount cascade below)
+    // it touches the same two rows, so it must take them in the SAME order or a
+    // concurrent quote edit and job edit on one transaction can deadlock. The
+    // lock is taken here, before the job's, and syncQuoteDiscountFromJobTx's own
+    // FOR UPDATE on the same row is then a no-op re-lock.
+    //
+    // `quote_id` is read WITHOUT a lock to decide which row to lock — it is
+    // effectively immutable once a quote has been converted (only
+    // convertQuoteToJob and deleteJob ever set or clear it), and the worst case
+    // if it did change under us is that we locked one row we did not need.
+    if (patch.discountPct !== undefined || patch.setupFee !== undefined) {
+      const link = await client.query('SELECT quote_id FROM rel_jobs WHERE id = $1', [id]);
+      const linkedQuoteId = link.rowCount && link.rows[0].quote_id != null ? Number(link.rows[0].quote_id) : null;
+      if (linkedQuoteId !== null) {
+        await client.query('SELECT id FROM rel_quotes WHERE id = $1 FOR UPDATE', [linkedQuoteId]);
+      }
+    }
+
     const curRes = await client.query('SELECT row_version FROM rel_jobs WHERE id = $1 FOR UPDATE', [id]);
     if (curRes.rowCount === 0) throw new BusinessRuleError(`job ${id} not found`);
     if (curRes.rows[0].row_version !== expectedVersion) throw new ConcurrencyConflictError('rel_jobs', id);
@@ -2734,8 +3314,58 @@ export async function updateJob(id: number, expectedVersion: number, patch: Part
       `UPDATE rel_jobs SET ${setClause}row_version = row_version + 1, updated_at = NOW() WHERE id = $${idIdx} RETURNING row_version`,
       vals
     );
+
+    // ── CANONICAL DISCOUNT CASCADE (2026-09-07) ─────────────────────────────
+    // See syncQuoteDiscountFromJobTx / syncLinkedInvoicesFromJobTx above for the
+    // full rationale.
+    //
+    // THE GATE IS DELIBERATELY NARROW: the DISCOUNT (or the setup fee, which is
+    // the same document-level adjustment in the other direction). Nothing else.
+    // This pass is scoped to discounts and payments, and widening the gate to
+    // `lines` or `value` would change behaviour well outside it — JobDetail's
+    // saveLines() sends `{lines}` alone and never restates the job's `value`, so
+    // rebuilding its invoice there would hold the new lines against the OLD
+    // declared value and assertJobInvoiceMatchesValueTx would refuse a line save
+    // that works correctly today. A job's lines drifting from its already-issued
+    // invoice is a real and separate issue; it is DOCUMENTED, not fixed here.
+    //
+    // The Edit Invoice form — the one screen that actually captures a job-stage
+    // discount — always sends discountPct alongside the recomputed `value` and
+    // `lines` in the same save, so when the discount does change the invoice is
+    // rebuilt from lines and a value that already agree with each other.
+    //
+    // Runs on THIS client, inside THIS transaction, AFTER the job row is
+    // written, so the quote and the invoice are rebuilt from the post-save job
+    // and the whole chain commits or rolls back together. "Job saved but the
+    // invoice still shows the old discount" can no longer happen.
+    const commercialContentTouched =
+      patch.discountPct !== undefined || patch.setupFee !== undefined;
+
+    const result: JobUpdateResult = { rowVersion: res.rows[0].row_version };
+    if (commercialContentTouched) {
+      const chain = await resolveTransactionChainTx(client, 'job', id);
+      // The DISCOUNT (and setup fee) is the transaction's, so it is written
+      // through to the chain's head quote. The quote's LINE ITEMS are never
+      // touched — a job's lines are production-owned after conversion, and the
+      // quote remains the historical offer it always was.
+      if (chain.quoteId !== null && (patch.discountPct !== undefined || patch.setupFee !== undefined)) {
+        const q = await syncQuoteDiscountFromJobTx(client, chain.quoteId, patch.discountPct, patch.setupFee);
+        if (q) { result.quoteId = chain.quoteId; result.quoteRowVersion = q.quoteRowVersion; }
+      }
+      if (chain.invoiceIds.length > 0) {
+        result.invoices = await syncLinkedInvoicesFromJobTx(client, id, chain.invoiceIds);
+      }
+      // An invoice whose total moved must re-derive its paid/partial position
+      // against the chain's payments. No payment row is read for anything but
+      // its amount, and none is created, altered or deleted: a payment is a
+      // historical financial event, only the OUTSTANDING balance moves.
+      if (chain.invoiceIds.length > 0 || chain.jobId !== null) {
+        await recomputeOwnerPaymentStatus(client, 'job', id);
+      }
+    }
+
     await client.query('COMMIT');
-    return { rowVersion: res.rows[0].row_version };
+    return result;
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw err;

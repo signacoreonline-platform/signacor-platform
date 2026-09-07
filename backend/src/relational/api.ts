@@ -323,7 +323,21 @@ router.put('/jobs/:id', async (req: AuthRequest, res: Response): Promise<void> =
       (patch as any).depositWaivedBy = (actor && (actor.email || actor.id)) || null;
     }
     const result = await updateJob(id, expectedVersion, patch);
-    res.json({ success: true, rowVersion: result.rowVersion });
+    // 2026-09-07 — CANONICAL DISCOUNT CASCADE. A save that changes the
+    // transaction's commercial content now also writes the discount through to
+    // the chain's head quote and rebuilds the linked invoice's lines, in the
+    // SAME transaction (see services.ts's updateJob). Both of those bump a
+    // row_version the caller is still holding the OLD value of, so they are
+    // reported back — exactly as convertQuoteToJob/deleteJob already report
+    // `unlinkedQuotes` — and the client refreshes its expected versions instead
+    // of discovering they went stale on its next save (a spurious 409).
+    res.json({
+      success: true,
+      rowVersion: result.rowVersion,
+      quoteId: result.quoteId,
+      quoteRowVersion: result.quoteRowVersion,
+      invoices: result.invoices,
+    });
   } catch (err) { handleServiceError(err, res); }
 });
 
@@ -496,7 +510,7 @@ router.delete('/invoices/:id', async (req: AuthRequest, res: Response): Promise<
 // case that genuinely crosses into creditNotes' authority.
 router.post('/payments', async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { ownerType, ownerId, amount, date, method, reference, notes } = req.body || {};
+    const { ownerType, ownerId, amount, date, method, reference, notes, clientRequestId } = req.body || {};
     if (!['job', 'invoice', 'quote'].includes(ownerType)) {
       res.status(400).json({ error: '"ownerType" must be one of job, invoice, quote' }); return;
     }
@@ -514,8 +528,25 @@ router.post('/payments', async (req: AuthRequest, res: Response): Promise<void> 
     if (!Number.isFinite(id) || !Number.isFinite(amt)) {
       res.status(400).json({ error: '"ownerId" and "amount" must be numbers' }); return;
     }
-    const result = await recordPayment({ type: ownerType, id }, amt, { date, method, reference, notes });
-    res.status(201).json({ success: true, paymentId: result.paymentId, rowVersion: result.rowVersion, creditApplied: result.creditApplied });
+    // 2026-09-07 — ACCIDENTAL DUPLICATE PROTECTION. `clientRequestId` identifies
+    // ONE payment submission attempt (see services.ts's recordPayment and
+    // migration 014). A retry of that same submission — after a timeout, a lost
+    // response, or a double-click — returns the payment the first attempt
+    // already persisted rather than creating a second one. Two genuinely
+    // separate payments carry different keys and are both recorded, so the
+    // legitimate "R5,000 twice on the same day" case is untouched. A caller that
+    // sends no key behaves exactly as before.
+    const result = await recordPayment({ type: ownerType, id }, amt, { date, method, reference, notes, clientRequestId });
+    // 201 on a real create, 200 on a recognised replay — an honest distinction
+    // the client can act on, while both are ordinary successes carrying the same
+    // canonical payment id.
+    res.status(result.deduplicated ? 200 : 201).json({
+      success: true,
+      paymentId: result.paymentId,
+      rowVersion: result.rowVersion,
+      creditApplied: result.creditApplied,
+      deduplicated: result.deduplicated === true,
+    });
   } catch (err) { handleServiceError(err, res); }
 });
 

@@ -113,18 +113,31 @@ function checkFrontendWiring(src: string) {
     'AccountingPage.deleteInvoice() surfaces a quarantined invoice-number collision instead of leaving it looking like a failed delete');
 
   console.log('\n  -- Accounting-view payments (PaymentHistoryModal) --');
-  ok(/async function addPayment\(\) \{[\s\S]{0,300}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,900}relationalApi\.recordPayment\('invoice', inv\._relId,/.test(src),
+  // 2026-09-07: addPayment is now wrapped in guardAction (synchronous
+  // double-click protection), so the relational branch lives in addPayment__impl.
+  // A brand-new payment's owner is still unambiguous — this invoice.
+  ok(/async function addPayment__impl\(\) \{[\s\S]{0,300}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,1400}relationalApi\.recordPayment\('invoice', inv\._relId,/.test(src),
     'PaymentHistoryModal.addPayment() checks isRelationalAuthoritative(\'accInvoices\') and calls relationalApi.recordPayment(\'invoice\', inv._relId, ...)');
-  ok(/async function editPayment\(pid\) \{[\s\S]{0,900}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,300}relationalApi\.updatePayment\(p\._relPaymentId, p\._relRowVersion, 'accInvoices',/.test(src),
-    'PaymentHistoryModal.editPayment() checks isRelationalAuthoritative(\'accInvoices\') and calls relationalApi.updatePayment with ownerSection \'accInvoices\'');
-  ok(/async function deletePayment\(pid\) \{[\s\S]{0,500}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,300}relationalApi\.deletePayment\(removed\._relPaymentId, removed\._relRowVersion, 'accInvoices'\)/.test(src),
-    'PaymentHistoryModal.deletePayment() checks isRelationalAuthoritative(\'accInvoices\') and calls relationalApi.deletePayment with ownerSection \'accInvoices\'');
+  // 2026-09-07: an invoice's `payments` array is now its whole transaction
+  // chain's (read.ts's buildInvoicesJson), so the section is resolved from the
+  // PAYMENT's own _relOwnerType via paymentOwnerSection() — falling back to
+  // 'accInvoices' — rather than hard-coded. Same rule BUG 7 established for the
+  // Job modal's merged view.
+  ok(/async function editPayment__impl\(pid\) \{[\s\S]{0,1400}paymentOwnerSection\(p, 'accInvoices'\)[\s\S]{0,400}isRelationalAuthoritative\(_editSection\)[\s\S]{0,400}relationalApi\.updatePayment\(p\._relPaymentId, p\._relRowVersion, _editSection,/.test(src),
+    'PaymentHistoryModal.editPayment() resolves the owning section from the payment (paymentOwnerSection, default accInvoices) and calls relationalApi.updatePayment with it');
+  // 2026-09-07: same true-owner resolution as editPayment above.
+  ok(/async function deletePayment__impl\(pid\) \{[\s\S]{0,1400}paymentOwnerSection\(removed, 'accInvoices'\)[\s\S]{0,400}isRelationalAuthoritative\(_delSection\)[\s\S]{0,400}relationalApi\.deletePayment\(removed\._relPaymentId, removed\._relRowVersion, _delSection\)/.test(src),
+    'PaymentHistoryModal.deletePayment() resolves the owning section from the payment (paymentOwnerSection, default accInvoices) and calls relationalApi.deletePayment with it');
 
   console.log('\n  -- markInvPaid records a REAL relational payment --');
   // Hoisted alongside the delete, for the same reason and with the same
   // strengthening: the relational behaviour is pinned where it now lives, and
   // both pages are pinned to it.
-  ok(/async function markCanonicalInvoicePaid\(inv, ctx\)\{[\s\S]{0,500}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,300}relationalApi\.recordPayment\('invoice', inv\._relId, remaining,/.test(src),
+  // 2026-09-07: "Mark Paid" records a real payment, so it is now wrapped in the
+  // shared synchronous guardAction and its body lives in
+  // markCanonicalInvoicePaid__impl, which also mints a deterministic submission
+  // key before the call. The behaviour asserted here is unchanged.
+  ok(/async function markCanonicalInvoicePaid__impl\(inv, ctx\)\{[\s\S]{0,600}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,1400}relationalApi\.recordPayment\('invoice', inv\._relId, remaining,/.test(src),
     'markInvPaid() checks isRelationalAuthoritative(\'accInvoices\') and calls relationalApi.recordPayment for the remaining balance, instead of routing an embedded payments array through saveInvoice');
   ok(src.includes('return markCanonicalInvoicePaid(inv, { setAccInvoices, onJsonFallback: saveInvoice });'),
     'AccountingPage delegates mark-paid to that ONE shared implementation');

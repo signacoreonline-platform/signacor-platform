@@ -662,6 +662,75 @@ export async function buildInvoicesJson(): Promise<any[]> {
   const invoiceIds = invRes.rows.map((r) => r.id);
   const linesByInvoice = await groupChildRows('rel_invoice_line_items', 'invoice_id', invoiceIds);
   const paymentsByInvoice = await paymentsForMany('invoice', invoiceIds);
+
+  /* ── CHAIN PAYMENT RESOLUTION (2026-09-07) ─────────────────────────────────
+     THE DEFECT THIS CLOSES. index.html's resolvePaymentSource() and
+     resolveQuotePaymentSource() pick exactly ONE payments array for a
+     transaction, and an invoice — once one exists — always wins. But no
+     relational path ever carried, or re-owned, a quote's or job's existing
+     payments onto a newly created invoice: createInvoiceForJob and
+     createInvoiceFromQuoteTx both leave them where they are, unlike the old
+     JSON path which copied them across as `carriedPayments`. So a deposit taken
+     BEFORE the invoice was raised became unreachable the instant it was raised
+     — still perfectly intact in rel_payments, but absent from the payments
+     modal, from the invoice's outstanding balance, from paid/part-paid status
+     and from the customer's statement. To the user it read as "the payment
+     didn't save", and the payment was captured again.
+
+     THE FIX IS RESOLUTION, NOT RELOCATION. An invoice's `payments` array is now
+     the payments of its whole transaction chain — its own, plus its job's, plus
+     its quote's. NOTHING is moved, copied, created or deleted: every row keeps
+     its own owner, its own id and its own row_version, so deleteInvoice still
+     removes only invoice-owned rows and a job paid directly still owns its own
+     payment. Each row already carries `_relOwnerType` (2026-08-24, BUG 7), and
+     index.html's paymentOwnerSection() already routes every edit and delete by
+     that field rather than by whichever screen is open — so a chain row edited
+     from the invoice view updates THE SAME payment, under its true owner, and
+     the server's cutover double-gate still checks the real owning section.
+
+     NO DOUBLE COUNTING. A payment appears in exactly one chain, under exactly
+     one owner, and the frontend reads exactly one source per transaction:
+     getAllInvoicesUnified() suppresses a job's synthesised invoice row whenever
+     a real accInvoices record resolves to that job (getManualInvoiceJobRefs),
+     and quotes are never a statement or ledger source. The job's and quote's
+     own arrays are left exactly as they were, so the pre-invoice views are
+     unchanged.
+
+     COMPANY ISOLATION. The links used are proven FK columns only
+     (rel_invoices.job_id / .quote_id, rel_jobs.quote_id), and each candidate's
+     company_code is checked against the invoice's before its payments are
+     admitted — a chain can never reach across the two company contexts. */
+  const chainJobIds = new Set<string>();
+  const chainQuoteIds = new Set<string>();
+  for (const r of invRes.rows) {
+    if (r.job_id != null) chainJobIds.add(String(r.job_id));
+    if (r.quote_id != null) chainQuoteIds.add(String(r.quote_id));
+  }
+  // An invoice linked only to a job still reaches that job's quote, and vice
+  // versa — one batched lookup each, never a per-invoice round trip.
+  const jobCompanyById = new Map<string, string>();
+  const jobQuoteById = new Map<string, string>();
+  if (chainJobIds.size > 0) {
+    const jr = await pool.query(
+      'SELECT id, company_code, quote_id FROM rel_jobs WHERE id = ANY($1::bigint[])',
+      [Array.from(chainJobIds)]
+    );
+    for (const j of jr.rows) {
+      jobCompanyById.set(String(j.id), String(j.company_code == null ? '' : j.company_code));
+      if (j.quote_id != null) { jobQuoteById.set(String(j.id), String(j.quote_id)); chainQuoteIds.add(String(j.quote_id)); }
+    }
+  }
+  const quoteCompanyById = new Map<string, string>();
+  if (chainQuoteIds.size > 0) {
+    const qr = await pool.query(
+      'SELECT id, company_code FROM rel_quotes WHERE id = ANY($1::bigint[])',
+      [Array.from(chainQuoteIds)]
+    );
+    for (const q of qr.rows) quoteCompanyById.set(String(q.id), String(q.company_code == null ? '' : q.company_code));
+  }
+  const paymentsByChainJob = await paymentsForMany('job', Array.from(chainJobIds));
+  const paymentsByChainQuote = await paymentsForMany('quote', Array.from(chainQuoteIds));
+
   const out: any[] = [];
   for (const r of invRes.rows) {
     const lineRows = linesByInvoice.get(String(r.id)) || [];
@@ -673,7 +742,32 @@ export async function buildInvoicesJson(): Promise<any[]> {
       accountCode: l.account_code ?? null,
       taxType: l.tax_type ?? null,
     }));
-    const payments = paymentsByInvoice.get(String(r.id)) || [];
+    // The invoice's OWN payments first, in their own line_index order — so an
+    // invoice with no chain extras hydrates byte-identically to before — then
+    // the job's, then the quote's, each in their own order, deduped by the
+    // rel_payments primary key. `_relOwnerType` on every row is what keeps each
+    // one editable and deletable against its TRUE owner.
+    const ownPayments = paymentsByInvoice.get(String(r.id)) || [];
+    const payments = ownPayments.slice();
+    const seenPaymentIds = new Set(ownPayments.map((p: any) => String(p._relPaymentId)));
+    const invCompany = String(r.company_code == null ? '' : r.company_code);
+    const chainJobId = r.job_id == null ? null : String(r.job_id);
+    let chainQuoteId = r.quote_id == null ? null : String(r.quote_id);
+    if (chainQuoteId === null && chainJobId !== null) chainQuoteId = jobQuoteById.get(chainJobId) ?? null;
+    if (chainJobId !== null && jobCompanyById.get(chainJobId) === invCompany) {
+      for (const p of paymentsByChainJob.get(chainJobId) || []) {
+        if (seenPaymentIds.has(String(p._relPaymentId))) continue;
+        seenPaymentIds.add(String(p._relPaymentId));
+        payments.push(p);
+      }
+    }
+    if (chainQuoteId !== null && quoteCompanyById.get(chainQuoteId) === invCompany) {
+      for (const p of paymentsByChainQuote.get(chainQuoteId) || []) {
+        if (seenPaymentIds.has(String(p._relPaymentId))) continue;
+        seenPaymentIds.add(String(p._relPaymentId));
+        payments.push(p);
+      }
+    }
     out.push({
       ...legacyBase(r),
       id: restoreId(r.source_id),

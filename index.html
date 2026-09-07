@@ -771,6 +771,67 @@ async function guardAction(key, fn) {
   }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   PAYMENT SUBMISSION IDENTITY (2026-09-07 — ACCIDENTAL DUPLICATE PROTECTION)
+
+   A payment SUBMISSION needs an identity of its own, separate from the payment
+   it will create, so the server can tell "this is the same submission arriving
+   again" apart from "this is a second, genuinely separate payment". Without one
+   there is no honest way to distinguish them: a customer may legitimately pay
+   R5,000 and another R5,000 on the same day by the same method, so comparing
+   amount + date + method would silently discard real money.
+
+   HOW A KEY LIVES. One key is minted when the user first submits, and is held
+   in a ref for as long as that submission is still the thing being attempted.
+   A retry after a timeout, a lost response or a second click therefore carries
+   the SAME key and can only ever produce one payment (migration 014's partial
+   unique index enforces that at the database write boundary; services.ts's
+   recordPayment answers the replay with the payment the first attempt already
+   persisted). The moment the user CHANGES what they are paying — amount, date,
+   method or notes — the key is discarded, because that is a different payment
+   and must be allowed through. It is also discarded on success, so the next
+   payment starts a fresh submission.
+
+   This is the second of two layers, and the weaker one on its own: guardAction
+   below stops a double-click before it leaves the browser, and this stops
+   everything the browser cannot see — a retry across a dropped connection, a
+   second tab, a request that timed out client-side but committed server-side.
+   ═══════════════════════════════════════════════════════════════════════════ */
+/* A payment id as the AUTHORITATIVE READ will hydrate it.
+
+   rel_payments.id is a BIGINT, so node-postgres hands it back as a STRING, and
+   that is what POST /payments returns as `paymentId`. But read.ts maps a
+   payment's `id` through restoreId(), which turns a numeric string into a
+   NUMBER — while keeping `_relPaymentId` as the raw string.
+
+   Every identity comparison in this file is a strict === : the merged job∪quote
+   dedupe, applyIfOwned(), and the find-by-id inside edit and delete. So an
+   optimistic row that stored the server's id verbatim would carry `id: "2"`
+   while the same payment, one refresh later, carries `id: 2` — and for the
+   window in between the two would not match each other. That is a payment
+   briefly appearing twice in a merged view, or an edit that cannot find its own
+   payment.
+
+   This mirrors read.ts's restoreId() exactly, so an optimistic row and the
+   hydrated row it becomes are indistinguishable from the moment it is created.
+   `_relPaymentId` is deliberately NOT put through it — read.ts leaves that one
+   raw, and the two must agree. */
+function relPaymentDisplayId(rawId) {
+  if (rawId == null) return rawId;
+  const s = String(rawId);
+  if (/^-?\d+(\.\d+)?$/.test(s)) {
+    const n = Number(s);
+    if (Number.isFinite(n)) return n;
+  }
+  return s;
+}
+
+function newPaymentRequestId() {
+  return 'pay_' + Date.now().toString(36)
+    + '_' + Math.random().toString(36).slice(2, 10)
+    + Math.random().toString(36).slice(2, 10);
+}
+
 function assertNoUnwiredRelationalSections(sectionNames, contextLabel) {
   const blocked = (sectionNames || []).filter(isRelationalAuthoritative);
   if (blocked.length > 0) {
@@ -3400,6 +3461,7 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
       ? { icon:'🏢', label:'View Customer', onClick: onOpenCustomer ? ()=>{ onClose(); onOpenCustomer(_links.customer); } : null }
       : { icon:'🏢', label:'No matching customer record found' },
   ];
+  const _invDiscountView = invoiceDiscountView(inv);
   return (
     <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[95vh] overflow-y-auto">
@@ -3417,7 +3479,12 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">DUE DATE</span><span>{fmtDate(inv.dueDate)}</span></div>
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">REFERENCE</span><span>{inv.reference||'—'}</span></div>
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">STATUS</span><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status}</span></div>
-            {inv.discount>0&&<div className="bg-red-50 rounded-xl p-3"><span className="text-xs font-bold text-red-400 block mb-1">DISCOUNT</span><span className="font-semibold text-red-600">{inv.discount}%{inv.discountAmount?' · − '+fmtAmt(inv.discountAmount):''}</span></div>}
+            {/* 2026-09-07: derived through invoiceDiscountView so an invoice
+                whose discount lives in its LINES (every invoice raised from a
+                quote or job) shows it here too, not only the legacy records
+                that happen to carry a discount field. Both halves of the one
+                financial fact are always shown: the percentage AND the money. */}
+            {_invDiscountView.pct>0&&<div className="bg-red-50 rounded-xl p-3"><span className="text-xs font-bold text-red-400 block mb-1">DISCOUNT</span><span className="font-semibold text-red-600">{_invDiscountView.pct}%{_invDiscountView.amt>0?' · − '+fmtAmt(_invDiscountView.amt):''}</span></div>}
             {inv.contactAddress&&<div className="bg-gray-50 rounded-xl p-3 col-span-2"><span className="text-xs font-bold text-gray-400 block mb-1">ADDRESS</span><span className="whitespace-pre-wrap">{inv.contactAddress}</span></div>}
           </div>
           <div className="border border-gray-200 rounded-xl overflow-hidden">
@@ -3591,7 +3658,15 @@ async function deleteCanonicalInvoice(id, ctx){
   setAccInvoices(prev=>prev.filter(i=>i.id!==id));
 }
 
+// 2026-09-07 — "Mark Paid" RECORDS A REAL PAYMENT, so it needs the same two
+// layers of duplicate protection every other payment path now has. It had
+// neither: a double-click fired two settlements, and a retry after a timeout
+// created a second one. guardAction (synchronous, keyed per invoice) stops the
+// first; the deterministic submission key below stops the rest.
 async function markCanonicalInvoicePaid(inv, ctx){
+  return guardAction('markInvoicePaid:'+relKey(inv), () => markCanonicalInvoicePaid__impl(inv, ctx));
+}
+async function markCanonicalInvoicePaid__impl(inv, ctx){
   const { setAccInvoices, onJsonFallback } = ctx || {};
   const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
   const alreadyPaid=(inv.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
@@ -3600,9 +3675,22 @@ async function markCanonicalInvoicePaid(inv, ctx){
   if(isRelationalAuthoritative('accInvoices') && inv._relId!=null){
     if(remaining<=0){ return; } // already fully paid — nothing to record
     try {
-      const result = await relationalApi.recordPayment('invoice', inv._relId, remaining, { date:today, method:'EFT', notes:'Quick mark paid' });
-      const newP = {id:Date.now(), date:today, method:'EFT', amount:remaining, notes:'Quick mark paid', _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion};
-      const accInvoicesUpdater = prev=>prev.map(i=>i.id===inv.id?{...i, status:'paid', paidDate:today, payments:[...(i.payments||[]),newP]}:i);
+      // A DETERMINISTIC submission key rather than a random one, because this
+      // action has no form to hold a ref across retries. It is derived from the
+      // three things that make this settlement THIS settlement: the invoice, the
+      // version of it being settled, and the balance being cleared. Two clicks —
+      // or a retry after a timeout — reproduce it exactly and resolve to the one
+      // payment. Anything that genuinely changes the invoice bumps its
+      // row_version and so mints a new key, and a settlement can only ever
+      // happen once per balance anyway (`remaining` is 0 afterwards), so no
+      // legitimate second payment can be swallowed by it.
+      const _settleKey = 'markpaid_' + relKey(inv) + '_v' + (inv._relRowVersion == null ? 'na' : inv._relRowVersion) + '_' + remaining.toFixed(2);
+      const result = await relationalApi.recordPayment('invoice', inv._relId, remaining, { date:today, method:'EFT', notes:'Quick mark paid', clientRequestId:_settleKey });
+      const newP = {id:relPaymentDisplayId(result.paymentId), date:today, method:'EFT', amount:remaining, notes:'Quick mark paid', _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion, _relOwnerType:'invoice'};
+      const accInvoicesUpdater = prev=>prev.map(i=>i.id===inv.id
+        ? {...i, status:'paid', paidDate:today,
+           payments: (i.payments||[]).some(p=>p&&String(p._relPaymentId)===String(result.paymentId)) ? i.payments : [...(i.payments||[]),newP]}
+        : i);
       setAccInvoices(accInvoicesUpdater);
       syncRelationalBaseline('accInvoices', accInvoicesUpdater);
     } catch(e){
@@ -5286,6 +5374,41 @@ function sgrSplitInvoiceLineItems(lineItems){
   const itemsSubtotal = items.reduce((s,l)=>s+sgrInvoiceLineAmount(l), 0);
   return { items, separated:true, setupFeeAmt, discAmt, discPct,
            itemsSubtotal, allSubtotal, vat, total };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   AN INVOICE'S DISCOUNT, FOR DISPLAY (2026-09-07)
+
+   An accInvoices record has NO discount field of its own — by design: its
+   discount is a negative qty-1 `Discount (x%)` line among its lineItems (see
+   stubAdjustmentLines / services.ts's writeInvoiceAdjustmentLinesTx), which is
+   what keeps it derived from the transaction's canonical discount rather than
+   becoming a third independent copy of it.
+
+   Two screens missed that. The View Invoice modal and the Accounting invoice
+   list both read `inv.discount` / `inv.discountAmount` — fields written by only
+   ONE legacy path (AccountingPage's job → GL invoice builder). Every invoice
+   raised through createInvoiceForJob or createInvoiceFromQuote carries its
+   discount as a line instead, so those two surfaces showed NO discount at all
+   on an invoice that plainly had one, while the same invoice's printed PDF
+   showed it correctly.
+
+   This reads the stored fields first, so nothing changes for the legacy records
+   that have them, and otherwise derives BOTH the percentage and the money from
+   the invoice's own lines through sgrSplitInvoiceLineItems — the same splitter
+   the printed document already uses, so the screen and the paper can never
+   disagree. Returns { pct: 0, amt: 0 } when there is no discount to show.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function invoiceDiscountView(inv){
+  if(!inv) return { pct:0, amt:0 };
+  const storedPct = parseFloat(inv.discount);
+  if(Number.isFinite(storedPct) && storedPct > 0){
+    const storedAmt = parseFloat(inv.discountAmount);
+    return { pct: storedPct, amt: Number.isFinite(storedAmt) ? storedAmt : 0 };
+  }
+  const split = sgrSplitInvoiceLineItems(inv.lineItems);
+  if(!split.separated || !(split.discAmt > 0)) return { pct:0, amt:0 };
+  return { pct: split.discPct, amt: split.discAmt };
 }
 
 /* An accInvoices record, expressed in the shape buildInvoiceHtml() consumes.
@@ -8251,6 +8374,13 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
   // showing a payment as recorded when it wasn't.
   const [saving, setSaving] = useState(false);
   const [saveErr, setSaveErr] = useState('');
+  // 2026-09-07 — one identity per payment SUBMISSION (see newPaymentRequestId
+  // at module scope). Held across retries of the same submission so a repeat
+  // can only ever resolve to the payment already persisted; discarded the
+  // instant the user changes what they are paying, because that is a different
+  // payment and must be allowed through.
+  const paymentRequestIdRef = useRef(null);
+  useEffect(() => { paymentRequestIdRef.current = null; }, [amount, date, method, notes]);
 
   // Writes `updated` to whichever record resolveQuotePaymentSource() picked
   // — the linked invoice (accInvoices), the linked job (job.payments — a
@@ -8352,7 +8482,25 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
   // job.payments ONLY").
   function resolvePaymentOwner(pid){
     if(paySource.kind==='invoice'){
-      return { ownerType:'invoice', relSection:'accInvoices', ownerId: paySource.record._relId };
+      // 2026-09-07: an invoice's `payments` array is now its whole transaction
+      // chain's — its own, plus its job's, plus its quote's (read.ts's
+      // buildInvoicesJson). Nothing was moved: each row still belongs to the
+      // owner it always had, and states it in `_relOwnerType`. Hard-coding
+      // 'invoice' here would edit or delete a job- or quote-owned payment
+      // against the wrong owner and the wrong cutover gate — the SAME defect
+      // BUG 7 fixed for the Job modal's merged job∪quote view. Resolve from the
+      // payment, never from the screen.
+      const p = payments.find(x=>x&&x.id===pid);
+      const ownerType = (p && p._relOwnerType) || 'invoice';
+      // The SECTION always follows the payment's real owner — that is what the
+      // server's cutover double-gate checks, and edit/delete address the payment
+      // by its own id, so an owner id this modal cannot resolve (a chain row
+      // whose job is not the one this view walked through) never makes the gate
+      // wrong. The id is best-effort and is only used by paths that need it.
+      const ownerId = ownerType==='invoice' ? paySource.record._relId
+        : ownerType==='job' ? (paySource.job && paySource.job._relId)
+        : quote._relId;
+      return { ownerType, relSection: PAYMENT_OWNER_SECTIONS[ownerType] || 'accInvoices', ownerId: ownerId == null ? undefined : ownerId };
     }
     if(paySource.kind==='quote'){
       return { ownerType:'quote', relSection:'quotes', ownerId: quote._relId };
@@ -8368,7 +8516,18 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
     }
     return null;
   }
+  // 2026-09-07 — DOUBLE-CLICK / RETRY PROTECTION, layer 1. `saving` is React
+  // STATE: two clicks dispatched before React re-renders both read the stale
+  // `false` and both fire. guardAction's registry is a plain synchronous Set,
+  // so the second call is dropped before it can leave the browser — the same
+  // shared guard createInvoiceFromQuote already uses, keyed per record so two
+  // different transactions never block each other. Layer 2 (the server-side
+  // idempotency key) still does the real work: this cannot see a retry that
+  // arrives after a timeout, from a second tab, or on a dropped connection.
   async function addPayment(){
+    return guardAction('recordPayment:quote:'+relKey(paySource.record || quote), () => addPayment__impl());
+  }
+  async function addPayment__impl(){
     if(saving) return;
     if(!amount||parseFloat(amount)<=0){ alert('Enter a valid amount'); return; }
     const amt = parseFloat(amount);
@@ -8384,12 +8543,27 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
       }
       setSaveErr('');
       setSaving(true);
+      if(!paymentRequestIdRef.current) paymentRequestIdRef.current = newPaymentRequestId();
       try {
-        const result = await relationalApi.recordPayment(addOwner.ownerType, addOwner.ownerId, amt, { date, method, notes: notes.trim() });
-        const newP = {id:Date.now(),date,method,amount:amt,notes:notes.trim(), _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion};
-        setPayments(prev=>[...prev,newP]);
+        const result = await relationalApi.recordPayment(addOwner.ownerType, addOwner.ownerId, amt, { date, method, notes: notes.trim(), clientRequestId: paymentRequestIdRef.current });
+        // The optimistic row carries the server's OWN payment id, not a local
+        // Date.now() — read.ts hydrates a relationally-created payment's `id`
+        // from its rel_payments primary key, so using anything else here would
+        // make the same payment appear under two different ids until the next
+        // refresh landed, and any merge deduping by id would briefly see two.
+        const newP = {id:relPaymentDisplayId(result.paymentId),date,method,amount:amt,notes:notes.trim(),
+          _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion, _relOwnerType:addOwner.ownerType};
+        // A recognised replay returns the payment the first attempt already
+        // persisted, so it must never be appended a second time. Compared as
+        // strings so the check cannot be defeated by a number/string mismatch.
+        setPayments(prev=>prev.some(p=>p&&String(p._relPaymentId)===String(result.paymentId)) ? prev : [...prev,newP]);
+        paymentRequestIdRef.current = null;
         setAmount(''); setNotes('');
       } catch(e){
+        // The key is deliberately KEPT on failure: if the user retries the same
+        // payment, that retry must carry the same identity so a request that
+        // actually committed before the connection dropped resolves to the one
+        // payment instead of creating a second.
         setSaveErr(describeSaveConflictError(e, 'payment'));
       } finally {
         setSaving(false);
@@ -8426,6 +8600,9 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
     } catch(e){ /* saveErr already shown; amount/notes deliberately left as typed */ }
   }
   async function editPayment(pid){
+    return guardAction('editPayment:'+pid, () => editPayment__impl(pid));
+  }
+  async function editPayment__impl(pid){
     if(saving) return;
     const p = payments.find(x=>x.id===pid);
     const patch0 = promptEditPayment(p);
@@ -8467,6 +8644,9 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
     try { await persist(updated, patch, null, jobPayload, quotePayload); } catch(e){ /* saveErr already shown */ }
   }
   async function deletePayment(pid){
+    return guardAction('deletePayment:'+pid, () => deletePayment__impl(pid));
+  }
+  async function deletePayment__impl(pid){
     if(saving) return;
     if(!window.confirm('Delete this payment record?')) return;
     const removed = payments.find(p=>p.id===pid);
@@ -10907,6 +11087,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const [notes,  setNotes]  = useState('');
     const [saving, setSaving] = useState(false);
     const [saveErr, setSaveErr] = useState('');
+    // 2026-09-07 — one identity per payment SUBMISSION (see newPaymentRequestId
+    // at module scope). Held across retries of the same submission so a repeat
+    // can only ever resolve to the payment already persisted; discarded the
+    // instant the user changes what they are paying, because that is a
+    // different payment and must be allowed through.
+    const paymentRequestIdRef = useRef(null);
+    useEffect(() => { paymentRequestIdRef.current = null; }, [amount, date, method, notes]);
     const availableCredit = creditNoteAvailable(creditNotes, job.client);
     const zr = n => 'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
 
@@ -10990,7 +11177,18 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       const nextPayments = transform(srcQuote.payments);
       return quotes.map(q=>q.id===srcQuote.id?{...q, payments:nextPayments}:q);
     }
+    // 2026-09-07 — DOUBLE-CLICK / RETRY PROTECTION, layer 1. `saving` is React
+    // STATE: two clicks dispatched before React re-renders both read the stale
+    // `false` and both fire. guardAction's registry is a plain synchronous Set,
+    // so the second call is dropped before it can leave the browser — the same
+    // shared guard createInvoiceFromQuote already uses, keyed per record so two
+    // different transactions never block each other. Layer 2 (the server-side
+    // idempotency key) still does the real work: this cannot see a retry that
+    // arrives after a timeout, from a second tab, or on a dropped connection.
     async function addPayment() {
+      return guardAction('recordPayment:job:'+relKey(paySource.record || job), () => addPayment__impl());
+    }
+    async function addPayment__impl() {
       if(saving) return;
       if(!amount||parseFloat(amount)<=0){alert('Enter a valid amount');return;}
       const amt = parseFloat(amount);
@@ -11032,17 +11230,30 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           // from its relational PK, so posting with .id here would record
           // the payment against the wrong owner (or a nonexistent one).
           const ownerId = paySource.kind==='invoice' ? paySource.record._relId : job._relId;
-          const result = await relationalApi.recordPayment(ownerType, ownerId, amt, { date, method, notes: notes.trim() });
+          if(!paymentRequestIdRef.current) paymentRequestIdRef.current = newPaymentRequestId();
+          const result = await relationalApi.recordPayment(ownerType, ownerId, amt, { date, method, notes: notes.trim(), clientRequestId: paymentRequestIdRef.current });
           // BUGFIX (Stage 3 follow-on): a payment's real relational identity
           // is _relPaymentId (rel_payments.id — see read.ts's paymentsFor),
           // set here immediately from the response so an immediately-
           // following edit/delete (also wired below) never calls
           // updatePayment/deletePayment with an undefined id or a stale
           // version.
-          const newP={id:Date.now(),date,method,amount:amt,notes:notes.trim(), _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion};
-          setPayments(prev=>[...prev,newP]);
+          // A recognised replay returns the payment the first attempt already
+          // persisted, so it must never be appended a second time. The
+          // optimistic row also carries the SERVER'S payment id rather than a
+          // local Date.now(): read.ts hydrates a relationally-created payment's
+          // `id` from its rel_payments primary key, so anything else made the
+          // same payment appear under two ids until the next refresh landed.
+          const newP={id:relPaymentDisplayId(result.paymentId),date,method,amount:amt,notes:notes.trim(),
+            _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion, _relOwnerType:ownerType};
+          setPayments(prev=>prev.some(p=>p&&String(p._relPaymentId)===String(result.paymentId)) ? prev : [...prev,newP]);
+          paymentRequestIdRef.current = null;
           setAmount(''); setNotes('');
         } catch(e){
+          // The key is deliberately KEPT on failure: if the user retries the
+          // same payment, that retry must carry the same identity so a request
+          // that actually committed before the connection dropped resolves to
+          // the one payment instead of creating a second.
           setSaveErr(describeSaveConflictError(e, 'payment'));
         } finally {
           setSaving(false);
@@ -11084,6 +11295,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       setAmount(''); setNotes('');
     }
     async function deletePayment(pid) {
+      return guardAction('deletePayment:'+pid, () => deletePayment__impl(pid));
+    }
+    async function deletePayment__impl(pid) {
       if(saving) return;
       // 2026-08-24 BUG 7: one rule everywhere; refusals explain themselves.
       { const _b = paymentDeleteBlockReason(payments.find(x=>x.id===pid), user, (paySource.kind==='invoice' ? 'accInvoices' : 'jobs')); if(_b){ alert(_b); return; } }
@@ -11142,6 +11356,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       } catch(e) {}
     }
     async function editPayment(pid) {
+      return guardAction('editPayment:'+pid, () => editPayment__impl(pid));
+    }
+    async function editPayment__impl(pid) {
       if(saving) return;
       { const _b = paymentDeleteBlockReason(payments.find(x=>x.id===pid), user, (paySource.kind==='invoice' ? 'accInvoices' : 'jobs')); if(_b){ alert(_b); return; } }
       const p=payments.find(x=>x.id===pid);
@@ -12016,13 +12233,67 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                     sqmL: l.sqmL===''||l.sqmL===undefined?null:l.sqmL, sqmW: l.sqmW===''||l.sqmW===undefined?null:l.sqmW,
                     pieces: l.pQty===''||l.pQty===undefined?null:l.pQty, cpId: l.cpId??null, cpLinked: l.cpLinked??null })),
                 });
-                const jobsUpdater = prev=>prev.map(j=>j.id===updated.id?{...updated, _relRowVersion: relResult.rowVersion}:j);
+                // ── STALE-SNAPSHOT PROTECTION (2026-09-07) ─────────────────
+                // `updated` is `{...job, <the ten fields this form owns>}`, and
+                // `job` here is the record captured when the modal OPENED. Any
+                // payment recorded against this job while the form was open is
+                // therefore absent from it, and writing `updated` back wholesale
+                // erased that payment from local state until the next
+                // authoritative refresh landed — which reads to the user as
+                // exactly the reported "my payment disappeared". The persisted
+                // data was never at risk (updateJob has no payments field, and
+                // rel_payments is the sole authority for a cut-over record's
+                // payments), but the SCREEN was wrong, and a wrong screen is
+                // what makes someone capture the payment a second time.
+                //
+                // `payments` is taken from the LIVE record in state, never from
+                // this form's snapshot. The form does not own that field and
+                // must not be able to write it.
+                const jobsUpdater = prev=>prev.map(j=>j.id===updated.id
+                  ? {...updated, payments: (j && j.payments !== undefined ? j.payments : updated.payments), _relRowVersion: relResult.rowVersion}
+                  : j);
                 setJobs(jobsUpdater);
                 syncRelationalBaseline('jobs', jobsUpdater);
+                // ── CANONICAL DISCOUNT CASCADE (2026-09-07) ────────────────
+                // Changing the discount here now writes it through to the
+                // chain's head quote and rebuilds the linked invoice's lines,
+                // in ONE server-side transaction (services.ts's updateJob), so
+                // Quote, Job and Invoice can never hold three different
+                // discounts for one transaction. Both of those rows have had
+                // their row_version bumped and this session is still holding
+                // the old values, so they are adopted here — otherwise the next
+                // save of that quote or invoice would fail with a 409 for a
+                // change the user did make, just not from that screen.
+                if(relResult.quoteId != null && relResult.quoteRowVersion != null && setQuotes){
+                  const quotesUpdater = prev=>prev.map(q=>(q && String(q._relId)===String(relResult.quoteId))
+                    ? {...q, _relRowVersion: relResult.quoteRowVersion, discount: (parseFloat(updated.discount)||0)||''}
+                    : q);
+                  setQuotes(quotesUpdater);
+                  syncRelationalBaseline('quotes', quotesUpdater);
+                }
+                if(Array.isArray(relResult.invoices) && relResult.invoices.length && setAccInvoices){
+                  const byRelId = new Map(relResult.invoices.filter(i=>i&&i.synced).map(i=>[String(i.invoiceId), i.invoiceRowVersion]));
+                  if(byRelId.size){
+                    const accUpdater = prev=>prev.map(i=>(i && byRelId.has(String(i._relId)))
+                      ? {...i, _relRowVersion: byRelId.get(String(i._relId))}
+                      : i);
+                    setAccInvoices(accUpdater);
+                    syncRelationalBaseline('accInvoices', accUpdater);
+                  }
+                }
+                // The coalesced authoritative re-read relationalFetch already
+                // scheduled brings the rebuilt invoice lines and the recomputed
+                // paid/outstanding position onto every other screen.
                 setEditInvoice(null);
                 return;
               }
-              const nextJobs = jobs.map(j=>j.id===updated.id?updated:j);
+              // Same stale-snapshot protection on the JSON path, where it
+              // matters MORE: here the whole jobs array really is written back,
+              // so a stale `payments` would not just look wrong, it would
+              // overwrite a newer persisted payment.
+              const nextJobs = jobs.map(j=>j.id===updated.id
+                ? {...updated, payments: (j && j.payments !== undefined ? j.payments : updated.payments)}
+                : j);
               await forceSaveSections({ jobs: nextJobs });
               setJobs(nextJobs);
               setEditInvoice(null);
@@ -21866,6 +22137,13 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
     const [notes,  setNotes]  = useState('');
     const [saving, setSaving] = useState(false);
     const [saveErr, setSaveErr] = useState('');
+    // 2026-09-07 — one identity per payment SUBMISSION (see newPaymentRequestId
+    // at module scope). Held across retries of the same submission so a repeat
+    // can only ever resolve to the payment already persisted; discarded the
+    // instant the user changes what they are paying, because that is a
+    // different payment and must be allowed through.
+    const paymentRequestIdRef = useRef(null);
+    useEffect(() => { paymentRequestIdRef.current = null; }, [amount, date, method, notes]);
     const availableCredit = creditNoteAvailable(creditNotes, inv.contactName);
 
     // This IS the single source of truth for a manual/quote-created invoice
@@ -21905,7 +22183,18 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
     // across job/quote. Credit-method cross-authority safety (creditNotes must
     // also be cut over) is enforced SERVER-SIDE (api.ts's POST/DELETE
     // /payments already check this) — errors surface via describeSaveConflictError.
+    // 2026-09-07 — DOUBLE-CLICK / RETRY PROTECTION, layer 1. `saving` is React
+    // STATE: two clicks dispatched before React re-renders both read the stale
+    // `false` and both fire. guardAction's registry is a plain synchronous Set,
+    // so the second call is dropped before it can leave the browser — the same
+    // shared guard createInvoiceFromQuote already uses, keyed per record so two
+    // different transactions never block each other. Layer 2 (the server-side
+    // idempotency key) still does the real work: this cannot see a retry that
+    // arrives after a timeout, from a second tab, or on a dropped connection.
     async function addPayment() {
+      return guardAction('recordPayment:invoice:'+relKey(inv), () => addPayment__impl());
+    }
+    async function addPayment__impl() {
       if(saving) return;
       if(!amount||parseFloat(amount)<=0){alert('Enter a valid amount');return;}
       const amt = parseFloat(amount);
@@ -21917,9 +22206,18 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
         setSaveErr('');
         setSaving(true);
         try {
-          const result = await relationalApi.recordPayment('invoice', inv._relId, amt, { date, method, notes: notes.trim() });
-          const newP = {id:Date.now(),date,method,amount:amt,notes:notes.trim(), _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion};
-          setPayments(prev=>[...prev,newP]);
+          if(!paymentRequestIdRef.current) paymentRequestIdRef.current = newPaymentRequestId();
+          const result = await relationalApi.recordPayment('invoice', inv._relId, amt, { date, method, notes: notes.trim(), clientRequestId: paymentRequestIdRef.current });
+          // A recognised replay returns the payment the first attempt already
+          // persisted, so it must never be appended a second time. The
+          // optimistic row also carries the SERVER'S payment id rather than a
+          // local Date.now(): read.ts hydrates a relationally-created payment's
+          // `id` from its rel_payments primary key, so anything else made the
+          // same payment appear under two ids until the next refresh landed.
+          const newP = {id:relPaymentDisplayId(result.paymentId),date,method,amount:amt,notes:notes.trim(),
+            _relPaymentId:result.paymentId, _relRowVersion:result.rowVersion, _relOwnerType:'invoice'};
+          setPayments(prev=>prev.some(p=>p&&String(p._relPaymentId)===String(result.paymentId)) ? prev : [...prev,newP]);
+          paymentRequestIdRef.current = null;
           setAmount(''); setNotes('');
           onSaved && onSaved({...inv, payments:[...payments,newP]});
         } catch(e){
@@ -21949,16 +22247,27 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
     }
 
     async function deletePayment(pid) {
+      return guardAction('deletePayment:'+pid, () => deletePayment__impl(pid));
+    }
+    async function deletePayment__impl(pid) {
       if(saving) return;
       // 2026-08-24 BUG 7: one rule everywhere; refusals explain themselves.
       { const _b = paymentDeleteBlockReason(payments.find(x=>x.id===pid), user, 'accInvoices'); if(_b){ alert(_b); return; } }
       if(!window.confirm('Delete this payment? This may change the invoice status.'))return;
       const removed = payments.find(p=>p.id===pid);
-      if(isRelationalAuthoritative('accInvoices') && removed && removed._relPaymentId!=null){
+      // 2026-09-07: an invoice's `payments` array is now its whole transaction
+      // chain's — its own, plus its job's, plus its quote's (read.ts's
+      // buildInvoicesJson). Nothing was moved: each row still belongs to the
+      // owner it always had and states it in `_relOwnerType`. Hard-coding
+      // 'accInvoices' would delete a job- or quote-owned payment against the
+      // wrong section's cutover gate — the SAME defect BUG 7 fixed for the Job
+      // modal's merged view. Resolve from the payment, never from the screen.
+      const _delSection = paymentOwnerSection(removed, 'accInvoices');
+      if(isRelationalAuthoritative(_delSection) && removed && removed._relPaymentId!=null){
         setSaveErr('');
         setSaving(true);
         try {
-          await relationalApi.deletePayment(removed._relPaymentId, removed._relRowVersion, 'accInvoices');
+          await relationalApi.deletePayment(removed._relPaymentId, removed._relRowVersion, _delSection);
           setPayments(prev=>prev.filter(p=>p.id!==pid));
         } catch(e){
           setSaveErr(describeSaveConflictError(e, 'payment'));
@@ -21980,16 +22289,21 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
     }
 
     async function editPayment(pid) {
+      return guardAction('editPayment:'+pid, () => editPayment__impl(pid));
+    }
+    async function editPayment__impl(pid) {
       if(saving) return;
       { const _b = paymentDeleteBlockReason(payments.find(x=>x.id===pid), user, 'accInvoices'); if(_b){ alert(_b); return; } }
       const p = payments.find(x=>x.id===pid);
       const patch = promptEditPayment(p);
       if(!patch) return;
-      if(isRelationalAuthoritative('accInvoices') && p && p._relPaymentId!=null){
+      // Same true-owner resolution as deletePayment above.
+      const _editSection = paymentOwnerSection(p, 'accInvoices');
+      if(isRelationalAuthoritative(_editSection) && p && p._relPaymentId!=null){
         setSaveErr('');
         setSaving(true);
         try {
-          const result = await relationalApi.updatePayment(p._relPaymentId, p._relRowVersion, 'accInvoices', patch);
+          const result = await relationalApi.updatePayment(p._relPaymentId, p._relRowVersion, _editSection, patch);
           setPayments(prev=>prev.map(x=>x.id===pid?{...x, ...patch, _relRowVersion:result.rowVersion}:x));
         } catch(e){
           setSaveErr(describeSaveConflictError(e, 'payment'));
@@ -23751,7 +24065,12 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                       <tr key={inv.id} className={`border-b border-gray-50 transition-colors ${isJob?'hover:bg-purple-50 bg-purple-50/30':'hover:bg-blue-50'}`}>
                         <td className="px-4 py-2.5 text-xs font-mono text-gray-600">
                           {inv.number}
-                          {inv.discount>0&&<div className="mt-0.5"><span className="bg-red-50 text-red-600 rounded-full px-1.5 py-0.5 text-[10px] font-bold whitespace-nowrap">−{inv.discount}% disc</span></div>}
+                          {/* 2026-09-07: derived through invoiceDiscountView, and now
+                              showing the money alongside the percentage — they are one
+                              financial fact and must never be shown apart. */}
+                          {(()=>{ const _d = invoiceDiscountView(inv); return _d.pct>0
+                            ? <div className="mt-0.5"><span className="bg-red-50 text-red-600 rounded-full px-1.5 py-0.5 text-[10px] font-bold whitespace-nowrap">−{_d.pct}% disc{_d.amt>0?' · '+fmtAmt(_d.amt):''}</span></div>
+                            : null; })()}
                         </td>
                         <td className="px-4 py-2.5 text-xs font-semibold text-gray-800">{inv.contactName}</td>
                         <td className="px-4 py-2.5 text-xs text-gray-500">{fmtDate(inv.date)}</td>
