@@ -1262,6 +1262,126 @@ function isHoldingsRecord(rec){ return !!rec && rec.co === HOLDINGS_CO_ID; }
 function belongsToUserCompany(rec, user){
   return isHoldingsUser(user) ? isHoldingsRecord(rec) : !isHoldingsRecord(rec);
 }
+
+/* ═══════════════════════════════════════════
+   COMPANY-SAFE TRANSACTION LINK RESOLUTION (2026-09-08)
+
+   THE DEFECT THIS CLOSES
+   Quote numbers (SQ-) and invoice numbers (INV-) are minted PER COMPANY by
+   backend/src/routes/documentNumbers.ts (only job/po/creditNote counters are
+   global), so SQ-00050 legitimately exists in BOTH Holdings and the original
+   company. The Job -> Quote back-link is stored as that number (job.quoteNum);
+   there is no job.quoteId in the JSON model. Every lookup shaped like
+       quotes.find(q => q.num === job.quoteNum)
+   therefore searched the FULL multi-company array and returned whichever
+   record happened to sit earlier in it — routinely another company's quote.
+   The live read-only audit of 2026-09-08 confirmed 17 Holdings jobs whose
+   raw quote number matches no Holdings quote but exactly one company-2 quote,
+   and 16 high-confidence payment-contamination cases flowing from the same
+   lookup inside reconcileJobInvoice.
+
+   THE RULE, applied by every resolver below
+     1. A stable relational id wins outright. When quote.convertedJobId (or
+        invoice.quoteId / invoice.jobId) is present it is AUTHORITATIVE: the
+        target is looked up by id and then company-verified. It is never
+        OR-ed with a document-number match — an OR lets an unrelated
+        same-number transaction qualify even though a stable id already
+        exists, which is exactly how the wrong record got selected.
+     2. A document number is a LEGACY FALLBACK only, usable solely when no
+        stable id exists, and then only as
+            same number AND same company.
+     3. Zero same-company matches => NO LINKED RECORD. Never fall through to
+        another company's document. For the 17 historical Holdings jobs this
+        deliberately yields "no source quote" rather than inventing history.
+
+   These resolvers are intrinsically safe: the company test lives INSIDE them,
+   so a future caller that passes an unfiltered array cannot bypass company
+   isolation the way several callers accidentally did before.
+═══════════════════════════════════════════ */
+
+// The company a record belongs to, as a stable comparison key. Mirrors the
+// normalisation backend/src/relational/read.ts's coNum() already performs when
+// relational rows re-enter the JSON shape: `co` is a real number for numeric
+// values, so 1 and "1" are the SAME logical company. Returns null for a legacy
+// record carrying no `co` at all.
+function companyTagOf(rec){
+  const v = rec ? rec.co : undefined;
+  if(v===null || v===undefined || v==='') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? String(n) : String(v).trim();
+}
+const HOLDINGS_CO_KEY = String(HOLDINGS_CO_ID);
+// Two records may only be linked to each other when they belong to the same
+// transaction company. Not a Holdings-specific hack — the rule is symmetric —
+// but Holdings isolation is absolute, including against untagged records:
+//   co 1 vs co "1"     -> same company (numeric/string drift is not a company)
+//   co 1 vs co 2       -> different
+//   co 1 vs untagged   -> different (an untagged record is, by this app's own
+//                         long-standing rule, NOT Holdings — see the
+//                         HOLDINGS_CO_ID comment block above)
+//   co 2 vs co 4       -> different (both tagged, so both must agree)
+//   co 2 vs untagged   -> SAME: every pre-Holdings record is untagged and
+//                         belongs to the original company. This is what keeps
+//                         all existing Original Signacore links working.
+function sameCompany(a, b){
+  if(!a || !b) return false;
+  const ta = companyTagOf(a), tb = companyTagOf(b);
+  if((ta===HOLDINGS_CO_KEY) !== (tb===HOLDINGS_CO_KEY)) return false;
+  if(ta!==null && tb!==null) return ta===tb;
+  return true;
+}
+// Does this job record carry the id a quote's convertedJobId is pointing at?
+// convertedJobId holds the JSON id; a relationally-hydrated job also carries
+// _relId. Both are accepted, exactly as the previous call sites did.
+function jobHasId(job, wantedId){
+  if(!job || wantedId===null || wantedId===undefined) return false;
+  if(job.id===wantedId) return true;
+  return job._relId!==null && job._relId!==undefined && Number(job._relId)===Number(wantedId);
+}
+// EVERY job this quote may legitimately resolve to — and, just as importantly,
+// the ONLY jobs a write originating on this quote may touch (see the payment
+// cascades in QuotesPage). Stable id first; legacy same-company number
+// fallback only when no stable id exists.
+function resolveJobsForQuote(quote, jobs){
+  if(!quote) return [];
+  const list = jobs||[];
+  const cj = quote.convertedJobId;
+  if(cj!==null && cj!==undefined){
+    const byId = list.find(j => jobHasId(j, cj));
+    return (byId && sameCompany(byId, quote)) ? [byId] : [];
+  }
+  if(!quote.num) return [];
+  return list.filter(j => j && j.quoteNum && j.quoteNum===quote.num && sameCompany(j, quote));
+}
+function resolveJobForQuote(quote, jobs){
+  return resolveJobsForQuote(quote, jobs)[0] || null;
+}
+// The source quote for a job. Stable id first (the quote that names THIS job
+// through convertedJobId), then the legacy same-company quoteNum fallback.
+// Returns null when nothing in this job's own company matches — the corrected
+// behaviour for the 17 historical Holdings jobs.
+function resolveQuoteForJob(job, quotes){
+  if(!job) return null;
+  const list = quotes||[];
+  const byId = list.find(q => q && q.convertedJobId!==null && q.convertedJobId!==undefined
+    && jobHasId(job, q.convertedJobId) && sameCompany(q, job));
+  if(byId) return byId;
+  if(!job.quoteNum) return null;
+  return list.find(q => q && q.num===job.quoteNum && sameCompany(q, job)) || null;
+}
+// The source quote for an invoice — same rule, over the invoice's own
+// quoteId / quoteNum pair.
+function resolveQuoteForInvoice(invoice, quotes){
+  if(!invoice) return null;
+  const list = quotes||[];
+  if(invoice.quoteId!==null && invoice.quoteId!==undefined){
+    const byId = list.find(q => q && q.id===invoice.quoteId);
+    return (byId && sameCompany(byId, invoice)) ? byId : null;
+  }
+  if(!invoice.quoteNum) return null;
+  return list.find(q => q && q.num===invoice.quoteNum && sameCompany(q, invoice)) || null;
+}
+
 // Companies a given user is allowed to create new records under — Holdings
 // users may only create Holdings (co:1) records; original-company users may
 // pick any non-Holdings company (Signacore, Cover X, etc), exactly as
@@ -3038,8 +3158,10 @@ function invoiceNumberExists(number, co, jobs, accInvoices, quotes, excludeQuote
 // so proforma-number reuse and payment reconciliation can never disagree
 // about which quote a job came from.
 function findSourceQuoteForJob(job, quotes) {
-  if (!job) return null;
-  return (quotes||[]).find(q=>q && q.num && job.quoteNum && q.num===job.quoteNum) || null;
+  // 2026-09-08: was an unscoped quotes.find(q => q.num === job.quoteNum) over
+  // the full multi-company array — the single biggest source of Holdings jobs
+  // resolving another company's quote. Now stable-id-first and company-safe.
+  return resolveQuoteForJob(job, quotes);
 }
 // Pure decision helper — never mutates anything, never reserves/writes a
 // number itself. This is where a PRO reservation is CONSUMED, never
@@ -3904,9 +4026,16 @@ function stubAdjustmentLines(doc){
 // rare case a record only carries the number. Void invoices never count.
 function getQuoteInvoice(quote, accInvoices) {
   if(!quote) return null;
-  return (accInvoices||[]).find(i => i && i.status!=='void' &&
-    ((quote.id!=null && i.quoteId===quote.id) || (quote.num && i.quoteNum===quote.num))
-  ) || null;
+  // 2026-09-08: stable quoteId wins outright; the quoteNum fallback is a
+  // legacy path only and now additionally requires the SAME company, because
+  // invoice/quote numbers are minted per company and legitimately repeat.
+  const live = (accInvoices||[]).filter(i => i && i.status!=='void');
+  if(quote.id!=null){
+    const byId = live.find(i => i.quoteId===quote.id);
+    if(byId) return byId;
+  }
+  if(!quote.num) return null;
+  return live.find(i => i.quoteNum===quote.num && sameCompany(i, quote)) || null;
 }
 // The accInvoices record this job has inherited from its source quote (its
 // `reference` field equals this job's number) — same rule
@@ -3941,7 +4070,7 @@ function getAllInvoicesUnified(jobs, quotes, accInvoices) {
   const jobInv = (jobs||[]).filter(j=>j && j.invoiceNum && !manualJobRefs.has(j.num)).map(j=>{
     const rec = reconcileJobInvoice(j, quotes||[]);
     return {
-      id:'job-'+j.id, number:j.invoiceNum, source:'job', jobNum:j.num, quoteNum:j.quoteNum||'',
+      id:'job-'+j.id, number:j.invoiceNum, source:'job', co:j.co, jobNum:j.num, quoteNum:j.quoteNum||'',
       client:j.client||'', date:j.invoiceDate||j.date||'', dueDate:j.invoiceDue||'',
       amount:parseFloat(j.value)||0, status:rec.invoiceStatus||'pending', payments:rec.payments||[],
     };
@@ -3950,7 +4079,7 @@ function getAllInvoicesUnified(jobs, quotes, accInvoices) {
     const sub=(i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
     const vat=(i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
     return {
-      id:i.id, number:i.number, source:'manual', jobNum:i.reference||'', quoteNum:'',
+      id:i.id, number:i.number, source:'manual', co:i.co, jobNum:i.reference||'', quoteNum:'',
       client:i.contactName||'', date:i.date||'', dueDate:i.dueDate||'',
       amount:sub+vat, status:i.status||'draft', payments:i.payments||[],
     };
@@ -4052,7 +4181,7 @@ function resolveQuotePaymentSource(quote, jobs, accInvoices) {
   if (directInvoice) {
     return { kind: 'invoice', record: directInvoice, invoice: directInvoice, job: null, payments: directInvoice.payments || [], label: `Invoice ${directInvoice.number}` };
   }
-  const linkedJob = (jobs || []).find(j => j && (j.id === quote.convertedJobId || (quote.num && j.quoteNum === quote.num))) || null;
+  const linkedJob = resolveJobForQuote(quote, jobs);
   if (linkedJob) {
     const jobInvoice = getJobManualInvoice(linkedJob, accInvoices, jobs);
     if (jobInvoice) {
@@ -4195,17 +4324,17 @@ function findLinkedRecords({ quote, job, invoice }, { quotes=[], jobs=[], accInv
   // Defensive: every lookup below skips null/undefined array entries rather
   // than throwing, in case any array ever contains a malformed record.
   let srcQuote = quote
-    || (job && job.quoteNum ? (quotes||[]).find(q=>q && q.num===job.quoteNum) : null)
-    || (invoice && invoice.quoteNum ? (quotes||[]).find(q=>q && q.num===invoice.quoteNum) : null)
+    || (job ? resolveQuoteForJob(job, quotes) : null)
+    || (invoice ? resolveQuoteForInvoice(invoice, quotes) : null)
     || null;
 
   let matchingJobs = [];
   if(job){
     matchingJobs = [job];
   } else if(srcQuote){
-    matchingJobs = (jobs||[]).filter(j=> j && (j.id===srcQuote.convertedJobId || (srcQuote.num && j.quoteNum===srcQuote.num)));
+    matchingJobs = resolveJobsForQuote(srcQuote, jobs);
   } else if(invoice && invoice.jobNum){
-    matchingJobs = (jobs||[]).filter(j=>j && j.num===invoice.jobNum);
+    matchingJobs = (jobs||[]).filter(j=>j && j.num===invoice.jobNum && sameCompany(j, invoice));
   }
   if(matchingJobs.length>1){
     warnings.push(`Multiple linked jobs found (${matchingJobs.map(j=>j&&j.num).filter(Boolean).join(', ')}) — review required.`);
@@ -4215,7 +4344,7 @@ function findLinkedRecords({ quote, job, invoice }, { quotes=[], jobs=[], accInv
   // Accounting) rather than directly — fall back to the job's own quote
   // back-link so "View Quote" still resolves from an Invoice view.
   if(!srcQuote && linkedJob && linkedJob.quoteNum){
-    srcQuote = (quotes||[]).find(q=>q && q.num===linkedJob.quoteNum) || null;
+    srcQuote = resolveQuoteForJob(linkedJob, quotes);
   }
 
   let linkedInvoices = [];
@@ -4225,7 +4354,7 @@ function findLinkedRecords({ quote, job, invoice }, { quotes=[], jobs=[], accInv
     // Same shared predicate as getJobManualInvoice — and a real fallback rather
     // than an empty list, so a job whose invoice cannot be matched still shows
     // its own invoiceNum link instead of appearing to have no invoice at all.
-    const matchedManual = (accInvoices||[]).filter(i=>invoiceBelongsToJob(i, linkedJob.num));
+    const matchedManual = (accInvoices||[]).filter(i=>invoiceBelongsToJob(i, linkedJob.num) && sameCompany(i, linkedJob));
     if(matchedManual.length){
       linkedInvoices = matchedManual;
     } else if(linkedJob.invoiceNum){
@@ -4251,37 +4380,54 @@ function getConsistencyIssues(quotes, jobs, accInvoices) {
   const issues = [];
   (quotes||[]).forEach(q=>{
     if(q.status!=='approved') return; // 'converted' quotes already have a job by definition
-    const hasJob = (jobs||[]).some(j=>j.id===q.convertedJobId || (q.num && j.quoteNum===q.num));
+    const hasJob = resolveJobsForQuote(q, jobs).length>0;
     if(!hasJob) issues.push({type:'quote_no_job', severity:'high', ref:q.num,
       message:`Quote ${q.num||'—'} (${q.client||'—'}) is approved but has no job registered. Use "Convert to Job" on this quote.`});
   });
   (jobs||[]).forEach(j=>{
-    if(j.quoteNum && !(quotes||[]).some(q=>q.num===j.quoteNum)){
-      issues.push({type:'job_orphan_quote', severity:'medium', ref:j.num,
-        message:`Job ${j.num||'—'} (${j.client||'—'}) references quote ${j.quoteNum}, which no longer exists.`});
+    // 2026-09-08: resolved company-safely. A job whose quote number exists
+    // ONLY under another company is reported as a company mismatch (its true
+    // condition) instead of being silently linked to that other document.
+    if(j.quoteNum && !resolveQuoteForJob(j, quotes)){
+      const elsewhere = (quotes||[]).filter(q=>q && q.num===j.quoteNum);
+      if(elsewhere.length){
+        issues.push({type:'job_quote_company_mismatch', severity:'high', ref:j.num,
+          message:`Job ${j.num||'—'} (${j.client||'—'}) references quote ${j.quoteNum}, which exists only under a different company. It is shown as having no source quote — please review which company this record belongs to.`});
+      } else {
+        issues.push({type:'job_orphan_quote', severity:'medium', ref:j.num,
+          message:`Job ${j.num||'—'} (${j.client||'—'}) references quote ${j.quoteNum}, which no longer exists.`});
+      }
     }
     if(j.status==='completed' && !j.invoiceNum){
       issues.push({type:'job_no_invoice', severity:'high', ref:j.num,
         message:`Job ${j.num||'—'} (${j.client||'—'}) is completed but has not been invoiced yet.`});
     }
-    // A job should always stay tagged to the same company as the quote it came from.
-    if(j.quoteNum){
-      const linkedQuote = (quotes||[]).find(q=>q.num===j.quoteNum);
-      if(linkedQuote && (linkedQuote.co??null) !== (j.co??null)){
-        issues.push({type:'job_quote_company_mismatch', severity:'high', ref:j.num,
-          message:`Job ${j.num||'—'} is tagged to a different company than its source quote ${j.quoteNum} — please review which company this record belongs to.`});
-      }
-    }
+    // (The company-mismatch check that used to live here relied on an
+    // UNSCOPED quotes.find() to pick the record it then compared companies
+    // against — it could select the wrong document and compare against that.
+    // It is superseded by the company-safe check above, which reports the same
+    // condition without ever resolving across a company boundary.)
   });
   // Duplicate document numbers — same quote/job number reused by more than one record.
-  function flagDuplicateNumbers(records, field, label, type){
+  // 2026-09-08: quote and invoice numbers are minted PER COMPANY (see
+  // documentNumbers.ts — only job/po/creditNote counters are global), so the
+  // same SQ-/INV- number existing in two companies is BY DESIGN, not a
+  // duplicate. Counting those together raised false high-severity alarms.
+  // Job numbers stay global and are still counted across everything.
+  function flagDuplicateNumbers(records, field, label, type, scopeByCo){
     const seen = {};
-    (records||[]).forEach(r=>{ const n=r&&r[field]; if(n) seen[n]=(seen[n]||0)+1; });
-    Object.keys(seen).forEach(n=>{ if(seen[n]>1) issues.push({type, severity:'high', ref:n,
-      message:`${label} ${n} is used by ${seen[n]} different records — check for a duplicate.`}); });
+    (records||[]).forEach(r=>{
+      const n=r&&r[field];
+      if(!n) return;
+      const k = scopeByCo ? (companyTagOf(r)+'\u0000'+n) : String(n);
+      if(!seen[k]) seen[k]={n, c:0};
+      seen[k].c++;
+    });
+    Object.keys(seen).forEach(k=>{ if(seen[k].c>1) issues.push({type, severity:'high', ref:seen[k].n,
+      message:`${label} ${seen[k].n} is used by ${seen[k].c} different records in the same company — check for a duplicate.`}); });
   }
-  flagDuplicateNumbers(quotes, 'num', 'Quote number', 'duplicate_quote_number');
-  flagDuplicateNumbers(jobs, 'num', 'Job number', 'duplicate_job_number');
+  flagDuplicateNumbers(quotes, 'num', 'Quote number', 'duplicate_quote_number', true);
+  flagDuplicateNumbers(jobs, 'num', 'Job number', 'duplicate_job_number', false);
 
   const unifiedInvoices = getAllInvoicesUnified(jobs, quotes, accInvoices);
   unifiedInvoices.forEach(inv=>{
@@ -4290,7 +4436,7 @@ function getConsistencyIssues(quotes, jobs, accInvoices) {
         message:`Invoice ${inv.number||'—'} (${inv.client||'—'}) is marked paid but has no payment recorded against it.`});
     }
   });
-  flagDuplicateNumbers(unifiedInvoices, 'number', 'Invoice number', 'duplicate_invoice_number');
+  flagDuplicateNumbers(unifiedInvoices, 'number', 'Invoice number', 'duplicate_invoice_number', true);
 
   // Duplicate payments — the same amount/date/method repeated within one
   // job or quote's payment history (the pattern behind past real incidents).
@@ -7002,7 +7148,7 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
     if(inv.manual){ onOpenInvoice&&onOpenInvoice(inv); return; }
     const j=myJobs.find(x=>x.id===inv.id);
     if(!j){ onOpenInvoice&&onOpenInvoice(inv); return; }
-    const link=myQuotes.find(q=>q && q.num && j.quoteNum && q.num===j.quoteNum);
+    const link=resolveQuoteForJob(j, myQuotes);
     const pj=link ? {...j,
       lines:link.lines, discount:link.discount||'', setupFee:link.setupFee||'',
       client:link.client, contact:link.contact||j.contact||'', email:link.email||j.email||'',
@@ -8875,7 +9021,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
   // the normal Convert button is hidden and the quote becomes a dead-end — you
   // can't reach the job to invoice it. Detect that and offer a safe Restore.
   const isConverted    = !!quote.convertedJobId || quote.status==='converted';
-  const matchingJobs   = (jobs||[]).filter(j=> j.id===quote.convertedJobId || (quote.num && j.quoteNum===quote.num));
+  const matchingJobs   = resolveJobsForQuote(quote, jobs);
   const linkedJobFound = matchingJobs.length>0;
   const orphanedJob    = isConverted && !linkedJobFound;
   const multipleJobsLinked = matchingJobs.length>1;
@@ -9632,7 +9778,10 @@ function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[], quotes
 ═══════════════════════════════════════════ */
 function reconcileJobInvoice(job, quotes){
   const own  = Array.isArray(job.payments) ? job.payments : [];
-  const link = (quotes||[]).find(q=>q && q.num && job.quoteNum && q.num===job.quoteNum);
+  // 2026-09-08: company-safe. Another company's quote can no longer be treated
+  // as this job's source, so its payments can never be merged into this job's
+  // paid total / invoiceStatus (the 16 confirmed contamination cases).
+  const link = resolveQuoteForJob(job, quotes);
   const seen = new Set(own.map(p=>p&&p.id));
   const merged = own.slice();
   if(link && Array.isArray(link.payments)){
@@ -9679,11 +9828,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
      including every other job — keeps refreshing normally. */
   const _editQuoteLinkedJobId = useMemo(() => {
     if (!editQuote) return null;
-    const cj = editQuote.convertedJobId;
-    const linked = (cj != null
-        ? (jobs || []).find(j => Number(j._relId) === Number(cj) || j.id === cj)
-        : null)
-      || (jobs || []).find(j => j.quoteNum === editQuote.num);
+    const linked = resolveJobForQuote(editQuote, jobs);
     return linked ? linked.id : null;
   }, [editQuote, jobs]);
   usePinnedRecord('jobs', _editQuoteLinkedJobId, !!editQuote);
@@ -9770,7 +9915,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // that also has a manual invoice raised against it never shows twice here.
   const _manualJobRefs = getManualInvoiceJobRefs(myAccInvoices, myJobs);
   const jobInvItems = myJobs.filter(j=>j.invoiceNum && !_manualJobRefs.has(j.num)).map(j=>{
-    const link = myQuotes.find(q=>q && q.num && j.quoteNum && q.num===j.quoteNum);
+    const link = resolveQuoteForJob(j, myQuotes);
     let job = j;
     if(link){
       const _sub      = (link.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
@@ -9786,7 +9931,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       };
     }
     // Pull through any deposit / partial recorded on the linked quote / proforma
-    const rec = reconcileJobInvoice(job, quotes);
+    const rec = reconcileJobInvoice(job, myQuotes);
     return {...job, payments:rec.payments, invoiceStatus:rec.invoiceStatus};
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const manualInvItems = myAccInvoices.filter(i=>i.status!=='void').map(i=>{
@@ -9917,10 +10062,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // authoritative one and is tried first; quoteNum remains the fallback for
       // records that predate it.
       const _convertedJobId = (live && live.convertedJobId != null) ? live.convertedJobId : q.convertedJobId;
-      const linkedJob = (_convertedJobId != null
-          ? (jobs||[]).find(j=>Number(j._relId)===Number(_convertedJobId) || j.id===_convertedJobId)
-          : null)
-        || (jobs||[]).find(j=>j.quoteNum===q.num);
+      const linkedJob = resolveJobForQuote({...q, convertedJobId: _convertedJobId}, jobs);
       const patch = {
         customerNameRaw: q.client, contactPerson: q.contact||'', email: q.email||'',
         phone: q.tel||'', address: q.address||'', vatNumber: q.vatNum||'',
@@ -10104,15 +10246,22 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // If the quote is declined, remove any job it was converted into so it no
     // longer shows up in Jobs / Accounting / Dashboard.
     if(updated && updated.status==='declined'){
-      setJobs(prev=>prev.filter(j=>!((updated.convertedJobId && j.id===updated.convertedJobId) || (updated.num && j.quoteNum===updated.num))));
+      // 2026-09-08 (WRITE PATH): only jobs this quote legitimately owns may be
+      // removed. Previously an unscoped quoteNum match could drop another
+      // company's job carrying the same quote number out of state.
+      const _declineTargets = new Set(resolveJobsForQuote(updated, jobs).map(x=>x.id));
+      setJobs(prev=>prev.filter(j=>!_declineTargets.has(j.id)));
       setViewQuote(updated);
       return;
     }
     // Keep any linked converted job's payments in sync with the quote / proforma,
     // so deposits & partials recorded here pull through to the invoice everywhere.
     if(updated && updated.num){
+      // 2026-09-08 (WRITE PATH): company-safe target set — stable
+      // convertedJobId when present, same-company quoteNum fallback otherwise.
+      const _syncTargets = new Set(resolveJobsForQuote(updated, jobs).map(x=>x.id));
       setJobs(prev=>prev.map(j=>{
-        if(j.quoteNum!==updated.num) return j;
+        if(!_syncTargets.has(j.id)) return j;
         const rec = reconcileJobInvoice(j, [updated]);
         // Deposit recorded on the quote/proforma auto-advances the linked job to
         // Deposit Received (stage 5); never regresses a job already further along.
@@ -10167,8 +10316,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const nextQuotes = quotes.map(q=>q.id===updated.id?updated:q);
     let nextJobs = jobs, jobsChanged = false;
     if(updated && updated.num){
+      // 2026-09-08 (WRITE PATH — this one PERSISTS via forceSaveSections):
+      // restricted to jobs this quote legitimately owns. Previously a Holdings
+      // quote payment edit could mutate and SAVE another company's job's
+      // payments / invoiceStatus / stage / status.
+      const _cascadeTargets = new Set(resolveJobsForQuote(updated, jobs).map(x=>x.id));
       const mapped = jobs.map(j=>{
-        if(j.quoteNum!==updated.num) return j;
+        if(!_cascadeTargets.has(j.id)) return j;
         let ownPayments = Array.isArray(j.payments) ? j.payments : [];
         let ownChanged = false;
         deletedIds.forEach(id=>{
@@ -10209,7 +10363,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // mutation of the live `quotes`/`jobs` state (or of the form fields
     // built from this quote) can never retroactively change what this
     // editor "started from".
-    const linkedJob = (jobs||[]).find(j=>j.quoteNum===q.num);
+    const linkedJob = resolveJobForQuote(q, jobs);
     editQuoteBaseRef.current = {
       quote: JSON.parse(JSON.stringify(q)),
       job: linkedJob ? JSON.parse(JSON.stringify(linkedJob)) : null,
@@ -10317,7 +10471,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // if more than one exists (e.g. a past double-click already created
       // a duplicate) we must not silently pick one; warn instead and let
       // a person sort it out in Jobs.
-      const matches = jobs.filter(j=> j.id===q.convertedJobId || (j.quoteNum && j.quoteNum===q.num));
+      const matches = resolveJobsForQuote(q, jobs);
       if(matches.length>1){
         alert(`Quote ${q.num||''} appears linked to ${matches.length} jobs (${matches.map(j=>j.num).join(', ')}).\n\nNo job has been created or changed. Please open Jobs and review these records to work out which one is correct before converting again.`);
         return;
@@ -11172,7 +11326,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // invoice-sourced payment, or the source quote never had this id).
     function syncedQuotesOverride(pid, transform){
       if(paySource.kind==='invoice') return null;
-      const srcQuote = (quotes||[]).find(q=>q && q.num && job.quoteNum && q.num===job.quoteNum);
+      const srcQuote = resolveQuoteForJob(job, quotes);
       if(!srcQuote || !Array.isArray(srcQuote.payments) || !srcQuote.payments.some(p=>p && p.id===pid)) return null;
       const nextPayments = transform(srcQuote.payments);
       return quotes.map(q=>q.id===srcQuote.id?{...q, payments:nextPayments}:q);
@@ -11716,7 +11870,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                 const setup=parseFloat(q.setupFee)||0;
                 const total=(sub-discAmt+setup)*1.15;
                 const co=companies.find(c=>c.id===q.co)||{short:'?'};
-                const linkedJob=jobs.find(j=>j.id===q.convertedJobId||j.quoteNum===q.num);
+                const linkedJob=resolveJobForQuote(q, jobs);
                 // A job inherited invoice (from this quote's own invoice-from-quote
                 // record, relinked on conversion) counts as "already invoiced" here too —
                 // never offer to create a second one.
@@ -15683,7 +15837,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   // recorded on the linked quote, via the same reconcile the lifecycle
   // auto-advance uses). Drives the wording below — never the permission.
   const _jobRecordedPayments = (job.payments||[]).concat(
-    ((quotes||[]).find(q=>q.num===job.quoteNum)||{}).payments||[]
+    (resolveQuoteForJob(job, quotes)||{}).payments||[]
   );
   const jobHasAnyPayment = _jobRecordedPayments.some(p=>(parseFloat(p&&p.amount)||0)>0);
 
@@ -15915,7 +16069,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     // Unlink the source quote so it no longer points at a deleted job
     if(setQuotes && (job.quoteNum || job.id)){
       setQuotes(prev=>prev.map(q=>{
-        const linked = (q.convertedJobId===job.id) || (job.quoteNum && q.num===job.quoteNum);
+        const linked = sameCompany(q, job) && ((q.convertedJobId===job.id) || (job.quoteNum && q.num===job.quoteNum));
         if(!linked) return q;
         return {...q, convertedJobId:null, status: q.status==='converted' ? 'approved' : q.status};
       }));
@@ -16289,7 +16443,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 
       {/* ─── SOURCE QUOTE — pricing document, hidden from Manufacturing (no Rand values) ─── */}
       {job.quoteNum&&!isFactory&&(()=>{
-        const srcQ=(quotes||[]).find(q=>q.num===job.quoteNum);
+        const srcQ=resolveQuoteForJob(job, quotes);
         const sub=srcQ?(srcQ.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0):0;
         const disc=srcQ?parseFloat(srcQ.discount)||0:0;
         const discAmt=sub*(disc/100);
@@ -22559,7 +22713,10 @@ async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll
     }
     working = { ...working, number: reserved, co };
   }
-  const duplicate = (accInvoicesAll||[]).find(i=>i.id!==working.id && i.number && i.number.trim().toLowerCase()===(working.number||'').trim().toLowerCase());
+  // 2026-09-08: invoice numbers are minted PER COMPANY, so the same INV-#####
+  // legitimately exists in both companies. Scoping this to the invoice's own
+  // company stops a legitimate number being rejected as a false duplicate.
+  const duplicate = (accInvoicesAll||[]).find(i=>i.id!==working.id && i.number && sameCompany(i, working) && i.number.trim().toLowerCase()===(working.number||'').trim().toLowerCase());
   if(duplicate){
     // 2026-08-20 hardening (Parts 6-13): a manually-entered/edited invoice
     // number that collides with an existing one used to be a dead end — an
