@@ -4010,6 +4010,61 @@ function stubAdjustmentLines(doc){
 }
 
 /* ═══════════════════════════════════════════
+   A JOB INVOICE'S LINE ITEMS + ITS DISCOUNT (2026-09-14 — DISCOUNT
+   PRESENTATION CONSISTENCY)
+
+   A job-derived invoice has no accInvoices record and therefore no stored
+   lineItems: every screen that wants to present it has to build them from the
+   job. Accounting has done that correctly since 2026-08-25 — reconstructing the
+   pre-discount subtotal and breaking the discount out as its own line whenever
+   the job's own lines prove the reconstruction — while Sales built a SECOND,
+   much cruder version inline: one lump line at value/1.15, with the discount
+   folded silently into it. The result was that the very same job invoice showed
+   its discount in Accounting and showed none at all in Sales.
+
+   This is Accounting's construction, moved out verbatim and shared, so the two
+   screens cannot build the same job invoice two different ways again. Nothing
+   about it changed: the same 0.5 reconstruction guard, the same descriptions,
+   the same account codes (6303 · Discount Allowed for the discount line), the
+   same fallback line when the shape cannot be proven.
+
+   TOTALS ARE UNCHANGED BY CONSTRUCTION. canBreakOut only passes when
+   jLinesSub - discAmt + setupFee reproduces the job's own value ex-VAT, so the
+   three lines sum to exactly what the single lump line summed to. This splits
+   the presentation of a total, never the total.
+
+   `discPct` / `discAmt` are returned alongside so a caller can present the one
+   financial fact without re-deriving it. They are DERIVED values handed to a
+   display projection — no invoice record gains a discount field, and the
+   canonical percentage still lives on the quote (or, with no quote, the job).
+═══════════════════════════════════════════ */
+function jobInvoiceLineItems(job){
+  const j = job || {};
+  const val = parseFloat(j.value) || 0;
+  // j.value is incl. VAT — convert to excl. VAT so the 15% added back lands on
+  // the original incl.-VAT total.
+  const valExVat  = val > 0 ? val / 1.15 : 0;
+  const discPct   = parseFloat(j.discount) || 0;
+  const jLinesSub = (j.lines||[]).reduce((s,l)=>s+(parseFloat(l&&l.subtotal)||0),0);
+  const setupFee  = parseFloat(j.setupFee) || 0;
+  const discAmt   = jLinesSub * (discPct/100);
+  const reconstructed = jLinesSub - discAmt + setupFee;
+  const canBreakOut = discPct>0 && jLinesSub>0 && Math.abs(reconstructed - valExVat) < 0.5;
+  const lineItems = canBreakOut ? [
+    { description: j.desc || 'Signage / Production Job', qty: 1, unitAmount: jLinesSub, accountCode: '4000', taxType: '15%' },
+    { description: `Discount (${discPct}%)`, qty: 1, unitAmount: -discAmt, accountCode: '6303', taxType: '15%' },
+    ...(setupFee>0 ? [{ description: 'Setup Fee', qty: 1, unitAmount: setupFee, accountCode: '4000', taxType: '15%' }] : [])
+  ] : [{
+    description: (j.desc || 'Signage / Production Job') + (discPct>0 ? ` (${discPct}% discount applied)` : ''),
+    qty: 1,
+    unitAmount: valExVat,
+    accountCode: '4000',
+    taxType: '15%'
+  }];
+  return { lineItems, discPct, discAmt, canBreakOut, valExVat };
+}
+
+/* ═══════════════════════════════════════════
    INVOICE-FROM-QUOTE LINKING HELPERS (2026-08-05)
    A quote can be invoiced directly, before any job exists (see
    QuotesPage.createInvoiceFromQuote). That invoice lives in accInvoices —
@@ -5555,6 +5610,23 @@ function invoiceDiscountView(inv){
   const split = sgrSplitInvoiceLineItems(inv.lineItems);
   if(!split.separated || !(split.discAmt > 0)) return { pct:0, amt:0 };
   return { pct: split.discPct, amt: split.discAmt };
+}
+
+/* The one discount pill every invoice LIST row draws (2026-09-14). Accounting
+   had it inline and Sales had nothing, so one screen announced a discount the
+   other silently swallowed. `view` is whatever invoiceDiscountView() (a stored
+   invoice) or jobInvoiceLineItems() (a job-derived one) already derived — this
+   never computes a discount itself, it only renders one. Both halves of the
+   fact are always shown together: the percentage AND the money. `fmt` is the
+   host page's own money formatter, so each list keeps its existing look.
+   Renders nothing at all when there is no discount — a transaction without one
+   must never grow a "0%" badge. */
+function InvoiceDiscountBadge({ view, fmt }){
+  if(!view || !(view.pct > 0)) return null;
+  const f = fmt || zar;
+  return (
+    <div className="mt-0.5"><span className="bg-red-50 text-red-600 rounded-full px-1.5 py-0.5 text-[10px] font-bold whitespace-nowrap">{`−${view.pct}% disc${view.amt>0?' · '+f(view.amt):''}`}</span></div>
+  );
 }
 
 /* An accInvoices record, expressed in the shape buildInvoiceHtml() consumes.
@@ -10004,7 +10076,17 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     }
     // Pull through any deposit / partial recorded on the linked quote / proforma
     const rec = reconcileJobInvoice(job, myQuotes);
-    return {...job, payments:rec.payments, invoiceStatus:rec.invoiceStatus};
+    // ── 2026-09-14 (discount presentation consistency) ──────────────────────
+    // The discount this row must show, derived by the SAME shared construction
+    // Accounting's job-invoice rows and this row's own View modal use, from the
+    // SAME resolved job — so the pill, the modal and Accounting can never state
+    // three different discounts for one transaction. `job` here is already the
+    // company-safe quote re-sync above, so the percentage is the canonical
+    // quote's whenever there is one and the job's own otherwise. Display only:
+    // nothing is stored and `value` is untouched.
+    const _disc = jobInvoiceLineItems(job);
+    return {...job, payments:rec.payments, invoiceStatus:rec.invoiceStatus,
+            _discountView:{ pct:_disc.discPct, amt:_disc.discAmt }};
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const manualInvItems = myAccInvoices.filter(i=>i.status!=='void').map(i=>{
     const sub=(i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
@@ -10026,7 +10108,16 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const normStatus = (i.status==='paid' || _settled==='paid') ? 'paid'
                      : (_settled==='partial' || i.status==='partial') ? 'partial'
                      : 'pending';
-    return {id:i.id,invoiceNum:i.number,invoiceStatus:normStatus,client:i.contactName||'',value:sub+vat,invoiceDate:i.date,invoiceDue:i.dueDate,paidAt:i.paidDate,reference:i.reference,payments:i.payments||[],num:'manual',co:i.co??null,_isManual:true};
+    // ── 2026-09-14 (discount presentation consistency) ──────────────────────
+    // This projection carried no discount of any kind, so the Sales row had
+    // nothing to show even though `value` above is already the DISCOUNTED total
+    // — the invoice's negative `Discount (x%)` line is inside that sum. Derived
+    // here through invoiceDiscountView, the same helper the View Invoice modal
+    // and Accounting's row already use, off the real accInvoices record. No new
+    // field is written to the record and the invoice still owns no discount of
+    // its own: this is a display projection built fresh on every render.
+    const _discountView = invoiceDiscountView(i);
+    return {id:i.id,invoiceNum:i.number,invoiceStatus:normStatus,client:i.contactName||'',value:sub+vat,invoiceDate:i.date,invoiceDue:i.dueDate,paidAt:i.paidDate,reference:i.reference,payments:i.payments||[],num:'manual',co:i.co??null,_isManual:true,_discountView};
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const invoicedJobs = numSort([...jobInvItems,...manualInvItems], 'invoiceNum').reverse(); // newest-first by default
   const _invSearch = searchInv.trim().toLowerCase();
@@ -12146,6 +12237,12 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       <span className="text-xs font-black text-brand-600 font-mono">{j.invoiceNum}</span>
                       <span className={`text-xs font-bold px-2 py-0.5 rounded-full border ${statusBadge}`}>{statusLabel}</span>
                       {hasWriteOff&&<span className={`text-xs font-bold px-2 py-0.5 rounded-full border ${j.writeOff==='warranty'?'bg-purple-100 text-purple-700 border-purple-200':'bg-orange-100 text-orange-700 border-orange-200'}`}>{j.writeOff==='warranty'?'🛡️ Warranty':'🔧 Maintenance'}</span>}
+                      {/* 2026-09-14: the discount this invoice actually carries.
+                          `value` on the right has ALWAYS been the discounted
+                          total — this row simply never said so, while Accounting's
+                          row for the same invoice did. Same badge, same
+                          derivation, both halves of the fact (% and money). */}
+                      <InvoiceDiscountBadge view={j._discountView} fmt={zar}/>
                       <span className="text-xs text-gray-400">{co.short}</span>
                     </div>
                     <div className="flex items-center gap-2 flex-wrap">
@@ -12227,14 +12324,26 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       )
                     ):(
                       <>
-                        <button onClick={()=>setViewInvoiceRow({
+                        {/* ── 2026-09-14 (discount presentation consistency) ──
+                            This used to hand the shared View modal a SINGLE lump
+                            line at value/1.15, with the discount folded invisibly
+                            into it — so the modal's line table showed no discount
+                            row and invoiceDiscountView() found nothing to put in
+                            its DISCOUNT tile, even though the very same job's
+                            Print and Accounting row both showed it. It now builds
+                            the lines through the shared jobInvoiceLineItems(),
+                            which is Accounting's own proven construction: the
+                            discount is broken out only when the job's lines prove
+                            the reconstruction, and the three lines sum to exactly
+                            what the one line summed to — the total does not move. */}
+                        <button onClick={()=>{ const _ji = jobInvoiceLineItems(j); setViewInvoiceRow({
                             id:'job-'+j.id, number:j.invoiceNum, source:'job', jobNum:j.num,
                             reference:j.num, contactName:j.client||'', contactEmail:j.email||'',
                             contactAddress:j.address||'', date:j.invoiceDate||'', dueDate:j.invoiceDue||'',
                             status:j.invoiceStatus||'pending', payments:j.payments||[],
-                            lineItems:[{description:j.desc||'Signage / Production Job', qty:1,
-                              unitAmount:(parseFloat(j.value)||0)/1.15, accountCode:'4000', taxType:'15%'}]
-                          })}
+                            discount:_ji.discPct, discountAmount:_ji.discAmt,
+                            lineItems:_ji.lineItems
+                          }); }}
                           className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#f0f4ff',color:'#4338ca'}}>
                           👁 View
                         </button>
@@ -23753,10 +23862,8 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   // "ready to invoice but not yet invoiced" banner further down.
   function getJobInvoices() {
     return (jobs||[]).filter(j=>j && j.invoiceNum).map(j=>{
-      const val = parseFloat(j.value)||0;
-      // j.value is incl. VAT — convert to excl. VAT so the accounting module
-      // can correctly add 15% VAT and arrive back at the original incl. VAT total.
-      const valExVat = val > 0 ? val / 1.15 : 0;
+      // j.value is incl. VAT — the excl.-VAT conversion, and everything built on
+      // it, now happens inside the shared jobInvoiceLineItems() below.
       // Pull through any deposit / partial recorded on the linked quote / proforma
       const rec = reconcileJobInvoice(j, quotes);
       // Derive status from recorded payments only (legacy paid flags are not trusted)
@@ -23778,23 +23885,11 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
       // its own GL line (6303 · Discount Allowed) so it shows on the invoice and
       // rolls up into the P&L / totals correctly. Otherwise we fall back to just
       // flagging the discount % on the invoice without altering the total.
-      const discPct   = parseFloat(j.discount) || 0;
-      const jLinesSub = (j.lines||[]).reduce((s,l)=>s+(parseFloat(l.subtotal)||0),0);
-      const setupFee  = parseFloat(j.setupFee) || 0;
-      const discAmt   = jLinesSub * (discPct/100);
-      const reconstructed = jLinesSub - discAmt + setupFee;
-      const canBreakOut = discPct>0 && jLinesSub>0 && Math.abs(reconstructed - valExVat) < 0.5;
-      const lineItems = canBreakOut ? [
-        { description: j.desc || 'Signage / Production Job', qty: 1, unitAmount: jLinesSub, accountCode: '4000', taxType: '15%' },
-        { description: `Discount (${discPct}%)`, qty: 1, unitAmount: -discAmt, accountCode: '6303', taxType: '15%' },
-        ...(setupFee>0 ? [{ description: 'Setup Fee', qty: 1, unitAmount: setupFee, accountCode: '4000', taxType: '15%' }] : [])
-      ] : [{
-        description: (j.desc || 'Signage / Production Job') + (discPct>0 ? ` (${discPct}% discount applied)` : ''),
-        qty: 1,
-        unitAmount: valExVat,
-        accountCode: '4000',
-        taxType: '15%'
-      }];
+      // 2026-09-14: this construction now lives at module scope as
+      // jobInvoiceLineItems() — UNCHANGED, just shared — because Sales was
+      // building the same job invoice a second, cruder way that dropped the
+      // discount entirely. One construction, one result, both screens.
+      const { lineItems, discPct, discAmt } = jobInvoiceLineItems(j);
       return {
         id: 'job-'+j.id,
         number: invNum,
@@ -24323,9 +24418,10 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                           {/* 2026-09-07: derived through invoiceDiscountView, and now
                               showing the money alongside the percentage — they are one
                               financial fact and must never be shown apart. */}
-                          {(()=>{ const _d = invoiceDiscountView(inv); return _d.pct>0
-                            ? <div className="mt-0.5"><span className="bg-red-50 text-red-600 rounded-full px-1.5 py-0.5 text-[10px] font-bold whitespace-nowrap">−{_d.pct}% disc{_d.amt>0?' · '+fmtAmt(_d.amt):''}</span></div>
-                            : null; })()}
+                          {/* 2026-09-14: the same badge Sales → Invoices now draws
+                              (InvoiceDiscountBadge), from the same derivation. The
+                              markup and this page's own fmtAmt are unchanged. */}
+                          <InvoiceDiscountBadge view={invoiceDiscountView(inv)} fmt={fmtAmt}/>
                         </td>
                         <td className="px-4 py-2.5 text-xs font-semibold text-gray-800">{inv.contactName}</td>
                         <td className="px-4 py-2.5 text-xs text-gray-500">{fmtDate(inv.date)}</td>

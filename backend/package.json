@@ -81,6 +81,7 @@
     "test:discount-payment-consistency": "ts-node --transpile-only test/relational.discount-payment-consistency.stress.ts",
     "test:holdings-company-scoped-links": "node test/holdings-company-scoped-links.test.js",
     "test:settlement-status-consistency": "node test/settlement-status-consistency.test.js",
+    "test:discount-display-consistency": "node test/discount-display-consistency.test.js",
     "diagnose:settlement-status-mismatch": "node scripts/diagnose-settlement-status-mismatch.js"
   },
   "dependencies": {

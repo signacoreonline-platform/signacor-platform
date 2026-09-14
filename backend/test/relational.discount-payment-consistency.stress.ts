@@ -147,8 +147,23 @@ function checkSourceWiring() {
     'invoiceDiscountView derives through the SAME splitter the printed document uses, so screen and paper cannot disagree');
   ok(/\{_invDiscountView\.pct>0&&<div className="bg-red-50 rounded-xl p-3">[\s\S]{0,200}\{_invDiscountView\.pct\}%\{_invDiscountView\.amt>0\?' · − '\+fmtAmt\(_invDiscountView\.amt\)/.test(html),
     'the View Invoice modal shows the percentage AND the money, derived rather than read from a rarely-set field');
-  ok(/const _d = invoiceDiscountView\(inv\); return _d\.pct>0[\s\S]{0,300}−\{_d\.pct\}% disc\{_d\.amt>0\?' · '\+fmtAmt\(_d\.amt\)/.test(html),
-    'the Accounting invoice list badge shows the percentage AND the money, derived the same way');
+  // 2026-09-14 — the Accounting badge that used to be inline here is now the
+  // SHARED InvoiceDiscountBadge, because Sales → Invoices drew no discount badge
+  // at all and the same invoice therefore announced a discount on one screen and
+  // none on the other. Same markup, same derivation, now in one place and used
+  // by both. The assertion is updated to the new call shape and widened to cover
+  // the Sales row it was silently missing.
+  ok(html.includes("−${view.pct}% disc${view.amt>0?' · '+f(view.amt):''}"),
+    'the shared invoice-list discount badge shows the percentage AND the money');
+  ok(/<InvoiceDiscountBadge view=\{invoiceDiscountView\(inv\)\} fmt=\{fmtAmt\}\/>/.test(html),
+    'the Accounting invoice list row draws that shared badge, derived through invoiceDiscountView');
+  ok(/<InvoiceDiscountBadge view=\{j\._discountView\} fmt=\{zar\}\/>/.test(html),
+    'the Sales invoice list row draws the SAME shared badge — it used to draw none');
+  ok(/const _discountView = invoiceDiscountView\(i\);/.test(html),
+    'Sales\' canonical-invoice projection derives its discount through invoiceDiscountView, not a legacy field');
+  ok(/const \{ lineItems, discPct, discAmt \} = jobInvoiceLineItems\(j\);/.test(html) &&
+     /const _ji = jobInvoiceLineItems\(j\); setViewInvoiceRow\(\{/.test(html),
+    'Accounting and Sales build a job invoice\'s lines through ONE shared construction, so its Discount (x%) line exists on both');
 
   console.log('\n[B · payment authority] one payment fact, resolved across the whole chain');
   ok(/export async function resolveTransactionChainTx\(/.test(services) && /export async function sumChainPaymentsTx\(/.test(services),
