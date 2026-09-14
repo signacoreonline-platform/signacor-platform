@@ -4131,43 +4131,186 @@ export interface InventoryItemInput {
   // action can reuse the plain update service rather than a bespoke route.
   active?: boolean;
 }
-export async function createInventoryItem(input: InventoryItemInput): Promise<{ id: number; rowVersion: number }> {
-  const res = await pool.query(
-    `WITH new_id AS (SELECT nextval('rel_inventory_items_id_seq') AS id)
-     INSERT INTO rel_inventory_items (id, source_id, sku, name, category, unit, cost, sell, stock_qty, reorder_level, supplier_id, legacy_data)
-     SELECT new_id.id, new_id.id::text, $1,$2,$3,$4,$5,$6,$7,$8,$9,'{}'::jsonb FROM new_id
-     RETURNING id, row_version`,
-    [input.sku ?? null, input.name, input.category ?? null, input.unit ?? null, input.cost || 0, input.sell || 0, input.stock || 0, input.reorder || 0, input.supplierId ?? null]
+// ── INVENTORY SAVE REPAIR (2026-09-14) — "Edit Stock Item -> Save Item fails
+// with Internal error" ──────────────────────────────────────────────────────
+//
+// EXACTLY the same defect class as resolveInventoryRef above (see its
+// "BUG 3 ROOT CAUSE #1" note), on the one relational link that fix did not
+// cover: an inventory item's SUPPLIER.
+//
+// `rel_inventory_items.supplier_id` is `BIGINT REFERENCES rel_suppliers(id)`
+// (007_relational_core.sql) — the real PK. But the frontend never holds that
+// PK: read.ts's mapItemRow renders an item's `supplierId` from
+// `supplier_source_id` (falling back to legacy_data.supplierId), i.e. the
+// supplier's ORIGINAL historical JSON id, and the Supplier <select> in
+// index.html's AddEditInventoryItemModal is likewise populated from
+// buildSuppliersJson's `restoreId(source_id)`. For every BACKFILLED supplier
+// those two values differ (backfill.ts sets source_id = the legacy JSON id and
+// resolves supplier_id separately via supplierIdBySourceId), so create/update
+// pushed a legacy id such as 1777018057084 straight into the FK column and
+// Postgres answered:
+//     23503 foreign_key_violation  (rel_inventory_items_supplier_id_fkey)
+// which is neither a ConcurrencyConflictError nor a BusinessRuleError, so
+// api.ts's handleServiceError fell through to `500 {error:'Internal error'}`
+// — the exact message reported, on the exact action reported (Inventory ->
+// Stock Items -> Edit Stock Item -> Save Item). Items created AFTER cutover
+// happened to work because createSupplier sets source_id = id::text, making
+// the two ids coincidentally identical.
+//
+// SECOND (silent) HALF OF THE SAME DEFECT, identical to the quote-line case:
+// neither writer ever populated `supplier_source_id`, yet read.ts reads
+// `supplierId` FROM that column first — so any item that DID save (one whose
+// supplier id happened to be a valid PK) came back with its supplier link
+// rendered from stale legacy_data, and a relationally-created item lost the
+// link entirely.
+//
+// Fixed at this ONE shared point: match on source_id first (the id the
+// frontend actually holds, correct for backfilled AND fresh rows), fall back
+// to the PK, and store BOTH the FK and the source id.
+//
+// FOUR cases, exhaustively:
+//   1. null / undefined / '' ("— No supplier linked —")
+//        -> supplier_id = NULL, supplier_source_id = NULL. A legitimate,
+//           fully-supported state: rel_inventory_items.supplier_id is
+//           nullable (007) and an item with no supplier is ordinary.
+//   2. matches rel_suppliers.source_id  (the backfilled/legacy case that
+//      produced the 23503)
+//        -> supplier_id = that supplier's real PK, supplier_source_id kept
+//           as the supplier's own source_id.
+//   3. matches a real rel_suppliers.id  (a post-cutover supplier, whose
+//      source_id = id::text, and any caller that legitimately holds the PK)
+//        -> accepted, and supplier_source_id normalised to that row's OWN
+//           source_id rather than echoing back whatever the caller sent, so
+//           read.ts's mapItemRow always renders the link consistently.
+//   4. NON-NULL but matches NEITHER source_id NOR a PK
+//        -> BusinessRuleError. Deliberately NOT resolved to NULL.
+//
+// Case 4 is a deliberate departure from resolveInventoryRef's forgiving
+// "unknown item -> null FK + breadcrumb" branch. A quote LINE that loses its
+// inventory link still carries its own stored desc/qty/unit_price and prints
+// correctly, so degrading that link costs nothing. An inventory item's
+// supplier is different: silently rewriting a non-null supplier reference to
+// NULL would UNLINK the item as a side effect of an unrelated edit (a price
+// change), with no error, no prompt, and no way for the user to notice — a
+// quiet data loss that is strictly worse than a refused save. So an invalid
+// non-null reference is refused as a BusinessRuleError, which api.ts maps to
+// a clean 409 `business_rule` that index.html's classifySaveError already
+// displays verbatim WITHOUT discarding the user's draft, and the surrounding
+// transaction rolls back leaving the row byte-for-byte unchanged.
+//
+// NO schema change, NO migration, NO data repair: supplier_id/
+// supplier_source_id already exist (007) and every historical row keeps
+// whatever it has.
+async function resolveSupplierRef(
+  q: { query: (text: string, params?: any[]) => Promise<any> },
+  supplierId: unknown
+): Promise<{ fk: number | null; sourceId: string | null }> {
+  if (supplierId === null || supplierId === undefined || supplierId === '') return { fk: null, sourceId: null };
+  const asText = String(supplierId).trim();
+  if (!asText) return { fk: null, sourceId: null };
+
+  const bySource = await q.query(
+    'SELECT id, source_id FROM rel_suppliers WHERE source_id = $1 LIMIT 1',
+    [asText]
   );
-  return { id: res.rows[0].id, rowVersion: res.rows[0].row_version };
+  if (bySource.rowCount) return { fk: Number(bySource.rows[0].id), sourceId: bySource.rows[0].source_id };
+
+  // Same length bound as resolveInventoryRef: /^\d+$/ constrains the SHAPE but
+  // not the MAGNITUDE, and a 20+ digit historical JS id cast to bigint raises
+  // 22003 numeric_value_out_of_range — another opaque 500 from the very helper
+  // written to stop them.
+  if (/^\d{1,18}$/.test(asText)) {
+    const byPk = await q.query(
+      'SELECT id, source_id FROM rel_suppliers WHERE id = $1::bigint LIMIT 1',
+      [asText]
+    );
+    if (byPk.rowCount) return { fk: Number(byPk.rows[0].id), sourceId: byPk.rows[0].source_id };
+  }
+
+  // Case 4 — non-null and unresolvable. Never silently unlinked. The caller's
+  // value is echoed back (truncated, exactly like assertCustomerExists does)
+  // so the message is actionable without ever logging anything sensitive.
+  throw new BusinessRuleError(
+    `The supplier reference on this item ("${asText.slice(0, 40)}") does not match any supplier on record. ` +
+    `Please re-select the supplier — or choose "No supplier linked" — before saving.`
+  );
+}
+
+export async function createInventoryItem(input: InventoryItemInput): Promise<{ id: number; rowVersion: number }> {
+  // Resolve + insert inside ONE transaction so the supplier lookup and the
+  // insert that depends on it cannot straddle a concurrent supplier change,
+  // and so any failure still leaves nothing behind (the previous single
+  // statement was atomic on its own; this is at least as strong, never weaker).
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sup = await resolveSupplierRef(client, input.supplierId);
+    const res = await client.query(
+      `WITH new_id AS (SELECT nextval('rel_inventory_items_id_seq') AS id)
+       INSERT INTO rel_inventory_items (id, source_id, sku, name, category, unit, cost, sell, stock_qty, reorder_level, supplier_id, supplier_source_id, legacy_data)
+       SELECT new_id.id, new_id.id::text, $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'{}'::jsonb FROM new_id
+       RETURNING id, row_version`,
+      [input.sku ?? null, input.name, input.category ?? null, input.unit ?? null, input.cost || 0, input.sell || 0, input.stock || 0, input.reorder || 0, sup.fk, sup.sourceId]
+    );
+    await client.query('COMMIT');
+    return { id: res.rows[0].id, rowVersion: res.rows[0].row_version };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 export async function updateInventoryItem(id: number, expectedVersion: number, patch: Partial<InventoryItemInput>): Promise<{ rowVersion: number }> {
+  // `supplierId` is deliberately NOT in this map: it is not a plain
+  // pass-through column any more — it is resolved to the real
+  // rel_suppliers PK (and mirrored into supplier_source_id) below. See
+  // resolveSupplierRef's note above. Every other field behaves exactly as
+  // before, including the `!== undefined` test that keeps a legitimate 0
+  // (stock/reorder/cost/sell) as a real 0 rather than dropping it.
   const colMap: Record<string, string> = {
     sku: 'sku', name: 'name', category: 'category', unit: 'unit', cost: 'cost', sell: 'sell',
-    stock: 'stock_qty', reorder: 'reorder_level', supplierId: 'supplier_id', active: 'is_active',
+    stock: 'stock_qty', reorder: 'reorder_level', active: 'is_active',
   };
-  const sets: string[] = []; const vals: any[] = [];
-  for (const [k, col] of Object.entries(colMap)) {
-    if ((patch as any)[k] !== undefined) { vals.push((patch as any)[k]); sets.push(`${col} = $${vals.length}`); }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sets: string[] = []; const vals: any[] = [];
+    for (const [k, col] of Object.entries(colMap)) {
+      if ((patch as any)[k] !== undefined) { vals.push((patch as any)[k]); sets.push(`${col} = $${vals.length}`); }
+    }
+    if ((patch as any).supplierId !== undefined) {
+      const sup = await resolveSupplierRef(client, (patch as any).supplierId);
+      vals.push(sup.fk); sets.push(`supplier_id = $${vals.length}`);
+      vals.push(sup.sourceId); sets.push(`supplier_source_id = $${vals.length}`);
+    }
+    if (sets.length === 0) {
+      const cur = await client.query('SELECT row_version FROM rel_inventory_items WHERE id = $1', [id]);
+      await client.query('COMMIT');
+      if (cur.rowCount === 0) throw new BusinessRuleError(`inventory item ${id} not found`);
+      return { rowVersion: cur.rows[0].row_version };
+    }
+    vals.push(id); const idIdx = vals.length;
+    vals.push(expectedVersion); const verIdx = vals.length;
+    const res = await client.query(
+      `UPDATE rel_inventory_items SET ${sets.join(', ')}, row_version = row_version + 1, updated_at = NOW()
+       WHERE id = $${idIdx} AND row_version = $${verIdx} RETURNING row_version`,
+      vals
+    );
+    if (res.rowCount === 0) {
+      const exists = await client.query('SELECT id FROM rel_inventory_items WHERE id = $1', [id]);
+      await client.query('ROLLBACK');
+      if (exists.rowCount === 0) throw new BusinessRuleError(`inventory item ${id} not found`);
+      throw new ConcurrencyConflictError('rel_inventory_items', id);
+    }
+    await client.query('COMMIT');
+    return { rowVersion: res.rows[0].row_version };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
   }
-  if (sets.length === 0) {
-    const cur = await pool.query('SELECT row_version FROM rel_inventory_items WHERE id = $1', [id]);
-    if (cur.rowCount === 0) throw new BusinessRuleError(`inventory item ${id} not found`);
-    return { rowVersion: cur.rows[0].row_version };
-  }
-  vals.push(id); const idIdx = vals.length;
-  vals.push(expectedVersion); const verIdx = vals.length;
-  const res = await pool.query(
-    `UPDATE rel_inventory_items SET ${sets.join(', ')}, row_version = row_version + 1, updated_at = NOW()
-     WHERE id = $${idIdx} AND row_version = $${verIdx} RETURNING row_version`,
-    vals
-  );
-  if (res.rowCount === 0) {
-    const exists = await pool.query('SELECT id FROM rel_inventory_items WHERE id = $1', [id]);
-    if (exists.rowCount === 0) throw new BusinessRuleError(`inventory item ${id} not found`);
-    throw new ConcurrencyConflictError('rel_inventory_items', id);
-  }
-  return { rowVersion: res.rows[0].row_version };
 }
 export async function adjustInventoryStock(id: number, expectedVersion: number, delta: number): Promise<{ rowVersion: number; newStock: number }> {
   const res = await pool.query(
