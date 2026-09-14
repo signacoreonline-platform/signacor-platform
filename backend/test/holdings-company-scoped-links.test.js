@@ -111,6 +111,11 @@ const WANTED_FNS = [
   'resolveQuoteForJob', 'resolveQuoteForInvoice',
   'findSourceQuoteForJob', 'reconcileJobInvoice', 'getQuoteInvoice',
   'isHoldingsRecord',
+  // 2026-09-14: reconcileJobInvoice now derives its status through the shared
+  // settlement rule (see settlement-status-consistency.test.js), so lifting it
+  // out of index.html means lifting those two helpers with it. Nothing this
+  // suite asserts changes — this is a harness dependency, not a rule change.
+  'sumPaymentAmounts', 'toCents', 'deriveSettlementStatus',
 ];
 const pieces = [extractConst(SRC, MASKED, 'HOLDINGS_CO_ID'), extractConst(SRC, MASKED, 'HOLDINGS_CO_KEY')];
 for (const f of WANTED_FNS) pieces.push(extractFunction(SRC, MASKED, f));

@@ -79,7 +79,9 @@
     "test:payment-status-cent-precision": "ts-node --transpile-only test/relational.payment-status-cent-precision.stress.ts",
     "diagnose:discount-payment-consistency": "ts-node --transpile-only src/scripts/diagnose-discount-payment-consistency.ts",
     "test:discount-payment-consistency": "ts-node --transpile-only test/relational.discount-payment-consistency.stress.ts",
-    "test:holdings-company-scoped-links": "node test/holdings-company-scoped-links.test.js"
+    "test:holdings-company-scoped-links": "node test/holdings-company-scoped-links.test.js",
+    "test:settlement-status-consistency": "node test/settlement-status-consistency.test.js",
+    "diagnose:settlement-status-mismatch": "node scripts/diagnose-settlement-status-mismatch.js"
   },
   "dependencies": {
     "@types/archiver": "^6.0.4",

@@ -9767,6 +9767,73 @@ function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[], quotes
 }
 
 /* ═══════════════════════════════════════════
+   SETTLEMENT AUTHORITY (2026-09-14 — ACCOUNTING ↔ SALES STATUS CONSISTENCY)
+
+   THE DEFECT THIS CLOSES. One transaction was reporting two different
+   settlement states: Accounting → Invoices said Paid while Sales → Invoices
+   said "⏳ Partly Paid" for the SAME invoice, the SAME total and the SAME
+   payments. There was nothing wrong with the money and nothing wrong with
+   rel_payments — the two screens were simply applying three different
+   comparison rules to it:
+
+     backend   services.ts recomputeOwnerPaymentStatus()
+               toCents(chain paid) >= toCents(invoice total)   ← CANONICAL
+     Accounting index.html invoice row
+               a display-only "outstanding <= R0.01" tolerance laid over the
+               stored status, which silently rescued the row
+     Sales      reconcileJobInvoice() / the manual-invoice row
+               a RAW float `paid >= total`, or the stored status verbatim,
+               with no rounding of any kind
+
+   Why raw floats diverge from the books. rel_jobs.value is NUMERIC(14,2) and
+   rel_payments.amount is NUMERIC(14,2) — the database stores, and the customer
+   is billed and pays, in CENTS. But the job value is computed as
+   `(subtotal − discount + setupFee) * 1.15` (services.ts's updateQuoteWithJobSync
+   and convertQuoteToJob) and rel_invoice_line_items.unit_amount is NUMERIC(14,4),
+   so the raw arithmetic routinely lands a fraction of a cent away from the cent
+   figure actually issued and settled. Sales re-derives that product in the
+   browser and never rounds it (QuotesPage's jobInvItems), so a job invoiced at
+   R5,716.44 and paid R5,716.44 was compared against 5716.4405 and read
+   'partial' — money that does not exist at any precision a bank can transfer.
+
+   THE RULE NOW. ONE rule, defined once, used by Accounting and Sales alike, and
+   byte-for-byte the backend's: BOTH sides are reduced to cents and then
+   compared. This is deliberately NOT a tolerance — services.ts says so in the
+   same words — because a tolerance would also forgive a genuine one-cent
+   shortfall whenever the raw total happens to round UP (raw 6351.595 → billed
+   R6,351.60, paid R6,351.59 is a real cent short and must stay 'partial').
+   Rounding both sides keeps that case correct, which the old Accounting-only
+   "<= R0.01" tolerance did not.
+
+   Nothing about payment OWNERSHIP or payment RESOLUTION changes here: the
+   rel_payments architecture, the transaction-chain resolver, _relOwnerType
+   routing and company scoping are all untouched. This governs only how an
+   already-resolved (total, paid) pair is turned into a word on the screen.
+═══════════════════════════════════════════ */
+// The platform's cent convention — the same Math.round(n*100)/100 already used
+// by services.ts's toCents() and by every src/scripts money helper.
+function toCents(n){ return Math.round((Number(n)||0)*100)/100; }
+// Money still owed, in cents, on a (total, paid) pair. Never negative.
+function settlementOutstanding(invoiceTotal, paidTotal){
+  return toCents(Math.max(0, toCents(invoiceTotal) - toCents(paidTotal)));
+}
+// THE single settlement rule. Mirrors services.ts's recomputeOwnerPaymentStatus
+// exactly: cent-precise on both sides, 'paid' only against a real positive
+// total, 'partial' whenever money has been received but does not cover it.
+function deriveSettlementStatus(invoiceTotal, paidTotal){
+  const total = toCents(invoiceTotal);
+  const paid  = toCents(paidTotal);
+  if(total > 0 && paid >= total) return 'paid';
+  if(paid > 0) return 'partial';
+  return 'pending';
+}
+// One place that knows how a payments array adds up, so no surface can count
+// it a slightly different way.
+function sumPaymentAmounts(payments){
+  return (payments||[]).reduce((s,p)=>s+(parseFloat(p&&p.amount)||0),0);
+}
+
+/* ═══════════════════════════════════════════
    PAYMENT RECONCILIATION
    A deposit / partial payment can be recorded against a quote / proforma
    (quote.payments) BEFORE or AFTER it is converted to a job. Once converted,
@@ -9788,13 +9855,18 @@ function reconcileJobInvoice(job, quotes){
     link.payments.forEach(p=>{ if(p && !seen.has(p.id)){ merged.push(p); seen.add(p.id); } });
   }
   const invTotal  = parseFloat(job.value)||0;
-  const totalPaid = merged.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+  const totalPaid = sumPaymentAmounts(merged);
   // Status is derived ONLY from recorded payments — a stored 'paid' flag is never
   // trusted on its own. An invoice can show Fully Paid only when payments recorded
   // in the Payments tab cover the full invoice value.
-  let invoiceStatus = 'pending';
-  if(totalPaid>=invTotal && invTotal>0) invoiceStatus = 'paid';
-  else if(totalPaid>0) invoiceStatus = 'partial';
+  // 2026-09-14: through deriveSettlementStatus, so this comparison is the
+  // platform's cent-precise one rather than a raw float `>=`. The rule itself is
+  // unchanged (paid / partial / pending, in that order, against a positive
+  // total); what changes is that a job invoiced and paid at the same CENT figure
+  // can no longer read 'partial' because the re-derived value*1.15 carried a
+  // fraction of a cent. Both callers of this function — Sales → Invoices and
+  // Accounting → getJobInvoices() — therefore now agree by construction.
+  const invoiceStatus = deriveSettlementStatus(invTotal, totalPaid);
   return { payments: merged, invoiceStatus, totalPaid };
 }
 
@@ -9937,7 +10009,23 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   const manualInvItems = myAccInvoices.filter(i=>i.status!=='void').map(i=>{
     const sub=(i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
     const vat=(i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
-    const normStatus=i.status==='paid'?'paid':i.status==='partial'?'partial':'pending';
+    // ── 2026-09-14 (Accounting ↔ Sales settlement consistency) ──────────────
+    // This row used to echo the STORED status verbatim while Accounting's own
+    // row for the same record laid a derived "is it actually settled?" test
+    // over it — so a canonical invoice whose stored status had not caught up
+    // with its chain payments read Paid in Accounting and "⏳ Partly Paid"
+    // here. It now applies the SAME shared settlement rule, against the SAME
+    // total (lineItems) and the SAME payments array (read.ts already resolves
+    // an invoice's whole transaction chain into it).
+    // Deliberately a WIDENING, never a narrowing: a stored 'paid' is still
+    // honoured on its own — a historical invoice settled before payments were
+    // kept as rows must not regress to Pending — and a stored 'partial' with no
+    // payment rows still reads Partly Paid. Nothing that shows Paid today stops
+    // showing Paid.
+    const _settled = deriveSettlementStatus(sub+vat, sumPaymentAmounts(i.payments));
+    const normStatus = (i.status==='paid' || _settled==='paid') ? 'paid'
+                     : (_settled==='partial' || i.status==='partial') ? 'partial'
+                     : 'pending';
     return {id:i.id,invoiceNum:i.number,invoiceStatus:normStatus,client:i.contactName||'',value:sub+vat,invoiceDate:i.date,invoiceDue:i.dueDate,paidAt:i.paidDate,reference:i.reference,payments:i.payments||[],num:'manual',co:i.co??null,_isManual:true};
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const invoicedJobs = numSort([...jobInvItems,...manualInvItems], 'invoiceNum').reverse(); // newest-first by default
@@ -24209,15 +24297,25 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                     // same total (sub+vat) and payments already used elsewhere
                     // in this row, just subtracted. Never changes inv.status
                     // or any stored/calculated payment value.
-                    const paidSoFar = (inv.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-                    const outstanding = Math.max(0, (sub+vat)-paidSoFar);
-                    // Display-only rounding tolerance: a "partial" invoice with
-                    // only a sub-cent amount left (<= R0.01, e.g. from VAT/
-                    // discount rounding) reads as effectively paid here. Never
-                    // touches inv.status, invoiceStatus, or any stored payment —
-                    // purely how this one badge is labelled/coloured, and never
-                    // triggers above the R0.01 tolerance.
-                    const isEffectivelyPaid = inv.status==='partial' && outstanding<=0.01;
+                    const paidSoFar = sumPaymentAmounts(inv.payments);
+                    // 2026-09-14: the balance is stated in CENTS — the precision
+                    // the invoice was issued at and the customer pays at — so a
+                    // fraction of a cent left over from 4-dp line arithmetic is
+                    // never shown as a debt of "R 0.00".
+                    const outstanding = settlementOutstanding(sub+vat, paidSoFar);
+                    // Display-only: a "partial" invoice whose recorded payments
+                    // actually settle it reads as paid here. This used to be a
+                    // private "<= R0.01" tolerance that existed on THIS screen
+                    // and nowhere else — which is precisely why Accounting could
+                    // say Paid while Sales said Partly Paid for one invoice. It
+                    // is now the shared, cent-precise settlement rule (the same
+                    // one services.ts stores), so both screens reach the same
+                    // word independently. Note this is slightly STRICTER than the
+                    // old tolerance: a genuine one-cent shortfall now correctly
+                    // stays outstanding instead of being forgiven. Never touches
+                    // inv.status, invoiceStatus, or any stored payment.
+                    const isEffectivelyPaid = inv.status==='partial'
+                      && deriveSettlementStatus(sub+vat, paidSoFar)==='paid';
                     return(
                       <tr key={inv.id} className={`border-b border-gray-50 transition-colors ${isJob?'hover:bg-purple-50 bg-purple-50/30':'hover:bg-blue-50'}`}>
                         <td className="px-4 py-2.5 text-xs font-mono text-gray-600">
