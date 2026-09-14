@@ -12229,6 +12229,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
               // notice only in the defensive case it can't be found (e.g. a
               // race with a delete elsewhere) rather than acting on nothing.
               const manualRec = j._isManual ? myAccInvoices.find(i=>i.id===j.id) : null;
+              // The discount this row states, as the projection derived it —
+              // never re-derived here. Defaulted so a row built before the
+              // projection carried one simply shows nothing.
+              const _rowDiscount = j._discountView || { pct:0, amt:0 };
               return (
                 <div key={j.id} id={'inv-row-'+j.id} className={`bg-white rounded-2xl border p-4 flex items-center gap-4 transition-all ${invHighlight===j.id?'border-brand-500 ring-2 ring-brand-300 shadow-md':isPartial?'border-blue-200':'border-gray-200'}`}>
                   <div className="w-10 h-10 bg-brand-600 rounded-xl flex items-center justify-center text-white font-black text-xs flex-shrink-0">INV</div>
@@ -12237,12 +12241,6 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       <span className="text-xs font-black text-brand-600 font-mono">{j.invoiceNum}</span>
                       <span className={`text-xs font-bold px-2 py-0.5 rounded-full border ${statusBadge}`}>{statusLabel}</span>
                       {hasWriteOff&&<span className={`text-xs font-bold px-2 py-0.5 rounded-full border ${j.writeOff==='warranty'?'bg-purple-100 text-purple-700 border-purple-200':'bg-orange-100 text-orange-700 border-orange-200'}`}>{j.writeOff==='warranty'?'🛡️ Warranty':'🔧 Maintenance'}</span>}
-                      {/* 2026-09-14: the discount this invoice actually carries.
-                          `value` on the right has ALWAYS been the discounted
-                          total — this row simply never said so, while Accounting's
-                          row for the same invoice did. Same badge, same
-                          derivation, both halves of the fact (% and money). */}
-                      <InvoiceDiscountBadge view={j._discountView} fmt={zar}/>
                       <span className="text-xs text-gray-400">{co.short}</span>
                     </div>
                     <div className="flex items-center gap-2 flex-wrap">
@@ -12266,6 +12264,23 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                   <div className="text-right flex-shrink-0">
                     <p className="text-base font-black text-gray-900">{zar(j.value||0)}</p>
                     <p className="text-xs text-gray-400">incl. VAT</p>
+                    {/* ── 2026-09-14 (b): THE DISCOUNT, IN THE FINANCIAL BLOCK ──
+                        The first attempt put this in the header line beside the
+                        status pill, where it reads as just another tag and is
+                        easy to miss. It belongs here, with the numbers it
+                        explains: the amount above is the DISCOUNTED total, and
+                        this is the line that says why. Same shape as the Balance
+                        line directly below, same `zar` formatter, both halves of
+                        the one financial fact — percentage AND money.
+                        `_rowDiscount` is the value the projection already derived
+                        (invoiceDiscountView for a canonical invoice,
+                        jobInvoiceLineItems for a job-derived one); nothing is
+                        recomputed here and no total is touched. */}
+                    {_rowDiscount.pct>0&&(
+                      <p className="text-xs font-semibold text-red-600 mt-0.5">
+                        {`Discount: ${_rowDiscount.pct}% (${zar(_rowDiscount.amt)})`}
+                      </p>
+                    )}
                     {isPartial&&<p className="text-xs font-bold text-blue-600 mt-0.5">Balance: {zar(balance)}</p>}
                   </div>
                   {/* ── INVOICE ACTION CONTRACT (2026-08-24) ──────────────────

@@ -367,8 +367,14 @@ section('8. SOURCE — one derivation, wired into every changed surface');
     'Sales\' canonical-invoice projection carries a derived discount view');
   ok(/_discountView:\{ pct:_disc\.discPct, amt:_disc\.discAmt \}/.test(SRC),
     'Sales\' job projection carries a derived discount view');
-  ok(/<InvoiceDiscountBadge view=\{j\._discountView\} fmt=\{zar\}\/>/.test(SRC),
-    'the Sales invoice row renders the shared badge');
+  // 2026-09-14 (b): the Sales row states the discount in its FINANCIAL block,
+  // beside the total it explains, rather than as a pill in the header line
+  // where it read as just another tag. Accounting's compact table cell keeps
+  // the shared badge. Both still derive from the same _discountView.
+  ok(/const _rowDiscount = j\._discountView \|\| \{ pct:0, amt:0 \};/.test(SRC),
+    'the Sales invoice row reads the derived discount view');
+  ok(SRC.includes('{`Discount: ${_rowDiscount.pct}% (${zar(_rowDiscount.amt)})`}'),
+    'and states it as "Discount: x% (Rn)" — percentage AND money — in its financial block');
   ok(/<InvoiceDiscountBadge view=\{invoiceDiscountView\(inv\)\} fmt=\{fmtAmt\}\/>/.test(SRC),
     'the Accounting invoice row renders the same shared badge');
   ok(/_invDiscountView\.pct>0&&/.test(SRC),

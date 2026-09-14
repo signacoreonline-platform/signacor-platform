@@ -1,7 +1,7 @@
 {
   "name": "signacore-backend",
   "version": "1.0.0",
-  "description": "Signacore Group Platform \u2014 Node.js API",
+  "description": "Signacore Group Platform — Node.js API",
   "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
@@ -82,7 +82,8 @@
     "test:holdings-company-scoped-links": "node test/holdings-company-scoped-links.test.js",
     "test:settlement-status-consistency": "node test/settlement-status-consistency.test.js",
     "test:discount-display-consistency": "node test/discount-display-consistency.test.js",
-    "diagnose:settlement-status-mismatch": "node scripts/diagnose-settlement-status-mismatch.js"
+    "diagnose:settlement-status-mismatch": "node scripts/diagnose-settlement-status-mismatch.js",
+    "test:sales-invoice-list-discount": "node test/sales-invoice-list-discount.render.test.js"
   },
   "dependencies": {
     "@types/archiver": "^6.0.4",

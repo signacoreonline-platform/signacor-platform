@@ -157,8 +157,8 @@ function checkSourceWiring() {
     'the shared invoice-list discount badge shows the percentage AND the money');
   ok(/<InvoiceDiscountBadge view=\{invoiceDiscountView\(inv\)\} fmt=\{fmtAmt\}\/>/.test(html),
     'the Accounting invoice list row draws that shared badge, derived through invoiceDiscountView');
-  ok(/<InvoiceDiscountBadge view=\{j\._discountView\} fmt=\{zar\}\/>/.test(html),
-    'the Sales invoice list row draws the SAME shared badge — it used to draw none');
+  ok(html.includes('{`Discount: ${_rowDiscount.pct}% (${zar(_rowDiscount.amt)})`}'),
+    'the Sales invoice list row states the discount in its financial block, beside Total and Balance — it used to state none');
   ok(/const _discountView = invoiceDiscountView\(i\);/.test(html),
     'Sales\' canonical-invoice projection derives its discount through invoiceDiscountView, not a legacy field');
   ok(/const \{ lineItems, discPct, discAmt \} = jobInvoiceLineItems\(j\);/.test(html) &&
