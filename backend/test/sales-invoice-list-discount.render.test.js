@@ -225,7 +225,7 @@ function renderSalesInvoiceRows(ctx, displayedInvoices){
   return <div className="space-y-2">{${ROW_MAP_SRC}}</div>;
 }
 
-return { buildSalesInvoiceList, renderSalesInvoiceRows };
+return { buildSalesInvoiceList, renderSalesInvoiceRows, jobInvoiceLineItems, invoiceDiscountView };
 `;
 
 let API;
@@ -265,6 +265,10 @@ function financialBlock(markup) {
   }
   return markup.slice(a);
 }
+/** The shared financial derivation, lifted from the same bundle — so the
+ *  Accounting-parity checks below compare against the SHIPPED helper, not a
+ *  re-implementation of it. */
+const API_HELPERS = API;
 const stripTags = (s) => s.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 const NB = ' '; // zar() uses a non-breaking space after R
 
@@ -277,6 +281,175 @@ const canonicalInvoice = (over) => Object.assign({
     { description: 'Discount (10%)', qty: 1, unitAmount: -1000, accountCode: '4000', taxType: '15%' },
   ],
 }, over);
+
+/* ═══════════════════════════════════════════════════════════════════════
+   THE LIVE DEFECT — INV-00057 / SNS-00083 · Signarama Port Elizabeth
+
+   A historical job-derived invoice with NO accounting record. The discount
+   cascade only arrived on 2026-09-07, so this transaction carries its 10% on
+   the JOB (rel_jobs.discount_pct) while its source quote still reads 0.
+
+   Sales rebuilt the total from the QUOTE — (quote subtotal − QUOTE discount
+   + quote setup fee) × 1.15 — which for this shape is the PRE-discount total.
+   Every figure below is the live one reported from the running site.
+   ═══════════════════════════════════════════════════════════════════════ */
+const LIVE = {
+  linesSub: 3853.49,       // quote AND job line subtotal, ex VAT, pre-discount
+  discPct: 10,
+  discAmt: 385.35,         // 3853.49 × 10%
+  exVat: 3468.14,          // 3853.49 − 385.35
+  vat: 520.22,
+  total: 3988.36,          // rel_jobs.value — NUMERIC(14,2)
+  paid: 3500.00,
+  balance: 488.36,
+  wrongTotal: 4431.51,     // 3853.49 × 1.15 — what Sales showed
+  wrongBalance: 931.51,
+};
+function liveFixture() {
+  const quote = { id: 83, num: 'SQ-00083', co: OTHER, convertedJobId: 183,
+    discount: '', setupFee: '', lines: [{ subtotal: LIVE.linesSub }], payments: [],
+    client: 'Signarama Port Elizabeth' };
+  const job = { id: 183, num: 'SNS-00083', co: OTHER, quoteNum: 'SQ-00083',
+    invoiceNum: 'INV-00057', desc: 'Signage', invoiceDate: '2026-07-01', invoiceDue: '2026-07-31',
+    value: LIVE.total, discount: String(LIVE.discPct), setupFee: '',
+    lines: [{ subtotal: LIVE.linesSub }], payments: [{ id: 'p1', amount: LIVE.paid }],
+    client: 'Signarama Port Elizabeth' };
+  return { quote, job };
+}
+/* The removed formula, kept verbatim so this suite proves the fixture really
+   does reproduce the defect — and so the defect can never be reintroduced
+   silently. This is the code that used to run in QuotesPage's jobInvItems. */
+function theRemovedQuoteResync(j, link) {
+  const _sub = (link.lines || []).reduce((s, l) => s + (l.subtotal || 0), 0);
+  const _discPct = parseFloat(link.discount) || 0;
+  const _setupFee = parseFloat(link.setupFee) || 0;
+  const _afterDisc = _sub - _sub * (_discPct / 100) + _setupFee;
+  return Object.assign({}, j, { lines: link.lines, discount: link.discount || '',
+    setupFee: link.setupFee || '', value: _afterDisc * 1.15 });
+}
+
+section('LIVE BEFORE — the fixture reproduces the reported defect exactly');
+{
+  const { quote, job } = liveFixture();
+  const broken = theRemovedQuoteResync(job, quote);
+  ok(Math.abs(broken.value - LIVE.wrongTotal) < 0.005,
+    'the old quote re-sync produces the reported wrong total R4,431.51', broken.value.toFixed(4));
+  ok(Math.abs((broken.value - LIVE.paid) - LIVE.wrongBalance) < 0.005,
+    'and the reported wrong balance R931.51', (broken.value - LIVE.paid).toFixed(4));
+  ok((parseFloat(broken.discount) || 0) === 0,
+    'and it overwrote the job\'s 10% with the quote\'s empty discount — so Sales showed none', broken.discount);
+  ok(String(job.discount) === '10' && Math.abs(job.value - LIVE.total) < 0.005,
+    'while the JOB itself held the correct 10% and R3,988.36 all along');
+}
+
+section('LIVE AFTER — the shipped Sales list now shows the correct figures');
+{
+  const { quote, job } = liveFixture();
+  const r = renderSalesInvoiceList({ myJobs: [job], myQuotes: [quote] });
+  const row = r.displayedInvoices[0];
+  const text = r.text.replace(new RegExp(NB, 'g'), ' ');
+  ok(Math.abs(row.value - LIVE.total) < 0.005, 'Total is R3,988.36', row.value);
+  ok(row._discountView.pct === LIVE.discPct, 'Discount percentage is 10%', row._discountView);
+  ok(Math.abs(row._discountView.amt - LIVE.discAmt) < 0.01, 'Discount amount is R385.35', row._discountView);
+  ok(Math.abs((row.value - LIVE.paid) - LIVE.balance) < 0.005, 'Balance is R488.36', row.value - LIVE.paid);
+  ok(/R\s*3\s*988,36/.test(text), 'the row renders R 3 988,36');
+  ok(/Discount: 10% \(R\s*385,35\)/.test(text), 'the row renders "Discount: 10% (R 385,35)"', text);
+  ok(/Paid: R\s*3\s*500,00/.test(text), 'the row renders Paid R 3 500,00');
+  ok(/Balance: R\s*488,36/.test(text), 'the row renders Balance R 488,36');
+  ok(text.indexOf('4 431,51') === -1 && text.indexOf('931,51') === -1,
+    'and the wrong figures appear nowhere on the row', text);
+  ok(text.indexOf('📜 No accounting record') !== -1,
+    'this is still the historical "No accounting record" representation');
+  ok(row.payments.length === 1 && row.payments[0].amount === LIVE.paid,
+    'the payment is untouched — one row, R3,500.00', row.payments);
+  /* The projected row is also what the row's Print / Edit / Payments buttons
+     receive. buildInvoiceHtml derives its document from job.lines +
+     job.discount + job.setupFee, so those must now be the JOB's own — the same
+     object Jobs, Job Detail and Accounting already hand their own Print. With
+     the quote's fields substituted, this invoice printed at R4,431.51 too. */
+  ok(row.discount === '10', 'the row carries the JOB\'s discount, not the quote\'s', row.discount);
+  ok(JSON.stringify(row.lines) === JSON.stringify(job.lines),
+    'and the JOB\'s own lines — so Print and Edit state the same document', row.lines);
+  const printSub = (row.lines || []).reduce((s, l) => s + (l.subtotal || 0), 0);
+  const printDisc = printSub * ((parseFloat(row.discount) || 0) / 100);
+  const printTotal = (printSub - printDisc + (parseFloat(row.setupFee) || 0)) * 1.15;
+  ok(Math.abs(printTotal - LIVE.total) < 0.01,
+    'the printed invoice therefore totals R3,988.36 as well', printTotal.toFixed(2));
+}
+
+section('LIVE PARITY — Accounting derives the same figures from the same job');
+{
+  const { job } = liveFixture();
+  const ji = API_HELPERS.jobInvoiceLineItems(job);
+  const sub = ji.lineItems.reduce((s, l) => s + l.qty * l.unitAmount, 0);
+  const vat = ji.lineItems.reduce((s, l) => l.taxType === '15%' ? s + l.qty * l.unitAmount * 0.15 : s, 0);
+  ok(ji.canBreakOut === true, 'the reconstruction guard passes — the job\'s lines prove the shape');
+  ok(ji.discPct === LIVE.discPct && Math.abs(ji.discAmt - LIVE.discAmt) < 0.01,
+    'Accounting: 10% / R385.35', { pct: ji.discPct, amt: ji.discAmt });
+  ok(Math.abs(sub - LIVE.exVat) < 0.01, 'Accounting: ex VAT R3,468.14', sub);
+  ok(Math.abs(vat - LIVE.vat) < 0.01, 'Accounting: VAT R520.22', vat);
+  ok(Math.abs(sub + vat - LIVE.total) < 0.01, 'Accounting: total R3,988.36', sub + vat);
+  ok(Math.abs(sub + vat - LIVE.paid - LIVE.balance) < 0.01, 'Accounting: outstanding R488.36');
+  const { quote } = liveFixture();
+  const r = renderSalesInvoiceList({ myJobs: [job], myQuotes: [quote] });
+  ok(Math.abs(r.displayedInvoices[0].value - (sub + vat)) < 0.005,
+    'Sales and Accounting now agree on the total to the cent');
+}
+
+section('HISTORICAL — a discounted job with no line rows left to prove the subtotal');
+{
+  // Same money, but the job's line rows are gone (a genuinely old record).
+  // The pre-discount subtotal is recovered from the job's own value.
+  const job = { id: 184, num: 'SNS-00084', co: OTHER, desc: 'Signage', invoiceNum: 'INV-00058',
+    invoiceDate: '2026-07-01', invoiceDue: '2026-07-31', value: LIVE.total,
+    discount: '10', setupFee: '', lines: [], payments: [{ id: 'p1', amount: LIVE.paid }],
+    client: 'Signarama Port Elizabeth' };
+  const r = renderSalesInvoiceList({ myJobs: [job] });
+  const row = r.displayedInvoices[0];
+  ok(Math.abs(row.value - LIVE.total) < 0.005, 'the total is still the job\'s own R3,988.36', row.value);
+  ok(row._discountView.pct === 10 && Math.abs(row._discountView.amt - LIVE.discAmt) < 0.01,
+    'and the discount is stated as 10% / R385.35 rather than 10% of nothing', row._discountView);
+  const ji = API_HELPERS.jobInvoiceLineItems(job);
+  const tot = ji.lineItems.reduce((s, l) => s + l.qty * l.unitAmount * (l.taxType === '15%' ? 1.15 : 1), 0);
+  ok(Math.abs(tot - LIVE.total) < 0.01, 'and the reconstructed lines still total exactly the job value', tot);
+}
+
+section('SETUP FEE + DISCOUNT — the existing accounting order is preserved');
+{
+  // subtotal 10 000 − 10% + 1 500 setup = 10 500 ex VAT → 12 075 incl.
+  const job = { id: 185, num: 'SNS-00085', co: OTHER, desc: 'Signage', invoiceNum: 'INV-00059',
+    invoiceDate: '2026-09-01', invoiceDue: '2026-10-01', value: 12075,
+    discount: '10', setupFee: '1500', lines: [{ subtotal: 10000 }], payments: [], client: 'Acme' };
+  const ji = API_HELPERS.jobInvoiceLineItems(job);
+  ok(ji.lineItems.length === 3, 'three lines: item, discount, setup fee', ji.lineItems.length);
+  ok(/^Signage/.test(ji.lineItems[0].description) && ji.lineItems[0].unitAmount === 10000,
+    'item line is the PRE-discount subtotal');
+  ok(ji.lineItems[1].description === 'Discount (10%)' && Math.abs(ji.lineItems[1].unitAmount + 1000) < 0.005,
+    'discount is next, negative, off the subtotal only');
+  ok(ji.lineItems[2].description === 'Setup Fee' && ji.lineItems[2].unitAmount === 1500,
+    'setup fee is added after the discount');
+  const r = renderSalesInvoiceList({ myJobs: [job] });
+  const text = r.text.replace(new RegExp(NB, 'g'), ' ');
+  ok(/R\s*12\s*075,00/.test(text), 'and Sales shows R12,075.00 incl. VAT', text);
+  ok(/Discount: 10% \(R\s*1\s*000,00\)/.test(text), 'with the discount stated off the subtotal');
+}
+
+section('ROUNDING — the row shows the stored cent value, not a re-multiplication');
+{
+  // 4970.88 × 1.15 = 5716.512 unrounded; rel_jobs.value NUMERIC(14,2) = 5716.51.
+  const quote = { id: 90, num: 'SQ-00090', co: OTHER, convertedJobId: 91, discount: '', setupFee: '',
+    lines: [{ subtotal: 4970.88 }], payments: [], client: 'Acme' };
+  const job = { id: 91, num: 'SNS-00091', co: OTHER, quoteNum: 'SQ-00090', desc: 'Signage',
+    invoiceNum: 'INV-00060', invoiceDate: '2026-09-01', invoiceDue: '2026-10-01',
+    value: 5716.51, discount: '', setupFee: '', lines: [{ subtotal: 4970.88 }],
+    payments: [{ id: 'p1', amount: 5716.51 }], client: 'Acme' };
+  const r = renderSalesInvoiceList({ myJobs: [job], myQuotes: [quote] });
+  const row = r.displayedInvoices[0];
+  ok(row.value === 5716.51, 'the row value is exactly the stored 5716.51', row.value);
+  ok(Math.abs(4970.88 * 1.15 - 5716.512) < 1e-9 && row.value !== 4970.88 * 1.15,
+    'not the 5716.512 the old re-multiplication produced');
+  ok(row.invoiceStatus === 'paid', 'and a payment of the billed cent figure settles it in full');
+}
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 section('MANDATORY — the element that renders "Balance:" also renders "Discount:"');
@@ -328,12 +501,18 @@ section('CASE B — historical canonical invoice: Discount (10%) line only, no l
 
 section('CASE C — job-derived row, discount from the canonical quote');
 {
+  // 2026-09-14 (c): the job carries `discount` and its own `lines` too. That is
+  // how the platform actually stores a converted job — convertQuoteToJob and
+  // the 2026-09-07 cascade both write discount_pct to rel_jobs as a
+  // synchronised projection. The original fixture left the job's discount empty
+  // and put it only on the quote, which no live record looks like, and that is
+  // why this suite passed while INV-00057 was wrong on screen.
   const quote = { id: 40, num: 'SQ-00040', co: OTHER, convertedJobId: 41, discount: '10', setupFee: '',
     lines: [{ subtotal: 10000 }], payments: [], client: 'Acme Signs' };
   const job = { id: 41, num: 'SNS-00041', co: OTHER, quoteNum: 'SQ-00040', desc: 'Signage',
     invoiceNum: 'INV-00400', invoiceDate: '2026-09-01', invoiceDue: '2026-10-01',
-    value: 10350, discount: '', setupFee: '', lines: [], payments: [{ id: 'p1', amount: 4000 }],
-    client: 'Acme Signs' };
+    value: 10350, discount: '10', setupFee: '', lines: [{ subtotal: 10000 }],
+    payments: [{ id: 'p1', amount: 4000 }], client: 'Acme Signs' };
   const r = renderSalesInvoiceList({ myJobs: [job], myQuotes: [quote] });
   const text = r.text.replace(new RegExp(NB, 'g'), ' ');
   ok(r.displayedInvoices.length === 1, 'one job-derived row is produced');
@@ -367,9 +546,12 @@ section('CASE E — company isolation: the row shows its OWN company\'s discount
     lines: [{ subtotal: 10000 }], payments: [], client: 'Holdings Client' };
   const otherQuote = { id: 102, num: 'SQ-00050', co: OTHER, convertedJobId: 202, discount: '40', setupFee: '',
     lines: [{ subtotal: 10000 }], payments: [], client: 'Other Client' };
+  // The Holdings job carries its OWN 5% (as the platform stores it); the
+  // other company's same-numbered quote carries 40% and must never reach it.
   const holdJob = { id: 201, num: 'SNS-00901', co: HOLD, quoteNum: 'SQ-00050', desc: 'Signage',
     invoiceNum: 'INV-00901', invoiceDate: '2026-09-01', invoiceDue: '2026-10-01',
-    value: 9500 * 1.15, discount: '', setupFee: '', lines: [], payments: [], client: 'Holdings Client' };
+    value: 9500 * 1.15, discount: '5', setupFee: '', lines: [{ subtotal: 10000 }],
+    payments: [], client: 'Holdings Client' };
 
   for (const order of [[otherQuote, holdQuote], [holdQuote, otherQuote]]) {
     const label = order[0] === otherQuote ? 'other-company quote first' : 'Holdings quote first';
@@ -379,8 +561,10 @@ section('CASE E — company isolation: the row shows its OWN company\'s discount
     ok(text.indexOf('40%') === -1 && text.indexOf('4 000,00') === -1,
       'and never the other company\'s 40% / R4,000.00 (' + label + ')', text);
   }
-  // A Holdings job whose quote number exists ONLY under the other company.
-  const orphanJob = Object.assign({}, holdJob, { id: 301, num: 'SNS-00040', invoiceNum: 'INV-00902', value: 11500 });
+  // A Holdings job with NO discount of its own, whose quote number exists only
+  // under the other company — the 40% must not leak in from anywhere.
+  const orphanJob = Object.assign({}, holdJob, { id: 301, num: 'SNS-00040', invoiceNum: 'INV-00902',
+    value: 11500, discount: '', lines: [{ subtotal: 10000 }] });
   const ro = renderSalesInvoiceList({ myJobs: [orphanJob], myQuotes: [otherQuote] });
   ok(ro.text.indexOf('Discount') === -1, 'it borrows no discount from the other company\'s quote');
   ok(/R\s*11\s*500,00/.test(ro.text.replace(new RegExp(NB, 'g'), ' ')), 'and its total is untouched');

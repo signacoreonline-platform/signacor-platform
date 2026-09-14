@@ -83,7 +83,8 @@
     "test:settlement-status-consistency": "node test/settlement-status-consistency.test.js",
     "test:discount-display-consistency": "node test/discount-display-consistency.test.js",
     "diagnose:settlement-status-mismatch": "node scripts/diagnose-settlement-status-mismatch.js",
-    "test:sales-invoice-list-discount": "node test/sales-invoice-list-discount.render.test.js"
+    "test:sales-invoice-list-discount": "node test/sales-invoice-list-discount.render.test.js",
+    "diagnose:job-invoice-discount": "node scripts/diagnose-job-invoice-discount.js"
   },
   "dependencies": {
     "@types/archiver": "^6.0.4",

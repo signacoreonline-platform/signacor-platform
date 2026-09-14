@@ -4045,8 +4045,21 @@ function jobInvoiceLineItems(job){
   // the original incl.-VAT total.
   const valExVat  = val > 0 ? val / 1.15 : 0;
   const discPct   = parseFloat(j.discount) || 0;
-  const jLinesSub = (j.lines||[]).reduce((s,l)=>s+(parseFloat(l&&l.subtotal)||0),0);
   const setupFee  = parseFloat(j.setupFee) || 0;
+  const ownLinesSub = (j.lines||[]).reduce((s,l)=>s+(parseFloat(l&&l.subtotal)||0),0);
+  /* 2026-09-14 (c): a historical job can carry a discount percentage with no
+     line rows left to prove the subtotal it was taken off. The pre-discount
+     subtotal is then recovered from the job's OWN value — the authoritative
+     total — by inverting the very formula that produced it:
+         valExVat = preDisc − preDisc×pct/100 + setupFee
+     so  preDisc  = (valExVat − setupFee) / (1 − pct/100).
+     That is the same arithmetic read backwards, not a second rule, and it is
+     total-preserving by construction. Without it such a job reported a real
+     percentage against R0.00 of money. Jobs that DO have lines are untouched:
+     their own subtotal still wins. */
+  const jLinesSub = (ownLinesSub > 0 || !(discPct > 0) || discPct >= 100)
+    ? ownLinesSub
+    : Math.max(0, (valExVat - setupFee) / (1 - discPct/100));
   const discAmt   = jLinesSub * (discPct/100);
   const reconstructed = jLinesSub - discAmt + setupFee;
   const canBreakOut = discPct>0 && jLinesSub>0 && Math.abs(reconstructed - valExVat) < 0.5;
@@ -10062,14 +10075,36 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const link = resolveQuoteForJob(j, myQuotes);
     let job = j;
     if(link){
-      const _sub      = (link.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
-      const _discPct  = parseFloat(link.discount)||0;
-      const _setupFee = parseFloat(link.setupFee)||0;
-      const _afterDisc= _sub - _sub*(_discPct/100) + _setupFee;
+      /* ── 2026-09-14 (c): THE JOB OWNS ITS OWN MONEY ─────────────────────
+         This re-sync used to overwrite the job's `lines`, `discount`,
+         `setupFee` and — the damaging one — its `value`, rebuilding the total
+         as (quote subtotal − QUOTE discount + quote setup fee) × 1.15.
+
+         That is wrong for any transaction where the quote and the job no
+         longer carry the same discount, which is exactly the historical
+         population: the quote → job → invoice discount cascade only arrived on
+         2026-09-07, so a job discounted before that has discount_pct on the
+         JOB while its source quote still reads 0. INV-00057 / SNS-00083 is one:
+         job.value R3,988.36 with discount_pct 10, source quote discount 0.
+         Rebuilding from the quote produced the PRE-discount total R4,431.51,
+         a balance of R931.51 instead of R488.36, and — because the quote's
+         empty discount was copied over the job's 10% — no discount to display
+         at all. Accounting, the printed invoice and the backend's own
+         assertJobInvoiceMatchesValueTx guard all read the JOB, which is why
+         only Sales was wrong.
+
+         The job's stored value IS the invoice: it is what the customer was
+         billed, what payments are settled against, and what every other
+         surface already uses. So nothing financial is taken from the quote
+         any more. The contact details below stay — those are genuinely
+         quote-owned display fields and were never part of the defect.
+
+         Where quote and job DO agree (every transaction created since the
+         cascade) this changes nothing, except that the total is now the
+         database's own cent-precise value rather than an unrounded
+         re-multiplication of it. */
       job = {
         ...j,
-        lines: link.lines, discount: link.discount||'', setupFee: link.setupFee||'',
-        value: _afterDisc*1.15,
         client: link.client, contact: link.contact||j.contact||'', email: link.email||j.email||'',
         tel: link.tel||j.tel||'', address: link.address||j.address||'', vatNum: link.vatNum||j.vatNum||'',
       };

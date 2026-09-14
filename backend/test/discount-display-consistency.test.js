@@ -141,15 +141,17 @@ const salesManualRow = (i) => ({ value: invTotalOf(i.lineItems), _discountView: 
 
 // Sales → Invoices, job row projection (QuotesPage → jobInvItems), including the
 // company-safe quote re-sync that runs before it.
+// 2026-09-14 (c): the quote re-sync no longer touches the job's money. It used
+// to rebuild `value`/`discount`/`setupFee`/`lines` from the source quote, which
+// produced the PRE-discount total for any transaction whose quote and job carry
+// different discounts — the historical population, and the INV-00057 defect.
+// Only the quote-owned contact fields are re-synced now, so nothing financial
+// is taken from the quote at all.
 function salesJobRow(j, quotes) {
   const link = A.resolveQuoteForJob(j, quotes);
   let job = j;
   if (link) {
-    const _sub = (link.lines || []).reduce((s, l) => s + (l.subtotal || 0), 0);
-    const _discPct = parseFloat(link.discount) || 0;
-    const _setupFee = parseFloat(link.setupFee) || 0;
-    const _afterDisc = _sub - _sub * (_discPct / 100) + _setupFee;
-    job = { ...j, lines: link.lines, discount: link.discount || '', setupFee: link.setupFee || '', value: _afterDisc * 1.15 };
+    job = { ...j, client: link.client };
   }
   const _disc = A.jobInvoiceLineItems(job);
   return { ...job, _discountView: { pct: _disc.discPct, amt: _disc.discAmt } };
@@ -260,17 +262,35 @@ section('CASE 3 — RELATIONAL INVOICE (discount carried by its adjustment line)
     'the Sales row total matches the invoice total exactly', { value: row.value, total: split.total });
 }
 
-section('CASE 4 — JOB/QUOTE-DERIVED INVOICE (canonical quote discount, no invoice record)');
+section('CASE 4 — JOB-DERIVED INVOICE, no invoice record (the job holds the billed facts)');
 {
+  // The quote's percentage is canonical for the CHAIN and is cascaded onto the
+  // job as a synchronised projection — so a converted job carries it too. The
+  // job is what the invoice was raised at, and it is what every surface reads.
   const quote = { id: 40, num: 'SQ-00040', co: OTHER, convertedJobId: 41, discount: '10', setupFee: '',
     lines: [{ subtotal: 10000 }], payments: [] };
   const job = { id: 41, num: 'SNS-00041', co: OTHER, quoteNum: 'SQ-00040', desc: 'Signage',
-    invoiceNum: 'INV-00400', value: 10350, discount: '', setupFee: '', lines: [] };
+    invoiceNum: 'INV-00400', value: 10350, discount: '10', setupFee: '', lines: [{ subtotal: 10000 }] };
 
   const row = salesJobRow(job, [quote]);
-  ok(row._discountView.pct === 10, 'Sales uses the CANONICAL quote percentage, not the job\'s empty one', row._discountView);
-  ok(near(row._discountView.amt, 1000), 'and the money derived from the quote\'s own subtotal');
+  ok(row._discountView.pct === 10, 'Sales states the 10% the job was invoiced at', row._discountView);
+  ok(near(row._discountView.amt, 1000), 'and R1,000.00 off its own subtotal');
   ok(near(row.value, 10350), 'the displayed total is the discounted R10,350.00');
+
+  /* THE HISTORICAL DIVERGENCE — INV-00057's shape. The discount cascade only
+     arrived on 2026-09-07, so an older transaction holds its discount on the
+     JOB while its source quote still reads 0. Sales must show what was billed,
+     which is the job's own value — not a rebuild from the quote, which would
+     produce the PRE-discount total and hide the discount entirely. */
+  const staleQuote = { id: 43, num: 'SQ-00043', co: OTHER, convertedJobId: 44, discount: '', setupFee: '',
+    lines: [{ subtotal: 10000 }], payments: [] };
+  const historicalJob = { id: 44, num: 'SNS-00044', co: OTHER, quoteNum: 'SQ-00043', desc: 'Signage',
+    invoiceNum: 'INV-00404', value: 10350, discount: '10', setupFee: '', lines: [{ subtotal: 10000 }] };
+  const hist = salesJobRow(historicalJob, [staleQuote]);
+  ok(near(hist.value, 10350), 'the historical row shows the DISCOUNTED total, not the quote rebuild', hist.value);
+  ok(!near(hist.value, 11500), 'never the pre-discount R11,500.00 the old re-sync produced');
+  ok(hist._discountView.pct === 10 && near(hist._discountView.amt, 1000),
+    'and states 10% / R1,000.00 rather than the quote\'s empty discount', hist._discountView);
   // With no quote at all the job's own percentage is canonical.
   const soloJob = { id: 42, num: 'SNS-00042', co: OTHER, desc: 'Signage', value: 10350, discount: '10', setupFee: '', lines: [{ subtotal: 10000 }] };
   const solo = salesJobRow(soloJob, []);
@@ -333,8 +353,12 @@ section('CASE 7 — COMPANY ISOLATION (same quote number, different discount)');
 {
   const holdQuote = { id: 101, num: 'SQ-00050', co: HOLD, convertedJobId: 201, discount: '5', setupFee: '', lines: [{ subtotal: 10000 }], payments: [] };
   const otherQuote = { id: 102, num: 'SQ-00050', co: OTHER, convertedJobId: 202, discount: '40', setupFee: '', lines: [{ subtotal: 10000 }], payments: [] };
+  // The Holdings job carries its own synchronised 5% and its own lines, as the
+  // platform stores them. The other company's same-numbered quote carries 40%
+  // and must never reach this job — and now cannot, because nothing financial
+  // is read from a quote at all.
   const holdJob = { id: 201, num: 'SNS-00901', co: HOLD, quoteNum: 'SQ-00050', desc: 'Signage',
-    invoiceNum: 'INV-00901', value: 9500 * 1.15, discount: '', setupFee: '', lines: [] };
+    invoiceNum: 'INV-00901', value: 9500 * 1.15, discount: '5', setupFee: '', lines: [{ subtotal: 10000 }] };
 
   for (const order of [[otherQuote, holdQuote], [holdQuote, otherQuote]]) {
     const row = salesJobRow(holdJob, order);
@@ -418,10 +442,15 @@ section('10. TOTALS — the presentation was split, the total was not');
   }
   // The unproven shape must NOT be broken out — a discount whose lines do not
   // reconstruct the value is stated, never silently re-derived into the total.
+  // 2026-09-14 (c): a discount with no line rows left to prove its subtotal is
+  // now recovered from the job's OWN value by inverting the same formula, so it
+  // is stated as real money instead of a percentage of nothing. The total is
+  // unchanged — asserted immediately above for this very case.
   const unproven = A.jobInvoiceLineItems(cases[3].job);
-  ok(unproven.canBreakOut === false, 'a discount with no proving lines is not broken out');
-  ok(unproven.lineItems.length === 1 && /10% discount applied/.test(unproven.lineItems[0].description),
-    'it is flagged on the single line instead, exactly as before');
+  ok(unproven.canBreakOut === true, 'a discount with no proving lines is recovered from the job value');
+  ok(unproven.lineItems.length === 2 && unproven.lineItems[1].description === 'Discount (10%)',
+    'and broken out as a real Discount (10%) line', unproven.lineItems.map(l => l.description));
+  ok(Math.abs(unproven.discAmt - 1000) < 0.01, 'stating R1,000.00, not R0.00', unproven.discAmt);
 }
 
 /* ── result ─────────────────────────────────────────────────────────────── */
