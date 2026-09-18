@@ -108,6 +108,10 @@ const MASKED = maskForCounting(SRC);
 const WANTED_FNS = [
   // the new shared settlement authority
   'toCents', 'settlementOutstanding', 'deriveSettlementStatus', 'sumPaymentAmounts',
+  // 2026-09-18 (zero-value settlement): deriveSettlementStatus's zero branch
+  // calls this, so it must be lifted alongside it. See
+  // zero-value-settlement.test.js for that repair's own suite.
+  'isGenuineZeroAmount',
   // company-safe chain resolution reconcileJobInvoice depends on
   'companyTagOf', 'sameCompany', 'jobHasId',
   'resolveJobsForQuote', 'resolveJobForQuote', 'resolveQuoteForJob',
@@ -153,17 +157,26 @@ function accountingJobStatus(job, quotes) {
   return rec.invoiceStatus === 'paid' ? 'paid' : rec.invoiceStatus === 'partial' ? 'partial' : 'pending';
 }
 
-// Sales → Invoices, job-derived row (QuotesPage, jobInvItems) — including the
-// long-standing display re-sync that rebuilds `value` from the source quote.
+// Sales → Invoices, job-derived row (QuotesPage, jobInvItems).
+//
+// 2026-09-18 — MIRROR CORRECTION. This mirror still rebuilt `value` from the
+// source quote as (quote subtotal − quote discount + quote setup fee) × 1.15.
+// Shipped Sales stopped doing that in the SAME 2026-09-14 repair this suite
+// covers ("THE JOB OWNS ITS OWN MONEY"): the re-sync now carries quote-owned
+// CONTACT fields only, and the job's stored value IS the invoice. The stale
+// mirror was invisible while a rebuilt total and the job's own total happened
+// to reach the same word; it is corrected here so this suite asserts the code
+// that actually ships. No shipped behaviour changed with this edit — only the
+// test's copy of it.
 function salesJobStatus(j, quotes) {
   const link = A.resolveQuoteForJob(j, quotes);
   let job = j;
   if (link) {
-    const _sub = (link.lines || []).reduce((s, l) => s + (l.subtotal || 0), 0);
-    const _discPct = parseFloat(link.discount) || 0;
-    const _setupFee = parseFloat(link.setupFee) || 0;
-    const _afterDisc = _sub - _sub * (_discPct / 100) + _setupFee;
-    job = { ...j, lines: link.lines, discount: link.discount || '', setupFee: link.setupFee || '', value: _afterDisc * 1.15 };
+    job = {
+      ...j,
+      client: link.client, contact: link.contact || j.contact || '', email: link.email || j.email || '',
+      tel: link.tel || j.tel || '', address: link.address || j.address || '', vatNum: link.vatNum || j.vatNum || '',
+    };
   }
   return A.reconcileJobInvoice(job, quotes).invoiceStatus;
 }
@@ -290,7 +303,18 @@ section('CASE 6 — ROUNDING (the platform money convention, both sides in cents
   ok(salesManualBadge(short) === 'partial', 'Sales keeps it Partly Paid too');
   ok(accountingBadge(short).outstanding === 0.01, 'and states the balance as exactly R0.01, not a sub-cent ghost');
 
-  ok(A.deriveSettlementStatus(0, 0) === 'pending', 'a zero-total document is never "paid"');
+  // 2026-09-18 (ZERO-VALUE SETTLEMENT) — this assertion used to read
+  //   ok(A.deriveSettlementStatus(0, 0) === 'pending', 'a zero-total document is never "paid"');
+  // and it was WRONG about the business, not about the code. Signacore sponsors
+  // signage, so a transaction's authoritative final amount due is legitimately
+  // R0.00 — and R0.00 due against R0.00 received is an outstanding balance of
+  // R0.00, i.e. settled. Requiring a positive total was what made a sponsored
+  // invoice read Unpaid and then Overdue. The expectation is inverted here and
+  // proved in full by zero-value-settlement.test.js; what must NOT change is
+  // that a total which merely failed to parse is not a zero, asserted next.
+  ok(A.deriveSettlementStatus(0, 0) === 'paid', 'a genuine zero-total document IS settled — nothing is due on it');
+  ok(A.deriveSettlementStatus(undefined, 0) === 'pending', 'but a total that failed to hydrate is NOT a settled zero');
+  ok(A.deriveSettlementStatus('', 0) === 'pending', 'nor is an empty value');
   ok(A.deriveSettlementStatus(10000, 12000) === 'paid', 'an overpayment is still paid');
   ok(A.settlementOutstanding(10000, 12000) === 0, 'and never reports a negative balance');
 }

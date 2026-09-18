@@ -9902,13 +9902,65 @@ function toCents(n){ return Math.round((Number(n)||0)*100)/100; }
 function settlementOutstanding(invoiceTotal, paidTotal){
   return toCents(Math.max(0, toCents(invoiceTotal) - toCents(paidTotal)));
 }
+/* ── ZERO-VALUE (SPONSORED) SETTLEMENT — 2026-09-18 ──────────────────────────
+   Signacore sometimes SPONSORS signage. The quote / job / invoice is then
+   legitimately issued with an authoritative final amount due of R0.00. R0.00
+   due against R0.00 received is an outstanding balance of R0.00 — there is no
+   debt, so the transaction is SETTLED the moment it is issued, and it must not
+   read Unpaid, Partial, Outstanding or Overdue on any screen.
+
+   Settlement is derived from the BALANCE, never from inventing a payment:
+   rel_payments stays the one canonical ledger and a sponsored transaction
+   keeps exactly zero payment rows.
+
+   The guard a zero total DOES need is validity, not positivity. The 2026-08-23
+   production cutover repair found a job whose value had FAILED to hydrate
+   (undefined / null / '' / non-numeric) being treated exactly like a genuine
+   sponsored / warranty / no-charge job, because `parseFloat(x)||0` turns a
+   broken value into a perfectly convincing zero. isGenuineZeroAmount is that
+   repair's own test — the same one JobDetail's isZeroValueJob applies to
+   job.value — so a broken total can never be mistaken for a settled one.
+──────────────────────────────────────────────────────────────────────────── */
+// A money value is GENUINELY zero only when it is a valid, FINITE number at or
+// below zero. A failed parse must never qualify. Empty string counts as
+// invalid, not zero, for the same reason (Number('') is 0 in JS, which would
+// otherwise silently accept missing data as "genuinely zero").
+function isGenuineZeroAmount(v){
+  const n = (v === null || v === undefined || v === '') ? NaN : Number(v);
+  return Number.isFinite(n) && n <= 0;
+}
+// The authoritative final total, incl. VAT, of a canonical invoice record, from
+// its own lines — the same sum Sales, Accounting and ViewInvoiceModal already
+// compute inline, in one place so the zero test cannot drift from the column.
+function invoiceLineTotalIncVat(inv){
+  const ls = (inv && inv.lineItems) || [];
+  const sub = ls.reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
+  const vat = ls.reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+  return sub+vat;
+}
+// TRUE only when a canonical invoice record's OWN lines prove its authoritative
+// final amount due is R0.00 — a zero-value (sponsored / warranty / no-charge)
+// invoice, which services.ts writes with no line item at all. A record whose
+// lineItems never hydrated is proof of nothing and never qualifies.
+function invoiceIsZeroValue(inv){
+  return !!inv && Array.isArray(inv.lineItems) && isGenuineZeroAmount(invoiceLineTotalIncVat(inv));
+}
 // THE single settlement rule. Mirrors services.ts's recomputeOwnerPaymentStatus
-// exactly: cent-precise on both sides, 'paid' only against a real positive
-// total, 'partial' whenever money has been received but does not cover it.
+// exactly: cent-precise on both sides, 'partial' whenever money has been
+// received but does not cover the total.
+//
+// 2026-09-18: the rule used to AND a positivity test onto that comparison, so
+// it would never say 'paid' unless the total was above zero — which is why a
+// sponsored R0.00 transaction fell through to 'pending' and Accounting's
+// due-date check then escalated that to 'overdue'. That test is gone: the
+// balance alone decides. Every POSITIVE-total case is byte-identical to before
+// (full, over, part and nil payment each reach exactly the word they did), and
+// a genuinely zero total is now settled.
 function deriveSettlementStatus(invoiceTotal, paidTotal){
   const total = toCents(invoiceTotal);
   const paid  = toCents(paidTotal);
-  if(total > 0 && paid >= total) return 'paid';
+  if(total <= 0) return isGenuineZeroAmount(invoiceTotal) ? 'paid' : (paid > 0 ? 'partial' : 'pending');
+  if(paid >= total) return 'paid';
   if(paid > 0) return 'partial';
   return 'pending';
 }
@@ -9939,7 +9991,14 @@ function reconcileJobInvoice(job, quotes){
   if(link && Array.isArray(link.payments)){
     link.payments.forEach(p=>{ if(p && !seen.has(p.id)){ merged.push(p); seen.add(p.id); } });
   }
-  const invTotal  = parseFloat(job.value)||0;
+  // 2026-09-18 (zero-value settlement): the RAW job value is handed to the
+  // settlement rule, which does its own cent conversion. `parseFloat(x)||0`
+  // laundered a value that had FAILED to hydrate into an indistinguishable
+  // 0 — and a zero total now means "settled", so that laundering would have
+  // made a broken job read Fully Paid. Every valid value behaves identically:
+  // deriveSettlementStatus's own toCents() is the same conversion this line
+  // was performing.
+  const invTotal  = job.value;
   const totalPaid = sumPaymentAmounts(merged);
   // Status is derived ONLY from recorded payments — a stored 'paid' flag is never
   // trusted on its own. An invoice can show Fully Paid only when payments recorded
@@ -10140,8 +10199,19 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // payment rows still reads Partly Paid. Nothing that shows Paid today stops
     // showing Paid.
     const _settled = deriveSettlementStatus(sub+vat, sumPaymentAmounts(i.payments));
-    const normStatus = (i.status==='paid' || _settled==='paid') ? 'paid'
-                     : (_settled==='partial' || i.status==='partial') ? 'partial'
+    // ── 2026-09-18 (zero-value settlement) ──────────────────────────────────
+    // A zero total means "settled" only on an invoice that has actually been
+    // ISSUED with lines proving R0.00 is the final amount due — a sponsored /
+    // warranty / no-charge invoice. Two records must not be swept up by that,
+    // and both keep exactly the reading they had before: a DRAFT (InvoiceModal
+    // creates every new invoice as a draft with one R0.00 line, so "nothing
+    // due" there means "nothing entered yet" — a blank new invoice must never
+    // announce itself as Fully Paid), and a record whose lineItems never
+    // hydrated, which invoiceIsZeroValue refuses to accept as proof of a zero.
+    const _settledForDisplay = (toCents(sub+vat)<=0 && !(i.status!=='draft' && invoiceIsZeroValue(i)))
+                             ? 'pending' : _settled;
+    const normStatus = (i.status==='paid' || _settledForDisplay==='paid') ? 'paid'
+                     : (_settledForDisplay==='partial' || i.status==='partial') ? 'partial'
                      : 'pending';
     // ── 2026-09-14 (discount presentation consistency) ──────────────────────
     // This projection carried no discount of any kind, so the Sales row had
@@ -10906,7 +10976,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // to the linked invoice going forward (resolvePaymentSource), so this
       // never causes a second, independently-editable copy to appear anywhere.
       payments: _paymentsForNewJob.map(p=>({...p})),
-      invoiceStatus: (()=>{ const paid=_paymentsForNewJob.reduce((s,p)=>s+(parseFloat(p.amount)||0),0); const tot=_qAfterDisc*1.15; return paid>=tot&&tot>0?'paid':paid>0?'partial':'pending'; })(),
+      // 2026-09-18: this open-coded copy of the settlement rule carried the
+      // same "requires a positive total" test the shared rule has now dropped,
+      // so a sponsored R0.00 quote was converted into a job stamped 'pending'.
+      // It now calls deriveSettlementStatus itself — one rule, one result. For
+      // every positive total the outcome is byte-identical to the line it
+      // replaces; a genuine R0.00 conversion is seeded 'paid', and no payment
+      // row is created for it.
+      invoiceStatus: deriveSettlementStatus(_qAfterDisc*1.15, sumPaymentAmounts(_paymentsForNewJob)),
     };
     const nextJobs = [newJob,...jobs];
 
@@ -16052,6 +16129,18 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   const numericJobValue = (rawJobValue === null || rawJobValue === undefined || rawJobValue === '') ? NaN : Number(rawJobValue);
   const hasValidJobValue = Number.isFinite(numericJobValue);
   const isZeroValueJob = hasValidJobValue && numericJobValue <= 0;
+  // ── 2026-09-18 (ZERO-VALUE SETTLEMENT) ───────────────────────────────────
+  // The invoice badge below read job.invoiceStatus — the STORED compatibility
+  // field. services.ts stamps rel_jobs.invoice_status 'pending' at the moment
+  // an invoice is created and only ever recomputes it when a PAYMENT changes,
+  // so on a sponsored transaction, which never takes a payment, 'pending' is
+  // what it says forever. This page was the only invoice surface still
+  // believing it: Sales, Accounting and the Sales View all already derive
+  // through reconcileJobInvoice. It now derives too, from the same resolved
+  // (total, paid) pair, so one transaction cannot read Pending here and Fully
+  // Paid two screens away. Read-only — nothing is stored or recomputed, no
+  // historical row is rewritten, and no payment is created.
+  const _jobSettlement = reconcileJobInvoice(job, quotes).invoiceStatus;
   // ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 5 ────────────────────
   // BUSINESS RULE CORRECTION: "payment status must NOT hard-block Job
   // progression." Some clients pay a deposit upfront, some during production,
@@ -17043,10 +17132,12 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
               <div className="flex items-center gap-2 text-xs bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5">
                 <span className="text-gray-400">Invoice:</span>
                 <span className="font-bold text-gray-700">{job.invoiceNum}</span>
-                <span className={`font-semibold px-2 py-0.5 rounded-full text-xs ${job.invoiceStatus==='paid'?'bg-emerald-100 text-emerald-700':job.invoiceStatus==='partial'?'bg-blue-100 text-blue-700':'bg-amber-100 text-amber-700'}`}>
-                  {job.invoiceStatus==='paid'?'✓ Fully Paid':job.invoiceStatus==='partial'?'⏳ Partly Paid':'🕐 Pending'}
+                {/* 2026-09-18: derived (_jobSettlement), not the stored
+                    job.invoiceStatus — see the note beside its declaration. */}
+                <span className={`font-semibold px-2 py-0.5 rounded-full text-xs ${_jobSettlement==='paid'?'bg-emerald-100 text-emerald-700':_jobSettlement==='partial'?'bg-blue-100 text-blue-700':'bg-amber-100 text-amber-700'}`}>
+                  {_jobSettlement==='paid'?'✓ Fully Paid':_jobSettlement==='partial'?'⏳ Partly Paid':'🕐 Pending'}
                 </span>
-                {job.invoiceStatus==='paid'&&job.paidAt&&(
+                {_jobSettlement==='paid'&&job.paidAt&&(
                   <span className="text-gray-400">{job.paidAt}</span>
                 )}
               </div>
@@ -23971,7 +24062,34 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   // getAllInvoicesUnified, which already exclude status==='void'. Void
   // invoices are not deleted or hidden from the data itself, only from this
   // active/counted list.
-  const allInvoices = [...accInvoices.filter(i=>i && i.status!=='void').map(i=>({...i,source:i.source||'manual'})), ...jobInvsFiltered];
+  // ── 2026-09-18 (ZERO-VALUE SETTLEMENT) ──────────────────────────────────
+  // A canonical invoice entered this page with its STORED status verbatim, and
+  // that status is the one thing on this screen the money never corrects: the
+  // pill, the status filter, the Paid / Outstanding counters, the overdue ⚠,
+  // the Aged Debtors list and ViewInvoiceModal's STATUS field all read it. So
+  // a sponsored invoice — authoritative final total R0.00, nothing to pay —
+  // sat here as 'sent', or literally as 'overdue' if anyone had set that
+  // before it was sponsored, with a balance of R0.00 behind it.
+  //
+  // An ISSUED invoice with nothing due is settled, so it is normalised to
+  // 'paid' once, here, where every one of those readers picks it up. Derived
+  // at render time through the SAME shared rule the job-invoice rows and Sales
+  // use — the stored record is not rewritten and NO payment row is created.
+  //
+  // Deliberately the narrowest possible widening. Only a genuine, line-proven
+  // R0.00 total qualifies (invoiceIsZeroValue), drafts are excluded (a blank
+  // new invoice is R0.00 because nothing has been entered into it yet), and
+  // every invoice with a real total keeps its stored status byte-for-byte —
+  // the row's existing 'partial' → Paid rescue below stays the only other
+  // settlement widening on this page, and it is untouched.
+  const allInvoices = [...accInvoices.filter(i=>i && i.status!=='void').map(i=>{
+    const _acc = {...i,source:i.source||'manual'};
+    if(_acc.status!=='draft' && invoiceIsZeroValue(_acc)
+       && deriveSettlementStatus(invoiceLineTotalIncVat(_acc), sumPaymentAmounts(_acc.payments))==='paid'){
+      return {..._acc, status:'paid'};
+    }
+    return _acc;
+  }), ...jobInvsFiltered];
   // Jobs that are invoice-ready but don't have an invoice number yet —
   // informational only, never mixed into allInvoices/exports/counts above.
   const pendingJobInvoicesAcc = getPendingJobInvoices(jobs, accInvoices);
@@ -24432,12 +24550,6 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                   {displayedAccInvoices.map(inv=>{
                     const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
                     const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
-                    const today=new Date(); const due=new Date(inv.dueDate||inv.date);
-                    const overdue=inv.status!=='paid'&&inv.status!=='void'&&today>due;
-                    const isJob = inv.source==='job';
-                    // The real job behind an unbacked historical job invoice —
-                    // the backend target for the two actions that ARE safe here.
-                    const linkedJobForRow = isJob ? (jobs.find(j=>j && j.num===inv.jobNum) || null) : null;
                     // Display-only: how much is still owed on this invoice —
                     // same total (sub+vat) and payments already used elsewhere
                     // in this row, just subtracted. Never changes inv.status
@@ -24447,7 +24559,26 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                     // the invoice was issued at and the customer pays at — so a
                     // fraction of a cent left over from 4-dp line arithmetic is
                     // never shown as a debt of "R 0.00".
+                    // 2026-09-18: hoisted above the overdue test below, which
+                    // now needs it. The computation is unchanged.
                     const outstanding = settlementOutstanding(sub+vat, paidSoFar);
+                    const today=new Date(); const due=new Date(inv.dueDate||inv.date);
+                    // 2026-09-18 (ZERO-VALUE SETTLEMENT): overdue means the due
+                    // date has passed AND money is still owed. This test asked
+                    // only about the date, so a sponsored invoice with an
+                    // outstanding balance of R0.00 was flagged overdue purely
+                    // for being old — a debt that does not exist at any
+                    // precision a bank can transfer. `outstanding` is the
+                    // cent-precise balance, so an invoice with a real one owing
+                    // is flagged exactly as before, and a settled or
+                    // zero-value one no longer can be. Supplier BILLS keep
+                    // their own unchanged date-only test further down: this
+                    // repair is customer-side only.
+                    const overdue=inv.status!=='paid'&&inv.status!=='void'&&today>due&&outstanding>0;
+                    const isJob = inv.source==='job';
+                    // The real job behind an unbacked historical job invoice —
+                    // the backend target for the two actions that ARE safe here.
+                    const linkedJobForRow = isJob ? (jobs.find(j=>j && j.num===inv.jobNum) || null) : null;
                     // Display-only: a "partial" invoice whose recorded payments
                     // actually settle it reads as paid here. This used to be a
                     // private "<= R0.01" tolerance that existed on THIS screen
