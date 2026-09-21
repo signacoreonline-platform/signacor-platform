@@ -146,6 +146,44 @@ async function saveQuote(quoteId: number, patch: any, opts: any = {}) {
   return services.updateQuoteWithJobSync(quoteId, await qv(quoteId), patch, opts);
 }
 
+/* ═════════════════════════════════════════════════════════════════════════════
+   TWO PATHS, AND WHY THE FINANCIAL CASES BELOW TAKE THE SECOND ONE
+   (2026-09-21 — converted-Quote financial divergence guard)
+
+   1. THE ORDINARY PRODUCTION PATH — no flag.
+      PUT /quotes/:id → updateQuoteWithJobSync with no opts. A converted
+      Quote's financial edit now REFUSES with a BusinessRuleError, and rolls
+      the whole chain back, when the resulting rel_jobs.value would no longer
+      agree with the Job's OWN rel_job_line_items. rel_jobs.value is
+      quote-owned and cascades; rel_job_line_items is production-owned and
+      does not (BLOCKER 2, 2026-08-24). Letting the two drift is what produced
+      SNS-00128: R24,963.62 declared against R16,044.80 of job lines, found
+      months later when the job could no longer be invoiced at all.
+
+      THAT behaviour is owned by
+          relational.converted-quote-value-divergence.stress.ts
+      and is NOT weakened here. The [guard] block at the end of this file
+      re-proves it on this suite's own fixture so the distinction is visible
+      in the place a reader will look for it.
+
+   2. THE EXPLICIT SERVICE-LEVEL RESYNC — `RESYNC` below.
+      `opts.resyncJobLines === true` is the one way to ask for the Quote's
+      lines to be pushed onto the Job in the same transaction. It is a SERVICE
+      capability only: api.ts:168 strips it at the HTTP boundary and no route
+      forwards it, so nothing a browser can send reaches it. With the Job's
+      lines moving too, the Job still reconciles and the cascade is allowed.
+
+   WHICH CASES USE IT. Only the ones whose PURPOSE is to verify an intentional
+   Quote → Job → Invoice FINANCIAL synchronisation — i.e. a case that changes
+   the transaction's money and then asserts the linked invoice followed.
+   Everything else stays on the ordinary path, including every
+   description-only, dimension-only, reorder-only, header-only and identical
+   re-save, because those change no money and must NOT be refused. Several of
+   them are now doing double duty: they also prove the new guard does not
+   over-block.
+   ═════════════════════════════════════════════════════════════════════════════ */
+const RESYNC = { resyncJobLines: true };
+
 // ── THE INV-00117 CONTROL FIXTURE ───────────────────────────────────────────
 // The real commercial shape: 1300 × 295 mm, 25 pieces, 0.3835 m² each, R550/m²,
 // R250 setup fee, no discount. Effective billable 9.5875 m²; line R5,273.13;
@@ -195,26 +233,30 @@ async function main() {
   {
     await reset();
     const c = await makeChain({ lines: [CTRL_LINE], setupFee: CTRL_SETUP, invoiceFrom: 'job' });
-    // [2] pieces 25 → 30
-    await saveQuote(c.quoteId, { lines: [toPatchLine({ ...CTRL_LINE, pieces: 30 })] });
+    // [2] pieces 25 → 30 — FINANCIAL: 9.5875 → 11.5050 billable. Explicit
+    // resync, so the Job's own lines move with the Quote's and the Job stays
+    // internally consistent. See the two-paths note above.
+    await saveQuote(c.quoteId, { lines: [toPatchLine({ ...CTRL_LINE, pieces: 30 })] }, RESYNC);
     let l = (await invLines(c.invoiceId!))[0];
     ok(cents(l.qty) === cents(30 * 0.3835), '[2] pieces 25→30: effective billable qty is 30 × 0.3835 = 11.5050', String(l.qty));
     ok(Number(l.legacy_data.pQty) === 30, '[2] …and the customer-facing PIECE COUNT is 30', l.legacy_data);
     ok(Number(l.legacy_data.pieceQty) === 0.3835, '[2] …while the PER-PIECE quantity is still 0.3835');
-    // [3] dimensions 1300×295 → 1500×400
+    // [3] dimensions 1300×295 → 1500×400 — ORDINARY PATH, deliberately. A
+    // dimension is presentation: the money does not move, so the converted-Job
+    // guard must not refuse it. This case now also proves that.
     await saveQuote(c.quoteId, { lines: [toPatchLine({ ...CTRL_LINE, pieces: 30, sqmL: 1500, sqmW: 400 })] });
     l = (await invLines(c.invoiceId!))[0];
     ok(Number(l.legacy_data.sqmL) === 1500 && Number(l.legacy_data.sqmW) === 400,
       '[3] dimension edit reaches the invoice', l.legacy_data);
     ok(Number(l.legacy_data.sqmL) === 1500 && String(l.legacy_data.sqmL) === '1500',
       '[3] …as a plain number, so a document never prints "1500.0000"', String(l.legacy_data.sqmL));
-    // [4] per-piece qty 0.3835 → 0.6
-    await saveQuote(c.quoteId, { lines: [toPatchLine({ ...CTRL_LINE, pieces: 30, sqmL: 1500, sqmW: 400, qty: 0.6 })] });
+    // [4] per-piece qty 0.3835 → 0.6 — FINANCIAL, explicit resync.
+    await saveQuote(c.quoteId, { lines: [toPatchLine({ ...CTRL_LINE, pieces: 30, sqmL: 1500, sqmW: 400, qty: 0.6 })] }, RESYNC);
     l = (await invLines(c.invoiceId!))[0];
     ok(cents(l.qty) === cents(18), '[4] per-piece qty edit: 30 × 0.6 = 18.0000 effective', String(l.qty));
     ok(Number(l.legacy_data.pieceQty) === 0.6, '[4] …and the per-piece figure follows it');
-    // [5] price 550 → 600
-    await saveQuote(c.quoteId, { lines: [toPatchLine({ ...CTRL_LINE, pieces: 30, sqmL: 1500, sqmW: 400, qty: 0.6, unitPrice: 600 })] });
+    // [5] price 550 → 600 — FINANCIAL, explicit resync.
+    await saveQuote(c.quoteId, { lines: [toPatchLine({ ...CTRL_LINE, pieces: 30, sqmL: 1500, sqmW: 400, qty: 0.6, unitPrice: 600 })] }, RESYNC);
     l = (await invLines(c.invoiceId!))[0];
     ok(cents(l.unit_amount) === cents(600), '[5] unit price edit reaches the invoice', String(l.unit_amount));
     const t = await invoiceTotals(c.invoiceId!);
@@ -230,17 +272,20 @@ async function main() {
     const c = await makeChain({ lines: [CTRL_LINE], setupFee: CTRL_SETUP, invoiceFrom: 'job' });
     let lines = await invLines(c.invoiceId!);
     ok(lines.length === 2 && lines[1].description === 'Design & Setup Fee', 'starts with one item + the setup fee line');
-    await saveQuote(c.quoteId, { lines: [toPatchLine(CTRL_LINE)], setupFee: 400 });
+    // [6],[7] — FINANCIAL: the setup fee and the discount are document-level
+    // money and cascade onto the Job. All four saves in this block therefore
+    // take the explicit resync path.
+    await saveQuote(c.quoteId, { lines: [toPatchLine(CTRL_LINE)], setupFee: 400 }, RESYNC);
     lines = await invLines(c.invoiceId!);
     ok(lines.length === 2 && cents(lines[1].unit_amount) === cents(400), '[6] setup fee 250→400 reaches the invoice', lines[1]);
-    await saveQuote(c.quoteId, { lines: [toPatchLine(CTRL_LINE)], setupFee: 0 });
+    await saveQuote(c.quoteId, { lines: [toPatchLine(CTRL_LINE)], setupFee: 0 }, RESYNC);
     lines = await invLines(c.invoiceId!);
     ok(lines.length === 1, '[6] setup fee → 0 REMOVES its adjustment line, leaving no orphan', lines.map((r: any) => r.description));
-    await saveQuote(c.quoteId, { lines: [toPatchLine(CTRL_LINE)], setupFee: 0, discountPct: 10 });
+    await saveQuote(c.quoteId, { lines: [toPatchLine(CTRL_LINE)], setupFee: 0, discountPct: 10 }, RESYNC);
     lines = await invLines(c.invoiceId!);
     ok(lines.length === 2 && /^Discount \(10%\)$/.test(lines[1].description) && Number(lines[1].unit_amount) < 0,
       '[7] a discount arrives as its own NEGATIVE adjustment line', lines[1]);
-    await saveQuote(c.quoteId, { lines: [toPatchLine(CTRL_LINE)], setupFee: 300, discountPct: 10 });
+    await saveQuote(c.quoteId, { lines: [toPatchLine(CTRL_LINE)], setupFee: 300, discountPct: 10 }, RESYNC);
     lines = await invLines(c.invoiceId!);
     ok(lines.length === 3 && /Discount/.test(lines[1].description) && lines[2].description === 'Design & Setup Fee',
       '[7] discount then setup fee, in the creation order', lines.map((r: any) => r.description));
@@ -257,13 +302,16 @@ async function main() {
     const C: LineSpec = { description: 'Line C', qty: 1, unitPrice: 900, pieces: 1, unit: 'ea' };
     const c = await makeChain({ lines: [A, B], invoiceFrom: 'job' });
     ok((await invLines(c.invoiceId!)).length === 2, 'starts with two lines');
-    await saveQuote(c.quoteId, { lines: [A, B, C].map(toPatchLine) });
+    // [8],[9] — FINANCIAL: adding and removing a line changes the total.
+    await saveQuote(c.quoteId, { lines: [A, B, C].map(toPatchLine) }, RESYNC);
     let lines = await invLines(c.invoiceId!);
     ok(lines.length === 3 && lines[2].description === 'Line C', '[8] an added quote line appears on the invoice', lines.map((r: any) => r.description));
-    await saveQuote(c.quoteId, { lines: [A, C].map(toPatchLine) });
+    await saveQuote(c.quoteId, { lines: [A, C].map(toPatchLine) }, RESYNC);
     lines = await invLines(c.invoiceId!);
     ok(lines.length === 2 && !lines.some((r: any) => r.description === 'Line B'),
       '[9] a deleted quote line is REMOVED from the invoice, not left behind', lines.map((r: any) => r.description));
+    // [10] — ORDINARY PATH: a reorder is the same two lines in the other
+    // order, so the total is identical and the guard must not refuse it.
     await saveQuote(c.quoteId, { lines: [C, A].map(toPatchLine) });
     lines = await invLines(c.invoiceId!);
     ok(lines[0].description === 'Line C' && lines[1].description === 'Line A',
@@ -311,9 +359,14 @@ async function main() {
   console.log('\n[15-20] payments are never altered; only the derived status moves');
   {
     await reset();
+    // [15]-[19] — FINANCIAL by design: the whole point of these cases is to
+    // move the invoice's total and prove the PAYMENT ROWS do not move with it.
+    // They therefore take the explicit resync path, so the Job's own lines
+    // follow the Quote and the Job stays internally consistent while its total
+    // changes. No payment row is read, written or considered by the guard.
     // [15] no payment
     const c0 = await makeChain({ lines: [{ description: 'X', qty: 1, unitPrice: 1000, pieces: 1, unit: 'ea' }], invoiceFrom: 'job' });
-    await saveQuote(c0.quoteId, { lines: [toPatchLine({ description: 'X', qty: 1, unitPrice: 1100, pieces: 1, unit: 'ea' })] });
+    await saveQuote(c0.quoteId, { lines: [toPatchLine({ description: 'X', qty: 1, unitPrice: 1100, pieces: 1, unit: 'ea' })] }, RESYNC);
     ok((await payRows(c0.invoiceId!)).length === 0, '[15] an invoice with no payment stays payment-free');
 
     // [16,18] full payment, then the invoice grows
@@ -324,7 +377,7 @@ async function main() {
     let inv = await invRow(c1.invoiceId!);
     ok(inv.status === 'paid', '[16] a fully-paid invoice is paid', inv.status);
     const payBefore = await payRows(c1.invoiceId!);
-    await saveQuote(c1.quoteId, { lines: [toPatchLine({ description: 'X', qty: 1, unitPrice: 1200, pieces: 1, unit: 'ea' })] });
+    await saveQuote(c1.quoteId, { lines: [toPatchLine({ description: 'X', qty: 1, unitPrice: 1200, pieces: 1, unit: 'ea' })] }, RESYNC);
     const payAfter = await payRows(c1.invoiceId!);
     ok(JSON.stringify(payBefore) === JSON.stringify(payAfter),
       '[18] the payment row is byte-identical after the invoice grows — id, amount, date, method, reference');
@@ -334,7 +387,7 @@ async function main() {
     ok(cents(t1.total - money(total1)) === cents(200 * 1.15), '[18] …with a real balance of the difference', money(t1.total - money(total1)));
 
     // [19] the invoice shrinks back to at or below the payment
-    await saveQuote(c1.quoteId, { lines: [toPatchLine({ description: 'X', qty: 1, unitPrice: 900, pieces: 1, unit: 'ea' })] });
+    await saveQuote(c1.quoteId, { lines: [toPatchLine({ description: 'X', qty: 1, unitPrice: 900, pieces: 1, unit: 'ea' })] }, RESYNC);
     inv = await invRow(c1.invoiceId!);
     ok(inv.status === 'paid', '[19] shrinking below the payment returns it to paid', inv.status);
     ok(JSON.stringify(await payRows(c1.invoiceId!)) === JSON.stringify(payBefore), '[19] …still without touching the payment row');
@@ -343,7 +396,7 @@ async function main() {
     await reset();
     const c2 = await makeChain({ lines: [{ description: 'Y', qty: 1, unitPrice: 2000, pieces: 1, unit: 'ea' }], invoiceFrom: 'job' });
     await services.recordPayment({ type: 'invoice', id: c2.invoiceId! }, 500, { method: 'EFT' });
-    await saveQuote(c2.quoteId, { lines: [toPatchLine({ description: 'Y', qty: 1, unitPrice: 2100, pieces: 1, unit: 'ea' })] });
+    await saveQuote(c2.quoteId, { lines: [toPatchLine({ description: 'Y', qty: 1, unitPrice: 2100, pieces: 1, unit: 'ea' })] }, RESYNC);
     ok((await invRow(c2.invoiceId!)).status === 'partial', '[17] a partly-paid invoice stays partial');
 
     // [20] cent precision — the deployed rule, not a tolerance
@@ -354,6 +407,9 @@ async function main() {
     await services.recordPayment({ type: 'invoice', id: c3.invoiceId! }, 6351.59, { method: 'EFT' });
     ok((await invRow(c3.invoiceId!)).status === 'paid',
       '[20] R6,351.59 settles a raw 6351.59375 invoice — the cent-precision fix still holds');
+    // [20] — ORDINARY PATH: an identical re-save moves no money at all, so the
+    // guard exempts it on the "value is not changing" test and it must still
+    // reach the invoice-sync code exactly as before.
     await saveQuote(c3.quoteId, { lines: [toPatchLine(CTRL_LINE)], setupFee: CTRL_SETUP });
     ok((await invRow(c3.invoiceId!)).status === 'paid', '[20] …and a no-op resync does not disturb it');
   }
@@ -544,6 +600,62 @@ async function main() {
   }
 
   // ══ 28,29,30 — nothing deployed regressed ═════════════════════════════════
+  // ══ guard — THE TWO PATHS, SIDE BY SIDE ═══════════════════════════════════
+  // This suite now drives its FINANCIAL cases through the explicit
+  // service-level resync. That must never be read as "a converted Quote can be
+  // repriced freely". It cannot — not over HTTP, and not without the flag. The
+  // same edit is run both ways here, on this suite's own fixture, so the
+  // distinction is stated in the file that relies on it.
+  //
+  // Full coverage of the refusal (rollback, row_version, payments, zero-value,
+  // migration-013, company isolation) lives in
+  // relational.converted-quote-value-divergence.stress.ts.
+  console.log('\n[guard] the SAME financial edit: refused on the ordinary path, allowed with an explicit resync');
+  {
+    await reset();
+    const c = await makeChain({ lines: [CTRL_LINE], setupFee: CTRL_SETUP, invoiceFrom: 'job' });
+    const jobValueBefore = await jobValue(c.jobId!);
+    const jobLinesQ = 'SELECT line_index, qty, unit_price, pieces FROM rel_job_line_items WHERE job_id=$1 ORDER BY line_index';
+    const jobLinesBefore = JSON.stringify((await pool.query(jobLinesQ, [c.jobId])).rows);
+    const invBefore = JSON.stringify(await invLines(c.invoiceId!));
+    const quoteVerBefore = await qv(c.quoteId);
+    const payBefore = JSON.stringify((await pool.query('SELECT * FROM rel_payments ORDER BY id')).rows);
+
+    // (a) ORDINARY PATH — this is what a browser can actually send.
+    const priced = { lines: [toPatchLine({ ...CTRL_LINE, unitPrice: 900 })], setupFee: CTRL_SETUP };
+    let refused: any = null;
+    try { await saveQuote(c.quoteId, priced); } catch (e) { refused = e; }
+    ok(refused instanceof services.BusinessRuleError,
+      '[guard] a converted-Quote reprice WITHOUT the flag is refused — the production path is unchanged',
+      refused && String(refused.message).slice(0, 160));
+    ok(cents(await jobValue(c.jobId!)) === cents(jobValueBefore), '[guard] …job.value unchanged', [jobValueBefore, await jobValue(c.jobId!)]);
+    ok(jobLinesBefore === JSON.stringify((await pool.query(jobLinesQ, [c.jobId])).rows), '[guard] …job line items unchanged');
+    ok(invBefore === JSON.stringify(await invLines(c.invoiceId!)), '[guard] …the linked invoice was NOT rebuilt');
+    ok((await qv(c.quoteId)) === quoteVerBefore, '[guard] …and the quote row_version did not move — no partial chain save');
+    ok(payBefore === JSON.stringify((await pool.query('SELECT * FROM rel_payments ORDER BY id')).rows),
+      '[guard] …rel_payments byte-identical');
+
+    // (b) EXPLICIT SERVICE-LEVEL RESYNC — the preserved internal capability.
+    const r = await saveQuote(c.quoteId, priced, RESYNC);
+    ok(r.invoice.reason === 'synced', '[guard] the SAME edit WITH resyncJobLines synchronises the chain', r.invoice);
+    const jl = (await pool.query('SELECT qty, unit_price FROM rel_job_line_items WHERE job_id=$1 ORDER BY line_index', [c.jobId])).rows;
+    ok(cents(jl[0].unit_price) === cents(900), '[guard] …the Job’s own lines moved with the Quote', String(jl[0].unit_price));
+    const gt = await invoiceTotals(c.invoiceId!);
+    const gj = await jobValue(c.jobId!);
+    ok(cents(gt.total) === cents(gj),
+      '[guard] …so the Job reconciles and the invoice equals the job value', { inv: gt.total, job: gj });
+    ok(payBefore === JSON.stringify((await pool.query('SELECT * FROM rel_payments ORDER BY id')).rows),
+      '[guard] …and rel_payments is still byte-identical');
+
+    // (c) The capability is service-level ONLY. Nothing a browser sends can
+    //     reach it.
+    const apiSrc = fs.readFileSync(API_TS_PATH, 'utf8');
+    ok(/resyncJobLines: _rsjl/.test(apiSrc),
+      '[guard] PUT /quotes/:id still STRIPS resyncJobLines — the flag used above has no HTTP surface');
+    ok(!/resyncJobLines:\s*(true|req\.body)/.test(apiSrc),
+      '[guard] …and no route sets or forwards it');
+  }
+
   console.log('\n[28,29,30] the deployed work is intact');
   {
     const src = fs.readFileSync(SERVICES_TS_PATH, 'utf8');
@@ -555,6 +667,10 @@ async function main() {
       '[28] synchronisation reuses the CREATION writer rather than a second mapping');
     ok(src.indexOf('if (finalLines && opts.resyncJobLines === true)') !== -1,
       'BLOCKER 2 is intact — a quote save still cannot rewrite production job lines');
+    ok(src.indexOf('await assertConvertedJobValueConsistencyTx(') !== -1,
+      'the converted-Job financial consistency guard is wired into updateQuoteWithJobSync');
+    ok(/const SOURCE_TOTAL_TOLERANCE = 0\.05;/.test(src),
+      'SOURCE_TOTAL_TOLERANCE is unchanged at 0.05 — the guard reads it, it does not redefine it');
     const api = fs.readFileSync(API_TS_PATH, 'utf8');
     ok(/resyncJobLines: _rsjl/.test(api), 'resyncJobLines is still stripped at the HTTP boundary');
     ok(/expectedInvoiceVersion/.test(api), 'expectedInvoiceVersion is forwarded so a stale invoice is detectable');

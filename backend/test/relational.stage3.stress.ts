@@ -131,10 +131,16 @@ async function testQuoteEditingAndSync() {
   const jobId = conv.jobId;
   const quoteVersionAfterConvert = plainPatch.rowVersion + 1;
 
+  // ── SECTION A — NON-FINANCIAL CASCADE (BLOCKER 2 CONTRACT) ─────────────
+  // The header cascade, exercised with the lines RESENT VERBATIM — which is
+  // exactly what the shipped frontend patch does on every quote save
+  // (index.html builds `lines` unconditionally). The job's declared value is
+  // therefore unchanged by this save, and the display-field cascade is proved
+  // without creating a divergence.
   const syncPatch = await services.updateQuoteWithJobSync(quote.id, quoteVersionAfterConvert, {
     contactPerson: 'Jane Doe', email: 'jane@test.com', phone: '0821234567',
     address: '1 Main Rd', vatNumber: 'VAT123', notes: 'Rush job',
-    lines: [{ desc: 'Sign (rush)', qty: 3, unitPrice: 1000 }], discountPct: 5, setupFee: 0,
+    lines: [{ desc: 'Sign', qty: 2, unitPrice: 1000 }], discountPct: 10, setupFee: 50,
   });
   ok(String(syncPatch.jobId) === String(jobId), 'sync result correctly identifies the linked job', { syncPatchJobId: syncPatch.jobId, jobId });
   ok(!!syncPatch.jobRowVersion, 'linked job row_version bumped by the cascade');
@@ -151,11 +157,42 @@ async function testQuoteEditingAndSync() {
   // EVERY save, so an unrelated quote edit destroyed production lines added to
   // the job after conversion. An ordinary quote save now leaves the job's lines
   // exactly as conversion left them (qty 2, from the plain edit above); the
-  // display-field cascade below is unaffected.
+  // display-field cascade above is unaffected.
   ok(jobAfterSync.lines.length === 1 && jobAfterSync.lines[0].qty === 2,
     'an ordinary quote save leaves the job\'s own line items untouched (production owns them after conversion)', jobAfterSync.lines);
-  // subtotal=3000, disc 5% = 150, afterDisc=2850, *1.15 = 3277.5
-  ok(Math.abs(jobAfterSync.value - 3277.5) < 0.01, 'cascade recomputed job.value = afterDisc*1.15 from the quote\'s NEW totals', jobAfterSync.value);
+  // subtotal=2000, disc 10% = 200, afterDisc=1850, *1.15 = 2127.5 — the value
+  // the job already carried, so this save changed no money at all.
+  ok(Math.abs(jobAfterSync.value - 2127.5) < 0.01,
+    'a header-only cascade leaves job.value exactly where it was — nothing financial moved', jobAfterSync.value);
+
+  // ── SECTION B — CONVERTED-QUOTE FINANCIAL DIVERGENCE IS REFUSED ────────
+  // (2026-09-21) This block previously asserted the OPPOSITE: it pushed the
+  // quote to qty 3 @ R1,000 less 5% and then asserted job.value === 3277.5
+  // while the job's own lines were still qty 2 — a job declaring R3,277.50 and
+  // supporting R2,185.00. That is the SNS-00128 defect in miniature, and it was
+  // a shipped, green assertion. The value cascade is now refused when it would
+  // leave the job inconsistent with its own lines. Full coverage of the new
+  // rule lives in relational.converted-quote-value-divergence.stress.ts; what
+  // is pinned HERE is that this cascade, on this path, refuses and writes
+  // nothing.
+  const jobBeforeRefusal = (await buildJobsJson()).find((j) => j._relId === jobId);
+  const quoteVerBeforeRefusal = (await pool.query('SELECT row_version FROM rel_quotes WHERE id=$1', [quote.id])).rows[0].row_version;
+  const jobVerBeforeRefusal = (await pool.query('SELECT row_version FROM rel_jobs WHERE id=$1', [jobId])).rows[0].row_version;
+  let divergenceRefused = false, divergenceMsg = '';
+  try {
+    await services.updateQuoteWithJobSync(quote.id, quoteVerBeforeRefusal, {
+      lines: [{ desc: 'Sign (rush)', qty: 3, unitPrice: 1000 }], discountPct: 5, setupFee: 0,
+    });
+  } catch (e: any) { divergenceRefused = e instanceof services.BusinessRuleError; divergenceMsg = String(e && e.message); }
+  ok(divergenceRefused,
+    'a converted-quote financial edit that would leave the job inconsistent with its own lines is refused', divergenceMsg.slice(0, 200));
+  const jobAfterRefusal = (await buildJobsJson()).find((j) => j._relId === jobId);
+  ok(Math.abs(jobAfterRefusal.value - jobBeforeRefusal.value) < 0.001, 'job.value unchanged by the refused save', [jobBeforeRefusal.value, jobAfterRefusal.value]);
+  ok(jobAfterRefusal.lines.length === 1 && jobAfterRefusal.lines[0].qty === 2, 'job line items unchanged by the refused save', jobAfterRefusal.lines);
+  ok(Number((await pool.query('SELECT row_version FROM rel_quotes WHERE id=$1', [quote.id])).rows[0].row_version) === Number(quoteVerBeforeRefusal),
+    'quote row_version NOT partially advanced');
+  ok(Number((await pool.query('SELECT row_version FROM rel_jobs WHERE id=$1', [jobId])).rows[0].row_version) === Number(jobVerBeforeRefusal),
+    'job row_version NOT partially advanced');
 
   // Quote's own status/convertedJobId must never be revertible through this path.
   const quotesAfterSync = await buildQuotesJson();
@@ -166,7 +203,14 @@ async function testQuoteEditingAndSync() {
   // rejected. The quote's version here (quoteVersionAfterConvert + 1, after
   // syncPatch's own bump) is the CORRECT current one — only the job's
   // asserted version (1) is stale (the cascade already bumped it to 2).
-  const quoteVersionAfterSync = quoteVersionAfterConvert + 1;
+  // Read LIVE rather than computed: Section B's refusal advances nothing, so
+  // quoteVersionAfterConvert + 1 is still correct today — but a version read
+  // from the row cannot be silently invalidated by a later insertion above.
+  const quoteVersionAfterSync = Number(
+    (await pool.query('SELECT row_version FROM rel_quotes WHERE id=$1', [quote.id])).rows[0].row_version
+  );
+  ok(quoteVersionAfterSync === quoteVersionAfterConvert + 1,
+    'exactly ONE quote save has landed since conversion — the refused one wrote nothing', quoteVersionAfterSync);
   let jobStaleBlocked = false;
   try {
     await services.updateQuoteWithJobSync(quote.id, quoteVersionAfterSync, { notes: 'another edit' }, { expectedJobVersion: 1 /* stale — actual is 2 */ });

@@ -18451,11 +18451,32 @@ function EditCompleteProductModal({ cp, completeProducts, setCompleteProducts, q
             setQuotes(quotesUpdater);
             syncRelationalBaseline('quotes', quotesUpdater);
           } catch(e){
-            failures.push(q.num||q.id);
+            // 2026-09-21 — MESSAGE ONLY. The repricing logic, which quotes are
+            // selected and what is sent are all unchanged; only what the user
+            // is TOLD about a failure changes. A converted quote whose linked
+            // job's own line items no longer support the new value is now
+            // refused by services.ts's converted-job consistency guard, and
+            // "could NOT be updated automatically" hides the one thing the
+            // user needs (which job to review). classifySaveError already
+            // returns a business-rule refusal's own words verbatim, so the
+            // server's actionable sentence is simply carried through here —
+            // for every failure reason, not just the new guard.
+            failures.push({ ref: q.num||q.id, reason: describeSaveConflictError(e, 'quote') });
           }
         }
         if(failures.length){
-          alert('Product saved, but these linked quotes could NOT be updated automatically: '+failures.join(', ')+'.\n\nOpen and re-save them manually to apply the new price.');
+          const _anyReason = failures.some(f=>f&&f.reason);
+          alert('Product saved, but these linked quotes could NOT be updated automatically:\n\n'
+            + failures.map(f=>{
+                const _ref = (f&&f.ref!=null) ? f.ref : f;
+                let _why = (f&&f.reason) ? String(f.reason).replace(/[ \t]+/g,' ').trim() : '';
+                if(_why.length>600) _why = _why.slice(0,600)+'…';
+                return '• '+_ref+(_why ? '\n'+_why : '');
+              }).join('\n\n')
+            + '\n\nThe product\'s own new price was saved. '
+            + (_anyReason
+                ? 'Open each quote above, deal with the reason shown, and re-save it to apply the new price.'
+                : 'Open and re-save them manually to apply the new price.'));
         }
       } else {
         setQuotes(prev=>prev.map(q=>({

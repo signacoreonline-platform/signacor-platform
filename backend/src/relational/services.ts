@@ -978,14 +978,172 @@ async function invoiceTotalTx(client: PoolClient, invoiceId: number): Promise<nu
   return Number(r.rows[0].total) || 0;
 }
 
+/** Money as a Signacore document states it — R24,963.62. Used ONLY inside
+ *  refusal messages, never in a comparison: every decision in this file is made
+ *  on exact NUMERIC, and this is presentation applied after the fact. */
+function zarText(n: unknown): string {
+  const v = Number(n) || 0;
+  const parts = Math.abs(v).toFixed(2).split('.');
+  return (v < 0 ? '-R' : 'R') + parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',') + '.' + parts[1];
+}
+
+/* ═════════════════════════════════════════════════════════════════════════════
+   THE ONE JOB FINANCIAL RECONSTRUCTION (2026-09-21 — CONVERTED-QUOTE
+   DIVERGENCE REPAIR)
+
+   "What do this Job's OWN line items, priced the way its invoice would price
+   them, come to?" Three callers now ask that question and they must never be
+   able to answer it differently:
+
+     1. assertConvertedJobValueConsistencyTx — refuses a converted-Quote save
+        that would move rel_jobs.value away from what the Job's lines support.
+     2. buildJobReconciliationDiagnosticTx — states the two figures in the
+        invoice guard's refusal.
+     3. (by construction) the invoice writer itself — writeInvoiceLinesFromJobTx
+        + writeInvoiceAdjustmentLinesTx produce exactly this total, which is why
+        assertJobInvoiceMatchesValueTx can keep comparing against what it
+        ACTUALLY wrote rather than against a second opinion.
+
+   This is an EXTRACTION, not a new formula. It is the same arithmetic
+   writeInvoiceLinesFromSourceTx's SUM(qty * unit_amount), the two adjustment
+   lines and invoiceTotalTx's `* 0.15` already perform — lifted into one place
+   so a second copy can never drift from the writer. That is the same move this
+   file already made when it exported writeInvoiceLinesFromJobTx for the
+   INV-00103 repair, and index.html made when jobInvoiceLineItems was hoisted to
+   module scope because Sales and Accounting were building one job invoice two
+   different ways.
+
+   EXACT NUMERIC, NEVER JS FLOAT. Line amounts are NUMERIC(14,4) and a
+   document's own total is NUMERIC(14,2); a JS double in between is how
+   21707.50 * 1.15 becomes 24963.624999999996. Postgres does every
+   multiplication here, on ::numeric parameters, for the same reason
+   writeInvoiceLinesFromSourceTx does.
+
+   PIECE COUNTS ARE RESOLVED, NEVER GUESSED. `effectivePieces` is
+   migration013Recovery's answer for this document, the same map the invoice
+   writer bills on. A line missing from it is a programming error and is
+   refused, exactly as writeInvoiceLinesFromSourceTx refuses it — silently
+   defaulting to 1 is the factor-of-N undercharge that protection exists to
+   remove.
+   ═════════════════════════════════════════════════════════════════════════════ */
+export interface JobLinesReconstruction {
+  /** How many rel_job_line_items rows this job has. 0 means there is nothing
+   *  independent to reconcile — see the no-lines fallback. */
+  lineCount: number;
+  /** Σ effectivePieces × qty × unit_price, VAT-exclusive, pre-discount. */
+  linesSubtotal: number;
+  discountAmount: number;
+  setupFee: number;
+  /** linesSubtotal − discountAmount + setupFee */
+  exVat: number;
+  /** exVat × 1.15 — the VAT-inclusive figure a job's `value` is stated in. */
+  total: number;
+}
+
+/** The one reconstruction, parameterised by which document's lines to read.
+ *  `sourceTable`/`fkColumn` are a CLOSED literal union chosen by this file —
+ *  never caller data — exactly as writeInvoiceLinesFromSourceTx already
+ *  interpolates its own source table. Everything that decides money is a bound
+ *  ::numeric parameter. */
+async function documentLinesReconstructedTotalTx(
+  client: PoolClient,
+  sourceTable: 'rel_job_line_items' | 'rel_quote_line_items',
+  fkColumn: 'job_id' | 'quote_id',
+  documentId: number,
+  discountPct: unknown,
+  setupFee: unknown,
+  effectivePieces: Map<number, number>
+): Promise<JobLinesReconstruction> {
+  const pct = Number(discountPct) || 0;
+  const fee = Number(setupFee) || 0;
+
+  const idsRes = await client.query(
+    `SELECT id FROM ${sourceTable} WHERE ${fkColumn} = $1 ORDER BY line_index`,
+    [documentId]
+  );
+  const lineIds: number[] = idsRes.rows.map((r: any) => Number(r.id));
+  if (lineIds.length === 0) {
+    // No lines: there is no line-based reconstruction. Callers must treat this
+    // as "nothing to reconcile", never as "reconstructs to zero".
+    return { lineCount: 0, linesSubtotal: 0, discountAmount: 0, setupFee: fee, exVat: 0, total: 0 };
+  }
+
+  const pieces: number[] = [];
+  for (const id of lineIds) {
+    const p = effectivePieces.get(id);
+    if (p === undefined || !Number.isFinite(p) || p <= 0) {
+      throw new BusinessRuleError(
+        `internal: no resolved piece count for ${sourceTable} line ${id} — refusing to reconstruct a document total on a guessed quantity`
+      );
+    }
+    pieces.push(p);
+  }
+
+  const r = await client.query(
+    `WITH p(line_id, pieces) AS (SELECT * FROM UNNEST($2::bigint[], $3::numeric[])),
+          s AS (
+            SELECT COALESCE(SUM(p.pieces * l.qty * l.unit_price), 0)::numeric AS lines_subtotal,
+                   COUNT(*)::int AS line_count
+              FROM ${sourceTable} l
+              JOIN p ON p.line_id = l.id
+             WHERE l.${fkColumn} = $1
+          )
+     SELECT s.line_count,
+            s.lines_subtotal,
+            (s.lines_subtotal * ($4::numeric / 100))                                          AS discount_amount,
+            (s.lines_subtotal - s.lines_subtotal * ($4::numeric / 100) + $5::numeric)         AS ex_vat,
+            ((s.lines_subtotal - s.lines_subtotal * ($4::numeric / 100) + $5::numeric) * 1.15) AS total
+       FROM s`,
+    [documentId, lineIds, pieces, pct, fee]
+  );
+  const row = r.rows[0];
+  return {
+    lineCount: Number(row.line_count) || 0,
+    linesSubtotal: Number(row.lines_subtotal) || 0,
+    discountAmount: Number(row.discount_amount) || 0,
+    setupFee: fee,
+    exVat: Number(row.ex_vat) || 0,
+    total: Number(row.total) || 0,
+  };
+}
+
+export async function jobLinesReconstructedTotalTx(
+  client: PoolClient,
+  jobId: number,
+  discountPct: unknown,
+  setupFee: unknown,
+  effectivePieces: Map<number, number>
+): Promise<JobLinesReconstruction> {
+  return documentLinesReconstructedTotalTx(
+    client, 'rel_job_line_items', 'job_id', jobId, discountPct, setupFee, effectivePieces
+  );
+}
+
+/** Builds a refusal message for an invoice that does not reconcile. Supplied by
+ *  assertJobInvoiceMatchesValueTx only; the Quote→Invoice path deliberately
+ *  keeps the generic wording, because a quote-derived invoice IS built from the
+ *  quote and "check the quote" is the correct instruction there. */
+type SourceMismatchDiagnostic =
+  (invoiceTotal: number, sourceTotal: number) => Promise<string> | string;
+
 /** Throws (→ ROLLBACK) when the invoice just written does not add up to the
- *  document it was raised for. */
+ *  document it was raised for.
+ *
+ *  2026-09-21: `diagnostic` is new and OPTIONAL. The comparison, the tolerance
+ *  and every caller's control flow are byte-for-byte unchanged — only the
+ *  sentence a refusal produces can now be supplied by the caller that knows
+ *  which two figures actually disagree. A caller that supplies nothing gets the
+ *  original message, verbatim. */
 async function assertInvoiceMatchesSourceTx(
   client: PoolClient, invoiceId: number,
-  sourceLabel: string, sourceTotalLabel: string, sourceTotal: number
+  sourceLabel: string, sourceTotalLabel: string, sourceTotal: number,
+  diagnostic?: SourceMismatchDiagnostic
 ): Promise<void> {
   const invoiceTotal = await invoiceTotalTx(client, invoiceId);
   if (Math.abs(invoiceTotal - sourceTotal) <= SOURCE_TOTAL_TOLERANCE) return;
+  if (diagnostic) {
+    throw new BusinessRuleError(await diagnostic(invoiceTotal, sourceTotal));
+  }
   throw new BusinessRuleError(
     `Invoice not created: the invoice this would produce comes to ` +
     `R${invoiceTotal.toFixed(2)}, but ${sourceLabel}'s own ${sourceTotalLabel} is ` +
@@ -1056,14 +1214,537 @@ export async function writeInvoiceLinesFromJobTx(
  * guard never refuses a document it did not actually verify.
  */
 async function assertJobInvoiceMatchesValueTx(
-  client: PoolClient, invoiceId: number, job: any, sourceLineCount: number
+  client: PoolClient, invoiceId: number, job: any, sourceLineCount: number,
+  effectivePieces: Map<number, number>
 ): Promise<void> {
   if (sourceLineCount === 0) return;               // no-lines fallback — see above
   const jobValue = Number(job.value) || 0;
-  if (jobValue <= 0) return;                       // nothing declared to check against
+  // ── ZERO-VALUE TIGHTENING (2026-09-21) ────────────────────────────
+  // This used to be a flat `if (jobValue <= 0) return;`. On a job that HAS
+  // line items that was a hole, not an exemption: a job whose stored value is
+  // R0.00 while its own lines price to R10,000 would have the guard skipped
+  // entirely, and writeInvoiceLinesFromJobTx would then issue a R10,000
+  // invoice against a job declared at zero — precisely the "declared value
+  // disagrees with the financial facts used to build the invoice" defect this
+  // guard exists to stop, entered through its own exemption.
+  //
+  // R0.00 is a legitimate accounting value (sponsored / warranty / no-charge)
+  // and remains fully supported — but it is not a bypass. A genuine sponsored
+  // job reconciles NATURALLY, because the very discount and setup fee that
+  // zeroed its value are applied to its own lines too: positive lines + a 100%
+  // discount reconstruct to R0.00 on both sides and pass. A job whose lines
+  // reconstruct to a positive amount does not, and is refused.
+  //
+  // The ONLY case still skipped is the one where there is genuinely nothing
+  // independent to reconcile: sourceLineCount === 0 above, where
+  // writeInvoiceLinesFromJobTx builds its single line FROM `value` itself and
+  // comparing the result back to `value` would be tautological.
+  //
+  // NOTE this is deliberately NOT a change to SOURCE_TOTAL_TOLERANCE, to the
+  // comparison, or to how any total is computed. A zero-valued job is simply
+  // now compared like every other number instead of being waved through.
+  // Settlement is a separate concern and is untouched: an ISSUED R0.00 invoice
+  // is still Fully Paid by the zero-value settlement rule, and no payment row
+  // is created here or anywhere below.
   await assertInvoiceMatchesSourceTx(
-    client, invoiceId, `job ${job.job_number}`, 'value', jobValue
+    client, invoiceId, `job ${job.job_number}`, 'value', jobValue,
+    (invoiceTotal, sourceTotal) =>
+      buildJobReconciliationDiagnosticTx(client, job, invoiceTotal, sourceTotal, effectivePieces)
   );
+}
+
+/* ═════════════════════════════════════════════════════════════════════════════
+   JOB INVOICE REFUSAL DIAGNOSTIC (2026-09-21)
+
+   "check its line items, piece counts, discount and setup fee" was not enough
+   for a live accounting platform: it named no amount, so nobody could tell
+   whether the job, the invoice or the source quote was the thing that had
+   moved.
+
+   THE PRIMARY DIAGNOSTIC IS JOB-vs-JOB AND NEEDS NO QUOTE. Every figure comes
+   from rows this transaction already holds — rel_jobs, rel_job_line_items and
+   the resolved piece counts — so it is produced for EVERY refusal, including a
+   job with no quote at all, a NULL quote_id, or an ambiguous quote link. The
+   authoritative statement is "this Job does not reconcile with itself".
+
+   THE QUOTE IS SECONDARY, OPTIONAL AND CLEARLY LABELLED. It is resolved by
+   stable quote_id only — never by a document number, which is minted per
+   company and legitimately repeats — and only when the company matches. If any
+   of that fails the block is silently omitted and the primary diagnostic stands
+   alone. It never changes the verdict, never appears as an instruction, and is
+   never worded as "the Job must match the Quote": the Job owns its own
+   financial facts, and the Quote is history.
+   ═════════════════════════════════════════════════════════════════════════════ */
+async function buildJobReconciliationDiagnosticTx(
+  client: PoolClient,
+  job: any,
+  invoiceTotal: number,
+  jobValue: number,
+  effectivePieces: Map<number, number>
+): Promise<string> {
+  // PRIMARY — the Job against its own lines, through the ONE shared helper.
+  let reconstructed = invoiceTotal;
+  try {
+    const recon = await jobLinesReconstructedTotalTx(
+      client, Number(job.id), job.discount_pct, job.setup_fee, effectivePieces
+    );
+    if (recon.lineCount > 0) reconstructed = recon.total;
+  } catch (e) {
+    // A diagnostic must never be able to turn a clean refusal into an internal
+    // error. If the reconstruction cannot be built, fall back to the total the
+    // writer actually produced — the same number, by construction.
+  }
+  const difference = Math.abs(jobValue - reconstructed);
+
+  let msg =
+    `Job ${job.job_number} does not reconcile with its own line items, so no invoice was created.\n\n` +
+    `  Stored Job value                            ${zarText(jobValue)}\n` +
+    `  Job line items + setup fee reconstruct to   ${zarText(reconstructed)}\n` +
+    `  Difference                                  ${zarText(difference)}\n\n` +
+    `The Job's own line items no longer support the value recorded against it. ` +
+    `Nothing was created and no invoice number was used.\n\n` +
+    `Open Job ${job.job_number} and review its line items, piece counts, discount and setup fee.`;
+
+  const secondary = await buildQuoteContextBlockTx(client, job, effectivePieces);
+  if (secondary) msg += '\n\n' + secondary;
+  return msg;
+}
+
+/** SECONDARY, forensic context only. Returns '' whenever it cannot be produced
+ *  safely — no quote link, missing quote, different company, no comparable
+ *  lines, or any error at all. Never throws. */
+async function buildQuoteContextBlockTx(
+  client: PoolClient, job: any, effectivePieces: Map<number, number>
+): Promise<string> {
+  try {
+    if (job.quote_id == null) return '';
+    const qRes = await client.query(
+      'SELECT id, quote_number, company_code FROM rel_quotes WHERE id = $1',
+      [Number(job.quote_id)]
+    );
+    if (qRes.rowCount === 0) return '';
+    const quote = qRes.rows[0];
+    // Company isolation — verified, never assumed (same rule
+    // resolveTransactionChainTx applies to every chain member).
+    if (String(quote.company_code ?? '') !== String(job.company_code ?? '')) return '';
+
+    const idsRes = await client.query(
+      'SELECT id FROM rel_job_line_items WHERE job_id = $1 ORDER BY line_index',
+      [Number(job.id)]
+    );
+    const lineIds: number[] = idsRes.rows.map((r: any) => Number(r.id));
+    if (lineIds.length === 0) return '';
+    const pieces: number[] = [];
+    for (const id of lineIds) {
+      const p = effectivePieces.get(id);
+      if (p === undefined || !Number.isFinite(p) || p <= 0) return '';
+      pieces.push(p);
+    }
+
+    // The QUOTE side uses the plain NULL-reads-as-1 rule, not a second
+    // migration-013 resolution: this is presentation, it decides nothing, and
+    // running the recovery matcher over a second document to render a comment
+    // would be cost without authority.
+    const cmp = await client.query(
+      `WITH jp(line_id, pieces) AS (SELECT * FROM UNNEST($2::bigint[], $3::numeric[])),
+            jl AS (
+              SELECT l.line_index, l.description,
+                     jp.pieces AS pieces, l.qty, l.unit_price,
+                     (jp.pieces * l.qty * l.unit_price) AS total
+                FROM rel_job_line_items l JOIN jp ON jp.line_id = l.id
+               WHERE l.job_id = $1
+            ),
+            ql AS (
+              SELECT l.line_index, l.description,
+                     COALESCE(NULLIF(l.pieces, 0), 1) AS pieces, l.qty, l.unit_price,
+                     (COALESCE(NULLIF(l.pieces, 0), 1) * l.qty * l.unit_price) AS total
+                FROM rel_quote_line_items l
+               WHERE l.quote_id = $4
+            )
+       SELECT jl.line_index,
+              jl.pieces AS j_pieces, jl.qty AS j_qty, jl.unit_price AS j_price, jl.total AS j_total,
+              ql.pieces AS q_pieces, ql.qty AS q_qty, ql.unit_price AS q_price, ql.total AS q_total,
+              ABS(jl.total - ql.total) AS delta
+         FROM jl JOIN ql ON ql.line_index = jl.line_index
+        ORDER BY ABS(jl.total - ql.total) DESC, jl.line_index ASC`,
+      [Number(job.id), lineIds, pieces, Number(quote.id)]
+    );
+    if (cmp.rowCount === 0) return '';
+    const top = cmp.rows[0];
+    const delta = Number(top.delta) || 0;
+    if (delta <= SOURCE_TOTAL_TOLERANCE) return '';
+    const differing = cmp.rows.filter((r: any) => (Number(r.delta) || 0) > SOURCE_TOTAL_TOLERANCE).length;
+
+    const num = (v: unknown) => String(Number(v));
+    return (
+      `Historical source comparison (Quote ${quote.quote_number} — context only, not the authority):\n\n` +
+      `  Largest line difference — line ${Number(top.line_index) + 1}\n` +
+      `    Job line       ${num(top.j_pieces)} × ${num(top.j_qty)} × ${zarText(top.j_price)} = ${zarText(top.j_total)}\n` +
+      `    Source Quote   ${num(top.q_pieces)} × ${num(top.q_qty)} × ${zarText(top.q_price)} = ${zarText(top.q_total)}\n` +
+      `    Difference ex VAT                       ${zarText(delta)}\n` +
+      `    Difference incl VAT                     ${zarText(delta * 1.15)}\n\n` +
+      (differing <= 1
+        ? `  All other lines are identical.\n\n`
+        : `  ${differing} line(s) differ in total.\n\n`) +
+      `The Quote is shown for context only. The Job owns its own financial facts — ` +
+      `this invoice was refused because the Job does not reconcile with itself, ` +
+      `not because it differs from the Quote.`
+    );
+  } catch (e) {
+    return '';
+  }
+}
+
+/* ═════════════════════════════════════════════════════════════════════════════
+   CONVERTED-JOB FINANCIAL CONSISTENCY GUARD (2026-09-21)
+
+   THE DEFECT THIS CLOSES. rel_jobs.value is quote-owned: updateQuoteWithJobSync
+   recomputes it from the quote's totals on EVERY save of a converted quote, and
+   the shipped edit patch always carries `lines`, so the money moves even when
+   the user only changed a phone number. rel_job_line_items is production-owned
+   and is deliberately NOT resynced (BLOCKER 2, 2026-08-24 — the implicit
+   cascade used to delete production lines, reproduced 3 → 1). Value cascaded,
+   lines did not, and the two came apart silently. SNS-00128 is the live case:
+   job.value R24,963.62 against job lines that reconstruct to R16,044.80, found
+   months later by the invoice guard when the job could no longer be invoiced at
+   all — with two real customer payments already banked against it.
+
+   THIS IS A DELTA GUARD, NOT A STATE GUARD. It refuses only a save that would
+   CHANGE the job's financial value INTO a state its own lines do not support:
+     • a value that is not changing is allowed, so every non-financial edit
+       (notes, reference, contact details, salesperson, validity dates) still
+       works exactly as before — and so does a financial edit whose accounting
+       effect is nil, e.g. qty 2 × R1,500 → 3 × R1,000;
+     • an ALREADY divergent job is not frozen: an unrelated edit still saves,
+       and an edit that REPAIRS the divergence is never blocked;
+     • the condition is the resulting accounting effect, never "this quote was
+       converted" and never "a price field was touched".
+
+   R0.00 IS NOT A BYPASS. A proposed value of zero is checked like any other
+   number: a genuine sponsored job reconciles naturally because the same
+   discount and setup fee are applied to the job's own lines, while zeroing a
+   quote against a job whose lines still price to R20,000 is refused.
+
+   NO ESCAPE HATCH, BY DESIGN. There is no force-save, no "create anyway" and no
+   divergence marker. The controlled Quote→Job reconciliation workflow belongs
+   to the planned Transaction Troubleshooter; until it exists, stopping the
+   unsafe save and saying exactly what to review is the honest outcome.
+   ═════════════════════════════════════════════════════════════════════════════ */
+
+/** Below this a proposed value is the SAME value — an identity test, not a
+ *  reconciliation test, which is why it is not SOURCE_TOTAL_TOLERANCE. Reusing
+ *  5c here would let a 4c drift through unchecked on every save, forever. */
+const JOB_VALUE_IDENTITY_TOLERANCE = 0.005;
+
+async function assertConvertedJobValueConsistencyTx(
+  client: PoolClient,
+  jobId: number,
+  job: any,
+  quoteNumber: string,
+  proposedJobValue: number,
+  proposedDiscountPct: number,
+  proposedSetupFee: number
+): Promise<void> {
+  const jobLabel = `Job ${job.job_number}`;
+  const quoteLabel = quoteNumber ? `Quote ${quoteNumber}` : 'This Quote';
+
+  // ── EXEMPTION 1 — no line items: nothing independent to reconcile ──────
+  // Mirrors assertJobInvoiceMatchesValueTx's own `sourceLineCount === 0` skip
+  // and the no-lines invoice fallback, which builds its single line FROM
+  // `value`. Count-based, never subtotal-based: a job whose lines price to
+  // R0.00 still HAS lines and is checked below.
+  const countRes = await client.query(
+    'SELECT COUNT(*)::int AS n FROM rel_job_line_items WHERE job_id = $1',
+    [jobId]
+  );
+  if ((Number(countRes.rows[0].n) || 0) === 0) return;
+
+  // ── EXEMPTION 2 — the financial value is not changing ───────────────
+  // `proposedJobValue` arrives as the JS double this function's caller will
+  // write, and is cast to the COLUMN's own type so the guard judges precisely
+  // the figure rel_jobs.value will hold. That cast is the whole reason the
+  // caller's arithmetic is left untouched: recomputing it in NUMERIC instead
+  // would move real stored values by a cent (21707.50 * 1.15 is
+  // 24963.624999999996 as a double and exactly 24963.6250 in NUMERIC), which
+  // is a data change, not a guard.
+  const cmpRes = await client.query(
+    `SELECT $1::numeric::numeric(14,2) AS proposed, value AS current FROM rel_jobs WHERE id = $2`,
+    [proposedJobValue, jobId]
+  );
+  const proposed = Number(cmpRes.rows[0].proposed) || 0;
+  const current = Number(cmpRes.rows[0].current) || 0;
+  if (Math.abs(proposed - current) <= JOB_VALUE_IDENTITY_TOLERANCE) return;
+
+  // ── THE VALUE IS ACTUALLY CHANGING ────────────────────────────
+  // Only from here does this cost anything: resolveDocument013ForInvoicing
+  // reads platform_state, so it is deliberately reached only by a converted
+  // quote whose job has lines and whose money is genuinely moving.
+  const res013 = await resolveDocument013ForInvoicing(client, 'job', jobId);
+  if (res013.blocked.length > 0) {
+    const detail = res013.blocked.map((l) => l.blockingReason).join('; ');
+    throw new BusinessRuleError(
+      `${quoteLabel} has already been converted to ${jobLabel}.\n\n` +
+      `This change would set the transaction value to ${zarText(proposed)}, but ${jobLabel} has ` +
+      `${res013.blocked.length} line item(s) with no piece count whose preserved historical records ` +
+      `cannot be matched to them with certainty, so the Job's own value cannot be confirmed. ` +
+      `The platform will not change a Job's financial value it cannot verify.\n\n` +
+      `Nothing was saved. The Quote, the Job and its line items are all exactly as they were, ` +
+      `and no payment was affected.\n\n` +
+      `Open ${jobLabel}, confirm the piece count on each line and save it — then try this save again. (${detail})`
+    );
+  }
+
+  const recon = await jobLinesReconstructedTotalTx(
+    client, jobId, proposedDiscountPct, proposedSetupFee, effectivePiecesByLineId(res013)
+  );
+  if (recon.lineCount === 0) return;               // raced to zero lines — Exemption 1
+  if (Math.abs(proposed - recon.total) <= SOURCE_TOTAL_TOLERANCE) return;
+
+  throw new BusinessRuleError(
+    `${quoteLabel} has already been converted to ${jobLabel}.\n\n` +
+    `This change would set the transaction value to ${zarText(proposed)}, but ${jobLabel}'s own ` +
+    `line items, discount and setup fee come to ${zarText(recon.total)} — a difference of ` +
+    `${zarText(Math.abs(proposed - recon.total))}.\n\n` +
+    `The platform will not change a converted Job's financial value without its Job line items ` +
+    `agreeing, because the Job would then be internally inconsistent and could not be invoiced.\n\n` +
+    `Nothing was saved. The Quote, the Job and its line items are all exactly as they were, ` +
+    `and no payment was affected.\n\n` +
+    `Open ${jobLabel} and review its line items against the value you intend to charge, ` +
+    `then try this save again.`
+  );
+}
+
+/* ═════════════════════════════════════════════════════════════════════════════
+   PRESERVED COMMERCIAL-LINE FALLBACK (2026-09-21 — SNS-00128)
+
+   THE SITUATION IT EXISTS FOR. rel_jobs.value is quote-owned and cascades on
+   every converted-Quote save; rel_job_line_items is production-owned and does
+   NOT (BLOCKER 2, 2026-08-24). A Quote repriced after conversion therefore
+   leaves the Job declaring the NEW sale while its own lines still describe the
+   OLD one. SNS-00128 is the live case: value R24,963.62, own lines R16,044.80,
+   and two real customer payments already banked — 80% of the original sale,
+   then 80% of the increase. The Job's lines are STALE COMMERCIAL DETAIL, not a
+   production variation, and the invoice guard correctly refuses to issue a
+   document built from them.
+
+   WHY THE LINKED QUOTE IS THE RIGHT SOURCE, AND NOT AN INVENTION. This is
+   already the deployed rule for every invoice that EXISTS:
+   syncLinkedInvoiceFromQuoteTx resolves an invoice by quote_id OR job_id, then
+   deletes its lines and rewrites them from rel_quote_line_items — on a
+   converted Job, through writeQuoteInvoiceLinesTx. See its own note: "JOB LINES
+   ARE DELIBERATELY NOT INVOLVED … The invoice is therefore rebuilt from the
+   QUOTE's lines — which is also what keeps it equal to the job's `value`."
+   Creation was the one place that asymmetry had not been closed. Three further
+   facts make the Quote the only candidate: conversion copies quote lines
+   VERBATIM, so any divergence is later; replaceJobLinesTx writes
+   legacy_data = '{}', so a job line keeps no record of the commercial line it
+   came from; and after conversion nothing but the invoice reads job lines for
+   money (inventory is consumed once, at conversion).
+
+   WHAT THIS IS NOT. It is not a bypass, a tolerance change, or a force-invoice.
+   The Job remains the FINANCIAL AUTHORITY: whichever source writes the lines,
+   assertJobInvoiceMatchesValueTx still requires the finished invoice to equal
+   rel_jobs.value, unchanged. Nothing is written to rel_jobs,
+   rel_job_line_items, rel_quotes, rel_quote_line_items or rel_payments. The
+   Quote supplies COMMERCIAL DETAIL for a document; it never becomes
+   authoritative over the Job.
+
+   NO GUESSWORK. Twelve conditions must all hold (below). Any failure returns
+   null, the job's own lines are written as before, and the EXISTING refusal —
+   with its existing Job-vs-Job-lines diagnostic — is what the user sees. There
+   is deliberately no separate "fallback declined" error: a reader should see
+   one refusal for one reason, not two.
+   ═════════════════════════════════════════════════════════════════════════════ */
+
+/** Line descriptions are compared for IDENTITY, not for formatting. A quote
+ *  line's description is free text a person typed, often across several lines,
+ *  and conversion copies it byte-for-byte — so a genuine re-measure of the same
+ *  product keeps the same words while an entirely different line does not.
+ *  Whitespace of every kind collapses to a single space and case is ignored;
+ *  nothing else is stripped, because removing punctuation or digits could make
+ *  two genuinely different products compare equal. */
+function normalizeLineDescription(v: unknown): string {
+  return String(v ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+interface CommercialLineSource {
+  quote: any;
+  quoteLines: any[];
+  quotePieces: Map<number, number>;
+  /** What the quote's lines come to under the JOB's own discount and setup fee. */
+  commercialTotal: number;
+}
+
+/**
+ * Resolves the linked Quote as the preserved commercial-line source for a Job
+ * whose own lines no longer reconcile — or returns null, which means "keep the
+ * existing refusal". READ-ONLY: this function writes nothing, anywhere.
+ */
+async function resolveCommercialLineSourceTx(
+  client: PoolClient,
+  job: any,
+  jobLineCount: number
+): Promise<CommercialLineSource | null> {
+  // 1. A stable quote id. NEVER quote_number_raw: document numbers are minted
+  //    per company and legitimately repeat, which is the ambiguity class this
+  //    codebase quarantines everywhere else (resolveTransactionChainTx:
+  //    "LINKAGE IS PROVEN COLUMNS ONLY").
+  if (job.quote_id == null) return null;
+  const quoteId = Number(job.quote_id);
+  if (!Number.isFinite(quoteId)) return null;
+
+  // 2,3. The quote must exist, resolved by that id alone.
+  const qRes = await client.query('SELECT * FROM rel_quotes WHERE id = $1', [quoteId]);
+  if (qRes.rowCount === 0) return null;
+  const quote = qRes.rows[0];
+
+  // 4. Company isolation — verified, never assumed.
+  if (!sameCompany(quote.company_code, job.company_code)) return null;
+
+  // 5,6. The relationship must be unique in BOTH directions. Two jobs claiming
+  //      one quote is the historical collision this file never resolves by
+  //      guessing; a converted_job_id pointing somewhere else means this job is
+  //      not the quote's job.
+  const claimRes = await client.query(
+    'SELECT COUNT(*)::int AS n FROM rel_jobs WHERE quote_id = $1', [quoteId]
+  );
+  if ((Number(claimRes.rows[0].n) || 0) !== 1) return null;
+  if (quote.converted_job_id != null && Number(quote.converted_job_id) !== Number(job.id)) return null;
+
+  // 7. The quote must actually have commercial lines.
+  const quoteLinesRes = await client.query(
+    'SELECT * FROM rel_quote_line_items WHERE quote_id = $1 ORDER BY line_index', [quoteId]
+  );
+  const quoteLines = quoteLinesRes.rows || [];
+  if (quoteLines.length === 0) return null;
+
+  // 9. The COMMERCIAL INTERPRETATION must be the same on both documents. If the
+  //    Job and the Quote disagree about the discount or the setup fee, issuing
+  //    the quote's lines would state a different deal from the value that was
+  //    agreed and part-paid. Refuse rather than reinterpret.
+  if (toCents(job.discount_pct) !== toCents(quote.discount_pct)) return null;
+  if (toCents(job.setup_fee) !== toCents(quote.setup_fee)) return null;
+  // (VAT needs no check: writeInvoiceLinesFromSourceTx and
+  //  writeInvoiceAdjustmentLinesTx stamp tax_type '15%' on every line from
+  //  either source, so the two cannot differ by construction.)
+
+  // 10,11. Same shape, same goods. A re-measured or re-priced line keeps its
+  //        description; a different line does not. This is what separates
+  //        "the same sale, revised" from "a different sale that happens to
+  //        total the same".
+  if (quoteLines.length !== jobLineCount) return null;
+  const jobLinesRes = await client.query(
+    'SELECT line_index, description FROM rel_job_line_items WHERE job_id = $1 ORDER BY line_index',
+    [Number(job.id)]
+  );
+  const jobDescs = jobLinesRes.rows.map((r: any) => normalizeLineDescription(r.description));
+  const quoteDescs = quoteLines.map((r: any) => normalizeLineDescription(r.description));
+  if (jobDescs.length !== quoteDescs.length) return null;
+  for (let i = 0; i < jobDescs.length; i++) {
+    if (jobDescs[i] !== quoteDescs[i]) return null;
+  }
+
+  // 8. Historical piece counts must resolve with certainty on the QUOTE too —
+  //    the same protection the invoice writer applies to whatever it bills.
+  const res013 = await resolveDocument013ForInvoicing(client, 'quote', quoteId);
+  if (res013.blocked.length > 0) return null;
+  const quotePieces = effectivePiecesByLineId(res013);
+
+  // 12. And the money must land on the Job's declared value, through the ONE
+  //     shared reconstruction, in exact NUMERIC, at the EXISTING tolerance.
+  //     The JOB's discount and setup fee are used (they equal the quote's, by
+  //     condition 9) so the Job remains the financial authority even here.
+  const recon = await documentLinesReconstructedTotalTx(
+    client, 'rel_quote_line_items', 'quote_id', quoteId, job.discount_pct, job.setup_fee, quotePieces
+  );
+  if (recon.lineCount === 0) return null;
+  const jobValue = Number(job.value) || 0;
+  if (Math.abs(jobValue - recon.total) > SOURCE_TOTAL_TOLERANCE) return null;
+
+  return { quote, quoteLines, quotePieces, commercialTotal: recon.total };
+}
+
+/**
+ * Writes a job invoice's line items, choosing the source. THE ORDINARY PATH IS
+ * FIRST AND IS UNCHANGED: a job whose own lines reconcile to its value, and a
+ * job with no lines at all, behave exactly as they did before this existed.
+ * Only a job whose lines do NOT reconcile reaches the fallback, and only a
+ * fully-proven linked Quote is accepted.
+ *
+ * When the fallback declines, the job's own lines are written anyway so that
+ * assertJobInvoiceMatchesValueTx — which the caller runs next, unchanged —
+ * produces the EXISTING refusal with its existing diagnostic.
+ */
+async function writeJobInvoiceLinesWithCommercialFallbackTx(
+  client: PoolClient,
+  invoiceId: number,
+  job: any,
+  jobLines: any[],
+  jobPieces: Map<number, number>
+): Promise<{ usedQuoteFallback: boolean; quoteId: number | null; quoteNumber: string | null }> {
+  const none = { usedQuoteFallback: false, quoteId: null, quoteNumber: null };
+
+  // ORDINARY PATH — no lines: the documented value-based fallback, untouched.
+  if (jobLines.length === 0) {
+    await writeInvoiceLinesFromJobTx(client, invoiceId, jobLines, job, jobPieces);
+    return none;
+  }
+
+  // ORDINARY PATH — the job's own lines reconcile to its own value.
+  const jobRecon = await jobLinesReconstructedTotalTx(
+    client, Number(job.id), job.discount_pct, job.setup_fee, jobPieces
+  );
+  const jobValue = Number(job.value) || 0;
+  if (Math.abs(jobValue - jobRecon.total) <= SOURCE_TOTAL_TOLERANCE) {
+    await writeInvoiceLinesFromJobTx(client, invoiceId, jobLines, job, jobPieces);
+    return none;
+  }
+
+  // The job's lines do not support its value. Is there a proven preserved
+  // commercial source?
+  const src = await resolveCommercialLineSourceTx(client, job, jobLines.length);
+  if (src === null) {
+    await writeInvoiceLinesFromJobTx(client, invoiceId, jobLines, job, jobPieces);
+    return none;
+  }
+
+  // PROVEN. Write the commercial detail with the DEPLOYED quote writer — the
+  // same one createInvoiceFromQuoteTx and syncLinkedInvoiceFromQuoteTx use, so
+  // a fallback-sourced invoice is indistinguishable from any other invoice for
+  // the same commercial content. The adjustment lines are built from the JOB's
+  // discount and setup fee (equal to the quote's by condition 9), because the
+  // Job is the financial authority.
+  await writeQuoteInvoiceLinesTx(
+    client, invoiceId, src.quoteLines,
+    { setup_fee: job.setup_fee, discount_pct: job.discount_pct },
+    src.quotePieces
+  );
+
+  // PROVENANCE. An additive marker on an existing NOT NULL DEFAULT '{}'::jsonb
+  // column — no schema change, no second financial total, no second source of
+  // truth. It records only WHERE the commercial detail came from, so anyone
+  // auditing this document later reads it rather than inferring it.
+  await client.query(
+    `UPDATE rel_invoices
+        SET legacy_data = COALESCE(legacy_data, '{}'::jsonb) || $2::jsonb
+      WHERE id = $1`,
+    [invoiceId, JSON.stringify({
+      commercialLineSource: {
+        kind: 'linked-quote-fallback',
+        reason: 'job-lines-stale',
+        quoteId: Number(src.quote.id),
+        quoteNumber: String(src.quote.quote_number ?? ''),
+        jobNumber: String(job.job_number ?? ''),
+        at: new Date().toISOString(),
+      },
+    })]
+  );
+
+  return {
+    usedQuoteFallback: true,
+    quoteId: Number(src.quote.id),
+    quoteNumber: String(src.quote.quote_number ?? ''),
+  };
 }
 
 const INSTALL_STAGE = 7;
@@ -1262,8 +1943,11 @@ async function jobInvoiceTx(jobId: number, mode: JobInvoiceMode): Promise<JobInv
          job.email, job.address]
       );
       const legacyInvoiceId = legacyInvRes.rows[0].id;
-      await writeInvoiceLinesFromJobTx(client, legacyInvoiceId, legacyLineItemsRes.rows, job, jobPiecesMap);
-      await assertJobInvoiceMatchesValueTx(client, legacyInvoiceId, job, legacyLineItemsRes.rows.length);
+      // Ordinary Job-line path first; the preserved commercial-line fallback
+      // only where the Job's own lines no longer support its value. The final
+      // assertion below is UNCHANGED either way — the Job stays the authority.
+      await writeJobInvoiceLinesWithCommercialFallbackTx(client, legacyInvoiceId, job, legacyLineItemsRes.rows, jobPiecesMap);
+      await assertJobInvoiceMatchesValueTx(client, legacyInvoiceId, job, legacyLineItemsRes.rows.length, jobPiecesMap);
       const jobUpdRes2 = await client.query(
         `UPDATE rel_jobs SET invoice_created = true, invoice_date = COALESCE(invoice_date, CURRENT_DATE), invoice_status = COALESCE(invoice_status, 'pending'),
            status = CASE WHEN stage >= $2 THEN 'invoiced' ELSE status END,
@@ -1377,8 +2061,11 @@ async function jobInvoiceTx(jobId: number, mode: JobInvoiceMode): Promise<JobInv
     );
     const invoiceId = invRes.rows[0].id;
 
-    await writeInvoiceLinesFromJobTx(client, invoiceId, lineItemsRes.rows, job, jobPiecesMap);
-    await assertJobInvoiceMatchesValueTx(client, invoiceId, job, lineItemsRes.rows.length);
+    // Ordinary Job-line path first; the preserved commercial-line fallback only
+    // where the Job's own lines no longer support its value. The final
+    // assertion below is UNCHANGED either way — the Job stays the authority.
+    await writeJobInvoiceLinesWithCommercialFallbackTx(client, invoiceId, job, lineItemsRes.rows, jobPiecesMap);
+    await assertJobInvoiceMatchesValueTx(client, invoiceId, job, lineItemsRes.rows.length, jobPiecesMap);
 
     const jobUpdRes3 = await client.query(
       `UPDATE rel_jobs SET invoice_num = $1, invoice_date = CURRENT_DATE, invoice_created = true, invoice_status = 'pending',
@@ -3196,7 +3883,7 @@ async function syncLinkedInvoicesFromJobTx(
     // it bills is never left in place. This throws, and because we are inside
     // the caller's transaction the job and quote changes roll back with it — no
     // half-updated chain.
-    await assertJobInvoiceMatchesValueTx(client, invoiceId, job, jobLinesRes.rowCount || 0);
+    await assertJobInvoiceMatchesValueTx(client, invoiceId, job, jobLinesRes.rowCount || 0, piecesMap);
 
     const afterRes = await client.query(
       `SELECT line_index, description, qty, unit_amount, account_code, tax_type, legacy_data
@@ -3776,6 +4463,23 @@ export async function updateQuoteWithJobSync(
       const resultPreparedBy = (patch.preparedBy !== undefined ? patch.preparedBy : quote.prepared_by) ?? null;
       const resultPoRef = (patch.poRef !== undefined ? patch.poRef : quote.po_ref) ?? null;
       const resultReference = (patch.reference !== undefined ? patch.reference : quote.reference) ?? null;
+
+      // ── CONVERTED-JOB FINANCIAL CONSISTENCY GUARD (2026-09-21) ──────────
+      // Deliberately HERE: after the optional explicit resyncJobLines above (so
+      // a resync that makes the job reconcile is never refused) and BEFORE the
+      // UPDATE below (so a refusal never writes rel_jobs at all, and never
+      // reaches syncLinkedInvoiceFromQuoteTx further down). Both rows are
+      // already held FOR UPDATE and the throw lands in this function's own
+      // catch → ROLLBACK, so the quote row, the quote lines, the job row, the
+      // job lines and any linked-invoice rebuild all roll back together.
+      //
+      // `jobValue` is passed as computed immediately above and is NOT
+      // recomputed here — the guard judges exactly the figure this UPDATE will
+      // write. See the function's own note on why that matters to the cent.
+      await assertConvertedJobValueConsistencyTx(
+        client, linkedJobId, job, String(quote.quote_number ?? ''),
+        jobValue, discountPct || 0, setupFee || 0
+      );
 
       const jobUpdateRes = await client.query(
         `UPDATE rel_jobs SET

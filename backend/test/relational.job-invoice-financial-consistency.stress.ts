@@ -659,6 +659,131 @@ async function main() {
     ok(Object.keys(editedLine.proposed).length === 0, 'and nothing is proposed for it', editedLine.proposed);
   }
 
+  // ══ R — ZERO-VALUE JOB INVOICE CONSISTENCY (2026-09-21) ═════════════════
+  // assertJobInvoiceMatchesValueTx used to skip outright on `jobValue <= 0`.
+  // On a job WITH line items that was a hole, not an exemption: a job stored at
+  // R0.00 whose own lines price to a positive amount had the guard skipped
+  // entirely and issued a positive invoice against a zero-value job.
+  //
+  // R0.00 stays a fully supported accounting value. It is simply no longer a
+  // bypass: a genuine sponsored job reconciles NATURALLY because the same
+  // discount and setup fee are applied to the job's own lines too.
+  console.log('\n[R] a zero-value Job is reconciled like any other, not waved through');
+  {
+    await reset();
+
+    // R1 — GENUINE SPONSORSHIP: positive lines, 100% discount, R0 setup fee.
+    //      Both sides reconstruct to R0.00, so the invoice is allowed.
+    const sponsored = await makeJob({
+      lines: [{ description: 'Sponsored signage', qty: 4, unitPrice: 3000, pieces: 1 }],
+      discountPct: 100, setupFee: 0, stage: 8, customerName: 'Sponsored Client',
+    });
+    ok(eqMoney(sponsored.jobValue, 0), 'R1 a 100%-discounted job carries a value of R0.00', sponsored.jobValue);
+    const sponsoredInv = await services.createInvoiceForJob(sponsored.jobId);
+    const sponsoredTotals = await invoiceTotals(sponsoredInv.invoiceId);
+    ok(eqMoney(sponsoredTotals.total, 0), 'R1 …and still invoices, at R0.00', sponsoredTotals.total);
+    ok(sponsoredTotals.lineCount >= 2,
+      'R1 …with its real positive line AND its discount line both present on the document', sponsoredTotals.lineCount);
+    ok((await pool.query('SELECT COUNT(*)::int n FROM rel_payments')).rows[0].n === 0,
+      'R1 …and NO payment row was invented to settle it');
+
+    // R2 — INVALID ZERO: positive lines, no zeroing adjustment, value forced to
+    //      R0.00. This is what the old skip let through.
+    await reset();
+    const badZero = await makeJob({
+      lines: [{ description: 'Sign', qty: 4, unitPrice: 2500, pieces: 1 }],
+      discountPct: 0, setupFee: 0, stage: 8, customerName: 'Invalid Zero Client',
+    });
+    ok(eqMoney(badZero.jobValue, 11500), 'R2 job starts at R11,500.00', badZero.jobValue);
+    await pool.query('UPDATE rel_jobs SET value = 0 WHERE id = $1', [badZero.jobId]);
+    const countersBefore = JSON.stringify((await pool.query('SELECT * FROM document_number_counters ORDER BY 1,2')).rows);
+    let zeroErr: any = null;
+    try { await services.createInvoiceForJob(badZero.jobId); }
+    catch (e) { zeroErr = e; }
+    ok(zeroErr instanceof services.BusinessRuleError,
+      'R2 a R0.00 job whose own lines price to R11,500.00 is REFUSED', zeroErr && zeroErr.message);
+    ok(!!zeroErr && /does not reconcile with its own line items/.test(String(zeroErr.message)),
+      'R2 …with the Job-vs-Job-lines diagnostic, not a generic message', zeroErr && String(zeroErr.message).slice(0, 120));
+    ok((await pool.query('SELECT COUNT(*)::int n FROM rel_invoices')).rows[0].n === 0, 'R2 …no invoice row was written');
+    ok(countersBefore === JSON.stringify((await pool.query('SELECT * FROM document_number_counters ORDER BY 1,2')).rows),
+      'R2 …and NO invoice number was consumed');
+    ok((await pool.query('SELECT COUNT(*)::int n FROM rel_payments')).rows[0].n === 0, 'R2 …and no payment was created');
+
+    // R3 — NO LINES + R0: the existing value-based fallback, preserved exactly.
+    //      There is nothing independent to reconcile, so nothing is refused.
+    await reset();
+    const noLines = await makeJob({
+      lines: [{ description: 'Sign', qty: 1, unitPrice: 1000, pieces: 1 }],
+      stage: 8, customerName: 'No Lines Client',
+    });
+    await pool.query('DELETE FROM rel_job_line_items WHERE job_id = $1', [noLines.jobId]);
+    await pool.query('UPDATE rel_jobs SET value = 0 WHERE id = $1', [noLines.jobId]);
+    const noLinesInv = await services.createInvoiceForJob(noLines.jobId);
+    ok(!!noLinesInv.invoiceNumber, 'R3 a lines-less R0.00 job still invoices — the fallback is untouched', noLinesInv.invoiceNumber);
+    const noLinesTotals = await invoiceTotals(noLinesInv.invoiceId);
+    ok(noLinesTotals.lineCount === 0 && eqMoney(noLinesTotals.total, 0),
+      'R3 …producing no line at all, exactly as before (there is nothing to bill)', noLinesTotals);
+    ok((await pool.query('SELECT COUNT(*)::int n FROM rel_payments')).rows[0].n === 0, 'R3 …and no payment was created');
+  }
+
+  // ══ S — THE IMPROVED REFUSAL DIAGNOSTIC (2026-09-21) ════════════════════
+  console.log('\n[S] the invoice refusal states the two figures and the difference');
+  {
+    await reset();
+    // SNS-00128's exact shape, at its exact numbers.
+    const fx = await makeJob({
+      lines: [
+        { description: 'Digitally printed vinyl', qty: 2.852, unitPrice: 3500, pieces: 1, unit: 'm²' },
+        { description: 'Aluminium composite panel', qty: 2, unitPrice: 1500, pieces: 1, unit: 'ea' },
+        { description: 'Installation', qty: 1, unitPrice: 720, pieces: 1, unit: 'ea' },
+      ],
+      setupFee: 250, discountPct: 0, stage: 8, customerName: 'SNS-00128 Shape',
+    });
+    ok(eqMoney(fx.jobValue, 16044.80), 'the fixture reproduces the R16,044.80 the Job\'s own lines support', fx.jobValue);
+
+    // Now move the declared value to the quote-derived figure, exactly as the
+    // old cascade did, and prove the refusal is readable.
+    await pool.query('UPDATE rel_jobs SET value = 24963.62 WHERE id = $1', [fx.jobId]);
+    let err: any = null;
+    try { await services.createInvoiceForJob(fx.jobId); } catch (e) { err = e; }
+    ok(err instanceof services.BusinessRuleError, 'the invoice is refused', err && err.message);
+    const m = String(err && err.message);
+    ok(m.includes(fx.jobNumber), 'the message names the Job', m.slice(0, 80));
+    ok(/R24,963\.62/.test(m), '…states the stored Job value', m);
+    ok(/R16,044\.80/.test(m), '…states what the Job\'s lines reconstruct to', m);
+    ok(/R8,918\.82/.test(m), '…and the difference', m);
+    ok(!/must match the Quote/i.test(m), '…and never says the Job must match the Quote', m);
+
+    // The SECONDARY quote block: same company, resolved by stable id.
+    await pool.query(
+      `UPDATE rel_quote_line_items SET qty = 5.9125, unit_price = 3000
+        WHERE quote_id = $1 AND line_index = 0`, [fx.quoteId]
+    );
+    let err2: any = null;
+    try { await services.createInvoiceForJob(fx.jobId); } catch (e) { err2 = e; }
+    const m2 = String(err2 && err2.message);
+    ok(/Historical source comparison/.test(m2), 'the secondary Quote block appears when the quote resolves safely', m2.slice(-320));
+    ok(/context only, not the authority/.test(m2), '…clearly labelled as context, not authority', m2.slice(-320));
+    ok(/R7,755\.50/.test(m2), '…and reports the largest line difference ex VAT', m2.slice(-320));
+
+    // Cross-company: the block must disappear, and the primary must remain.
+    await pool.query('UPDATE rel_quotes SET company_code = $1 WHERE id = $2', ['9', fx.quoteId]);
+    let err3: any = null;
+    try { await services.createInvoiceForJob(fx.jobId); } catch (e) { err3 = e; }
+    const m3 = String(err3 && err3.message);
+    ok(!/Historical source comparison/.test(m3), 'a cross-company quote contributes NO context block', m3.slice(-200));
+    ok(/does not reconcile with its own line items/.test(m3), '…while the Job-vs-Job-lines diagnostic still stands alone', m3.slice(0, 120));
+
+    // No quote link at all: the primary diagnostic is still produced.
+    await pool.query('UPDATE rel_jobs SET quote_id = NULL WHERE id = $1', [fx.jobId]);
+    let err4: any = null;
+    try { await services.createInvoiceForJob(fx.jobId); } catch (e) { err4 = e; }
+    const m4 = String(err4 && err4.message);
+    ok(/R24,963\.62/.test(m4) && /R16,044\.80/.test(m4),
+      'a Job with NO quote link still gets the full primary diagnostic', m4.slice(0, 200));
+    ok(!/Historical source comparison/.test(m4), '…and no context block');
+  }
+
   console.log('\n============================================================');
   console.log(`${passed} passed, ${failures} failed`);
   console.log('============================================================');
