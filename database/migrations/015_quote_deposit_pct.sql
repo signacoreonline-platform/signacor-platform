@@ -1,0 +1,65 @@
+-- ============================================================================
+-- 015_quote_deposit_pct.sql
+-- Signacore — optional custom deposit percentage on a Quote
+-- Created 2026-09-21
+-- ============================================================================
+--
+-- WHY THIS EXISTS
+--   A Quote may now carry an OPTIONAL custom deposit percentage (0-100) as an
+--   alternative to the platform's standard deposit terms. It is a COMMERCIAL
+--   PAYMENT TERM printed on the quotation, the cover letter, the proforma and
+--   the PDFs — it is NOT a financial total. It never changes the quote's
+--   subtotal, VAT or total, never changes job.value or any invoice total, and
+--   never creates, moves or settles a payment.
+--
+--   "quotes" is relational-authoritative on the live platform, so a new field
+--   on the quote object cannot survive in platform_state JSON: the JSON
+--   `quotes` section is stripped on save (platformState.ts write-isolation)
+--   and the authoritative read is rebuilt from rel_quotes. updateQuote /
+--   updateQuoteWithJobSync also write through a strict column whitelist, so an
+--   unknown key is silently dropped. Without a real column the setting would
+--   appear to save and then vanish on the next authoritative read — exactly
+--   the post-cutover data loss migration 012 was written to stop.
+--
+--   legacy_data is deliberately NOT used. It is documented as historical
+--   backfill provenance (see reconcile.ts, and the header of
+--   013_quote_line_dimensions.sql: "legacy_data is ... not a store for live
+--   business fields"), it is written as '{}' by every relational create, and
+--   read.ts spreads it UNDER the real columns — so a value held there would
+--   be destroyed by the first relational write and could resurrect a cleared
+--   value on read. That is precisely the second-source-of-truth divergence
+--   this column exists to avoid.
+--
+-- NULL IS MEANINGFUL AND IS THE DEFAULT
+--   NULL  = "no custom percentage" -> the EXISTING deposit rules apply
+--           unchanged: 100% when the quote total is R5,000 or less, otherwise
+--           the standard 80%.
+--   0-100 = an explicit custom percentage chosen by the user.
+--
+--   Therefore NO BACKFILL IS REQUIRED and none is performed. Every existing
+--   quote keeps deposit_pct NULL and renders EXACTLY as it does today. 80 is
+--   deliberately NOT written onto historical quotes: that would turn a
+--   platform-wide default into thousands of frozen per-quote overrides, so a
+--   future change to the standard rate would silently not apply to them.
+--
+-- WHY NUMERIC(6,3)
+--   The same type as rel_quotes.discount_pct (007_relational_core.sql), the
+--   other percentage on this table. It accepts a fractional percentage without
+--   a raw 22P02/22003, and the 0-100 business range is enforced in the service
+--   layer (services.ts validateQuoteDepositPct) where it can be REFUSED with a
+--   readable message rather than silently clamped by a constraint.
+--
+-- SAFETY
+--   * Purely ADDITIVE — one ADD COLUMN IF NOT EXISTS, nothing else.
+--   * IDEMPOTENT — safe to run, and re-run, via Render's
+--     `npm run migrate && npm start`.
+--   * NON-DESTRUCTIVE — no DROP, no DELETE, no TRUNCATE, no UPDATE of any
+--     existing row, no retyping, no constraint change, no data movement, no
+--     change to any historical migration and no change to any cutover flag.
+--   * No backup step is needed because nothing existing is read or altered.
+-- ============================================================================
+
+ALTER TABLE rel_quotes ADD COLUMN IF NOT EXISTS deposit_pct NUMERIC(6,3);
+
+COMMENT ON COLUMN rel_quotes.deposit_pct IS
+  'OPTIONAL custom deposit percentage (0-100) for this quote. NULL means no custom percentage: the standard rules apply (100% when total <= R5,000, else 80%). A printed PAYMENT TERM only — it never affects subtotal/vat_amount/total, job value, invoice totals or any payment record.';

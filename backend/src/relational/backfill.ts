@@ -70,6 +70,20 @@ function num(v: unknown, fallback = 0): number {
   const n = parseFloat(v as any);
   return isNaN(n) ? fallback : n;
 }
+/**
+ * migration 015 (2026-09-21) — a quote's OPTIONAL custom deposit percentage.
+ * Backfill is best-effort by design: anything missing, blank, non-numeric or
+ * outside 0-100 becomes NULL, which means "no custom percentage — use the
+ * standard deposit rules". That is the same safe default every historical
+ * quote already has, so a malformed legacy value can never print a wrong
+ * deposit requirement; it simply reverts to the standard terms.
+ */
+function depositPctOrNull(v: unknown): number | null {
+  if (v === undefined || v === null || String(v).trim() === '') return null;
+  const n = Number(String(v).trim());
+  if (!Number.isFinite(n) || n < 0 || n > 100) return null;
+  return Math.round(n * 1000) / 1000;
+}
 function dateOrNull(v: unknown): string | null {
   const s = str(v);
   if (!s) return null;
@@ -468,6 +482,12 @@ export async function runBackfill(opts: { apply: boolean; sourceFile?: string; r
           vat_amount: vatAmount,
           total,
           proforma_num: str(rec.proformaNum),
+          // migration 015 (2026-09-21): a custom deposit percentage saved
+          // through the legacy JSON path (before this section was cut over)
+          // is carried into its REAL column here, rather than being left in
+          // legacy_data where the first relational write would destroy it.
+          // Undefined/blank/out-of-range stays NULL = "standard rules".
+          deposit_pct: depositPctOrNull(rec.depositPct),
           converted_job_source_id: rec.convertedJobId !== undefined && rec.convertedJobId !== null ? String(rec.convertedJobId) : null,
         };
         const outcome = await upsertRow(client, 'rel_quotes', ['source_id'], columns, rec);

@@ -448,7 +448,17 @@ export async function buildQuotesJson(): Promise<any[]> {
       // they do today.
       date: dateStr(r.quote_date) ?? legacyBase(r).date ?? null,
       validUntil: dateStr(r.valid_until) ?? legacyBase(r).validUntil ?? null,
-      proformaNum: r.proforma_num ?? legacyBase(r).proformaNum ?? null,
+      // ── migration 015 (2026-09-21) — CUSTOM DEPOSIT PERCENTAGE ───────────
+      // The column is the ONE authoritative value, with NO legacy_data
+      // fallback, unlike the 012/013 fields above. That is deliberate: NULL
+      // here is MEANINGFUL (it means "Standard" — use the default deposit
+      // rules), so a `?? legacyBase(r).depositPct` would resurrect a custom
+      // percentage the user had just switched back to Standard, and the quote
+      // would keep printing a deposit requirement nobody could clear. A value
+      // that genuinely lived in a backfilled quote's legacy JSON is carried
+      // into this column by backfill.ts instead, which keeps exactly one
+      // source of truth at every moment.
+      depositPct: numOrNull(r.deposit_pct),
       convertedJobId: r.converted_job_source_id != null ? restoreId(r.converted_job_source_id) : (legacyBase(r).convertedJobId ?? null),
       lines: items.length ? items : (legacyBase(r).lines ?? []),
       payments,

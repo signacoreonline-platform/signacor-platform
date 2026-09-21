@@ -130,10 +130,18 @@ router.post('/quotes', async (req: AuthRequest, res: Response): Promise<void> =>
     // field the Quote form collects even though rel_quotes has a column for
     // each. Widened to the full createQuote input; all the added fields are
     // optional, so existing callers are unaffected.
+    // migration 015 (2026-09-21): `depositPct` is the optional custom deposit
+    // percentage. Accepted here so the very FIRST save of a quote already
+    // carries it (the same reason BUG 2 widened this handler) instead of
+    // needing a follow-up edit. Validated/normalised in services.ts
+    // (validateQuoteDepositPct) — out-of-range or non-numeric is refused
+    // there with a readable message, never clamped.
+    // PUT /quotes/:id needs no equivalent change: it rest-spreads the body
+    // into `patch`, and updateQuoteWithJobSync's colMap is the whitelist.
     const {
       companyCode, customerId, customerNameRaw, lines, discountPct, setupFee, notes,
       contactPerson, email, phone, address, vatNumber, terms, salesperson, preparedBy,
-      poRef, reference, quoteDate, validUntil, status,
+      poRef, reference, quoteDate, validUntil, status, depositPct,
     } = req.body || {};
     if (!companyCode || !customerNameRaw || !Array.isArray(lines) || lines.length === 0) {
       res.status(400).json({ error: '"companyCode", "customerNameRaw" and a non-empty "lines" array are required' }); return;
@@ -141,7 +149,7 @@ router.post('/quotes', async (req: AuthRequest, res: Response): Promise<void> =>
     const result = await createQuote({
       companyCode, customerId, customerNameRaw, lines, discountPct, setupFee, notes,
       contactPerson, email, phone, address, vatNumber, terms, salesperson, preparedBy,
-      poRef, reference, quoteDate, validUntil, status,
+      poRef, reference, quoteDate, validUntil, status, depositPct,
     });
     res.status(201).json({ success: true, id: result.id, quoteNumber: result.quoteNumber, rowVersion: result.rowVersion });
   } catch (err) { handleServiceError(err, res); }

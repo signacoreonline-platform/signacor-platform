@@ -217,6 +217,11 @@ export interface CreateQuoteInput {
   quoteDate?: string | null;
   validUntil?: string | null;
   status?: string | null;
+  // migration 015 (2026-09-21) — OPTIONAL custom deposit percentage (0-100).
+  // null/undefined means "no custom percentage": the standard deposit rules
+  // apply (100% at/below R5,000, otherwise 80%). A printed payment term only;
+  // it is deliberately absent from every total computed below.
+  depositPct?: number | null;
 }
 
 export async function createQuote(input: CreateQuoteInput): Promise<{ id: number; quoteNumber: string; rowVersion: number }> {
@@ -249,17 +254,21 @@ export async function createQuote(input: CreateQuoteInput): Promise<{ id: number
       `WITH new_id AS (SELECT nextval('rel_quotes_id_seq') AS id)
        INSERT INTO rel_quotes (id, source_id, quote_number, company_code, customer_id, customer_name_raw,
          contact_person, email, phone, address, vat_number, terms, salesperson, prepared_by, po_ref, reference,
-         quote_date, valid_until, notes, setup_fee, discount_pct, subtotal, vat_amount, total, status, legacy_data)
+         quote_date, valid_until, notes, setup_fee, discount_pct, subtotal, vat_amount, total, status, deposit_pct, legacy_data)
        SELECT new_id.id, new_id.id::text, $1, $2, $3, $4,
          $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-         $15::date, $16::date, $17, $18, $19, $20, $21, $22, COALESCE($23, 'draft'), '{}'::jsonb FROM new_id
+         $15::date, $16::date, $17, $18, $19, $20, $21, $22, COALESCE($23, 'draft'), $24, '{}'::jsonb FROM new_id
        RETURNING id, row_version`,
       [quoteNumber, input.companyCode, input.customerId ?? null, input.customerNameRaw,
        input.contactPerson ?? null, input.email ?? null, input.phone ?? null, input.address ?? null,
        input.vatNumber ?? null, input.terms ?? null, input.salesperson ?? null, input.preparedBy ?? null,
        input.poRef ?? null, input.reference ?? null,
        input.quoteDate || null, input.validUntil || null,
-       input.notes ?? null, setupFee, discountPct, subtotal, vatAmount, total, input.status || null]
+       input.notes ?? null, setupFee, discountPct, subtotal, vatAmount, total, input.status || null,
+       // migration 015: validateQuoteHeader has already normalised this to
+       // either a 0-100 number or null (and REFUSED anything else), so the
+       // bind is the validated value, never the caller's raw input.
+       input.depositPct ?? null]
     );
     const quoteId = insertRes.rows[0].id;
     const quoteRowVersion = insertRes.rows[0].row_version;
@@ -3430,6 +3439,44 @@ function validateOptionalNumber(
   return n;
 }
 
+/**
+ * migration 015 (2026-09-21) — QUOTE CUSTOM DEPOSIT PERCENTAGE.
+ *
+ * Deliberately NOT validateOptionalNumber: that helper collapses null and ''
+ * to `undefined` (meaning "not supplied, leave the column alone"), and this
+ * field NEEDS the third state. Here:
+ *
+ *   undefined       -> undefined  the patch does not mention deposit; the
+ *                                 stored column is left exactly as it is.
+ *   null | '' | ' ' -> null       "Standard" was chosen: CLEAR the column, so
+ *                                 the quote goes back to the default rules.
+ *   0 .. 100        -> number     an explicit custom percentage.
+ *   anything else   -> THROWS     non-numeric or out of range is REFUSED with
+ *                                 a readable message. Never silently clamped,
+ *                                 never silently ignored — a typo must not
+ *                                 quietly bill a customer a different deposit.
+ */
+const RANGE_DEPOSIT_PCT = { min: 0, max: 100 };
+// Exported for backend/test/relational.quote-deposit-pct.stress.ts, which
+// exercises this rule directly (no database required). Not used elsewhere.
+export function validateQuoteDepositPct(value: unknown, label = 'Deposit %'): number | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || String(value).trim() === '') return null;
+  if (typeof value !== 'number' && typeof value !== 'string') {
+    throw new BusinessRuleError(`${label} must be a number, or blank for the standard deposit.`);
+  }
+  const n = Number(String(value).trim());
+  if (!Number.isFinite(n)) {
+    throw new BusinessRuleError(`${label} must be a number ("${String(value).slice(0, 40)}").`);
+  }
+  if (n < RANGE_DEPOSIT_PCT.min || n > RANGE_DEPOSIT_PCT.max) {
+    throw new BusinessRuleError(
+      `${label} must be between ${RANGE_DEPOSIT_PCT.min} and ${RANGE_DEPOSIT_PCT.max} — got ${n}. Please correct it before saving.`
+    );
+  }
+  return Math.round(n * 1000) / 1000;   // NUMERIC(6,3)
+}
+
 // Column ranges, from 007_relational_core.sql / 013_quote_line_dimensions.sql.
 const RANGE_MONEY = { min: -99999999.99, max: 99999999.99 };        // NUMERIC(14,2)
 const RANGE_RATE = { min: -9999999999.9999, max: 9999999999.9999 }; // NUMERIC(14,4)
@@ -3480,6 +3527,11 @@ function validateQuoteHeader(input: any, label = 'Quote'): void {
   if (v !== undefined) input.validUntil = v;
   validateOptionalNumber(input.discountPct, 'Discount %', RANGE_DISCOUNT);
   validateOptionalNumber(input.setupFee, 'Setup fee', RANGE_MONEY);
+  // migration 015 — normalise IN PLACE, same contract as the dates above: the
+  // value that was validated is the value that gets written. undefined stays
+  // undefined so an unrelated patch never touches the column.
+  const dp = validateQuoteDepositPct(input.depositPct, 'Deposit %');
+  if (dp !== undefined || 'depositPct' in input) input.depositPct = dp;
   if (typeof input.notes === 'string') input.notes = sanitizeText(input.notes);
   if (typeof input.reference === 'string') input.reference = sanitizeText(input.reference);
   if (typeof input.poRef === 'string') input.poRef = sanitizeText(input.poRef);
@@ -3614,6 +3666,10 @@ export interface QuotePatchInput {
   // the Quote form but had no relational column, so they were lost on every
   // post-cutover quote. See 012_post_migration_stabilization.sql.
   quoteDate?: string | null; validUntil?: string | null;
+  // migration 015 (2026-09-21) — OPTIONAL custom deposit percentage.
+  // undefined = leave the stored value alone; null = clear it back to the
+  // standard rules; 0-100 = an explicit custom percentage.
+  depositPct?: number | null;
   lines?: LineItemPatch[];
 }
 export async function updateQuote(id: number, expectedVersion: number, patch: Partial<QuotePatchInput>): Promise<{ rowVersion: number }> {
@@ -3642,6 +3698,12 @@ export async function updateQuote(id: number, expectedVersion: number, patch: Pa
       // non-cascading patch), never in updateQuoteWithJobSync: reserving a
       // proforma number must not cascade anything onto a linked job.
       proformaNum: 'proforma_num',
+      // migration 015 (2026-09-21) — custom deposit %. In BOTH quote update
+      // paths, because either one can be the save that switches a quote
+      // between Standard and Custom. The loop below writes an explicit null
+      // (clearing the column) and skips undefined (leaving it untouched),
+      // which is exactly the three-state contract this field needs.
+      depositPct: 'deposit_pct',
     };
     const sets: string[] = []; const vals: any[] = [];
     for (const [k, col] of Object.entries(colMap)) {
@@ -4342,6 +4404,11 @@ export async function updateQuoteWithJobSync(
       poRef: 'po_ref', reference: 'reference', setupFee: 'setup_fee', discountPct: 'discount_pct',
       // migration 012 (2026-08-24) — see updateQuote's identical entry.
       quoteDate: 'quote_date', validUntil: 'valid_until',
+      // migration 015 (2026-09-21) — see updateQuote's identical entry.
+      // Purely a quote payment term: it is NOT added to the job cascade
+      // below, so job.value, the job's own fields and the linked invoice are
+      // untouched by a deposit-percentage change.
+      depositPct: 'deposit_pct',
     };
     const sets: string[] = []; const vals: any[] = [];
     for (const [k, col] of Object.entries(colMap)) {
