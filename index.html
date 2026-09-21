@@ -5228,6 +5228,13 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
   const afterDisc = sub - discAmt + setupFeeAmt;
   const vat = afterDisc*0.15;
   const total = afterDisc+vat;
+  /* DEPOSIT REQUIRED on the proforma (2026-09-21) - presentation only.
+     Same shared resolver every other quote surface uses (custom q.depositPct
+     -> the R5,000 full-deposit rule -> the standard 80%), fed this document's
+     OWN final total. The quote stays the single source of the requested
+     deposit terms: nothing is copied into a proforma-specific field, no
+     payment record is read, and the proforma total is untouched. */
+  const _depInfo = quoteDepositInfo(quote, total);
   const fmt = n=>'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const today = new Date().toISOString().slice(0,10);
   const due = new Date(Date.now()+30*864e5).toISOString().slice(0,10);
@@ -5270,6 +5277,7 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
 ".tots table{width:100%;border-collapse:collapse}.tots td{padding:4px 6px;font-size:11px;border-bottom:1px solid #f0f0f0}"+
 ".tots td:last-child{text-align:right;font-weight:600}.tots .vat-row td{color:#555}"+
 ".tots .total-row td{background:#06065c;color:#fff;font-size:13px;font-weight:900;border:none;padding:7px 6px;font-family:'Barlow Condensed',Arial,sans-serif;letter-spacing:0.04em}"+
+".tots .dep-row td{background:#e8f5e9;color:#2e7d32;font-weight:700;font-size:10.5px;border:none;padding:5px 6px}"+
 ".bank{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 13px;margin-bottom:16px;clear:both}"+
 ".bank .lbl{font-size:8px;font-weight:700;color:#065f46;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}"+
 ".bank table td{padding:2px 0;font-size:9.5px;color:#374151}.bank table td:first-child{color:#6b7280;width:130px}"+
@@ -5317,6 +5325,7 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
 (setupFeeAmt>0?'<tr style="color:#4f46e5"><td>Design &amp; Setup Fee</td><td>+ '+fmt(setupFeeAmt)+'</td></tr>':'')+
 '<tr class="vat-row"><td>VAT (15%)</td><td>'+fmt(vat)+'</td></tr>'+
 '<tr class="total-row"><td>TOTAL DUE</td><td>'+fmt(total)+'</td></tr>'+
+'<tr class="dep-row"><td>'+_depInfo.label+' Deposit Required'+(_depInfo.autoFull?'<div style="font-size:8.5px;font-weight:600;margin-top:1px;">Full deposit applies as the total is R5,000 or less.</div>':'')+'</td><td>'+fmt(_depInfo.amount)+'</td></tr>'+
 '</table></div></div>'+
 '<div class="proforma-notice no-break"><p>This is a Proforma Invoice only. Payment is required before production commences. This document is not a VAT invoice. A Tax Invoice will be issued upon completion.</p></div>'+
 '<div class="bank no-break"><div class="lbl">Banking Details</div><table><tbody>'+
@@ -17123,7 +17132,15 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
               need the Job Card above. */}
           {!isFactory&&(<>
           {/* Proforma Invoice — available at any stage; uses the same number that becomes the Tax Invoice */}
-          <button onClick={()=>printProformaWindow(job, job.invoiceNum||('PRO-'+String(job.num||'')), companies, logoDataUrl)}
+          <button onClick={()=>{
+              /* The requested deposit % lives ONLY on the quote (migration 015).
+                 A job carries no depositPct, so resolve its source quote at
+                 render time and hand that value straight to the shared
+                 resolver - nothing is written, copied or persisted. Unresolved
+                 source quote -> existing standard/R5,000 rules, as before. */
+              const _srcQ = findSourceQuoteForJob(job, quotes);
+              printProformaWindow({ ...job, depositPct: _srcQ ? _srcQ.depositPct : null }, job.invoiceNum||('PRO-'+String(job.num||'')), companies, logoDataUrl);
+            }}
             className="flex items-center gap-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded-xl px-4 py-2.5 font-bold">
             📄 Print Proforma Invoice
           </button>
