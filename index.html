@@ -26593,9 +26593,185 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
 }
 
 /* ═══════════════════════════════════════════
+   REPORTS → PAYMENTS — CANONICAL PAYMENT MODEL (2026-09-22)
+
+   WHY. The Payments tab used to read ONLY `job.payments`. Since the relational
+   cutover that array holds job-owned rel_payments rows only, so quote /
+   proforma deposits, invoice-owned payments and standalone accounting
+   invoices never reached the report.
+
+   THE RULE — read-only, nothing is moved, re-owned or written:
+     * Every payment in the user's company scope is gathered from the
+       Quote / Proforma → Job → Invoice transaction flow: invoice chains
+       (read.ts already resolves invoice ∪ job ∪ quote), job.payments, and
+       every quote's / proforma's own payments — including deposits on
+       quotes that are not invoiced yet.
+     * ONE rel_payments id = ONE payment (a JSON-era row without one falls
+       back to its own id), so a payment visible from several stages counts
+       once.
+     * Only POSITIVE amounts are money received: R0.00 rows stay in the chain
+       for audit but never reach the calendar, Total Paid or Last Paid.
+     * Each payment sits on its OWN payment date — never an invoice, quote,
+       job, paidAt or creation date.
+     * Each payment names the customer-facing document it belongs to: its
+       owner's Quote / Proforma / Invoice. A historical job-owned row resolves
+       through the existing links to the Invoice when it was received on or
+       after the invoice date, otherwise to the source Quote / Proforma. A Job
+       is never shown as a payment document.
+     * Paid Invoices rows, status and balances keep the shared settlement rule
+       (sgrSettleRecordCents / sgrOutstandingForRecordCents against
+       sgrCanonicalPayableCents). */
+function sgrReportPaymentKey(p){
+  if(!p) return null;
+  if(p._relPaymentId!==null && p._relPaymentId!==undefined && p._relPaymentId!=='') return 'rel:'+String(p._relPaymentId);
+  if(p.id!==null && p.id!==undefined && p.id!=='') return 'id:'+String(p.id);
+  return null;
+}
+function sgrReportPaymentDate(p){
+  const d = p && p.date;
+  if(!d) return null;
+  const s = String(d).slice(0,10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+/* sources: [{kind:'quote'|'job'|'invoice', list:[…]}], earliest stage first,
+   so a row without _relOwnerType keeps the stage it was first recorded on. */
+function sgrReportChainPayments(sources){
+  const payments = [], kinds = new Map(), seenKeys = new Set(), seenObjs = new Set();
+  (sources||[]).forEach(src=>{
+    if(!src) return;
+    (Array.isArray(src.list) ? src.list : []).forEach(p=>{
+      if(!p || seenObjs.has(p)) return;
+      const k = sgrReportPaymentKey(p);
+      if(k!==null){ if(seenKeys.has(k)) return; seenKeys.add(k); }
+      seenObjs.add(p); payments.push(p);
+      kinds.set(p, p._relOwnerType || src.kind || null);
+    });
+  });
+  return { payments, kinds };
+}
+function sgrReportLastPaid(payments){
+  let last = null;
+  (payments||[]).forEach(p=>{
+    if(!p || sgrToCents0(p.amount) <= 0) return;      // R0.00 is never "last paid"
+    const d = sgrReportPaymentDate(p);
+    if(d && (last===null || d > last)) last = d;
+  });
+  return last;
+}
+/* The customer-facing document a payment belongs to. ctx = {quote, invoice:
+   {number, date} | null}. Display resolution only. */
+function sgrReportPaymentDocument(p, ownerKind, ctx){
+  const q = ctx && ctx.quote;
+  const quoteDoc = q ? (q.proformaNum ? { kind:'Proforma', number:String(q.proformaNum) }
+                                      : (q.num ? { kind:'Quote', number:String(q.num) } : null)) : null;
+  const inv = ctx && ctx.invoice && ctx.invoice.number ? ctx.invoice : null;
+  const invDoc = inv ? { kind:'Invoice', number:String(inv.number) } : null;
+  if(ownerKind==='invoice') return invDoc || quoteDoc;
+  if(ownerKind==='quote')   return quoteDoc || invDoc;
+  // job-owned (internal history): the invoice if it was received on/after
+  // the invoice date, otherwise the quote / proforma it was taken against.
+  const pd = sgrReportPaymentDate(p);
+  const invDate = inv && inv.date ? String(inv.date).slice(0,10) : null;
+  if(invDoc && (!quoteDoc || (pd && invDate && pd >= invDate))) return invDoc;
+  return quoteDoc || invDoc;
+}
+function sgrPaymentsReportModel(jobs, quotes, accInvoices, user){
+  const myJobs   = (jobs||[]).filter(j=>j && j.co!==UNIONTECH_ID && belongsToUserCompany(j,user));
+  const myQuotes = (quotes||[]).filter(q=>q && belongsToUserCompany(q,user));
+  const myInv    = (accInvoices||[]).filter(i=>i && i.status!=='void' && belongsToUserCompany(i,user));
+  const rows = [], claimed = new Set(), chains = [];
+  const finish = (row, settleRec, payableC, rawTotal, chain, ctx)=>{
+    const payments = chain.payments, paidC = sgrPaidCents(payments);
+    row._payments      = payments;
+    row._payableC      = payableC;
+    row._paidC         = paidC;
+    row._status        = sgrSettleRecordCents(settleRec, payableC, paidC, rawTotal);
+    row._outstandingC  = sgrOutstandingForRecordCents(settleRec, payableC, paidC);
+    row._lastPaid      = sgrReportLastPaid(payments);
+    rows.push(row);
+    chains.push({ chain, ctx, client: row.client||'', invoiced: true });
+  };
+  // 1. Job invoices — the rows this page has always listed (job object kept,
+  //    so the invoice-number hover/print behaviour is unchanged).
+  myJobs.forEach(j=>{
+    if(!j.invoiceNum) return;
+    const found  = resolveJobInvoiceRecord(j, myInv, myJobs);
+    const issued = (found && sameCompany(found, j)) ? found : null;
+    if(issued) claimed.add(issued);
+    const quote  = resolveQuoteForJob(j, myQuotes);
+    const chain = sgrReportChainPayments([
+      { kind:'quote', list: quote && quote.payments }, { kind:'job', list: j.payments },
+      { kind:'invoice', list: issued && issued.payments }]);
+    const payableC = issued ? sgrCanonicalPayableCents(issued) : sgrToCents0(j.value);
+    const ctx = { quote, invoice: issued ? { number: issued.number || j.invoiceNum, date: issued.date || j.invoiceDate }
+                                         : { number: j.invoiceNum, date: j.invoiceDate } };
+    finish({...j, _issued: issued}, issued, payableC, issued ? sgrRands(payableC) : j.value, chain, ctx);
+  });
+  // 2. Accounting invoices no job row represents. read.ts has already resolved
+  //    their whole chain into `payments`. A draft is listed only once money
+  //    has actually been received against it.
+  myInv.forEach(i=>{
+    if(claimed.has(i)) return;
+    const chain = sgrReportChainPayments([{ kind:'invoice', list: i.payments }]);
+    if(i.status==='draft' && !chain.payments.some(p=>sgrToCents0(p && p.amount)>0)) return;
+    const payableC = sgrCanonicalPayableCents(i);
+    const job = sgrJobForInvoice(i, myJobs);
+    const quote = resolveQuoteForInvoice(i, myQuotes) || (job ? resolveQuoteForJob(job, myQuotes) : null);
+    finish({ id:'inv-'+i.id, invoiceNum:i.number, client:i.contactName||'', co:i.co,
+             invoiceDate:i.date||null, invoiceDue:i.dueDate||null, value:sgrRands(payableC),
+             reference:i.reference, _isManual:true, _inv:i },
+           i, payableC, sgrRands(payableC), chain, { quote, invoice: { number: i.number, date: i.date } });
+  });
+  // 3. Money received before any invoice exists: jobs not yet invoiced, then
+  //    every quote / proforma. Not Paid-Invoices rows — cash only.
+  myJobs.forEach(j=>{
+    if(j.invoiceNum) return;
+    const quote = resolveQuoteForJob(j, myQuotes);
+    chains.push({ chain: sgrReportChainPayments([{ kind:'quote', list: quote && quote.payments }, { kind:'job', list: j.payments }]),
+                  ctx: { quote, invoice: null }, client: j.client||'' });
+  });
+  myQuotes.forEach(q=>{
+    chains.push({ chain: sgrReportChainPayments([{ kind:'quote', list: q.payments }]),
+                  ctx: { quote: q, invoice: null }, client: q.client||'' });
+  });
+  // Cash received: every positive payment ONCE across the whole report, on its
+  // own date, labelled with its customer-facing document.
+  const seenKeys = new Set(), seenObjs = new Set();
+  const byDate = {}, receipts = []; let totalPaidC = 0, invoiceCollectedC = 0, undatedReceipts = 0;
+  // Invoice chains are walked first, so a payment that belongs to an issued
+  // invoice's chain is always attributed to it — Collection Rate counts it;
+  // a deposit on a quote / proforma with no issued invoice yet does not.
+  chains.forEach(({chain, ctx, client, invoiced})=>{
+    chain.payments.forEach(p=>{
+      if(seenObjs.has(p)) return;
+      const k = sgrReportPaymentKey(p);
+      if(k!==null){ if(seenKeys.has(k)) return; seenKeys.add(k); }
+      seenObjs.add(p);
+      const c = sgrToCents0(p.amount);
+      if(c <= 0) return;                                 // R0.00 is not money received
+      totalPaidC += c;
+      if(invoiced) invoiceCollectedC += c;
+      const doc = sgrReportPaymentDocument(p, chain.kinds.get(p), ctx);
+      const d = sgrReportPaymentDate(p);
+      const rec = { _payAmt: sgrRands(c), _payCents: c, _payDate: d, _payment: p, client,
+                    _docKind: doc ? doc.kind : null, _docRef: doc ? doc.number : null };
+      receipts.push(rec);
+      if(!d){ undatedReceipts++; return; }
+      (byDate[d] = byDate[d] || []).push(rec);
+    });
+  });
+  const paidRows = rows.filter(r=>r._paidC>0)
+    .sort((a,b)=>String(b._lastPaid||'').localeCompare(String(a._lastPaid||'')));
+  const pendingRows = rows.filter(r=>r._outstandingC>0)
+    .sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
+  const totalPendingC = rows.reduce((s,r)=>s+r._outstandingC,0);
+  return { rows, paidRows, pendingRows, byDate, receipts, totalPaidC, invoiceCollectedC, totalPendingC, undatedReceipts };
+}
+
+/* ═══════════════════════════════════════════
    REPORTS
 ═══════════════════════════════════════════ */
-function ReportsPage({ jobs, companies, user, logoDataUrl, customers }) {
+function ReportsPage({ jobs, quotes, accInvoices, companies, user, logoDataUrl, customers }) {
   const isAdmin = user.role !== 'assistant';
   // Invoice hover-preview (Payments tab) — {job, x, y} while hovering a blue invoice no.
   const [hoverInv, setHoverInv] = useState(null);
@@ -26610,26 +26786,27 @@ function ReportsPage({ jobs, companies, user, logoDataUrl, customers }) {
   const [active,setActive]=useState(0);
   const chartRef=useRef(null); const instRef=useRef(null);
 
-  // Payments tab
-  // Actual cash received against a job = sum of every recorded payment
-  // (this already INCLUDES deposits & partial payments pulled through from the
-  // linked quote / proforma, so the figures match the rest of the platform).
-  const _jobPaid = j => (j.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-  const _jobBalance = j => (parseFloat(j.value)||0) - _jobPaid(j);
-  const _lastPayDate = j => { const ps=j.payments||[]; if(j.paidAt) return j.paidAt; if(ps.length){ const ds=ps.map(p=>p.date).filter(Boolean).sort(); if(ds.length) return ds[ds.length-1]; } return j.invoiceDate||null; };
-  const _isJobFullyPaid = j => { const tot=parseFloat(j.value)||0; return tot>0 && _jobPaid(j)>=tot-0.005; };
-  // Company-scoped: visibleJobs only, so the Payments tab (paid/outstanding/
-  // calendar) never mixes Holdings and original-company invoices.
-  const invoicedJobs = visibleJobs.filter(j=>j.invoiceNum);
+  // Payments tab — 2026-09-22: every figure comes from ONE canonical model
+  // (sgrPaymentsReportModel above): chain-resolved rel_payments, each counted
+  // once, settled against the canonical payable. Company-scoped inside the
+  // model with the same belongsToUserCompany rule as before.
+  const payModel = useMemo(()=>sgrPaymentsReportModel(jobs, quotes, accInvoices, user),[jobs, quotes, accInvoices, user]);
+  const _jobPaid = j => sgrRands(j._paidC||0);
+  const _jobBalance = j => sgrRands(j._outstandingC||0);
+  const _lastPayDate = j => j._lastPaid||null;
   // Paid Invoices list = every invoice that has actually received money (deposits included),
   // newest receipt first.
-  const paidJobs = invoicedJobs.filter(j=>_jobPaid(j)>0.005).sort((a,b)=>new Date(_lastPayDate(b)||0)-new Date(_lastPayDate(a)||0));
+  const paidJobs = payModel.paidRows;
   // Outstanding list = every invoice that still has a balance owing.
-  const pendingJobs = invoicedJobs.filter(j=>_jobBalance(j)>0.005).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
+  const pendingJobs = payModel.pendingRows;
   // Total Paid  = actual cash received across all invoices (incl. deposits/partials).
   // Outstanding = sum of the remaining balances only.
-  const totalPaid = invoicedJobs.reduce((s,j)=>s+_jobPaid(j),0);
-  const totalPending = invoicedJobs.reduce((s,j)=>{const b=_jobBalance(j); return s+(b>0?b:0);},0);
+  const totalPaid = sgrRands(payModel.totalPaidC);
+  const totalPending = sgrRands(payModel.totalPendingC);
+  // Collection Rate is issued-invoice scoped ("of all invoices collected"):
+  // cash in issued-invoice chains only — deposits on not-yet-invoiced quotes /
+  // proformas are in Total Paid but not in this percentage.
+  const invoiceCollected = sgrRands(payModel.invoiceCollectedC);
 
   // Blue invoice number: hover to preview the invoice, click to open the full printable doc.
   const InvNum = (j) => (
@@ -26637,7 +26814,7 @@ function ReportsPage({ jobs, companies, user, logoDataUrl, customers }) {
       onMouseEnter={e=>setHoverInv({job:j,x:e.clientX,y:e.clientY})}
       onMouseMove={e=>setHoverInv({job:j,x:e.clientX,y:e.clientY})}
       onMouseLeave={()=>setHoverInv(h=>(h&&h.job&&h.job.id===j.id)?null:h)}
-      onClick={()=>printInvoice(j,companies,logoDataUrl,customers)}
+      onClick={()=>j._isManual ? printManualInvoice(j._inv,companies,logoDataUrl,{quotes,jobs,accInvoices,customers}) : printInvoice(j,companies,logoDataUrl,customers)}
       className="font-black text-brand-600 hover:text-brand-800 hover:underline cursor-pointer"
       title="Hover to preview · click to open the full invoice">
       {j.invoiceNum}
@@ -26648,18 +26825,8 @@ function ReportsPage({ jobs, companies, user, logoDataUrl, customers }) {
   const today = new Date();
   const [calYear, setCalYear] = useState(today.getFullYear());
   const [calMonth, setCalMonth] = useState(today.getMonth()); // 0-indexed
-  const paymentsByDate = useMemo(()=>{
-    const m={};
-    // Plot each actual receipt (deposit / partial / final) on the day it was received.
-    invoicedJobs.forEach(j=>{
-      (j.payments||[]).forEach(p=>{
-        const amt=parseFloat(p.amount)||0;
-        const d=p.date||_lastPayDate(j);
-        if(d&&amt>0){ if(!m[d])m[d]=[]; m[d].push({...j,_payAmt:amt}); }
-      });
-    });
-    return m;
-  },[jobs]);
+  // Plot each actual receipt (deposit / partial / final) once, on its own payment date.
+  const paymentsByDate = payModel.byDate;
   const monthName = new Date(calYear,calMonth,1).toLocaleString('en-ZA',{month:'long',year:'numeric'});
   const firstDay = new Date(calYear,calMonth,1).getDay(); // 0=Sun
   const daysInMonth = new Date(calYear,calMonth+1,0).getDate();
@@ -26749,7 +26916,7 @@ function ReportsPage({ jobs, companies, user, logoDataUrl, customers }) {
           <div className="bg-white border border-gray-200 rounded-2xl p-4">
             <p className="text-xs text-gray-400">Collection Rate</p>
             <p className="text-xl font-black text-gray-700 mt-1">
-              {totalPaid+totalPending>0?((totalPaid/(totalPaid+totalPending))*100).toFixed(1)+'%':'—'}
+              {invoiceCollected+totalPending>0?((invoiceCollected/(invoiceCollected+totalPending))*100).toFixed(1)+'%':'—'}
             </p>
             <p className="text-xs text-gray-400 mt-0.5">of all invoices collected</p>
           </div>
@@ -26811,7 +26978,7 @@ function ReportsPage({ jobs, companies, user, logoDataUrl, customers }) {
                 </tr>
               </thead>
               <tbody>
-                {paidJobs.map(j=>{const paid=_jobPaid(j),val=parseFloat(j.value)||0,full=paid>=val-0.005;return(
+                {paidJobs.map(j=>{const paid=_jobPaid(j),val=sgrRands(j._payableC),full=j._status==='paid';return(
                   <tr key={j.id} className="border-t border-gray-50 hover:bg-gray-50">
                     <td className="px-4 py-2.5">{InvNum(j)}</td>
                     <td className="px-4 py-2.5 font-semibold text-gray-700">{j.client}</td>
@@ -26829,7 +26996,7 @@ function ReportsPage({ jobs, companies, user, logoDataUrl, customers }) {
                     </td>
                     <td className="px-4 py-2.5 text-right">
                       <div className="font-black text-emerald-700">{zar(paid)}</div>
-                      {!full&&<div className="text-xs text-amber-500">of {zar(val)} · bal {zar(val-paid)}</div>}
+                      {!full&&<div className="text-xs text-amber-500">of {zar(val)} · bal {zar(_jobBalance(j))}</div>}
                     </td>
                   </tr>
                 );})}
@@ -26855,7 +27022,7 @@ function ReportsPage({ jobs, companies, user, logoDataUrl, customers }) {
                 </tr>
               </thead>
               <tbody>
-                {pendingJobs.map(j=>{const paid=_jobPaid(j),val=parseFloat(j.value)||0,bal=val-paid;return(
+                {pendingJobs.map(j=>{const paid=_jobPaid(j),val=sgrRands(j._payableC),bal=_jobBalance(j);return(
                   <tr key={j.id} className="border-t border-gray-50 hover:bg-gray-50">
                     <td className="px-4 py-2.5">{InvNum(j)}</td>
                     <td className="px-4 py-2.5 font-semibold text-gray-700">{j.client}</td>
@@ -26875,7 +27042,7 @@ function ReportsPage({ jobs, companies, user, logoDataUrl, customers }) {
         {/* Invoice hover preview — follows the cursor, never clipped by the cards */}
         {hoverInv&&(()=>{
           const j=hoverInv.job, co=(companies.find(c=>c.id===j.co)||{short:'Manual'});
-          const paid=_jobPaid(j), val=parseFloat(j.value)||0, bal=val-paid, full=paid>=val-0.005;
+          const paid=_jobPaid(j), val=sgrRands(j._payableC), bal=_jobBalance(j), full=j._status==='paid';
           const lns=j.lines||[];
           const left=Math.min(hoverInv.x+16,(typeof window!=='undefined'?window.innerWidth:1200)-308);
           const top=Math.min(hoverInv.y+16,(typeof window!=='undefined'?window.innerHeight:800)-300);
@@ -28873,7 +29040,7 @@ function App() {
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quotes={quotes} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
-    reports:     <ReportsPage     jobs={jobs} companies={companies} user={user} logoDataUrl={brandingLogo} customers={customers}/>,
+    reports:     <ReportsPage     jobs={jobs} quotes={quotes} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} customers={customers}/>,
     accounting:  <AccountingPage jobs={jobs} setJobs={setJobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user} onOpenJob={openJobRecord} onOpenQuote={openQuoteRecord} onOpenCustomer={openCustomerRecord} onOpenJobPayments={openJobPaymentsRecord} initialStatementContact={accountingOpen&&accountingOpen.contact} onInitialStatementHandled={()=>setAccountingOpen(null)} forceSaveSections={forceSaveSections}/>,
     hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={brandingLogo} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
     // Admin-only (main Admin, never Holdings Admin) — guarded again here in
