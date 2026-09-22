@@ -119,7 +119,20 @@ const WANTED_FNS = [
   // the shared job-invoice reconciler used by BOTH Sales and Accounting
   'reconcileJobInvoice',
 ];
+/* 2026-09-22 (ONE-CENT RECONCILIATION): the lifted settlement/document
+   functions now delegate to the shared canonical-cents module, so that module
+   must be in scope here too. It is lifted verbatim between its sentinels, for
+   the same reason everything else in this harness is lifted rather than
+   re-implemented: this suite must never drift from shipped behaviour. */
+const _SGR_MOD_A = SRC.indexOf('BEGIN SGR-CANONICAL-CENTS');
+const _SGR_MOD_B = SRC.indexOf('/* END SGR-CANONICAL-CENTS */');
+if (_SGR_MOD_A < 0 || _SGR_MOD_B < 0) {
+  console.error('SGR-CANONICAL-CENTS sentinels not found in index.html'); process.exit(1);
+}
+const SGR_CANONICAL_CENTS_SRC =
+  SRC.slice(SRC.lastIndexOf('/*', _SGR_MOD_A), _SGR_MOD_B + '/* END SGR-CANONICAL-CENTS */'.length);
 const pieces = [extractConst(SRC, MASKED, 'HOLDINGS_CO_ID'), extractConst(SRC, MASKED, 'HOLDINGS_CO_KEY')];
+pieces.push(SGR_CANONICAL_CENTS_SRC);
 for (const f of WANTED_FNS) pieces.push(extractFunction(SRC, f));
 pieces.push('return {' + WANTED_FNS.join(',') + '};');
 
@@ -348,19 +361,29 @@ section('8. SOURCE — one rule, wired into both surfaces');
   ok(/\nfunction deriveSettlementStatus\(invoiceTotal, paidTotal\)\{/.test(SRC), 'deriveSettlementStatus() is defined once, at module scope');
   ok((SRC.match(/\nfunction toCents\(/g) || []).length === 1, 'toCents() is defined exactly once');
   ok((SRC.match(/\nfunction deriveSettlementStatus\(/g) || []).length === 1, 'deriveSettlementStatus() is defined exactly once');
-  ok(/const invoiceStatus = deriveSettlementStatus\(invTotal, totalPaid\);/.test(SRC),
-    'reconcileJobInvoice() — shared by Sales and Accounting — derives through the shared rule');
+  // 2026-09-22 (ONE-CENT RECONCILIATION): the shared rule is now applied in
+  // exact integer cents, against the issued DOCUMENT rather than job.value.
+  ok(/const invoiceStatus = sgrSettleRecordCents\(_settleRec, invTotalCents, paidC, invTotal\);/.test(SRC),
+    'reconcileJobInvoice() — shared by Sales and Accounting — derives through the shared rule, in cents');
+  ok(/const invTotalCents = _issued \? sgrCanonicalPayableCents\(_issued\) : sgrToCents0\(job\.value\);/.test(SRC),
+    'against the ISSUED INVOICE where one exists, else rel_jobs.value \u2014 Option D (2026-09-22)');
   ok(!/if\(totalPaid>=invTotal && invTotal>0\) invoiceStatus = 'paid';/.test(MASKED),
     'the old raw-float comparison is gone from reconcileJobInvoice');
-  ok(/const _settled = deriveSettlementStatus\(sub\+vat, sumPaymentAmounts\(i\.payments\)\);/.test(SRC),
+  ok(/const _settled = sgrSettleRecordCents\(i, totalC, sgrPaidCents\(i\.payments\), sgrRands\(totalC\)\);/.test(SRC),
     'Sales → Invoices derives a canonical invoice\'s status instead of echoing the stored one');
   ok(!/const normStatus=i\.status==='paid'\?'paid':i\.status==='partial'\?'partial':'pending';/.test(MASKED),
     'the old stored-status-verbatim line is gone from Sales');
-  ok(/const isEffectivelyPaid = inv\.status==='partial'\s*\n?\s*&& deriveSettlementStatus\(sub\+vat, paidSoFar\)==='paid';/.test(SRC),
+  ok(/const isEffectivelyPaid = inv\.status==='partial'\s*\n?\s*&& sgrSettleRecordCents\(inv, _rowTotalC, _rowPaidC, sgrRands\(_rowTotalC\)\)==='paid';/.test(SRC),
     'Accounting\'s badge uses the shared rule');
   ok(!/outstanding<=0\.01/.test(MASKED), 'Accounting\'s private "<= R0.01" tolerance is gone');
-  ok(/const outstanding = settlementOutstanding\(sub\+vat, paidSoFar\);/.test(SRC),
-    'Accounting states the outstanding balance in cents');
+  ok(/const outstanding = sgrRands\(sgrOutstandingForRecordCents\(inv, _rowTotalC, _rowPaidC\)\);/.test(SRC),
+    'Accounting states the outstanding balance in exact cents');
+  // and the 2026-09-22 additions: one canonical pipeline, no raw-float writes
+  ok(/function sgrToUnits4\(n\)\{/.test(SRC), 'the canonical cents converter is present');
+  ok(!/newTotal>=invTotal/.test(MASKED) && !/newTotal>=statusTotal/.test(MASKED),
+    'no raw-float status write survives anywhere');
+  ok(/function sgrStatusForPayments\(rec, totalC, payments, pendingFallback, rawTotal\)\{/.test(SRC),
+    'every payment write goes through the one shared rule');
 }
 
 section('9. SOURCE — rel_payments architecture and company scoping untouched');

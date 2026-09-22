@@ -117,7 +117,20 @@ const WANTED_FNS = [
   // suite asserts changes — this is a harness dependency, not a rule change.
   'sumPaymentAmounts', 'toCents', 'deriveSettlementStatus',
 ];
+/* 2026-09-22 (ONE-CENT RECONCILIATION): the lifted settlement/document
+   functions now delegate to the shared canonical-cents module, so that module
+   must be in scope here too. It is lifted verbatim between its sentinels, for
+   the same reason everything else in this harness is lifted rather than
+   re-implemented: this suite must never drift from shipped behaviour. */
+const _SGR_MOD_A = SRC.indexOf('BEGIN SGR-CANONICAL-CENTS');
+const _SGR_MOD_B = SRC.indexOf('/* END SGR-CANONICAL-CENTS */');
+if (_SGR_MOD_A < 0 || _SGR_MOD_B < 0) {
+  console.error('SGR-CANONICAL-CENTS sentinels not found in index.html'); process.exit(1);
+}
+const SGR_CANONICAL_CENTS_SRC =
+  SRC.slice(SRC.lastIndexOf('/*', _SGR_MOD_A), _SGR_MOD_B + '/* END SGR-CANONICAL-CENTS */'.length);
 const pieces = [extractConst(SRC, MASKED, 'HOLDINGS_CO_ID'), extractConst(SRC, MASKED, 'HOLDINGS_CO_KEY')];
+pieces.push(SGR_CANONICAL_CENTS_SRC);
 for (const f of WANTED_FNS) pieces.push(extractFunction(SRC, MASKED, f));
 pieces.push('return {' + WANTED_FNS.join(',') + ', HOLDINGS_CO_ID};');
 

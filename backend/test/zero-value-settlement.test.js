@@ -128,7 +128,20 @@ const WANTED_FNS = [
   // the shared job-invoice reconciler used by BOTH Sales and Accounting
   'reconcileJobInvoice',
 ];
+/* 2026-09-22 (ONE-CENT RECONCILIATION): the lifted settlement/document
+   functions now delegate to the shared canonical-cents module, so that module
+   must be in scope here too. It is lifted verbatim between its sentinels, for
+   the same reason everything else in this harness is lifted rather than
+   re-implemented: this suite must never drift from shipped behaviour. */
+const _SGR_MOD_A = SRC.indexOf('BEGIN SGR-CANONICAL-CENTS');
+const _SGR_MOD_B = SRC.indexOf('/* END SGR-CANONICAL-CENTS */');
+if (_SGR_MOD_A < 0 || _SGR_MOD_B < 0) {
+  console.error('SGR-CANONICAL-CENTS sentinels not found in index.html'); process.exit(1);
+}
+const SGR_CANONICAL_CENTS_SRC =
+  SRC.slice(SRC.lastIndexOf('/*', _SGR_MOD_A), _SGR_MOD_B + '/* END SGR-CANONICAL-CENTS */'.length);
 const pieces = [extractConst(SRC, MASKED, 'HOLDINGS_CO_ID'), extractConst(SRC, MASKED, 'HOLDINGS_CO_KEY')];
+pieces.push(SGR_CANONICAL_CENTS_SRC);
 for (const f of WANTED_FNS) pieces.push(extractFunction(SRC, f));
 pieces.push('return {' + WANTED_FNS.join(',') + '};');
 
@@ -508,36 +521,43 @@ section('12. SOURCE — the one settlement rule is balance-only');
   ok((SRC.match(/\nfunction toCents\(/g) || []).length === 1, 'toCents() is still defined exactly once');
   ok(!/if\(total > 0 && paid >= total\) return 'paid';/.test(SRC),
      'the "positive total required" guard is gone from deriveSettlementStatus');
-  ok(/if\(paid >= total\) return 'paid';/.test(SRC),
-     'settlement is now decided by the balance alone: paid >= total -> paid');
-  ok(/if\(total <= 0\) return isGenuineZeroAmount\(invoiceTotal\) \? 'paid' : \(paid > 0 \? 'partial' : 'pending'\);/.test(SRC),
-     'the zero branch requires a GENUINE zero, not merely a total that parsed to 0');
+  /* 2026-09-22 (ONE-CENT RECONCILIATION): the rule moved into the shared
+     canonical-cents module and compares exact INTEGER CENTS. The zero-value
+     behaviour this suite guards is unchanged and still expressed here. */
+  ok(/if\(p >= t\) return 'paid';/.test(SRC),
+     'settlement is still decided by the balance alone: paid >= total -> paid');
+  ok(/isGenuineZeroAmount\(arguments\.length < 3 \? t \/ 100 : rawTotal\)/.test(SRC),
+     'the zero branch still requires a GENUINE zero, not merely a total that parsed to 0');
+  ok((SRC.match(/\nfunction sgrSettlementStatusCents\(/g) || []).length === 1,
+     'the cents rule is defined exactly once, at module scope');
   ok((SRC.match(/\nfunction isGenuineZeroAmount\(/g) || []).length === 1, 'isGenuineZeroAmount() is defined exactly once, at module scope');
   ok((SRC.match(/\nfunction invoiceIsZeroValue\(/g) || []).length === 1, 'invoiceIsZeroValue() is defined exactly once, at module scope');
   ok((SRC.match(/\nfunction invoiceLineTotalIncVat\(/g) || []).length === 1, 'invoiceLineTotalIncVat() is defined exactly once, at module scope');
-  ok(/const invTotal  = job\.value;/.test(SRC),
-     'reconcileJobInvoice hands the RAW job value to the rule, so a broken value is not laundered into a zero');
+  ok(/const invTotal      = _issued \? sgrRands\(invTotalCents\) : job\.value;/.test(SRC),
+     'reconcileJobInvoice still holds the RAW job value where no invoice was issued, so a broken value is not laundered into a zero');
+  ok(/const invoiceStatus = sgrSettleRecordCents\(_settleRec, invTotalCents, paidC, invTotal\);/.test(SRC),
+     'and hands that raw value straight to the rule, so a broken value is never a genuine zero');
   ok(!/const invTotal  = parseFloat\(job\.value\)\|\|0;/.test(SRC),
      'the laundering parseFloat(job.value)||0 is gone from reconcileJobInvoice');
-  ok(/invoiceStatus: deriveSettlementStatus\(_qAfterDisc\*1\.15, sumPaymentAmounts\(_paymentsForNewJob\)\),/.test(SRC),
-     'quote->job conversion seeds the stored status through the SHARED rule, not an open-coded copy');
+  ok(/invoiceStatus: sgrSettlementStatusCents\(_qCanonC, sgrPaidCents\(_paymentsForNewJob\), sgrRands\(_qCanonC\)\),/.test(SRC),
+     'quote->job conversion seeds the stored status through the SHARED rule, in canonical cents');
   ok(!/return paid>=tot&&tot>0\?'paid':paid>0\?'partial':'pending';/.test(MASKED),
      'the open-coded copy of the rule is gone from the conversion');
-  ok(/const _jobSettlement = reconcileJobInvoice\(job, quotes\)\.invoiceStatus;/.test(SRC),
+  ok(/const _jobSettlement = reconcileJobInvoice\(job, quotes, \{ accInvoices, jobs \}\)\.invoiceStatus;/.test(SRC),
      'Job Detail derives its invoice badge instead of reading the stored compatibility field');
   ok(!/\{job\.invoiceStatus==='paid'\?'✓ Fully Paid'/.test(SRC),
      'Job Detail no longer badges from job.invoiceStatus');
   ok(/if\(_acc\.status!=='draft' && invoiceIsZeroValue\(_acc\)/.test(SRC),
      'Accounting normalises an ISSUED, line-proven R0.00 canonical invoice — and only that');
-  ok(/const _settledForDisplay = \(toCents\(sub\+vat\)<=0 && !\(i\.status!=='draft' && invoiceIsZeroValue\(i\)\)\)/.test(SRC),
+  ok(/const _settledForDisplay = \(totalC<=0 && !\(i\.status!=='draft' && invoiceIsZeroValue\(i\)\)\)/.test(SRC),
      'Sales applies the same issued-and-proven test before calling a zero total settled');
-  ok(/const invoiceStatus = deriveSettlementStatus\(invTotal, totalPaid\);/.test(SRC),
+  ok(/const invoiceStatus = sgrSettleRecordCents\(_settleRec, invTotalCents, paidC, invTotal\);/.test(SRC),
      'reconcileJobInvoice() still derives through the shared rule');
-  ok(/const _settled = deriveSettlementStatus\(sub\+vat, sumPaymentAmounts\(i\.payments\)\);/.test(SRC),
+  ok(/const _settled = sgrSettleRecordCents\(i, totalC, sgrPaidCents\(i\.payments\), sgrRands\(totalC\)\);/.test(SRC),
      'Sales -> Invoices still derives a canonical invoice through the shared rule');
-  ok(/const isEffectivelyPaid = inv\.status==='partial'\s*\n?\s*&& deriveSettlementStatus\(sub\+vat, paidSoFar\)==='paid';/.test(SRC),
+  ok(/const isEffectivelyPaid = inv\.status==='partial'\s*\n?\s*&& sgrSettleRecordCents\(inv, _rowTotalC, _rowPaidC, sgrRands\(_rowTotalC\)\)==='paid';/.test(SRC),
      'Accounting\'s existing partial-rescue is untouched');
-  ok(/const outstanding = settlementOutstanding\(sub\+vat, paidSoFar\);/.test(SRC),
+  ok(/const outstanding = sgrRands\(sgrOutstandingForRecordCents\(inv, _rowTotalC, _rowPaidC\)\);/.test(SRC),
      'Accounting still states the outstanding balance in cents');
   ok(!/outstanding<=0\.01/.test(MASKED), 'no display tolerance was reintroduced');
 }

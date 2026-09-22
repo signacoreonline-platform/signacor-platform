@@ -119,7 +119,20 @@ const WANTED_FNS = [
 ];
 const CONSTS = ['HOLDINGS_CO_ID', 'HOLDINGS_CO_KEY',
   'SGR_INV_SETUP_FEE_DESC', 'SGR_INV_DISCOUNT_RE', 'SGR_INV_ADJ_EPSILON'];
+/* 2026-09-22 (ONE-CENT RECONCILIATION): the lifted settlement/document
+   functions now delegate to the shared canonical-cents module, so that module
+   must be in scope here too. It is lifted verbatim between its sentinels, for
+   the same reason everything else in this harness is lifted rather than
+   re-implemented: this suite must never drift from shipped behaviour. */
+const _SGR_MOD_A = SRC.indexOf('BEGIN SGR-CANONICAL-CENTS');
+const _SGR_MOD_B = SRC.indexOf('/* END SGR-CANONICAL-CENTS */');
+if (_SGR_MOD_A < 0 || _SGR_MOD_B < 0) {
+  console.error('SGR-CANONICAL-CENTS sentinels not found in index.html'); process.exit(1);
+}
+const SGR_CANONICAL_CENTS_SRC =
+  SRC.slice(SRC.lastIndexOf('/*', _SGR_MOD_A), _SGR_MOD_B + '/* END SGR-CANONICAL-CENTS */'.length);
 const pieces = CONSTS.map(c => extractConst(SRC, MASKED, c));
+pieces.push(SGR_CANONICAL_CENTS_SRC);
 for (const f of WANTED_FNS) pieces.push(extractFunction(SRC, f));
 pieces.push('return {' + WANTED_FNS.join(',') + '};');
 
@@ -413,8 +426,13 @@ section('9. SOURCE — discount authority and company scoping unchanged');
     'the adjustment-line splitter is unchanged and still the only parser');
   ok((SRC.match(/SGR_INV_DISCOUNT_RE\s*=/g) || []).length === 1,
     'there is still exactly ONE Discount (x%) pattern in the codebase');
-  ok(/if\(discAmt>0\.005\) out\.push\(\{ description:`Discount \(\$\{discPct\}%\)`/.test(SRC),
+  // 2026-09-22 (OPTION D): the line now carries the CANONICAL discount cents
+  // from the shared pipeline instead of a 4-decimal float that the cent
+  // conversion would round a second time. Same single writer, same shape.
+  ok(/if\(_c\.discC > 0\) out\.push\(\{ description:`Discount \(\$\{discPct\}%\)`/.test(SRC),
     'stubAdjustmentLines is still the writer of the discount line');
+  ok(/unitAmount:sgrRands\(-_c\.discC\)/.test(SRC),
+    'and it carries the canonical discount cents');
   ok(/const link = resolveQuoteForJob\(j, myQuotes\);/.test(SRC),
     'Sales still resolves a job\'s source quote through the company-safe resolver');
   ok(!/\.find\(\s*q\s*=>\s*q\.num\s*===\s*job\.quoteNum\s*\)/.test(MASKED),

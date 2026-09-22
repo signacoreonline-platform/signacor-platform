@@ -777,8 +777,193 @@ function roundMoney4(n: number): number {
  * and must stay 'partial'). Rounding both sides keeps that case correct.
  */
 function toCents(n: number): number {
-  return Math.round((Number(n) || 0) * 100) / 100;
+  // 2026-09-22 (ONE-CENT RECONCILIATION): delegates to the decimal-safe
+  // converter below. Math.round(n*100)/100 rounds the BINARY approximation, so
+  // toCents(132.825) came out 132.82 (132.825*100 === 13282.499999999998) —
+  // the helper written to make comparisons cent-precise was itself a source of
+  // cent drift. Same name, same signature, same rand-denominated return.
+  return sgrRands(sgrToCents0(n));
 }
+
+/* ╔═══════════════════════════════════════════════════════════════════════════╗
+   ║  SGR CANONICAL CENTS — backend mirror (2026-09-22)                        ║
+   ╚═══════════════════════════════════════════════════════════════════════════╝
+   BEGIN SGR-CANONICAL-CENTS
+
+   Byte-for-byte the same rule index.html applies, for the same reason: money is
+   an INTEGER NUMBER OF CENTS, produced by ONE pipeline, and both status
+   projections read that one integer.
+
+     lineAmountCents = round(qty x unit_amount)        per DISPLAYED line
+     subtotalCents   = SUM(lineAmountCents)
+     vatCents        = round(taxable lines x 15 / 100) ONCE, never per line
+     totalCents      = subtotalCents + vatCents
+
+   Rounding is HALF AWAY FROM ZERO, on the DECIMAL, and symmetric — a discount
+   is stored as a NEGATIVE line, so -0.005 must round to -0.01 exactly as +0.005
+   rounds to +0.01. JavaScript's Math.round is asymmetric at the negative half
+   and is never used for money here.
+
+   Line quantities and amounts are NUMERIC(14,4); a value is resolved to an
+   exact integer number of 1e-4 units and the product taken in INTEGER space
+   (1e-8 units) before the single rounding to cents, so no double rounding and
+   no float can enter. Exact for any line extension up to about R10,000,000.
+
+   NOT A TOLERANCE. Settlement is exact integer equality on cents: paying
+   totalCents settles, paying totalCents-1 leaves one cent outstanding.
+   SOURCE_TOTAL_TOLERANCE is a DIFFERENT thing — source-document reconciliation,
+   not payment settlement — and is deliberately left at 0.05.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+/** A money/quantity value as an exact integer number of 1e-4 units — the
+ *  precision NUMERIC(14,4) stores. `toFixed(4)` is the correctly-rounded
+ *  DECIMAL string of the double, which strips the binary residue. */
+export function sgrToUnits4(n: unknown): number {
+  if (n === null || n === undefined || n === '') return NaN;
+  const x = Number(n);
+  if (!Number.isFinite(x)) return NaN;
+  const str = x.toFixed(4);
+  const neg = str.charCodeAt(0) === 45;
+  const b = neg ? str.slice(1) : str;
+  const dot = b.indexOf('.');
+  const u = Number(b.slice(0, dot)) * 10000 + Number(b.slice(dot + 1));
+  if (!Number.isSafeInteger(u)) return NaN;
+  return neg ? -u : u;
+}
+
+/** Integer division, HALF AWAY FROM ZERO — symmetric for negative amounts. */
+export function sgrDivRound(a: number, den: number): number {
+  if (!Number.isFinite(a) || !Number.isFinite(den) || den <= 0) return NaN;
+  const neg = a < 0;
+  const m = neg ? -a : a;
+  const q = (m - (m % den)) / den;
+  const out = q + ((m % den) * 2 >= den ? 1 : 0);
+  return neg ? -out : out;
+}
+
+/** round(base x num / den), in exact integer arithmetic, half away from zero. */
+export function sgrMulDivRound(base: number, num: number, den: number): number {
+  if (!Number.isFinite(base) || !Number.isFinite(num) || !Number.isFinite(den) || den <= 0) return NaN;
+  const neg = (base < 0) !== (num < 0);
+  const p = Math.abs(base) * Math.abs(num);
+  if (!Number.isSafeInteger(p)) return NaN;
+  const out = sgrDivRound(p, den);
+  return neg ? -out : out;
+}
+
+/** A single money value in cents; NaN for a failed parse. */
+export function sgrToCents(n: unknown): number {
+  const u = sgrToUnits4(n);
+  return Number.isFinite(u) ? sgrDivRound(u, 100) : NaN;
+}
+/** Same, with a failed parse reading as 0 (the `Number(x) || 0` contract). */
+export function sgrToCents0(n: unknown): number {
+  const c = sgrToCents(n);
+  return Number.isFinite(c) ? c : 0;
+}
+/** Cents back to a rand amount. */
+export function sgrRands(cents: number): number {
+  return Number.isFinite(cents) ? cents / 100 : 0;
+}
+
+/** A DISPLAYED line extension in cents: qty x unit_amount, multiplied in
+ *  integer 1e-8 space and rounded exactly once. */
+export function sgrExtCents(qty: unknown, unitAmount: unknown): number {
+  const q = sgrToUnits4(qty === null || qty === undefined || qty === '' ? 1 : qty);
+  const u = sgrToUnits4(unitAmount === null || unitAmount === undefined || unitAmount === '' ? 0 : unitAmount);
+  if (!Number.isFinite(q) || !Number.isFinite(u)) return 0;
+  const p = q * u;
+  if (Number.isSafeInteger(p)) return sgrDivRound(p, 1000000);
+  return sgrToCents0((q / 10000) * (u / 10000));
+}
+
+/** THE canonical money of an invoice, in cents, from its own line rows —
+ *  each displayed line extension rounded to cents, VAT taken ONCE over the
+ *  taxable lines. Which lines are taxable is unchanged (tax_type === '15%')
+ *  and the rate is unchanged (15%). */
+export function sgrInvoiceCentsFromRows(
+  rows: Array<{ qty: unknown; unit_amount: unknown; tax_type?: unknown }>
+): { subC: number; taxBaseC: number; vatC: number; totalC: number } {
+  let subC = 0, taxBaseC = 0;
+  for (const l of rows || []) {
+    const c = sgrExtCents(l.qty, l.unit_amount);
+    subC += c;
+    if (l.tax_type === '15%') taxBaseC += c;
+  }
+  const vatC = sgrMulDivRound(taxBaseC, 15, 100) || 0;
+  return { subC, taxBaseC, vatC, totalC: subC + vatC };
+}
+/* ── VERIFIED LEGACY SYSTEM-GENERATED ROUNDING SETTLEMENT (2026-09-22) ────
+ *  The server-side half of the audited historical exception. See index.html's
+ *  block of the same name for the full rationale.
+ *
+ *  A HISTORICAL invoice can sit a cent short of its own issued total because
+ *  the OLD platform asked for a cent less than the document stated, and the
+ *  customer paid exactly what they were asked. The invoice and its VAT are
+ *  left untouched; only the settlement STATUS is reconciled.
+ *
+ *  THIS IS NOT A ONE-CENT TOLERANCE. Nothing is forgiven on the strength of its
+ *  size. The marker must still name this EXACT payable, this EXACT paid total
+ *  and this EXACT residual; one cent of movement on either side and it stops
+ *  applying on the very next recompute, automatically.
+ *
+ *  NORMAL RUNTIME NEVER CREATES ONE. Nothing in this file — no payment save,
+ *  invoice save, job save, quote save, status recompute or invoice
+ *  synchronisation — writes this key. The ONLY writer in the whole codebase is
+ *  src/scripts/reconcile-historical-settlement.ts, under an explicit --apply.
+ *  A future genuine R0.01 short payment can therefore never be reclassified as
+ *  legacy by anything the application does on its own.
+ *
+ *  The marker lives in rel_invoices.legacy_data — the SAME additive JSONB
+ *  column writeQuoteInvoiceLinesTx already records commercialLineSource
+ *  provenance in. No schema change, no migration, no second financial ledger.
+ */
+export const SGR_LEGACY_SETTLEMENT_KEY = 'legacyRoundingSettlement';
+export const SGR_LEGACY_SETTLEMENT_VERSION = 1;
+
+export interface LegacyRoundingSettlementMarker {
+  settled: true;
+  reason: string;
+  payableCentsAtVerification: number;
+  paidCentsAtVerification: number;
+  residualCents: number;
+  legacyGeneratedAmountCents: number;
+  verificationMode: string;
+  verifiedAt: string;
+  version: number;
+}
+
+/** The marker, only if it is structurally self-consistent. A marker that does
+ *  not state what it was verified against cannot be verified again, so it is
+ *  ignored rather than trusted. */
+export function sgrLegacySettlementMarker(legacyData: unknown): LegacyRoundingSettlementMarker | null {
+  if (!legacyData || typeof legacyData !== 'object' || Array.isArray(legacyData)) return null;
+  const m = (legacyData as any)[SGR_LEGACY_SETTLEMENT_KEY];
+  if (!m || typeof m !== 'object' || Array.isArray(m)) return null;
+  if (m.settled !== true) return null;
+  if (m.version !== SGR_LEGACY_SETTLEMENT_VERSION) return null;
+  if (!Number.isSafeInteger(m.payableCentsAtVerification)) return null;
+  if (!Number.isSafeInteger(m.paidCentsAtVerification)) return null;
+  if (!Number.isSafeInteger(m.residualCents)) return null;
+  if (!Number.isSafeInteger(m.legacyGeneratedAmountCents)) return null;
+  if (m.residualCents <= 0) return null;
+  if (m.payableCentsAtVerification - m.paidCentsAtVerification !== m.residualCents) return null;
+  return m as LegacyRoundingSettlementMarker;
+}
+
+/** TRUE only while this transaction is still the one the marker was verified
+ *  against. Any material change to the payable or to the payments invalidates
+ *  it here, on the spot, with no cleanup step and no automatic refresh. */
+export function sgrLegacySettlementApplies(legacyData: unknown, payableC: number, paidC: number): boolean {
+  const m = sgrLegacySettlementMarker(legacyData);
+  if (!m) return false;
+  if (!Number.isFinite(payableC) || !Number.isFinite(paidC)) return false;
+  if (payableC !== m.payableCentsAtVerification) return false;   // the commercial value changed
+  if (paidC !== m.paidCentsAtVerification) return false;         // a payment changed
+  if (payableC - paidC !== m.residualCents) return false;
+  return true;
+}
+/* END SGR-CANONICAL-CENTS */
 
 /** "10.000" -> "10", "12.500" -> "12.5" — the discount line reads the way a
  *  person wrote it, matching index.html's `parseFloat(quote.discount)`. */
@@ -907,7 +1092,20 @@ async function writeInvoiceAdjustmentLinesTx(
   let lineIndex = startIndex;
 
   const pct = Number(discountPct) || 0;
-  const discountAmount = roundMoney4(linesSubtotal * (pct / 100));
+  /* 2026-09-22 (OPTION D — CANONICAL DISCOUNT CENTS). This used to persist
+     roundMoney4(linesSubtotal * pct/100) — a 4-decimal figure that the cent
+     pipeline then rounded a SECOND time. Double rounding: an exhaustive sweep
+     found 33,810 of 20.1M (subtotal, percentage) pairs at UI-producible 0.5%
+     steps where the line's cents differ from the canonical discount cents, e.g.
+     R4.99 at 0.5% -> canonical 2c, persisted line 3c. That could put a NEWLY
+     issued invoice one cent from its own quote/job total — the defect this work
+     removes, recreated on brand-new transactions.
+     The discount is now the SAME canonical cents the shared document pipeline
+     produced, persisted as an exact 2-decimal amount. It is NOT recalculated
+     here, and historical lines are never rewritten. */
+  const subtotalC = sgrToCents0(linesSubtotal);
+  const discountCents = sgrMulDivRound(subtotalC, sgrToUnits4(pct), 1000000) || 0;
+  const discountAmount = sgrRands(discountCents);
   if (discountAmount > ADJUSTMENT_LINE_THRESHOLD) {
     await client.query(
       `INSERT INTO rel_invoice_line_items (invoice_id, line_index, description, qty, unit_amount, account_code, tax_type, legacy_data)
@@ -2906,32 +3104,104 @@ export async function recomputeOwnerPaymentStatus(client: PoolClient, ownerType:
   // touched quote.status either. What changes is that a payment recorded against
   // a QUOTE now updates its linked job/invoice, which is the whole point: it is
   // the same transaction's money.
+  /* ── 2026-09-22 (ONE-CENT RECONCILIATION, CORRECTED) — ONE PAYABLE PER CHAIN
+     A transaction chain has ONE payable amount, so it must have ONE
+     comparison. This function used to derive the job's status from
+     rel_jobs.value and the invoice's status from the invoice's own LINES —
+     two different totals for one transaction, one cent apart whenever the
+     float arithmetic landed the other side of a half-cent boundary. That is
+     how the same money could report Partly Paid on the Job and Paid on the
+     Invoice.
+
+     THE JOB'S STORED COMMERCIAL VALUE IS THE AUTHORITY where a Job exists.
+     rel_jobs.value is the amount that was quoted, accepted and billed.
+     rel_invoice_line_items is its DETAILED REPRESENTATION and can legitimately
+     sit a fraction of a cent away from it — SNS-00128 / INV-00146: value
+     R24,963.62, line arithmetic R24,963.625, paid R24,963.62. Settling against
+     the representation turns a paid transaction into a one-cent debt.
+
+     So: a chain WITH a job settles both projections against that job's value;
+     a standalone invoice (no job in the chain) settles against its own lines,
+     because there is no commercial value to defer to. rel_job_line_items is
+     never consulted — those can be a stale earlier representation.
+
+     Every reconciliation protection around rel_jobs.value is untouched:
+     assertJobInvoiceMatchesValueTx, the converted-Quote divergence guard, the
+     commercial-line fallback and SOURCE_TOTAL_TOLERANCE all still govern
+     whether the detail reconciles to the value. That is a DIFFERENT question
+     from what the customer owes, and this function only answers the latter.
+
+     UNCHANGED: the paid/partial/pending rule itself, the deliberate absence of
+     a paid_at column, an invoice's fallback being its CURRENT status rather
+     than a force-reset, and the deliberate non-bump of row_version. No payment
+     row is read differently, written, rounded in place, moved or re-owned —
+     rel_payments remains the one canonical ledger and is only SUMMED here.
+     There is no tolerance: a genuine cent short stays a cent short. */
   const chain = await resolveTransactionChainTx(client, ownerType, ownerId);
   if (chain.owners.length === 0) return; // owner row vanished mid-transaction elsewhere
-  const totalPaid = toCents(await sumChainPaymentsTx(client, chain));
+  // Canonical paid cents. Postgres sums NUMERIC(14,2) exactly; the conversion
+  // to integer cents is decimal-safe.
+  const totalPaidC = sgrToCents0(await sumChainPaymentsTx(client, chain));
 
-  if (chain.jobId !== null) {
-    const jobRes = await client.query(`SELECT value FROM rel_jobs WHERE id = $1`, [chain.jobId]);
-    if ((jobRes.rowCount || 0) > 0) {
-      const jobValue = toCents(Number(jobRes.rows[0].value) || 0);
-      const newStatus = totalPaid >= jobValue && jobValue > 0 ? 'paid' : totalPaid > 0 ? 'partial' : 'pending';
-      await client.query(`UPDATE rel_jobs SET invoice_status = $1 WHERE id = $2`, [newStatus, chain.jobId]);
-    }
-  }
-
+  /* THE CHAIN'S ONE PAYABLE (Option D):
+       an ISSUED INVOICE -> that invoice's own canonical cents, through the
+                            SHARED document pipeline (sgrInvoiceCentsFromRows:
+                            each line rounded to cents, VAT ONCE over the
+                            taxable base — never a sum of independently rounded
+                            per-line VAT amounts);
+       no invoice yet    -> rel_jobs.value.
+     rel_job_line_items is never consulted. */
+  const invoiceOwnTotalsC = new Map<number, number>();
+  let chainPayableC: number | null = null;
+  let markerInvoiceId: number | null = null;
   for (const invoiceId of chain.invoiceIds) {
     const linesRes = await client.query(
       `SELECT qty, unit_amount, tax_type FROM rel_invoice_line_items WHERE invoice_id = $1`,
       [invoiceId]
     );
-    const invTotal = toCents(linesRes.rows.reduce((s, l) => {
-      const sub = Number(l.qty) * Number(l.unit_amount);
-      return s + sub + (l.tax_type === '15%' ? sub * 0.15 : 0);
-    }, 0));
-    const curRes = await client.query(`SELECT status FROM rel_invoices WHERE id = $1`, [invoiceId]);
+    const totalC = sgrInvoiceCentsFromRows(linesRes.rows as any[]).totalC;
+    invoiceOwnTotalsC.set(invoiceId, totalC);
+    // A chain normally holds exactly one invoice. Where more than one exists the
+    // largest issued total governs, so a job is never reported Paid off a
+    // smaller sibling.
+    if (chainPayableC === null || totalC > chainPayableC) { chainPayableC = totalC; markerInvoiceId = invoiceId; }
+  }
+  if (chainPayableC === null && chain.jobId !== null) {
+    const jobRes = await client.query(`SELECT value FROM rel_jobs WHERE id = $1`, [chain.jobId]);
+    if ((jobRes.rowCount || 0) > 0) chainPayableC = sgrToCents0(jobRes.rows[0].value);
+  }
+
+  /* An AUDITED historical rounding settlement settles an invoice the OLD
+     platform itself asked the exact captured amount for. Not a tolerance: the
+     marker must still name this exact payable, paid total and residual, so one
+     cent of change on either side invalidates it here, automatically. Read
+     only — this function never writes the marker. */
+  let chainSettledByMarker = false;
+  if (markerInvoiceId !== null && chainPayableC !== null) {
+    const mRes = await client.query(`SELECT legacy_data FROM rel_invoices WHERE id = $1`, [markerInvoiceId]);
+    if ((mRes.rowCount || 0) > 0) {
+      chainSettledByMarker = sgrLegacySettlementApplies(mRes.rows[0].legacy_data, chainPayableC, totalPaidC);
+    }
+  }
+
+  if (chain.jobId !== null && chainPayableC !== null) {
+    const newStatus = chainSettledByMarker ? 'paid'
+      : totalPaidC >= chainPayableC && chainPayableC > 0 ? 'paid'
+      : totalPaidC > 0 ? 'partial' : 'pending';
+    await client.query(`UPDATE rel_jobs SET invoice_status = $1 WHERE id = $2`, [newStatus, chain.jobId]);
+  }
+
+  for (const invoiceId of chain.invoiceIds) {
+    const invTotalC = invoiceOwnTotalsC.get(invoiceId) || 0;
+    const curRes = await client.query(
+      `SELECT status, legacy_data FROM rel_invoices WHERE id = $1`, [invoiceId]
+    );
     if (curRes.rowCount === 0) continue;
     const curStatus = curRes.rows[0].status;
-    const newStatus = totalPaid >= invTotal && invTotal > 0 ? 'paid' : totalPaid > 0 ? 'partial' : curStatus;
+    const settledByMarker = sgrLegacySettlementApplies(curRes.rows[0].legacy_data, invTotalC, totalPaidC);
+    const newStatus = settledByMarker ? 'paid'
+      : totalPaidC >= invTotalC && invTotalC > 0 ? 'paid'
+      : totalPaidC > 0 ? 'partial' : curStatus;
     await client.query(`UPDATE rel_invoices SET status = $1 WHERE id = $2`, [newStatus, invoiceId]);
   }
 }
@@ -3627,11 +3897,24 @@ async function replaceJobLinesTx(client: PoolClient, jobId: number, lines: LineI
 // Exact formula from CreateQuoteModal/QuotesPage — never independently
 // stored, always recomputed from subtotal/discount/setupFee.
 function computeQuoteTotals(subtotal: number, discountPct: number, setupFee: number): { subtotal: number; vat: number; total: number } {
-  const discAmt = subtotal * ((discountPct || 0) / 100);
-  const afterDisc = subtotal - discAmt + (setupFee || 0);
-  const vat = afterDisc * 0.15;
-  const total = afterDisc + vat;
-  return { subtotal, vat, total };
+  /* 2026-09-22 (ONE-CENT RECONCILIATION): the same canonical cents pipeline
+     index.html's sgrDocumentCents applies, in the same order:
+        taxable = subtotal - round(subtotal x pct/100) + setupFee
+        vat     = round(taxable x 15 / 100)           ONCE
+        total   = taxable + vat
+     `subtotal` arrives here as the sum of rel_quote_line_items.subtotal, which
+     is NUMERIC(14,2) — already cent-rounded PER LINE — so this is exactly the
+     "round each displayed line extension before summing" rule, and
+     subtotal - discount + setup fee + VAT === total to the cent.
+     Previously `afterDisc * 0.15` on floats, which is how rel_quotes.total
+     could sit a cent away from the document it describes. */
+  const subC = sgrToCents0(subtotal);
+  const pctU = sgrToUnits4(discountPct || 0);
+  const discC = Number.isFinite(pctU) ? (sgrMulDivRound(subC, pctU, 1000000) || 0) : 0;
+  const setupC = sgrToCents0(setupFee);
+  const taxableC = subC - discC + setupC;
+  const vatC = sgrMulDivRound(taxableC, 15, 100) || 0;
+  return { subtotal: sgrRands(subC), vat: sgrRands(vatC), total: sgrRands(taxableC + vatC) };
 }
 
 // ── UPDATE QUOTE / UPDATE JOB — Stage 2 addition, extended in Stage 3 ───────
@@ -4516,8 +4799,15 @@ export async function updateQuoteWithJobSync(
       const jobNotesCurrent = job.notes == null ? '' : String(job.notes);
       const resultNotes = quoteNotesChanged ? quoteNotesAfter : jobNotesCurrent;
 
-      const _afterDisc = totals.subtotal - totals.subtotal * ((discountPct || 0) / 100) + (setupFee || 0);
-      const jobValue = _afterDisc * 1.15;
+      /* 2026-09-22 (ONE-CENT RECONCILIATION): the job's value is the CANONICAL
+         total of the document it issues — the same integer-cents figure
+         computeQuoteTotals just wrote to rel_quotes.total and the same one
+         index.html's quote→job cascade writes — not the raw float
+         `afterDisc * 1.15`, which disagreed with the printed
+         `afterDisc + afterDisc*0.15` by a cent on 1.56% of values.
+         assertConvertedJobValueConsistencyTx and SOURCE_TOTAL_TOLERANCE are
+         untouched and still guard this write. */
+      const jobValue = totals.total;
 
       // BUG 2 (same root cause as convertQuoteToJob): the cascade kept the
       // job's client/contact/email/tel/address/VAT in step with the quote but

@@ -1190,6 +1190,614 @@ const zar  = n => {
 };
 const zarK = n => 'R ' + (Number(n)/1000).toFixed(0) + 'k';
 
+/* ╔═══════════════════════════════════════════════════════════════════════════╗
+   ║  SGR CANONICAL CENTS  (2026-09-22 — ONE-CENT RECONCILIATION)              ║
+   ╚═══════════════════════════════════════════════════════════════════════════╝
+   BEGIN SGR-CANONICAL-CENTS
+
+   THE DEFECT THIS CLOSES. A customer could pay the exact TOTAL DUE printed on
+   an issued invoice and the platform would still report it Partly Paid, one
+   cent short. Nothing was wrong with the money. The platform simply had no
+   canonical payable amount: the same commercial total was re-derived on demand
+   by five different floating-point expressions and then rounded, per surface,
+   with Math.round(n*100)/100.
+
+     1  afterDisc * 1.15                       -> job.value / rel_jobs.value
+     2  afterDisc + afterDisc*0.15             -> the printed TOTAL DUE
+     3  SUM(qty*unit) + SUM(qty*unit*0.15)     -> the stored invoice record
+     4  exact NUMERIC SUM in Postgres          -> invoiceTotalTx
+     5  job.value / 1.15 -> NUMERIC(14,4) -> *1.15
+
+   (1) and (2) are algebraically identical and numerically different. Over
+   2-dp ex-VAT subtotals they disagree on 1.56% of values, always by one cent:
+     21707.50 * 1.15         === 24963.624999999996   -> R24,963.62
+     21707.50 + 21707.50*.15 === 24963.625            -> R24,963.63
+   (3) differs from both again, because per-line VAT accumulates differently
+   from one VAT figure on the sum.
+
+   AND THE ROUNDING HELPER ITSELF WAS WRONG. Math.round(n*100)/100 rounds the
+   BINARY approximation, not the decimal value:
+     132.825 * 100  ===  13282.499999999998   -> Math.round -> R132.82
+   so the helper written on 2026-09-14 to make comparisons cent-precise was
+   itself a source of cent drift. toFixed(2) and toLocaleString disagreed on
+   the same double for the same reason, which is why the emailed jsPDF invoice
+   and the printed HTML invoice could state two different totals.
+
+   THE RULE NOW. Money is an INTEGER NUMBER OF CENTS, produced by ONE pipeline,
+   and every document, every list, every payment comparison and both status
+   projections read that one integer.
+
+     lineAmountCents   = round(qty x unitPrice x pieces)      per DISPLAYED line
+     subtotalCents     = SUM(lineAmountCents)
+     discountCents     = round(subtotalCents x discountPct / 100)
+     setupFeeCents     = round(setup fee)
+     taxableCents      = subtotalCents - discountCents + setupFeeCents
+     vatCents          = round(taxableCents x 15 / 100)        ONCE, never per line
+     totalCents        = taxableCents + vatCents
+
+   so on every document, always and exactly:
+     subtotal - discount + setup fee + VAT === TOTAL DUE
+
+   Each displayed ex-VAT line extension is rounded to cents BEFORE it is
+   summed, so the printed line column adds up to the printed subtotal and no
+   fraction of a cent hides behind a two-decimal figure.
+
+   VAT IS COMPUTED ONCE, from the canonical taxable amount — never per line
+   and re-summed, which was itself a source of drift. Which lines are taxable
+   is unchanged (taxType === '15%'), and the rate is unchanged (15%).
+
+   DELIBERATELY NOT A TOLERANCE. Settlement is exact integer equality on cents.
+   Paying totalCents settles; paying totalCents-1 leaves one cent outstanding.
+   That is the whole point, and it is why nothing here forgives a shortfall.
+
+   ROUNDING IS HALF AWAY FROM ZERO, ON THE DECIMAL, AND SYMMETRIC. A discount
+   is a NEGATIVE amount on an invoice, so -0.005 must round to -0.01 exactly as
+   +0.005 rounds to +0.01. JavaScript's Math.round is asymmetric at the
+   negative half (Math.round(-0.5) === -0) and is never used for money here.
+
+   PRECISION. Line quantities and amounts are NUMERIC(14,4) in the database, so
+   a value is first resolved to an exact integer number of 1e-4 units and the
+   qty x amount product is taken in INTEGER space (1e-8 units) before the single
+   rounding to cents. That avoids double rounding (8dp -> 4dp -> 2dp) and keeps
+   every intermediate an exact integer. Exact for any line extension up to
+   about R10,000,000; sgrExtCents falls back to the decimal path beyond that
+   and says so, rather than silently losing a cent.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+/* A money/quantity value as an exact integer number of 1e-4 units — the
+   precision NUMERIC(14,4) stores. toFixed(4) is the correctly-rounded DECIMAL
+   string of the double, which is what strips the binary residue that
+   Math.round(n*100) trips over. NaN for anything non-numeric, never 0: a
+   failed parse is not the number zero. */
+function sgrToUnits4(n){
+  if(n === null || n === undefined || n === '') return NaN;
+  const x = Number(n);
+  if(!Number.isFinite(x)) return NaN;
+  const s = x.toFixed(4);
+  const neg = s.charCodeAt(0) === 45;
+  const b = neg ? s.slice(1) : s;
+  const dot = b.indexOf('.');
+  const u = Number(b.slice(0, dot)) * 10000 + Number(b.slice(dot + 1));
+  if(!Number.isSafeInteger(u)) return NaN;
+  return neg ? -u : u;
+}
+
+/* Integer division with HALF AWAY FROM ZERO rounding. Both arguments are
+   exact integers, the magnitude is taken first, so positive and negative
+   amounts round identically in magnitude — the symmetry a discount line
+   needs. */
+function sgrDivRound(a, den){
+  if(!Number.isFinite(a) || !Number.isFinite(den) || den <= 0) return NaN;
+  const neg = a < 0;
+  const m = neg ? -a : a;
+  const q = (m - (m % den)) / den;
+  const out = q + ((m % den) * 2 >= den ? 1 : 0);
+  return neg ? -out : out;
+}
+
+/* round(base x num / den), every step in exact integer arithmetic, half away
+   from zero. Used for VAT (num 15, den 100), for a percentage discount and
+   for a deposit percentage. */
+function sgrMulDivRound(base, num, den){
+  if(!Number.isFinite(base) || !Number.isFinite(num) || !Number.isFinite(den) || den <= 0) return NaN;
+  const neg = (base < 0) !== (num < 0);
+  const p = Math.abs(base) * Math.abs(num);
+  if(!Number.isSafeInteger(p)) return NaN;
+  const out = sgrDivRound(p, den);
+  return neg ? -out : out;
+}
+
+/* A single money value in cents. */
+function sgrToCents(n){
+  const u = sgrToUnits4(n);
+  return Number.isFinite(u) ? sgrDivRound(u, 100) : NaN;
+}
+/* Same, but a failed parse reads as 0 — for the many call sites whose existing
+   contract is `parseFloat(x)||0`. Keep sgrToCents where a failed parse must
+   stay distinguishable from a genuine zero (see isGenuineZeroAmount). */
+function sgrToCents0(n){
+  const c = sgrToCents(n);
+  return Number.isFinite(c) ? c : 0;
+}
+/* Cents back to a rand amount, for display and for the rand-denominated
+   signatures this module keeps compatible. */
+function sgrRands(cents){
+  return Number.isFinite(cents) ? cents / 100 : 0;
+}
+
+/* A DISPLAYED line extension in cents: qty x unitAmount, multiplied in integer
+   1e-8 space and rounded exactly once. This — not the raw float product — is
+   the number the line column prints and the number the subtotal sums. */
+function sgrExtCentsU(q4, u4){
+  if(!Number.isFinite(q4) || !Number.isFinite(u4)) return 0;
+  const p = q4 * u4;                            // exact, in 1e-8 units
+  if(Number.isSafeInteger(p)) return sgrDivRound(p, 1000000);
+  return sgrToCents0((q4 / 10000) * (u4 / 10000)); // beyond ~R10m: decimal path
+}
+function sgrExtCents(qty, unitAmount){
+  return sgrExtCentsU(
+    sgrToUnits4(qty === null || qty === undefined || qty === '' ? 1 : qty),
+    sgrToUnits4(unitAmount === null || unitAmount === undefined || unitAmount === '' ? 0 : unitAmount));
+}
+
+/* A quote / job DOCUMENT line's displayed extension, in cents.
+   pieces x qty x unitPrice — the same product `l.subtotal` holds and the same
+   one docLinesSubtotal and the backend bill on. A missing/0 piece count reads
+   as 1, exactly as everywhere else in this file. */
+function sgrDocLineCents(l){
+  if(!l) return 0;
+  const pq = parseFloat(l.pQty);
+  const pieces = (Number.isFinite(pq) && pq > 0) ? pq : 1;
+  const hasQty  = !(l.qty       === null || l.qty       === undefined || l.qty       === '');
+  const hasRate = !(l.unitPrice === null || l.unitPrice === undefined || l.unitPrice === '');
+  /* THE PIECE-AWARE PRODUCT IS THE RULE (docLinesSubtotal, the writers and the
+     backend all bill on pieces x qty x unitPrice, and the 2026-08-25 repair
+     deliberately stopped trusting a stale stored `subtotal` over it).
+     THE STORED SUBTOTAL IS THE FALLBACK, and only when the product cannot be
+     formed at all: a historical line can carry nothing but `subtotal`, and that
+     figure IS what buildInvoiceHtml prints for it. Returning 0 there would
+     silently zero a real line. A healthy line never reaches the fallback. */
+  if(hasQty || hasRate){
+    const q = sgrToUnits4(hasQty ? l.qty : 1);
+    const u = sgrToUnits4(hasRate ? l.unitPrice : 0);
+    if(Number.isFinite(q) && Number.isFinite(u)) return sgrExtCentsU(q * pieces, u);
+  }
+  const stored = sgrToCents(l.subtotal);
+  return Number.isFinite(stored) ? stored : 0;
+}
+
+/* THE canonical money of a stored INVOICE RECORD, from its own line items.
+   An issued invoice IS its lines, so this is the settlement authority for it.
+   Adjustment lines (a negative `Discount (x%)` line, a `Design & Setup Fee`
+   line) are ordinary lines here and are rounded to cents like any other, which
+   is what keeps the printed partition adding up. VAT is taken ONCE over the
+   taxable lines — which lines are taxable is unchanged. */
+function sgrInvoiceCents(lineItems){
+  const ls = Array.isArray(lineItems) ? lineItems.filter(Boolean) : [];
+  let subC = 0, taxBaseC = 0;
+  const lineC = ls.map(l => {
+    const c = sgrExtCents(l.qty, l.unitAmount);
+    subC += c;
+    if(l.taxType === '15%') taxBaseC += c;
+    return c;
+  });
+  const vatC = sgrMulDivRound(taxBaseC, 15, 100) || 0;
+  return { lineC, subC, taxBaseC, vatC, totalC: subC + vatC };
+}
+
+/* THE canonical money of a DOCUMENT that carries its money as fields — a
+   quote, a proforma, a job — in the exact order the document prints it. */
+function sgrDocumentCents(lines, discountPct, setupFee){
+  const ls = Array.isArray(lines) ? lines.filter(Boolean) : [];
+  const lineC = ls.map(sgrDocLineCents);
+  const subC = lineC.reduce((s, c) => s + c, 0);
+  const pctU = sgrToUnits4(discountPct === null || discountPct === undefined || discountPct === '' ? 0 : discountPct);
+  const discC = Number.isFinite(pctU) ? (sgrMulDivRound(subC, pctU, 1000000) || 0) : 0;
+  const setupC = sgrToCents0(setupFee);
+  const taxableC = subC - discC + setupC;
+  const vatC = sgrMulDivRound(taxableC, 15, 100) || 0;
+  return { lineC, subC, discC, setupC, taxableC, vatC, totalC: taxableC + vatC };
+}
+
+/* The ex-VAT cents that best regenerate an inclusive total through this
+   module's own VAT step, so a job invoice reconstructed from a bare inclusive
+   value adds up to that value.
+
+   NOT EVERY INCLUSIVE CENT AMOUNT IS REACHABLE. With VAT at 15% and both sides
+   held in whole cents, some inclusive totals have no integer ex-VAT amount that
+   produces them — R132.82 is one: R115.49 gives R132.81 and R115.50 gives
+   R132.83. That is a property of the arithmetic, not a defect, and it only
+   arises for a record that carries a bare inclusive value with NO lines to
+   state how it was reached (a historical job). This picks the exact answer
+   whenever one exists and otherwise the nearest, preferring the LOWER of two
+   equally near candidates so a reconstruction can never overstate what the
+   customer owes. It is arithmetic only: never an adjustment line, never a
+   payment, and never a change to the record's own stored value — settlement
+   for such a record still uses that value (see sgrCanonicalPayableCents), and
+   the surfaces that show it carry the canonical figure alongside. */
+function sgrExVatCentsFor(totalC){
+  if(!Number.isFinite(totalC) || totalC === 0) return 0;
+  const seed = sgrMulDivRound(totalC, 100, 115) || 0;
+  let best = seed, bestErr = Infinity;
+  for(let ex = seed - 2; ex <= seed + 2; ex++){
+    const made = ex + (sgrMulDivRound(ex, 15, 100) || 0);
+    if(made === totalC) return ex;
+    const err = Math.abs(made - totalC);
+    if(err < bestErr || (err === bestErr && ex < best)){ best = ex; bestErr = err; }
+  }
+  return best;
+}
+
+/* Canonical PAID cents. Each payment is converted independently — payment rows
+   are NUMERIC(14,2) and are never altered, rounded in place, merged or
+   re-owned; this reads them. The caller supplies the already chain-resolved
+   array, so every payment is counted exactly once. */
+function sgrPaidCents(payments){
+  return (Array.isArray(payments) ? payments : []).reduce(
+    (s, p) => s + (p ? sgrToCents0(p.amount) : 0), 0);
+}
+
+/* Money still owed, in cents. Never negative — an overpayment is a zero
+   balance, which is the behaviour every surface already had. */
+function sgrOutstandingCents(totalC, paidC){
+  const t = Number.isFinite(totalC) ? totalC : 0;
+  const p = Number.isFinite(paidC) ? paidC : 0;
+  return Math.max(0, t - p);
+}
+
+/* THE settlement rule. Exact integer cents, no tolerance.
+   `rawTotal` is the total as its surface holds it, used ONLY for the
+   zero-value test — a value that failed to hydrate must never be mistaken for
+   a genuine sponsored R0.00 (see isGenuineZeroAmount). */
+function sgrSettlementStatusCents(totalC, paidC, rawTotal){
+  const t = Number.isFinite(totalC) ? totalC : 0;
+  const p = Number.isFinite(paidC) ? paidC : 0;
+  // `arguments.length < 3` — not `rawTotal === undefined` — because undefined
+  // is itself a meaningful rawTotal: it is exactly the "value failed to
+  // hydrate" case isGenuineZeroAmount exists to refuse. Omitting the argument
+  // means "this zero was derived, not read", which IS a genuine zero.
+  if(t <= 0) return isGenuineZeroAmount(arguments.length < 3 ? t / 100 : rawTotal)
+    ? 'paid' : (p > 0 ? 'partial' : 'pending');
+  if(p >= t) return 'paid';
+  if(p > 0)  return 'partial';
+  return 'pending';
+}
+
+/* ╔═══════════════════════════════════════════════════════════════════════╗
+   ║  THE PAYABLE-SOURCE HIERARCHY (2026-09-22 — OPTION D)                  ║
+   ╚═══════════════════════════════════════════════════════════════════════╝
+   What does the customer owe? ONE question, ONE answer, on every surface.
+
+     CASE 1 — AN ISSUED INVOICE
+              -> that Invoice's OWN canonical cents total. The issued tax
+                 document is what the customer was handed and what SARS sees.
+     CASE 2 — A JOB WITH NO ISSUED INVOICE
+              -> that Job's stored commercial value, in cents. Nothing has been
+                 issued yet, so the agreed commercial amount is the payable.
+     CASE 3 — rel_job_line_items
+              -> NEVER a settlement authority, in any case. Job lines can be a
+                 STALE earlier commercial representation: SNS-00128 carries
+                 lines reconstructing to R16,044.80 against an agreed value of
+                 R24,963.62. That is a SOURCE REPRESENTATION DIFFERENCE, not a
+                 statement about what is owed.
+
+   WHY THE ISSUED DOCUMENT WINS.
+   VAT is declared on the issued invoice. R21,707.50 x 15% = R3,256.125, and
+   SARS rounds a half cent UP, so the invoice declares R3,256.13 and totals
+   R24,963.63. Reducing that VAT to R3,256.12 to make an older stored job value
+   fit would be rewriting a tax figure to paper over an arithmetic difference.
+   The issued figure stands; where a historical job value disagrees with it, the
+   difference is handled as AUDITED EVIDENCE (below), never by restatement.
+
+   WHY THE HIERARCHY EXISTS AT ALL.
+   Only because history contains two derivations. For every FUTURE transaction
+   one canonical cents calculation produces the Quote total, the Job commercial
+   value, the Invoice total, the PDF/HTML total, the payment-modal balance and
+   the settlement payable, so all three cases collapse to the same integer and
+   there is nothing to choose between.
+
+   NOT A LOOSENING. Every comparison remains exact integer cents with no
+   tolerance; only WHICH amount is compared against is defined here. */
+function sgrCanonicalPayableCents(rec){
+  if(!rec) return 0;
+  // CASE 1 — an issued invoice record carries lineItems. Its canonical total
+  // comes from the SHARED document cents pipeline (sgrInvoiceCents): each
+  // displayed line rounded to cents, then VAT ONCE over the taxable base.
+  // Never a sum of independently rounded per-line VAT amounts — that formula
+  // is precisely the defect this whole repair removes.
+  if(Array.isArray(rec.lineItems)) return sgrInvoiceCents(rec.lineItems).totalC;
+  // CASE 2 — a job (or quote) with no issued invoice.
+  return sgrToCents0(rec.value);
+}
+/* Linkage lookup ONLY — used to find a transaction's other half when replaying
+   the old arithmetic, and by the reports. It is NEVER consulted to decide what
+   is owed. The same predicate resolveJobInvoiceRecord/getJobManualInvoice use,
+   read from the other end, so a link can never be resolved two ways. */
+function sgrJobForInvoice(inv, jobs){
+  if(!inv || !Array.isArray(jobs)) return null;
+  const byRef = jobs.find(j => j && j.num && invoiceBelongsToJob(inv, j.num) && sameCompany(j, inv));
+  if(byRef) return byRef;
+  const num = inv.number || inv.invoiceNum;
+  if(!num) return null;
+  const claimants = jobs.filter(j => j && j.invoiceNum === num && sameCompany(j, inv));
+  return claimants.length === 1 ? claimants[0] : null;
+}
+
+/* ── VERIFIED LEGACY SYSTEM-GENERATED ROUNDING SETTLEMENT (2026-09-22) ─────
+   A HISTORICAL transaction can sit a cent short of its issued invoice through
+   no fault of the customer, because the OLD platform asked for a cent less
+   than the document stated:
+
+     INV-00146 / SNS-00128   issued R24,963.63, old Job-side balance R24,963.62,
+                             captured R24,963.62, old UI then showed R0.00
+     INV-00139               first payment, then the old platform's own final
+                             balance, captured exactly, old UI showed R0.00
+
+   In both the customer paid EXACTLY what the platform instructed. The invoice
+   and its VAT are left untouched; the settlement STATUS is reconciled through
+   an audited, non-monetary marker.
+
+   THIS IS NOT A ONE-CENT TOLERANCE, AND IT CANNOT BECOME ONE.
+     * No amount is ever forgiven on the strength of its size.
+     * A marker takes effect only while it still names the EXACT payable, the
+       EXACT paid total and the EXACT residual it was verified against. One
+       cent of movement on either side and it stops applying, automatically,
+       on the very next recomputation.
+     * NORMAL RUNTIME CAN NEVER CREATE ONE. No payment save, invoice save, job
+       save, quote save, settlement recompute, status recompute or invoice
+       synchronisation writes this key. The ONLY writer is the explicit
+       historical reconciliation utility, and only under --apply. A future
+       genuine R0.01 short payment can therefore never be reclassified as
+       legacy by anything the application does on its own.
+
+   The marker is EVIDENCE, not a second financial ledger: it carries no
+   replacement invoice total, no payment and no adjustment. */
+const SGR_LEGACY_SETTLEMENT_KEY = 'legacyRoundingSettlement';
+const SGR_LEGACY_SETTLEMENT_VERSION = 1;
+function sgrLegacySettlementMarker(rec){
+  const m = rec && rec[SGR_LEGACY_SETTLEMENT_KEY];
+  if(!m || typeof m !== 'object' || Array.isArray(m)) return null;
+  if(m.settled !== true) return null;
+  if(m.version !== SGR_LEGACY_SETTLEMENT_VERSION) return null;
+  // A marker that does not state what it was verified against cannot be
+  // verified again, so it is ignored rather than trusted.
+  if(!Number.isSafeInteger(m.payableCentsAtVerification)) return null;
+  if(!Number.isSafeInteger(m.paidCentsAtVerification)) return null;
+  if(!Number.isSafeInteger(m.residualCents)) return null;
+  if(!Number.isSafeInteger(m.legacyGeneratedAmountCents)) return null;
+  if(m.residualCents <= 0) return null;
+  if(m.payableCentsAtVerification - m.paidCentsAtVerification !== m.residualCents) return null;
+  return m;
+}
+/* TRUE only while this record still IS the transaction the marker was verified
+   against. Any material change invalidates it on the spot — no refresh, no
+   cleanup step, and deliberately no automatic rewrite of the marker. */
+function sgrLegacySettlementApplies(rec, payableC, paidC){
+  const m = sgrLegacySettlementMarker(rec);
+  if(!m) return false;
+  if(!Number.isFinite(payableC) || !Number.isFinite(paidC)) return false;
+  if(payableC !== m.payableCentsAtVerification) return false;   // commercial value moved
+  if(paidC    !== m.paidCentsAtVerification)    return false;   // a payment changed
+  if(payableC - paidC !== m.residualCents)      return false;
+  return true;
+}
+/* Settlement for a RECORD: the ordinary exact-cents rule, with the audited
+   historical exception applied only where it still verifies. */
+function sgrSettleRecordCents(rec, payableC, paidC, rawTotal){
+  if(sgrLegacySettlementApplies(rec, payableC, paidC)) return 'paid';
+  return arguments.length < 4
+    ? sgrSettlementStatusCents(payableC, paidC)
+    : sgrSettlementStatusCents(payableC, paidC, rawTotal);
+}
+function sgrOutstandingForRecordCents(rec, payableC, paidC){
+  if(sgrLegacySettlementApplies(rec, payableC, paidC)) return 0;
+  return sgrOutstandingCents(payableC, paidC);
+}
+
+/* THE money formatter. Every financial document, list and badge renders
+   through this, from cents, so the printed figure is the canonical figure and
+   no two builders can disagree because one used toFixed and another
+   toLocaleString. `sgrZarC` is the display form; `sgrMoneyC` is the plain
+   grouped form the HTML/PDF builders use. */
+function sgrZarC(cents){
+  if(!Number.isFinite(cents)) return 'R —';
+  return 'R ' + (cents / 100).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+function sgrMoneyC(cents){
+  if(!Number.isFinite(cents)) return 'R —';
+  return 'R ' + (cents / 100).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+/* The word a payments array earns against a canonical total — the ONE
+   settlement rule, in the shape the payment-recording paths need. Every
+   payment add / edit / delete on every screen goes through this, so the status
+   that is PERSISTED is the same status every screen independently derives.
+   Before 2026-09-22 those paths compared raw floats (`newTotal >= invTotal`)
+   with no rounding at all — the 2026-09-14 repair had converted the display
+   derivations and left the writes behind, which is why a payment of the exact
+   displayed amount could still store 'partial'.
+   `pendingFallback` preserves each caller's own "no money recorded yet"
+   answer (a stored status, or 'sent' / 'pending'), unchanged. */
+function sgrStatusForPayments(rec, totalC, payments, pendingFallback, rawTotal){
+  // 2026-09-22 (CORRECTED): the record is passed so an audited historical
+  // rounding settlement reaches the STORED status too, not just the displayed
+  // one — otherwise the stored word and the derived word could disagree for a
+  // marked invoice, which is the very class of defect this work removes. The
+  // marker self-invalidates whenever the payments change, so an ordinary
+  // payment edit still recomputes from the money alone.
+  const paidC = sgrPaidCents(payments);
+  const st = sgrSettleRecordCents(rec, totalC, paidC,
+    rawTotal === undefined ? sgrRands(totalC) : rawTotal);
+  return st === 'pending' ? pendingFallback : st;
+}
+
+/* ── THE EVIDENCE: REPLAYING THE OLD PLATFORM CALCULATION ─────────────────
+   A marker is never created because "the difference is one cent". It is
+   created only when the OLD platform's own arithmetic can be replayed and
+   shown to have produced the captured amount itself.
+
+   WHAT THE OLD CODE DID, verbatim, before 2026-09-22:
+
+     PaymentHistoryModal / JobPaymentsModal:
+       invTotal = (lineItems||[]).reduce((s,l)=>{
+                    const sub = parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);
+                    return s + sub + (l.taxType==='15%' ? sub*0.15 : 0); }, 0)
+       ... or, where payments lived on the job:
+       invTotal = parseFloat(job.value)||0
+       balance  = invTotal - totalPaid
+       and the amount field OFFERED that balance as `balance.toFixed(2)`.
+
+     The status line then read `newTotal >= invTotal ? 'paid' : ...` on raw
+     floats, so the badge showed Balance R0.00.
+
+   PAYMENT COUNT IS NOT THE EVIDENCE. A transaction settled in ONE payment is
+   just as much a platform-generated figure as a final balance after several:
+   on a fresh invoice the old modal offered the FULL total, and that is what was
+   captured. What matters is that the captured amount came from the platform's
+   own arithmetic, not from someone typing a smaller number.
+
+   THE CONDITIONS, all required:
+
+     1. REPLAY the old calculation applicable at the time. Both derivations the
+        old code could have used are tried — the invoice's own lines, and the
+        linked job's value — because either modal could have offered the
+        balance.
+     2. THE CAPTURED FINAL PAYMENT EQUALS WHAT THE OLD UI WOULD HAVE
+        INSTRUCTED, to the cent: `oldTotal - priorPaid === finalPayment`. With
+        one payment `priorPaid` is zero and this reads "they were asked for the
+        whole total and paid it".
+     3. THE OLD UI WOULD THEN HAVE SHOWN BALANCE R0.00: `paid === oldTotal`.
+     4. THE RESIDUAL IS EXACTLY THE DIFFERENCE BETWEEN THE TWO DERIVATIONS:
+        `payable - oldTotal === residual`. Not "about a cent" — exactly, so no
+        part of it can represent anyone paying less than they were asked for.
+
+   Condition 3 is what keeps a genuine underpayment out: payable R100.00, old
+   derivation ALSO R100.00, paid R99.99 -> `paid !== oldTotal` -> refused. The
+   platform never asked for R99.99, so no replay produces it. */
+
+/* The OLD invoice total, reproduced exactly: raw float products, VAT summed
+   PER LINE, then the old binary-rounding cent helper. */
+function sgrOldInvoiceTotalCents(lineItems){
+  const raw = (Array.isArray(lineItems) ? lineItems : []).reduce((s,l)=>{
+    if(!l) return s;
+    const sub = parseFloat(l.qty==null?1:l.qty) * parseFloat(l.unitAmount||0);
+    if(!Number.isFinite(sub)) return s;
+    return s + sub + (l.taxType==='15%' ? sub*0.15 : 0);
+  }, 0);
+  return Math.round(Math.round(raw*100)/100 * 100);   // the old toCents, then to integer cents
+}
+/* The OLD job-value total, reproduced exactly. */
+function sgrOldJobValueCents(job){
+  const v = parseFloat(job && job.value);
+  return Number.isFinite(v) ? Math.round(Math.round(v*100)/100 * 100) : NaN;
+}
+/* Payments in the order the old interface accumulated them: by date, then by
+   the order they sit in the stored array (its insertion order). */
+function sgrPaymentsInCaptureOrder(payments){
+  return (Array.isArray(payments) ? payments.filter(Boolean) : [])
+    .map((p,i)=>({ p, i }))
+    .sort((a,b)=>{
+      const da = String(a.p.date||''), db = String(b.p.date||'');
+      if(da !== db) return da < db ? -1 : 1;
+      return a.i - b.i;
+    })
+    .map(x=>x.p);
+}
+/* THE FINAL MONETARY PAYMENT OF A CHAIN — 2026-09-22 (ZERO-ROW REPLAY FIX).
+
+   A R0.00 rel_payments row is not an instruction this platform is capable of
+   having generated. Every shipped settlement path that records a payment is
+   guarded by the balance being POSITIVE — markInvPaid's
+   `remaining>0?[...]:(inv.payments||[])`, markCanonicalInvoicePaid's
+   `if(remaining<=0){ return; }`, every payment modal's
+   `if(!amount||parseFloat(amount)<=0)`, and the auto-credit effect's
+   `t.amount>0.005`. When the old platform considered a balance settled it
+   recorded NOTHING and wrote only `status:'paid'`. A zero row is therefore the
+   opposite of the settled-signature: it is an audit-trail artefact (an imported
+   legacy entry whose JSON amount was missing, blank or non-numeric — backfill's
+   `num(p.amount)` fallback — or an unvalidated direct write), and it carries no
+   statement whatsoever about the balance.
+
+   So it stays in the chain, stays counted, stays printed in the evidence — and
+   can never be the payment a replay tests. Replaying against it asks "did the
+   old platform instruct R0.00?", which is a question with no true answer.
+
+   Returns the chain UNCHANGED plus the index of the last non-zero payment, its
+   cents, everything received before it, and how many rows of each kind exist,
+   so a report can say "4 payments (1 zero-value row ignored)". `priorCents` is
+   derived as paid − final, which is exact: by construction nothing non-zero
+   follows the last non-zero row, and zero rows contribute nothing either way. */
+function sgrLastMeaningfulPayment(payments){
+  const ordered = sgrPaymentsInCaptureOrder(payments);
+  let lastIdx = -1, meaningfulCount = 0, zeroCount = 0, paidC = 0;
+  for(let i = 0; i < ordered.length; i++){
+    const c = sgrToCents0(ordered[i] && ordered[i].amount);
+    paidC += c;
+    if(c === 0){ zeroCount++; continue; }
+    meaningfulCount++; lastIdx = i;
+  }
+  const finalC = lastIdx < 0 ? 0 : sgrToCents0(ordered[lastIdx].amount);
+  return { ordered, lastIdx, finalCents:finalC, priorCents:paidC - finalC,
+           paidCents:paidC, meaningfulCount, zeroCount, count:ordered.length };
+}
+
+/* Classifies a record against the conditions above. Returns a decision object —
+   never a boolean — so a report can state WHY, and so a refusal names the
+   condition that failed. PURE: reads only what it is given, writes nothing, and
+   creates no marker. Marker creation belongs exclusively to the historical
+   reconciliation utility, under --apply. */
+function sgrClassifyLegacyRoundingSettlement(rec, payableC, oldTotalCandidatesC){
+  const chain = sgrLastMeaningfulPayment(rec && rec.payments);
+  const payments = chain.ordered;
+  const paidC = chain.paidCents;
+  const residualC = payableC - paidC;
+  const base = { qualifies:false, payableCents:payableC, paidCents:paidC,
+                 residualCents:residualC, paymentCount:chain.count,
+                 meaningfulPaymentCount:chain.meaningfulCount,
+                 zeroValuePaymentCount:chain.zeroCount };
+
+  if(residualC <= 0) return Object.assign(base, { reason:'no residual — already settled or overpaid' });
+  if(!chain.count) return Object.assign(base, { reason:'no payments recorded — nothing the platform could have generated' });
+  if(chain.lastIdx < 0) return Object.assign(base, { reason:'every payment in this chain is a R0.00 row — there is no monetary payment to replay, and a zero row is never evidence that the old platform generated an amount' });
+
+  const candidates = (oldTotalCandidatesC||[]).filter(c => Number.isSafeInteger(c));
+  if(!candidates.length) return Object.assign(base, { reason:'the old platform total could not be reproduced for this record' });
+
+  /* The last MEANINGFUL payment — never a R0.00 row (see
+     sgrLastMeaningfulPayment). `priorC` is everything the chain had already
+     received when the old interface computed the balance it offered for it. */
+  const lastC = chain.finalCents;
+  const priorC = chain.priorCents;
+  const zeroNote = chain.zeroCount
+    ? ' (' + chain.zeroCount + ' zero-value payment row' + (chain.zeroCount===1?'':'s')
+      + ' in the chain carried no instruction and were not replayed)' : '';
+
+  for(const oldTotalC of candidates){
+    const offeredC = oldTotalC - priorC;          // what the old UI put in the amount field
+    if(offeredC !== lastC) continue;              // 2 — captured === instructed
+    if(paidC !== oldTotalC) continue;             // 3 — the old UI then showed R0.00
+    if(payableC - oldTotalC !== residualC) continue; // 4 — residual IS the derivation gap
+    const shape = chain.meaningfulCount === 1 ? 'the full payable total' : 'the remaining balance';
+    return { qualifies:true,
+             payableCents:payableC, paidCents:paidC, residualCents:residualC,
+             paymentCount:chain.count,
+             meaningfulPaymentCount:chain.meaningfulCount,
+             zeroValuePaymentCount:chain.zeroCount,
+             oldTotalCents:oldTotalC, legacyGeneratedAmountCents:offeredC,
+             priorPaidCents:priorC, finalPaymentCents:lastC,
+             reason:'the old platform\'s own total was '+sgrZarC(oldTotalC)+'; it instructed '
+                  + sgrZarC(offeredC)+' as '+shape
+                  + (priorC>0 ? ' after '+sgrZarC(priorC)+' already received' : '')
+                  + ', exactly that was captured, and the old interface then showed Balance R0.00. '
+                  + 'The corrected canonical payable is '+sgrZarC(payableC)+', so the entire residual of '
+                  + sgrZarC(residualC)+' is the difference between the two derivations — no part of it is '
+                  + 'the customer paying less than the platform requested.' + zeroNote };
+  }
+  return Object.assign(base, {
+    reason:'the captured final MEANINGFUL payment of '+sgrZarC(lastC)+' does not replay as a platform-generated amount '
+         + '(old totals tried: '+candidates.map(sgrZarC).join(', ')+'; prior payments '+sgrZarC(priorC)+')' + zeroNote });
+}
+/* END SGR-CANONICAL-CENTS */
+
 /* ═══════════════════════════════════════════
    USER ACCOUNTS
    ─────────────────────────────────────────
@@ -1956,9 +2564,11 @@ function autoCreditNoteUsage(creditNotes, invoiceList){
     const invs = (invoiceList||[])
       .filter(i=>i.status!=='void' && cnNorm(i.contactName)===k)
       .map(i=>{
-        const total=(i.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
-        const paid=(i.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-        return { id:i.id, number:i.number, date:i.date, source:i.source, jobNum:i.jobNum, balance:Math.max(0,total-paid) };
+        // 2026-09-22: canonical cents.
+        const _cc=sgrInvoiceCents(i.lineItems);
+        const _pp=sgrPaidCents(i.payments);
+        return { id:i.id, number:i.number, date:i.date, source:i.source, jobNum:i.jobNum,
+                 balance:sgrRands(sgrOutstandingCents(_cc.totalC,_pp)) };
       })
       .sort((a,b)=>new Date(a.date||0)-new Date(b.date||0));
     const claimed = invs.map(()=>0);
@@ -2335,17 +2945,46 @@ function fmtQuoteDepositPct(p){
 /* doc   — the quote (anything carrying an optional .depositPct); null is fine
    total — that document's OWN final total incl. VAT, already computed */
 function quoteDepositInfo(doc, total){
-  const t = Number(total)||0;
+  /* ── 2026-09-22 (ONE-CENT RECONCILIATION) — DEPOSIT IN CENTS ──────────────
+     The deposit is still a PAYMENT TERM and still never touches the total,
+     VAT, discount, setup fee, job value, invoice or any payment record. Two
+     things change, both arithmetic:
+
+     1. THE R5,000 RULE IS TESTED IN CENTS. `t <= 5000` compared the RAW
+        floating total, so a transaction whose canonical total is exactly
+        R5,000.00 but whose float sat at 5000.000000000001 silently dropped
+        from a 100% deposit to 80% — and the document then stated the wrong
+        deposit rule. `totalCents <= 500000` is the same rule, decided on the
+        amount the customer is actually shown.
+
+     2. THE BALANCE ABSORBS THE ROUNDING CENT. The deposit and the balance are
+        no longer two independent percentage calculations that can disagree:
+            depositCents = round(totalCents x pct / 100)
+            balanceCents = totalCents - depositCents
+        so depositCents + balanceCents === totalCents, ALWAYS. Where the
+        percentage split leaves an odd cent it stays in the final balance
+        rather than vanishing. `balanceLabel` remains the complementary
+        PERCENTAGE for the terms wording, which is all the documents state;
+        `balanceCents` is here so that any surface which ever prints a balance
+        AMOUNT prints the one that ties back to the total. */
+  const totalCents = sgrToCents0(total);
+  const t = sgrRands(totalCents);
   const custom = normalizeQuoteDepositPct(doc && doc.depositPct);
-  const autoFull = custom===null && t<=5000;     // the R5,000 rule, untouched
+  const autoFull = custom===null && totalCents<=500000;   // the R5,000 rule, in cents
   const pct = custom!==null ? custom : (autoFull ? 100 : QUOTE_DEFAULT_DEPOSIT_PCT);
   const bal = Math.round((100-pct)*100)/100;
+  // pct is normalised to 2 decimals (see normalizeQuoteDepositPct), so 1e-4
+  // units and a 1e6 denominator carry it exactly.
+  const depositCents = sgrMulDivRound(totalCents, sgrToUnits4(pct), 1000000) || 0;
+  const balanceCents = totalCents - depositCents;
   return {
     pct, rate: pct/100, isCustom: custom!==null, autoFull,
     label: fmtQuoteDepositPct(pct),
     hasBalance: bal > 0.0001,
     balanceLabel: fmtQuoteDepositPct(bal),
-    amount: t*(pct/100),
+    amount: sgrRands(depositCents),
+    totalCents, depositCents, balanceCents,
+    balanceAmount: sgrRands(balanceCents),
   };
 }
 /* Back-compatible reader: accepts either a quoteDepositInfo object or the
@@ -2357,7 +2996,8 @@ function quoteDepositTermsInfo(dep){
   const bal  = Math.round((100-pct)*100)/100;
   return { pct, rate: pct/100, isCustom:false, autoFull: pct===100,
            label: fmtQuoteDepositPct(pct), hasBalance: bal>0.0001,
-           balanceLabel: fmtQuoteDepositPct(bal), amount: 0 };
+           balanceLabel: fmtQuoteDepositPct(bal), amount: 0,
+           totalCents: 0, depositCents: 0, balanceCents: 0, balanceAmount: 0 };
 }
 
 function quoteTermsList(depRate){
@@ -2615,17 +3255,25 @@ function sgrOpenPrintPreview(rawHtml, docLabel, docFileName){
 function buildQuoteHtml(q, companies, logoDataUrl) {
   const co = companies.find(c=>c.id===q.co)||{name:'Signacore',short:'SGR'};
   const legal = sgrCompanyLegal(co);
-  const sub = q.lines.reduce((s,l)=>s+(l.subtotal||0),0);
+  /* 2026-09-22 (ONE-CENT RECONCILIATION): every figure this document prints
+     comes from the ONE canonical cents pipeline — each displayed line
+     extension rounded to cents, VAT taken once over the taxable amount — so
+     subtotal − discount + setup fee + VAT === TOTAL DUE exactly, and the
+     TOTAL DUE stated here is the amount settlement compares against. */
+  const _c = sgrDocumentCents(q.lines, q.discount, q.setupFee);
+  const subC=_c.subC, discC=_c.discC, setupC=_c.setupC, vatC=_c.vatC, totalC=_c.totalC, lineC=_c.lineC;
+  const sub = sgrRands(subC);
   const disc = parseFloat(q.discount)||0;
-  const setupFeeAmt = parseFloat(q.setupFee)||0;
-  const discAmt = sub*(disc/100);
-  const subAfterDisc = sub-discAmt+setupFeeAmt;
-  const vat = subAfterDisc*0.15;
-  const total = subAfterDisc+vat;
+  const setupFeeAmt = sgrRands(setupC);
+  const discAmt = sgrRands(discC);
+  const subAfterDisc = sgrRands(_c.taxableC);
+  const vat = sgrRands(vatC);
+  const total = sgrRands(totalC);
   const _depInfo = quoteDepositInfo(q, total);   // custom % -> R5,000 rule -> 80%
   const depRate = _depInfo.rate;
   const dep = _depInfo.amount;
-  const fmt = n=>'R\u00a0'+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const depC = _depInfo.depositCents;
+  const fmt = c=>sgrZarC(c);
   const rows = q.lines.map((l,i)=>{
     /* CONVERGED (2026-08-27). This builder's own inline wording WAS the
        established Signacore specification line; it now lives in the shared
@@ -2644,7 +3292,7 @@ function buildQuoteHtml(q, companies, logoDataUrl) {
         ${specsLine?`<br/><span style="font-size:9.5px;color:#4b5563;font-style:italic;">${specsLine}</span>`:''}
       </td>
       <td style="width:80px;text-align:center;font-size:10px;color:#555;vertical-align:top;padding-top:9px;">${qtyDisplay}</td>
-      <td style="width:100px;text-align:right;font-size:10.5px;font-weight:700;color:#06065c;vertical-align:top;padding-top:9px;">${fmt(l.subtotal||0)}</td>
+      <td style="width:100px;text-align:right;font-size:10.5px;font-weight:700;color:#06065c;vertical-align:top;padding-top:9px;">${fmt(lineC[i]||0)}</td>
     </tr>`;
   }).join('');
   const logoHtml = (logoDataUrl
@@ -2774,12 +3422,12 @@ table.ln tfoot tr td{background:#06065c;color:#fff;font-size:8px;text-transform:
 
 <!-- TOTALS -->
 <div class="tots-wrap no-break"><div class="tots"><table>
-  <tr><td>Subtotal (excl. VAT &amp; discounts)</td><td>${fmt(sub)}</td></tr>
-  ${disc>0?`<tr class="disc"><td>Discount (${disc}%)</td><td>− ${fmt(discAmt)}</td></tr>`:''}
-  ${setupFeeAmt>0?`<tr class="setup"><td>Design &amp; Setup Fee</td><td>+ ${fmt(setupFeeAmt)}</td></tr>`:''}
-  <tr class="vat"><td>VAT (15%)</td><td>${fmt(vat)}</td></tr>
-  <tr class="total-row"><td>TOTAL DUE</td><td>${fmt(total)}</td></tr>
-  <tr class="dep-row"><td>${_depInfo.label} Deposit Required</td><td>${fmt(dep)}</td></tr>
+  <tr><td>Subtotal (excl. VAT &amp; discounts)</td><td>${fmt(subC)}</td></tr>
+  ${discC>0?`<tr class="disc"><td>Discount (${disc}%)</td><td>− ${fmt(discC)}</td></tr>`:''}
+  ${setupC>0?`<tr class="setup"><td>Design &amp; Setup Fee</td><td>+ ${fmt(setupC)}</td></tr>`:''}
+  <tr class="vat"><td>VAT (15%)</td><td>${fmt(vatC)}</td></tr>
+  <tr class="total-row"><td>TOTAL DUE</td><td>${fmt(totalC)}</td></tr>
+  <tr class="dep-row"><td>${_depInfo.label} Deposit Required</td><td>${fmt(depC)}</td></tr>
 </table></div></div>
 
 ${q.notes?(`<div class="notes"><div class="lbl">Notes</div><p>${q.notes}</p></div>`):''}
@@ -2792,7 +3440,7 @@ ${q.notes?(`<div class="notes"><div class="lbl">Notes</div><p>${q.notes}</p></di
 
 <!-- BANK DETAILS -->
 <div class="bank no-break">
-  <div class="lbl">Banking Details — ${_depInfo.label} Deposit: ${fmt(dep)}</div>
+  <div class="lbl">Banking Details — ${_depInfo.label} Deposit: ${fmt(depC)}</div>
   <table><tbody>
     <tr><td>Bank:</td><td>${legal.bankName}</td></tr>
     <tr><td>Account Name:</td><td>${legal.bankAccName}</td></tr>
@@ -2850,11 +3498,17 @@ function printCoverLetter(data, companies, logoDataUrl, type) {
   const today   = new Date().toLocaleDateString('en-ZA',{day:'numeric',month:'long',year:'numeric'});
   const validity= isQuote ? (data.validUntil||'14 days from date of issue') : (data.invoiceDue||'30 days from invoice date');
   // Deposit rate: 100% for totals ≤ R5,000, else 80%
-  const _clSub = (data.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
-  const _clDisc = parseFloat(data.discount)||0;
-  const _clSetup = parseFloat(data.setupFee)||0;
-  const _clAfter = _clSub - _clSub*(_clDisc/100) + _clSetup;
-  const _clTotal = _clAfter * 1.15;
+  // 2026-09-22: the cover letter's deposit wording must be derived from the
+  // SAME canonical total the quote/invoice document itself states — this used
+  // `_clAfter * 1.15`, one of the two float expressions that disagreed by a
+  // cent, so the letter could quote the R5,000 rule off a different total than
+  // the document it accompanies.
+  const _clC     = sgrDocumentCents(data.lines, data.discount, data.setupFee);
+  const _clSub   = sgrRands(_clC.subC);
+  const _clDisc  = parseFloat(data.discount)||0;
+  const _clSetup = sgrRands(_clC.setupC);
+  const _clAfter = sgrRands(_clC.taxableC);
+  const _clTotal = sgrRands(_clC.totalC);
   const _depInfo = quoteDepositInfo(isQuote?data:null, _clTotal);   // custom % -> R5,000 rule -> 80%
   const depRate = _depInfo.rate;
   const qrUrl   = 'https://api.qrserver.com/v1/create-qr-code/?size=110x110&format=png&data='+encodeURIComponent(GOOGLE_REVIEW_URL);
@@ -3622,8 +4276,12 @@ const STATUS_COLORS = { draft:'#6b7280', sent:'#2563eb', paid:'#059669', partial
 function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, customers,
   companies, logoDataUrl, onOpenQuote, onOpenJob, onOpenCustomer, onOpenJobPayments,
   onOpenInvoicePayments , fmtDate, fmtAmt }) {
-  const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-  const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+  // 2026-09-22 (ONE-CENT RECONCILIATION): canonical cents, so this on-screen
+  // view states exactly what the printed and emailed documents state.
+  const _vc=sgrInvoiceCents(inv.lineItems);
+  const _vLineC=_vc.lineC;
+  const sub=sgrRands(_vc.subC);
+  const vat=sgrRands(_vc.vatC);
   const isJob=inv.source==='job';
   // ── Linked-record lookup (read-only; never edits/relinks/deletes anything) ──
   const _links = findLinkedRecords(
@@ -3854,9 +4512,20 @@ async function markCanonicalInvoicePaid(inv, ctx){
 }
 async function markCanonicalInvoicePaid__impl(inv, ctx){
   const { setAccInvoices, onJsonFallback } = ctx || {};
-  const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
-  const alreadyPaid=(inv.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-  const remaining=Math.max(0,invTotal-alreadyPaid);
+  /* 2026-09-22 (ONE-CENT RECONCILIATION): the balance this settles is the
+     CANONICAL outstanding amount in cents, so "Mark paid" records exactly what
+     the issued document still asks for — never a float remainder that leaves a
+     cent behind, and never a cent more than is owed. */
+  // 2026-09-22 (CORRECTED): a job-linked invoice settles from the linked Job's
+  // stored commercial value; a standalone invoice from its own lines. `ctx.jobs`
+  // is supplied by every caller that has them.
+  const invTotalC=sgrCanonicalPayableCents(inv);
+  const alreadyPaidC=sgrPaidCents(inv.payments);
+  // An audited historical rounding settlement leaves nothing to settle.
+  const remainingC=sgrOutstandingForRecordCents(inv, invTotalC, alreadyPaidC);
+  const invTotal=sgrRands(invTotalC);
+  const alreadyPaid=sgrRands(alreadyPaidC);
+  const remaining=sgrRands(remainingC);
   const today=new Date().toISOString().slice(0,10);
   if(isRelationalAuthoritative('accInvoices') && inv._relId!=null){
     if(remaining<=0){ return; } // already fully paid — nothing to record
@@ -4063,13 +4732,19 @@ function docLinesSubtotal(lines){
 }
 function stubAdjustmentLines(doc){
   if(!doc) return [];
-  const sub     = docLinesSubtotal(doc.lines);
+  /* 2026-09-22 (OPTION D — CANONICAL DISCOUNT CENTS). The discount line used to
+     carry `sub * pct/100` as an unrounded float, which the 4-decimal column then
+     rounded a SECOND time. The canonical document calculation rounds the
+     discount to CENTS, so a double-rounded line could put a newly issued
+     invoice one cent away from its own quote/job total — the very defect this
+     work removes, recreated on brand-new transactions.
+     The line now carries the SAME canonical discount cents the shared pipeline
+     produced. It is NOT recalculated here. */
+  const _c      = sgrDocumentCents(doc.lines, doc.discount, doc.setupFee);
   const discPct = parseFloat(doc.discount)||0;
-  const discAmt = sub*(discPct/100);
-  const setupFee= parseFloat(doc.setupFee)||0;
   const out = [];
-  if(discAmt>0.005) out.push({ description:`Discount (${discPct}%)`, qty:1, unitAmount:-discAmt, accountCode:'4000', taxType:'15%' });
-  if(setupFee>0.005) out.push({ description:'Design & Setup Fee', qty:1, unitAmount:setupFee, accountCode:'4000', taxType:'15%' });
+  if(_c.discC > 0) out.push({ description:`Discount (${discPct}%)`, qty:1, unitAmount:sgrRands(-_c.discC), accountCode:'4000', taxType:'15%' });
+  if(_c.setupC > 0) out.push({ description:'Design & Setup Fee', qty:1, unitAmount:sgrRands(_c.setupC), accountCode:'4000', taxType:'15%' });
   return out;
 }
 
@@ -4127,18 +4802,45 @@ function jobInvoiceLineItems(job){
   const discAmt   = jLinesSub * (discPct/100);
   const reconstructed = jLinesSub - discAmt + setupFee;
   const canBreakOut = discPct>0 && jLinesSub>0 && Math.abs(reconstructed - valExVat) < 0.5;
+
+  /* ── 2026-09-22 (ONE-CENT RECONCILIATION, CORRECTED) — CENT-EXACT LINES ───
+     The shape below is UNCHANGED: same break-out decision, same descriptions,
+     same account codes, same tax types, same three-vs-one line structure.
+
+     THE JOB'S STORED VALUE IS THE TOTAL THIS PROJECTION MUST COME TO. It is
+     never recomputed from the job's own lines — those can be a stale earlier
+     representation (SNS-00128 carries lines reconstructing to R16,044.80
+     against an agreed value of R24,963.62), and a GL projection that restated
+     the agreed amount would be worse than one that simply carries it.
+
+     `canBreakOut` is the EXISTING test for "do these lines still reconcile to
+     this value" (within R0.50). Only then are the subtotal / discount / setup
+     fee broken out, and the discount line absorbs whatever cent the percentage
+     rounding leaves, so the partition sums to the taxable amount exactly.
+     Otherwise one lump line carries the whole ex-VAT figure, exactly as before.
+
+     Nothing is invented: no adjustment line, no rounding line, no payment, and
+     j.value itself is never rewritten. */
+  const _totalC   = sgrToCents0(j.value);
+  const _taxC     = sgrExVatCentsFor(_totalC);
+  const _subC     = sgrToCents0(jLinesSub);
+  const _setupC   = sgrToCents0(setupFee);
+  // sub - disc + setup === taxable, by construction.
+  const _discCAdj = canBreakOut ? (_subC + _setupC - _taxC) : sgrToCents0(discAmt);
+
   const lineItems = canBreakOut ? [
-    { description: j.desc || 'Signage / Production Job', qty: 1, unitAmount: jLinesSub, accountCode: '4000', taxType: '15%' },
-    { description: `Discount (${discPct}%)`, qty: 1, unitAmount: -discAmt, accountCode: '6303', taxType: '15%' },
-    ...(setupFee>0 ? [{ description: 'Setup Fee', qty: 1, unitAmount: setupFee, accountCode: '4000', taxType: '15%' }] : [])
+    { description: j.desc || 'Signage / Production Job', qty: 1, unitAmount: sgrRands(_subC), accountCode: '4000', taxType: '15%' },
+    { description: `Discount (${discPct}%)`, qty: 1, unitAmount: sgrRands(-_discCAdj), accountCode: '6303', taxType: '15%' },
+    ...(setupFee>0 ? [{ description: 'Setup Fee', qty: 1, unitAmount: sgrRands(_setupC), accountCode: '4000', taxType: '15%' }] : [])
   ] : [{
     description: (j.desc || 'Signage / Production Job') + (discPct>0 ? ` (${discPct}% discount applied)` : ''),
     qty: 1,
-    unitAmount: valExVat,
+    unitAmount: sgrRands(_taxC),
     accountCode: '4000',
     taxType: '15%'
   }];
-  return { lineItems, discPct, discAmt, canBreakOut, valExVat };
+  return { lineItems, discPct, discAmt: sgrRands(_discCAdj), canBreakOut,
+           valExVat: sgrRands(_taxC), totalCents: _totalC };
 }
 
 /* ═══════════════════════════════════════════
@@ -4208,8 +4910,9 @@ function getAllInvoicesUnified(jobs, quotes, accInvoices) {
     };
   });
   const manualInv = (accInvoices||[]).filter(i=>i && i.status!=='void').map(i=>{
-    const sub=(i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-    const vat=(i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+    // 2026-09-22: canonical cents.
+    const _uc=sgrInvoiceCents(i.lineItems);
+    const sub=sgrRands(_uc.subC), vat=sgrRands(_uc.vatC);
     return {
       id:i.id, number:i.number, source:'manual', co:i.co, jobNum:i.reference||'', quoteNum:'',
       client:i.contactName||'', date:i.date||'', dueDate:i.dueDate||'',
@@ -5038,28 +5741,42 @@ function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
      carries this key, so every existing caller is bit-for-bit unaffected - the
      `: ` branch of each line below is the original expression verbatim. */
   const _ovr = job._sgrTotals || null;
-  const sub = _ovr ? _ovr.sub : lines.reduce((s,l)=>s+(l.subtotal||0),0);
+  /* 2026-09-22 (ONE-CENT RECONCILIATION). Every figure this document prints is
+     now an integer number of cents from the one canonical pipeline, so
+     subtotal − discount + setup fee + VAT === TOTAL DUE exactly, the line
+     column adds up to the printed subtotal, and the TOTAL DUE on this page is
+     the amount settlement compares a payment against. `_ovr` (supplied by
+     sgrInvoiceRecordToPrintable for a stored invoice record) is already
+     canonical cents and is rendered as handed down, exactly as before. */
+  const _c = _ovr ? _ovr.cents : sgrDocumentCents(lines, job.discount, job.setupFee);
+  const subC = _c.subC, discC = _c.discC, setupC = _c.setupC, vatC = _c.vatC, totalC = _c.totalC;
   const discPct = _ovr ? _ovr.discPct : (parseFloat(job.discount)||0);
-  const discAmt = _ovr ? _ovr.discAmt : sub*(discPct/100);
-  const setupFeeAmt = _ovr ? _ovr.setupFeeAmt : (parseFloat(job.setupFee)||0);
-  const afterDisc = _ovr ? _ovr.afterDisc : sub - discAmt + setupFeeAmt;
-  const vat = _ovr ? _ovr.vat : afterDisc*0.15; const total = _ovr ? _ovr.total : afterDisc+vat;
+  const sub = sgrRands(subC), discAmt = sgrRands(discC), setupFeeAmt = sgrRands(setupC);
+  const afterDisc = sgrRands(_c.taxableC), vat = sgrRands(vatC), total = sgrRands(totalC);
   const payments = Array.isArray(job.payments) ? job.payments : [];
-  const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-  const balanceDue = Math.max(0, total-totalPaid);
+  const paidC = sgrPaidCents(payments);
+  const totalPaid = sgrRands(paidC);
+  const balanceC = sgrOutstandingCents(totalC, paidC);
+  const balanceDue = sgrRands(balanceC);
+  const _lineC = _ovr ? _ovr.lineCents : _c.lineC;
   // Prefer whatever VAT number is already stored on the job/invoice; fall
   // back to the saved Customer record so historical jobs pick it up too.
   const billVatNum = job.vatNum || sgrCustomerVatLookup(job.client, customers);
   // Full client address on the printed invoice, matching the Quotation's
   // "Quoted To" block (job.address is copied from q.address on conversion).
   const billAddress = job.address || sgrCustomerAddressLookup(job.client, customers);
-  const fmt = n=>'R\u00a0'+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+  // 2026-09-22: ONE money formatter, fed cents. toFixed and toLocaleString
+  // disagreed on the same double (132.825 -> "132.82" vs "132,83"), which is
+  // why the emailed PDF and this printed page could state different totals.
+  // The amount is fixed before it is formatted, and every builder now renders
+  // through sgrZarC.
+  const fmt = c=>sgrZarC(c);
   const rows = lines.map((l,i)=>{
     const sz = lineSizeText(l);
     return '<tr><td style="width:42px;color:#4b5563;font-size:10px;vertical-align:top;">'+(i+1)+'</td>'+
     '<td style="font-size:11px;word-break:break-word;vertical-align:top;">'+(l.desc||'\u2014')+(sz?'<div style="font-size:9px;color:#777;margin-top:2px;">'+sz+'</div>':'')+'</td>'+
     '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+lineItemCountText(l)+'</td>'+
-    '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(l.subtotal||0)+'</td></tr>';
+    '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(_lineC[i]||0)+'</td></tr>';
   }).join('');
   const invNum = sgrJobInvoiceNumber(job);
   const invDate = job.invoiceDate||(new Date().toISOString().slice(0,10));
@@ -5183,20 +5900,20 @@ function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
 :'<div style="border:1px solid #e5e7eb;border-radius:6px;padding:14px;text-align:center;color:#4b5563;font-size:11px;margin-bottom:12px;">No line items on record.</div>')+
 
 '<div class="tots-wrap no-break"><div class="tots"><table>'+
-'<tr><td>Subtotal (excl. VAT)</td><td>'+fmt(sub)+'</td></tr>'+
-(discAmt>0?'<tr class="vat-row"><td>Discount ('+discPct+'%)</td><td>- '+fmt(discAmt)+'</td></tr>':'')+
-(setupFeeAmt>0?'<tr style="color:#4f46e5"><td>Design &amp; Setup Fee</td><td>+ '+fmt(setupFeeAmt)+'</td></tr>':'')+
-'<tr class="vat-row"><td>VAT (15%)</td><td>'+fmt(vat)+'</td></tr>'+
-'<tr class="total-row"><td>'+(totalPaid>0?'INVOICE TOTAL':'TOTAL DUE')+'</td><td>'+fmt(total)+'</td></tr>'+
-(totalPaid>0?'<tr class="paid-row"><td>Less: Payments Received</td><td>- '+fmt(totalPaid)+'</td></tr>':'')+
-(totalPaid>0?'<tr class="bal-row" style="background:'+(balanceDue<=0.005?'#059669':'#ED0101')+'"><td>'+(balanceDue<=0.005?'PAID IN FULL':'BALANCE DUE')+'</td><td>'+fmt(balanceDue)+'</td></tr>':'')+
+'<tr><td>Subtotal (excl. VAT)</td><td>'+fmt(subC)+'</td></tr>'+
+(discC>0?'<tr class="vat-row"><td>Discount ('+discPct+'%)</td><td>- '+fmt(discC)+'</td></tr>':'')+
+(setupC>0?'<tr style="color:#4f46e5"><td>Design &amp; Setup Fee</td><td>+ '+fmt(setupC)+'</td></tr>':'')+
+'<tr class="vat-row"><td>VAT (15%)</td><td>'+fmt(vatC)+'</td></tr>'+
+'<tr class="total-row"><td>'+(paidC>0?'INVOICE TOTAL':'TOTAL DUE')+'</td><td>'+fmt(totalC)+'</td></tr>'+
+(paidC>0?'<tr class="paid-row"><td>Less: Payments Received</td><td>- '+fmt(paidC)+'</td></tr>':'')+
+(paidC>0?'<tr class="bal-row" style="background:'+(balanceC<=0?'#059669':'#ED0101')+'"><td>'+(balanceC<=0?'PAID IN FULL':'BALANCE DUE')+'</td><td>'+fmt(balanceC)+'</td></tr>':'')+
 '</table></div></div>'+
 
 (totalPaid>0
 ?'<div class="pay-hist no-break">'+
   '<div class="lbl">Payments Received To Date</div>'+
   '<table><tbody>'+
-  payments.map(p=>'<tr><td style="width:90px">'+(p.date||'—')+'</td><td>'+(p.method||'Payment')+(p.notes?' – '+p.notes:'')+'</td><td>'+fmt(parseFloat(p.amount)||0)+'</td></tr>').join('')+
+  payments.map(p=>'<tr><td style="width:90px">'+(p.date||'—')+'</td><td>'+(p.method||'Payment')+(p.notes?' – '+p.notes:'')+'</td><td>'+fmt(sgrToCents0(p&&p.amount))+'</td></tr>').join('')+
   '</tbody></table>'+
 '</div>'
 :'')+
@@ -5237,13 +5954,20 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl, customers
   const co = companies.find(c=>c.id===quote.co)||{name:'Signacore',short:'SGR'};
   const legal = sgrCompanyLegal(co);
   const lines = quote.lines||[];
-  const sub = lines.reduce((s,l)=>s+(l.subtotal||0),0);
+  /* 2026-09-22 (ONE-CENT RECONCILIATION): every figure this document prints
+     comes from the ONE canonical cents pipeline — each displayed line
+     extension rounded to cents, VAT taken once over the taxable amount — so
+     subtotal − discount + setup fee + VAT === TOTAL DUE exactly, and the
+     TOTAL DUE stated here is the amount settlement compares against. */
+  const _c = sgrDocumentCents(lines, quote.discount, quote.setupFee);
+  const subC=_c.subC, discC=_c.discC, setupC=_c.setupC, vatC=_c.vatC, totalC=_c.totalC, lineC=_c.lineC;
+  const sub = sgrRands(subC);
   const discPct = parseFloat(quote.discount)||0;
-  const discAmt = sub*(discPct/100);
-  const setupFeeAmt = parseFloat(quote.setupFee)||0;
-  const afterDisc = sub - discAmt + setupFeeAmt;
-  const vat = afterDisc*0.15;
-  const total = afterDisc+vat;
+  const discAmt = sgrRands(discC);
+  const setupFeeAmt = sgrRands(setupC);
+  const afterDisc = sgrRands(_c.taxableC);
+  const vat = sgrRands(vatC);
+  const total = sgrRands(totalC);
   /* DEPOSIT REQUIRED on the proforma (2026-09-21) - presentation only.
      Same shared resolver every other quote surface uses (custom q.depositPct
      -> the R5,000 full-deposit rule -> the standard 80%), fed this document's
@@ -5255,7 +5979,7 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl, customers
   // "Quoted To" block. `customers` is optional — callers that don't pass it
   // simply get the address already stored on the quote/job, as before.
   const billAddress = quote.address || sgrCustomerAddressLookup(quote.client, customers);
-  const fmt = n=>'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const fmt = c=>sgrMoneyC(c);   // 2026-09-22: one formatter, fed cents
   const today = new Date().toISOString().slice(0,10);
   const due = new Date(Date.now()+30*864e5).toISOString().slice(0,10);
   const rows = lines.map((l,i)=>{
@@ -5263,7 +5987,7 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl, customers
     return '<tr><td style="width:42px;color:#4b5563;font-size:10px;vertical-align:top;">'+(i+1)+'</td>'+
     '<td style="font-size:11px;word-break:break-word;vertical-align:top;">'+(l.desc||'—')+(sz?'<div style="font-size:9px;color:#777;margin-top:2px;">'+sz+'</div>':'')+'</td>'+
     '<td style="width:60px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+lineItemCountText(l)+'</td>'+
-    '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(l.subtotal||0)+'</td></tr>';
+    '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(lineC[i]||0)+'</td></tr>';
   }).join('');
   const logoHtml = (logoDataUrl
     ? '<img src="'+logoDataUrl+'" style="max-height:112px;max-width:322px;object-fit:contain;display:block;">'
@@ -5341,12 +6065,12 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl, customers
 '</tr></thead><tbody>'+rows+'</tbody></table>':
 '<div style="border:1px solid #e5e7eb;border-radius:6px;padding:14px;text-align:center;color:#4b5563;font-size:11px;margin-bottom:12px;">No line items.</div>')+
 '<div class="tots-wrap no-break"><div class="tots"><table>'+
-'<tr><td>Subtotal (excl. VAT)</td><td>'+fmt(sub)+'</td></tr>'+
-(discAmt>0?'<tr class="vat-row"><td>Discount ('+discPct+'%)</td><td>- '+fmt(discAmt)+'</td></tr>':'')+
-(setupFeeAmt>0?'<tr style="color:#4f46e5"><td>Design &amp; Setup Fee</td><td>+ '+fmt(setupFeeAmt)+'</td></tr>':'')+
-'<tr class="vat-row"><td>VAT (15%)</td><td>'+fmt(vat)+'</td></tr>'+
-'<tr class="total-row"><td>TOTAL DUE</td><td>'+fmt(total)+'</td></tr>'+
-'<tr class="dep-row"><td>'+_depInfo.label+' Deposit Required'+(_depInfo.autoFull?'<div style="font-size:8.5px;font-weight:600;margin-top:1px;">Full deposit applies as the total is R5,000 or less.</div>':'')+'</td><td>'+fmt(_depInfo.amount)+'</td></tr>'+
+'<tr><td>Subtotal (excl. VAT)</td><td>'+fmt(subC)+'</td></tr>'+
+(discC>0?'<tr class="vat-row"><td>Discount ('+discPct+'%)</td><td>- '+fmt(discC)+'</td></tr>':'')+
+(setupC>0?'<tr style="color:#4f46e5"><td>Design &amp; Setup Fee</td><td>+ '+fmt(setupC)+'</td></tr>':'')+
+'<tr class="vat-row"><td>VAT (15%)</td><td>'+fmt(vatC)+'</td></tr>'+
+'<tr class="total-row"><td>TOTAL DUE</td><td>'+fmt(totalC)+'</td></tr>'+
+'<tr class="dep-row"><td>'+_depInfo.label+' Deposit Required'+(_depInfo.autoFull?'<div style="font-size:8.5px;font-weight:600;margin-top:1px;">Full deposit applies as the total is R5,000 or less.</div>':'')+'</td><td>'+fmt(_depInfo.depositCents)+'</td></tr>'+
 '</table></div></div>'+
 '<div class="proforma-notice no-break"><p>This is a Proforma Invoice only. Payment is required before production commences. This document is not a VAT invoice. A Tax Invoice will be issued upon completion.</p></div>'+
 '<div class="bank no-break"><div class="lbl">Banking Details</div><table><tbody>'+
@@ -5410,20 +6134,23 @@ function buildManualInvoiceHtml(inv, companies, logoDataUrl) {
   const co = companies.find(c=>c.id===inv.co)||{name:'Signacore',short:'SGR'};
   const legal = sgrCompanyLegal(co);
   const lines = inv.lineItems||[];
-  const sub = lines.reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-  const vat = lines.reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
-  const total = sub+vat;
+  // 2026-09-22: canonical cents, same as every other builder.
+  const _c = sgrInvoiceCents(lines);
+  const subC=_c.subC, vatC=_c.vatC, totalC=_c.totalC, lineC=_c.lineC;
+  const sub = sgrRands(subC), vat = sgrRands(vatC), total = sgrRands(totalC);
   const payments = Array.isArray(inv.payments) ? inv.payments : [];
-  const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-  const balanceDue = Math.max(0, total-totalPaid);
-  const fmt = n=>'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const paidC = sgrPaidCents(payments);
+  const totalPaid = sgrRands(paidC);
+  const balanceC = sgrOutstandingCents(totalC, paidC);
+  const balanceDue = sgrRands(balanceC);
+  const fmt = c=>sgrMoneyC(c);
   const rows = lines.map((l,i)=>{
     const lNeg = (parseFloat(l.unitAmount)||0) < 0;
-    const lineTotal = parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);
+    const lineTotal = lineC[i]||0;
     return '<tr style="'+(lNeg?'color:#dc2626;':'')+'"><td style="width:42px;color:#4b5563;font-size:10px;vertical-align:top;">'+(i+1)+'</td>'+
     '<td style="font-size:11px;word-break:break-word;vertical-align:top;">'+(l.description||'-')+'</td>'+
     '<td style="width:50px;text-align:center;font-size:10.5px;color:#555;vertical-align:top;">'+(l.qty||1)+'</td>'+
-    '<td style="width:110px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(parseFloat(l.unitAmount||0))+'</td>'+
+    '<td style="width:110px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(sgrToCents0(l.unitAmount))+'</td>'+
     '<td style="width:120px;text-align:right;font-size:10.5px;font-weight:600;vertical-align:top;">'+fmt(lineTotal)+'</td></tr>';
   }).join('');
   const invNum = inv.number||'';
@@ -5532,17 +6259,17 @@ function buildManualInvoiceHtml(inv, companies, logoDataUrl) {
 '</tr></thead><tbody>'+rows+'</tbody></table>'
 :'<div style="border:1px solid #e5e7eb;border-radius:6px;padding:14px;text-align:center;color:#4b5563;font-size:11px;margin-bottom:12px;">No line items on record.</div>')+
 '<div class="tots-wrap no-break"><div class="tots"><table>'+
-'<tr><td>Subtotal (excl. VAT)</td><td>'+fmt(sub)+'</td></tr>'+
-'<tr class="vat-row"><td>VAT (15%)</td><td>'+fmt(vat)+'</td></tr>'+
-'<tr class="total-row"><td>'+(totalPaid>0?'INVOICE TOTAL':'TOTAL DUE')+'</td><td>'+fmt(total)+'</td></tr>'+
-(totalPaid>0?'<tr class="paid-row"><td>Less: Payments Received</td><td>- '+fmt(totalPaid)+'</td></tr>':'')+
-(totalPaid>0?'<tr class="bal-row" style="background:'+(balanceDue<=0.005?'#059669':'#ED0101')+'"><td>'+(balanceDue<=0.005?'PAID IN FULL':'BALANCE DUE')+'</td><td>'+fmt(balanceDue)+'</td></tr>':'')+
+'<tr><td>Subtotal (excl. VAT)</td><td>'+fmt(subC)+'</td></tr>'+
+'<tr class="vat-row"><td>VAT (15%)</td><td>'+fmt(vatC)+'</td></tr>'+
+'<tr class="total-row"><td>'+(paidC>0?'INVOICE TOTAL':'TOTAL DUE')+'</td><td>'+fmt(totalC)+'</td></tr>'+
+(paidC>0?'<tr class="paid-row"><td>Less: Payments Received</td><td>- '+fmt(paidC)+'</td></tr>':'')+
+(paidC>0?'<tr class="bal-row" style="background:'+(balanceC<=0?'#059669':'#ED0101')+'"><td>'+(balanceC<=0?'PAID IN FULL':'BALANCE DUE')+'</td><td>'+fmt(balanceC)+'</td></tr>':'')+
 '</table></div></div>'+
 (totalPaid>0
 ?'<div class="pay-hist no-break">'+
   '<div class="lbl">Payments Received To Date</div>'+
   '<table><tbody>'+
-  payments.map(p=>'<tr><td style="width:90px">'+(p.date||'-')+'</td><td>'+(p.method||'Payment')+(p.notes?' - '+p.notes:'')+'</td><td>'+fmt(parseFloat(p.amount)||0)+'</td></tr>').join('')+
+  payments.map(p=>'<tr><td style="width:90px">'+(p.date||'-')+'</td><td>'+(p.method||'Payment')+(p.notes?' - '+p.notes:'')+'</td><td>'+fmt(sgrToCents0(p&&p.amount))+'</td></tr>').join('')+
   '</tbody></table>'+
 '</div>'
 :'')+
@@ -5654,11 +6381,20 @@ function sgrInvoiceAdjustmentKind(l){
    all lines either way, so the printed document still adds up exactly. */
 function sgrSplitInvoiceLineItems(lineItems){
   const all = Array.isArray(lineItems) ? lineItems.filter(Boolean) : [];
-  // Canonical money — over ALL lines, adjustments included. Identical
-  // arithmetic to buildManualInvoiceHtml / the invoice lists / statements.
-  const allSubtotal = all.reduce((s,l)=>s+sgrInvoiceLineAmount(l), 0);
-  const vat         = all.reduce((s,l)=>l.taxType==='15%' ? s+sgrInvoiceLineAmount(l)*0.15 : s, 0);
-  const total       = allSubtotal + vat;
+  /* 2026-09-22 (ONE-CENT RECONCILIATION). Canonical money — over ALL lines,
+     adjustments included — now through the one cents pipeline: each displayed
+     line extension rounded to cents, then VAT ONCE over the taxable lines.
+     This used to sum raw float products and add up per-line VAT, which is why
+     the printed line column could hide sub-cent fractions and why this total
+     could sit a cent away from the same invoice's other derivations. The
+     partition below is taken from the SAME rounded per-line cents, so
+     itemsSubtotal - discAmt + setupFeeAmt === allSubtotal stays exact. */
+  const _c   = sgrInvoiceCents(all);
+  const cents = _c;
+  const allSubtotalC = _c.subC, vatC = _c.vatC, totalC = _c.totalC;
+  const allSubtotal = sgrRands(allSubtotalC);
+  const vat         = sgrRands(vatC);
+  const total       = sgrRands(totalC);
 
   const setupLines = all.filter(l=>sgrInvoiceAdjustmentKind(l)==='setupFee');
   const discLines  = all.filter(l=>sgrInvoiceAdjustmentKind(l)==='discount');
@@ -5669,19 +6405,34 @@ function sgrSplitInvoiceLineItems(lineItems){
                     && (setupLines.length + discLines.length) > 0;
   if(!separated){
     return { items: all, separated:false, setupFeeAmt:0, discAmt:0, discPct:0,
-             itemsSubtotal: allSubtotal, allSubtotal, vat, total };
+             itemsSubtotal: allSubtotal, allSubtotal, vat, total,
+             cents, itemLineCents: _c.lineC,
+             setupFeeC:0, discC:0, itemsSubtotalC: allSubtotalC,
+             allSubtotalC, vatC, totalC };
   }
-  const items       = all.filter(l=>sgrInvoiceAdjustmentKind(l)===null);
-  const setupFeeAmt = setupLines.length ? sgrInvoiceLineAmount(setupLines[0]) : 0;
-  const discAmt     = discLines.length  ? Math.abs(sgrInvoiceLineAmount(discLines[0])) : 0;
+  // The partition is taken from the SAME per-line cents the totals above ran
+  // over (index-matched), never re-derived from the floats — that is what makes
+  // itemsSubtotal - discAmt + setupFeeAmt === allSubtotal true to the cent.
+  const _kindOf     = all.map(sgrInvoiceAdjustmentKind);
+  const _centsOf    = k => all.reduce((s,l,i)=> _kindOf[i]===k ? s + _c.lineC[i] : s, 0);
+  const items = [], itemLineCents = [];
+  all.forEach((l,i)=>{ if(_kindOf[i]===null){ items.push(l); itemLineCents.push(_c.lineC[i]); } });
+  const setupFeeC   = _centsOf('setupFee');
+  const discC       = Math.abs(_centsOf('discount'));
+  const itemsSubtotalC = _centsOf(null);
+  const setupFeeAmt = sgrRands(setupFeeC);
+  const discAmt     = sgrRands(discC);
   const pctMatch    = discLines.length
     ? SGR_INV_DISCOUNT_RE.exec(String(discLines[0].description).trim()) : null;
   const discPct     = pctMatch ? Number(pctMatch[1]) : 0;
   // itemsSubtotal - discAmt + setupFeeAmt === allSubtotal by construction: the
-  // three parts are the same numbers the sum above ran over, just partitioned.
-  const itemsSubtotal = items.reduce((s,l)=>s+sgrInvoiceLineAmount(l), 0);
+  // three parts are the same CENT figures the sum above ran over, just
+  // partitioned.
+  const itemsSubtotal = sgrRands(itemsSubtotalC);
   return { items, separated:true, setupFeeAmt, discAmt, discPct,
-           itemsSubtotal, allSubtotal, vat, total };
+           itemsSubtotal, allSubtotal, vat, total,
+           cents, itemLineCents,
+           setupFeeC, discC, itemsSubtotalC, allSubtotalC, vatC, totalC };
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -5852,6 +6603,14 @@ function sgrInvoiceRecordToPrintable(inv, ctx){
       afterDisc: split.allSubtotal,  // === itemsSubtotal - discAmt + setupFeeAmt
       vat: split.vat,                // canonical, per-line taxType
       total: split.total,            // canonical, unchanged from the record
+      // 2026-09-22: the same figures as INTEGER CENTS, which is what
+      // buildInvoiceHtml renders. Passed down rather than recomputed so the
+      // printed document states the record's own canonical amount and nothing
+      // between here and the page can round it a second time.
+      cents: { subC: split.itemsSubtotalC, discC: split.discC, setupC: split.setupFeeC,
+               taxableC: split.allSubtotalC, vatC: split.vatC, totalC: split.totalC,
+               lineC: split.itemLineCents },
+      lineCents: split.itemLineCents,
     },
   };
 }
@@ -6002,9 +6761,12 @@ async function generateCoverLetterPdf(data, companies, logoDataUrl, type) {
   const today    = new Date().toLocaleDateString('en-ZA',{day:'numeric',month:'long',year:'numeric'});
   const validity = isQuote ? (data.validUntil||'14 days from date of issue') : (data.invoiceDue||'30 days from invoice date');
   // Deposit rate: 100% for totals ≤ R5,000, else 80%
-  const _gpSub = (data.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
-  const _gpAfter = _gpSub - _gpSub*((parseFloat(data.discount)||0)/100) + (parseFloat(data.setupFee)||0);
-  const _depInfo = quoteDepositInfo(isQuote?data:null, _gpAfter*1.15);   // custom % -> R5,000 rule -> 80%
+  // 2026-09-22: canonical total, so this cover page's deposit terms match the
+  // document it is stapled to (see buildCoverLetterHtml's note).
+  const _gpC     = sgrDocumentCents(data.lines, data.discount, data.setupFee);
+  const _gpSub   = sgrRands(_gpC.subC);
+  const _gpAfter = sgrRands(_gpC.taxableC);
+  const _depInfo = quoteDepositInfo(isQuote?data:null, sgrRands(_gpC.totalC));   // custom % -> R5,000 rule -> 80%
   const depRate = _depInfo.rate;
   const W=210, LM=20, RM=190, CW=170;
   let y = 20;
@@ -6136,19 +6898,33 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   const isQuote    = type === 'quote';
   const isProforma = type === 'proforma';
   const co      = companies.find(c=>c.id===data.co)||{name:'Signacore',short:'SGR'};
-  const fmt     = n => 'R '+Number(n||0).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,',');
+  /* 2026-09-22 (ONE-CENT RECONCILIATION). THIS BUILDER IS THE ONE THE
+     CUSTOMER RECEIVES BY EMAIL, and it was the worst offender: it formatted
+     with toFixed(2) while every printed HTML document formatted with
+     toLocaleString, and those two disagree on the SAME double — 132.825 gives
+     "132.82" through toFixed and "132,83" through toLocaleString, because one
+     rounds the exact binary value and the other rounds the shortest decimal
+     string. So the emailed PDF and the printed invoice could state different
+     TOTAL DUEs for one invoice before a cent was ever paid.
+     Both the amount and the formatter are fixed here: the figures come from
+     the one canonical cents pipeline, and sgrMoneyC renders them. */
+  const fmt     = c => sgrMoneyC(c);
   const refNum  = isQuote ? data.num : (isProforma ? (data._proformaNum||data.num) : (data.invoiceNum||data.num));
   const lines   = data.lines||[];
-  const sub         = lines.reduce((s,l)=>s+(l.subtotal||0),0);
+  const _c          = sgrDocumentCents(lines, data.discount, data.setupFee);
+  const lineC       = _c.lineC;
+  const subC=_c.subC, discC=_c.discC, setupC=_c.setupC, vatC=_c.vatC, totalC=_c.totalC;
+  const sub         = sgrRands(subC);
   const disc        = data.discount||0;
-  const discAmt     = sub*disc/100;
-  const setupFeeAmt = parseFloat(data.setupFee)||0;
-  const after       = sub-discAmt+setupFeeAmt;
-  const vat         = after*0.15;
-  const total       = after+vat;
+  const discAmt     = sgrRands(discC);
+  const setupFeeAmt = sgrRands(setupC);
+  const after       = sgrRands(_c.taxableC);
+  const vat         = sgrRands(vatC);
+  const total       = sgrRands(totalC);
   const _depInfo = quoteDepositInfo(isQuote?data:null, total);   // custom % -> R5,000 rule -> 80%
   const depRate = _depInfo.rate;
   const dep     = _depInfo.amount;
+  const depC    = _depInfo.depositCents;
   const today   = new Date().toLocaleDateString('en-ZA',{day:'2-digit',month:'2-digit',year:'numeric'});
   const W=210, LM=20, RM=190, CW=170;
   let y = 20;
@@ -6276,7 +7052,7 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
     const qtyStr = lineItemCountText(ln, { decimals: 2 });
     doc.text(qtyStr, qtyX, y+5, {align:'center'});
     // Total
-    doc.text(fmt(ln.subtotal||0).replace('R ',''), amtX, y+5, {align:'right'});
+    doc.text(fmt(lineC[idx]||0).replace('R ',''), amtX, y+5, {align:'right'});
     y += rH;
   });
   y += 5;
@@ -6291,12 +7067,12 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
     doc.text(val, RM-1, y+5, {align:'right'});
     y+=7;
   };
-  totRow('Subtotal:', fmt(sub));
-  if (disc>0) totRow('Discount ('+disc+'%):', '- '+fmt(discAmt));
-  if (setupFeeAmt>0) totRow('Design & Setup Fee:', '+ '+fmt(setupFeeAmt));
-  totRow('VAT (15%):', fmt(vat));
+  totRow('Subtotal:', fmt(subC));
+  if (discC>0) totRow('Discount ('+disc+'%):', '- '+fmt(discC));
+  if (setupC>0) totRow('Design & Setup Fee:', '+ '+fmt(setupC));
+  totRow('VAT (15%):', fmt(vatC));
   sd(C_RED); doc.setLineWidth(0.4); doc.line(tX,y,RM,y); y+=1;
-  totRow('TOTAL (incl. VAT):', fmt(total), true, true);
+  totRow('TOTAL (incl. VAT):', fmt(totalC), true, true);
   y += 5;
 
   // Bank details — if not enough room on current page, start new page
@@ -6305,7 +7081,7 @@ async function generateDocumentPdf(data, companies, logoDataUrl, type) {
   sf(C_LGREEN); sd(C_BGREEN); doc.setLineWidth(0.3);
   doc.roundedRect(LM,y,CW/2-4,bankH,2,2,'FD');
   doc.setFont('helvetica','bold'); doc.setFontSize(7.5); sc(C_GREEN);
-  doc.text(isQuote?'PAYMENT DETAILS — '+_depInfo.label+' DEPOSIT: '+fmt(dep):'PAYMENT DETAILS', LM+3,y+6);
+  doc.text(isQuote?'PAYMENT DETAILS — '+_depInfo.label+' DEPOSIT: '+fmt(depC):'PAYMENT DETAILS', LM+3,y+6);
   const bRows=[['Bank:','Standard Bank'],['Account Name:','Hornet Honey trading as Signacore'],['Account No:','2-825-229-72'],['Branch Code:','051001'],['Reference:',refNum+' / '+(data.client||'')]];
   let bY=y+11;
   bRows.forEach(([k,v])=>{
@@ -7904,11 +8680,17 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       return u;
     }));
   }
-  const subtotal=lines.reduce((s,l)=>s+(l.subtotal||0),0);
-  const discountAmt=subtotal*(parseFloat(discount)||0)/100;
-  const setupFeeAmt=parseFloat(setupFee)||0;
-  const afterDiscount=subtotal-discountAmt+setupFeeAmt;
-  const vat=afterDiscount*0.15; const total=afterDiscount+vat;
+  /* 2026-09-22 (ONE-CENT RECONCILIATION): the quote form's live totals come
+     from the SAME canonical cents pipeline the printed quote, the proforma,
+     the emailed PDF and the converted job all use, so what the user sees while
+     building the quote is the amount that is ultimately issued and settled. */
+  const _qc = sgrDocumentCents(lines, discount, setupFee);
+  const qLineCents = _qc.lineC;
+  const subtotal=sgrRands(_qc.subC);
+  const discountAmt=sgrRands(_qc.discC);
+  const setupFeeAmt=sgrRands(_qc.setupC);
+  const afterDiscount=sgrRands(_qc.taxableC);
+  const vat=sgrRands(_qc.vatC); const total=sgrRands(_qc.totalC);
   // Deposit preview — derived from the SAME `total` the summary shows, via
   // the one shared resolver the documents/PDFs use. Display only.
   const _formDep = quoteDepositInfo({depositPct: depositPctValue}, total);
@@ -8558,7 +9340,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                   {/* Line Sub Total */}
                   <div className="flex-shrink-0 w-36">
                     <label className="block text-xs font-semibold text-gray-400 mb-1">Sub Total</label>
-                    <div className="w-full border border-brand-200 bg-brand-50 rounded-xl px-3 py-2.5 text-sm font-black text-brand-700 text-right">{zar(line.subtotal||0)}</div>
+                    <div className="w-full border border-brand-200 bg-brand-50 rounded-xl px-3 py-2.5 text-sm font-black text-brand-700 text-right">{zar(sgrRands(qLineCents[lines.indexOf(line)]||0))}</div>
                     {(line.unit==='m²'||line.unit==='m (linear)')&&(line.pQty||1)>1&&line.qty>0&&(
                       <div className="text-xs text-amber-600 font-semibold text-right mt-0.5">
                         {line.pQty} × {parseFloat(line.qty).toFixed(4)} = {((line.pQty||1)*(parseFloat(line.qty)||0)).toFixed(4)} {line.unit}
@@ -8730,11 +9512,16 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
   // record's own total, not blindly the quote's own total (they're normally
   // identical, but once a linked invoice/job is the real source, ITS total
   // is what actually governs its status).
-  const statusTotal = paySource.kind==='invoice'
-    ? (paySource.record.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0)
-    : paySource.kind==='job'
-      ? (parseFloat(paySource.record.value)||0)
-      : total;
+  /* 2026-09-22 (ONE-CENT RECONCILIATION): the total this modal judges
+     paid/partial/balance against is now the ONE canonical cents figure —
+     the resolved invoice record's own lines when there is an invoice (the
+     invoice is the settlement authority the moment it exists), otherwise the
+     resolved job's own document, otherwise this quote's own canonical total.
+     job.value is no longer consulted ahead of the document it issued. */
+  const statusTotalC = (paySource.kind==='invoice' || paySource.kind==='job')
+    ? sgrCanonicalPayableCents(paySource.record)
+    : sgrToCents0(total);
+  const statusTotal = sgrRands(statusTotalC);
   // ── Linked-record quick access (read-only) — uses the linked job/customer
   // QuoteViewModal already resolved, so this never invents a new relationship. ──
   const linkPanelLinks = [
@@ -8754,8 +9541,13 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
   const [notes,  setNotes]  = useState('');
   const zr = n => 'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const iCls = "w-full border border-gray-200 rounded-lg px-3 py-2 text-sm";
-  const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-  const balance   = statusTotal - totalPaid;
+  const paidC     = sgrPaidCents(payments);
+  const totalPaid = sgrRands(paidC);
+  // 2026-09-22: cent-precise outstanding, so a fraction of a cent can never be
+  // displayed as a debt.
+  const _settleRec = (paySource.kind==='invoice') ? paySource.record : null;
+  const balanceC  = sgrOutstandingForRecordCents(_settleRec, statusTotalC, paidC);
+  const balance   = sgrRands(balanceC);
   const _depInfo  = quoteDepositInfo(quote, total);   // custom % -> R5,000 rule -> 80%
   const depRate   = _depInfo.rate;
   const deposit   = _depInfo.amount;
@@ -8975,12 +9767,13 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
     const newTotal = updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
     let patch, jobPayload;
     if(paySource.kind==='invoice'){
-      const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':paySource.record.status;
-      const paidDate  = newTotal>=statusTotal?(paySource.record.paidDate||date||new Date().toISOString().slice(0,10)):(paySource.record.paidDate||null);
+      // 2026-09-22: the ONE settlement rule, exact integer cents, no tolerance.
+      const newStatus = sgrStatusForPayments(_settleRec, statusTotalC, updated, paySource.record.status);
+      const paidDate  = newStatus==='paid'?(paySource.record.paidDate||date||new Date().toISOString().slice(0,10)):(paySource.record.paidDate||null);
       patch = {status:newStatus, paidDate};
     } else if(paySource.kind==='job'){
-      const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':'pending';
-      const paidAt    = newTotal>=statusTotal?(date||new Date().toISOString().slice(0,10)):paySource.record.paidAt||null;
+      const newStatus = sgrStatusForPayments(_settleRec, statusTotalC, updated, 'pending');
+      const paidAt    = newStatus==='paid'?(date||new Date().toISOString().slice(0,10)):paySource.record.paidAt||null;
       patch = {invoiceStatus:newStatus, paidAt};
       // A brand-new payment is always written to job.payments ONLY — never
       // mirrored onto the quote merely for symmetry (Section 7).
@@ -9020,11 +9813,11 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
     const newTotal = updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
     let patch, jobPayload, quotePayload;
     if(paySource.kind==='invoice'){
-      const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':paySource.record.status;
-      patch = {status:newStatus, paidDate:newTotal>=statusTotal?paySource.record.paidDate:null};
+      const newStatus = sgrStatusForPayments(_settleRec, statusTotalC, updated, paySource.record.status);
+      patch = {status:newStatus, paidDate:newStatus==='paid'?paySource.record.paidDate:null};
     } else if(paySource.kind==='job'){
-      const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':'pending';
-      patch = {invoiceStatus:newStatus, paidAt:newTotal>=statusTotal?paySource.record.paidAt:null};
+      const newStatus = sgrStatusForPayments(_settleRec, statusTotalC, updated, 'pending');
+      patch = {invoiceStatus:newStatus, paidAt:newStatus==='paid'?paySource.record.paidAt:null};
       // Update the id wherever it's actually represented — job.payments if
       // owned there, quote.payments if ALSO owned there (a deposit carried
       // over at conversion time) — never in an array that never had it.
@@ -9063,11 +9856,11 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
     const newTotal = updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
     let patch, jobPayload, quotePayload;
     if(paySource.kind==='invoice'){
-      const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':'sent';
-      patch = {status:newStatus, paidDate:newTotal>=statusTotal?paySource.record.paidDate:null};
+      const newStatus = sgrStatusForPayments(_settleRec, statusTotalC, updated, 'sent');
+      patch = {status:newStatus, paidDate:newStatus==='paid'?paySource.record.paidDate:null};
     } else if(paySource.kind==='job'){
-      const newStatus = newTotal>=statusTotal?'paid':newTotal>0?'partial':'pending';
-      patch = {invoiceStatus:newStatus, paidAt:newTotal>=statusTotal?paySource.record.paidAt:null};
+      const newStatus = sgrStatusForPayments(_settleRec, statusTotalC, updated, 'pending');
+      patch = {invoiceStatus:newStatus, paidAt:newStatus==='paid'?paySource.record.paidAt:null};
       // Permanently remove this id from EVERY active representation that
       // could otherwise feed it back via reconciliation — job.payments if
       // owned there, quote.payments if ALSO owned there — in this SAME
@@ -9207,13 +10000,16 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
   const [showRelink, setShowRelink] = useState(false);
   const [relinkTarget, setRelinkTarget] = useState('');
   const co = companies.find(c=>c.id===quote.co)||{short:'?',name:'—'};
-  const sub = quote.lines.reduce((s,l)=>s+(l.subtotal||0),0);
+  // 2026-09-22: canonical cents, so this view states exactly what the printed
+  // quote, the proforma and the emailed PDF state.
+  const _vqc = sgrDocumentCents(quote.lines, quote.discount, quote.setupFee);
+  const sub = sgrRands(_vqc.subC);
   const disc = parseFloat(quote.discount)||0;
-  const discAmt = sub*(disc/100);
-  const setupFeeAmt = parseFloat(quote.setupFee)||0;
-  const subAfterDisc = sub - discAmt + setupFeeAmt;
-  const vat = subAfterDisc*0.15;
-  const total = subAfterDisc+vat;
+  const discAmt = sgrRands(_vqc.discC);
+  const setupFeeAmt = sgrRands(_vqc.setupC);
+  const subAfterDisc = sgrRands(_vqc.taxableC);
+  const vat = sgrRands(_vqc.vatC);
+  const total = sgrRands(_vqc.totalC);
   const _depInfo = quoteDepositInfo(quote, total);   // custom % -> R5,000 rule -> 80%
   const depRate = _depInfo.rate;
   const dep = _depInfo.amount;
@@ -9256,12 +10052,16 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
   // own `total` when there's no invoice/job yet, otherwise the linked
   // invoice/job's actual total (normally identical, but this is what
   // actually governs that record's paid/partial status).
-  const _quoteBalTotal = _quotePaySource.kind==='invoice'
-    ? (_quotePaySource.record.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0)
-    : _quotePaySource.kind==='job'
-      ? (parseFloat(_quotePaySource.record.value)||0)
-      : total;
-  const quoteBalance  = _quoteBalTotal - quotePaid;
+  // 2026-09-22 (ONE-CENT RECONCILIATION): the resolved record's CANONICAL
+  // total in cents — its own invoice lines, or its own document — so this
+  // badge can never disagree with the modal it opens or with Accounting.
+  const _quoteBalTotalC = (_quotePaySource.kind==='invoice' || _quotePaySource.kind==='job')
+    ? sgrCanonicalPayableCents(_quotePaySource.record)
+    : sgrToCents0(total);
+  const _quoteBalTotal = sgrRands(_quoteBalTotalC);
+  const quoteBalance  = sgrRands(sgrOutstandingForRecordCents(
+    _quotePaySource.kind==='invoice' ? _quotePaySource.record : null,
+    _quoteBalTotalC, sgrToCents0(quotePaid)));
   // ── Converted-job link health ──
   // A quote can be flagged "converted" yet its job may be missing from Jobs
   // (e.g. the job was deleted, or lives under a hidden entity). When that happens
@@ -9702,13 +10502,21 @@ function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[], quotes
   const [saving,       setSaving]       = useState(false);
   const [saveErr,      setSaveErr]      = useState('');
 
-  const linesSubtotal  = lines.reduce((s,l)=>s+(l.subtotal||0),0);
+  /* 2026-09-22 (ONE-CENT RECONCILIATION). This editor WRITES job.value, and it
+     used the `afterDisc + afterDisc*0.15` expression while the conversion and
+     quote-cascade paths used `afterDisc * 1.15` — so the same job could carry
+     either of two totals a cent apart depending on which screen last saved it.
+     All of them now write the one canonical cents figure. */
+  const _ic            = sgrDocumentCents(lines, discount, job.setupFee);
+  const invLineCents   = _ic.lineC;
+  const linesTotalC    = _ic.totalC;
+  const linesSubtotal  = sgrRands(_ic.subC);
   const linesDiscPct   = parseFloat(discount)||0;
-  const linesDiscAmt   = linesSubtotal*(linesDiscPct/100);
-  const linesSetupFee  = parseFloat(job.setupFee)||0;
-  const linesAfterDisc = linesSubtotal - linesDiscAmt + linesSetupFee;
-  const linesVat       = linesAfterDisc*0.15;
-  const linesTotal     = linesAfterDisc+linesVat;
+  const linesDiscAmt   = sgrRands(_ic.discC);
+  const linesSetupFee  = sgrRands(_ic.setupC);
+  const linesAfterDisc = sgrRands(_ic.taxableC);
+  const linesVat       = sgrRands(_ic.vatC);
+  const linesTotal     = sgrRands(linesTotalC);
   const hasLines       = lines.length>0;
 
   // ── Auto-save invoice draft to localStorage after every line change ──
@@ -9759,7 +10567,9 @@ function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[], quotes
 
   async function save(){
     if(saving) return;
-    const finalValue = hasLines ? linesTotal : parseFloat(value)||0;
+    // 2026-09-22: the canonical cents total when the invoice has lines — the
+    // exact amount its printed document states.
+    const finalValue = hasLines ? sgrRands(linesTotalC) : sgrRands(sgrToCents0(value));
 
     // ── Block silent duplicate invoice numbers ──
     // Only checked when the number was actually changed — mirrors the
@@ -9970,7 +10780,7 @@ function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[], quotes
                   {/* Line Total */}
                   <div className="flex-shrink-0 w-32">
                     <label className="block text-xs font-semibold text-gray-400 mb-1">Line Total</label>
-                    <div className="w-full border rounded-xl px-3 py-2.5 text-sm font-black text-right" style={{borderColor:'#c7d2fe',background:'#eef2ff',color:'#06065c'}}>{zar(line.subtotal||0)}</div>
+                    <div className="w-full border rounded-xl px-3 py-2.5 text-sm font-black text-right" style={{borderColor:'#c7d2fe',background:'#eef2ff',color:'#06065c'}}>{zar(sgrRands(invLineCents[lines.indexOf(line)]||0))}</div>
                   </div>
 
                   {lines.length>1&&(
@@ -10057,12 +10867,24 @@ function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[], quotes
    routing and company scoping are all untouched. This governs only how an
    already-resolved (total, paid) pair is turned into a word on the screen.
 ═══════════════════════════════════════════ */
-// The platform's cent convention — the same Math.round(n*100)/100 already used
-// by services.ts's toCents() and by every src/scripts money helper.
-function toCents(n){ return Math.round((Number(n)||0)*100)/100; }
+// The platform's cent convention.
+// 2026-09-22 (ONE-CENT RECONCILIATION): this used to be
+// Math.round((Number(n)||0)*100)/100, which rounds the BINARY approximation
+// rather than the decimal value — toCents(132.825) came out R132.82, because
+// 132.825*100 === 13282.499999999998. So the helper written on 2026-09-14 to
+// make comparisons cent-precise was itself a source of cent drift. It now
+// delegates to the canonical cents pipeline (sgrToCents), which resolves the
+// value through its correctly-rounded 4-dp DECIMAL string and rounds half away
+// from zero, symmetrically for positive and negative amounts. Same name, same
+// signature, same rand-denominated return: every existing call site is
+// unchanged, and now correct at the half-cent boundary.
+function toCents(n){ return sgrRands(sgrToCents0(n)); }
 // Money still owed, in cents, on a (total, paid) pair. Never negative.
+// Prefer sgrOutstandingCents(canonicalTotalCents, canonicalPaidCents) in new
+// code; this rand-denominated form is kept for the display call sites and is
+// the identical integer comparison underneath.
 function settlementOutstanding(invoiceTotal, paidTotal){
-  return toCents(Math.max(0, toCents(invoiceTotal) - toCents(paidTotal)));
+  return sgrRands(sgrOutstandingCents(sgrToCents0(invoiceTotal), sgrToCents0(paidTotal)));
 }
 /* ── ZERO-VALUE (SPONSORED) SETTLEMENT — 2026-09-18 ──────────────────────────
    Signacore sometimes SPONSORS signage. The quote / job / invoice is then
@@ -10094,11 +10916,13 @@ function isGenuineZeroAmount(v){
 // The authoritative final total, incl. VAT, of a canonical invoice record, from
 // its own lines — the same sum Sales, Accounting and ViewInvoiceModal already
 // compute inline, in one place so the zero test cannot drift from the column.
+// 2026-09-22: through the canonical cents pipeline — each displayed line
+// extension rounded to cents, VAT taken ONCE over the taxable lines. Same
+// question, same lines, one answer; the float per-line-VAT sum this used to
+// perform is exactly what made this figure disagree with job.value and with
+// the printed TOTAL DUE by a cent.
 function invoiceLineTotalIncVat(inv){
-  const ls = (inv && inv.lineItems) || [];
-  const sub = ls.reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-  const vat = ls.reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
-  return sub+vat;
+  return sgrRands(sgrInvoiceCents(inv && inv.lineItems).totalC);
 }
 // TRUE only when a canonical invoice record's OWN lines prove its authoritative
 // final amount due is R0.00 — a zero-value (sponsored / warranty / no-charge)
@@ -10118,18 +10942,23 @@ function invoiceIsZeroValue(inv){
 // balance alone decides. Every POSITIVE-total case is byte-identical to before
 // (full, over, part and nil payment each reach exactly the word they did), and
 // a genuinely zero total is now settled.
+// 2026-09-22: the comparison is now exact INTEGER CENTS on both sides
+// (sgrSettlementStatusCents), not a comparison of two rounded doubles. Still
+// deliberately NOT a tolerance: paying the canonical total settles, paying one
+// cent less leaves one cent outstanding. The zero-value branch is unchanged
+// and still hands the RAW total to isGenuineZeroAmount, so a value that failed
+// to hydrate can never be read as a genuine sponsored R0.00.
 function deriveSettlementStatus(invoiceTotal, paidTotal){
-  const total = toCents(invoiceTotal);
-  const paid  = toCents(paidTotal);
-  if(total <= 0) return isGenuineZeroAmount(invoiceTotal) ? 'paid' : (paid > 0 ? 'partial' : 'pending');
-  if(paid >= total) return 'paid';
-  if(paid > 0) return 'partial';
-  return 'pending';
+  return sgrSettlementStatusCents(sgrToCents0(invoiceTotal), sgrToCents0(paidTotal), invoiceTotal);
 }
 // One place that knows how a payments array adds up, so no surface can count
 // it a slightly different way.
+// 2026-09-22: each payment converted to cents independently and summed as
+// integers, so a payments array can no longer carry float residue into a
+// settlement comparison. rel_payments rows are READ here and never altered,
+// rounded in place, merged or re-owned.
 function sumPaymentAmounts(payments){
-  return (payments||[]).reduce((s,p)=>s+(parseFloat(p&&p.amount)||0),0);
+  return sgrRands(sgrPaidCents(payments));
 }
 
 /* ═══════════════════════════════════════════
@@ -10142,7 +10971,7 @@ function sumPaymentAmounts(payments){
    invoice status. Quote total and job.value are both VAT-inclusive, so the
    amounts reconcile directly.
 ═══════════════════════════════════════════ */
-function reconcileJobInvoice(job, quotes){
+function reconcileJobInvoice(job, quotes, ctx){
   const own  = Array.isArray(job.payments) ? job.payments : [];
   // 2026-09-08: company-safe. Another company's quote can no longer be treated
   // as this job's source, so its payments can never be merged into this job's
@@ -10160,8 +10989,31 @@ function reconcileJobInvoice(job, quotes){
   // made a broken job read Fully Paid. Every valid value behaves identically:
   // deriveSettlementStatus's own toCents() is the same conversion this line
   // was performing.
-  const invTotal  = job.value;
-  const totalPaid = sumPaymentAmounts(merged);
+  /* ── 2026-09-22 (OPTION D) — THE ISSUED DOCUMENT, ELSE THE JOB'S VALUE ───
+     One transaction, one word. If this job has ISSUED an invoice record, that
+     invoice's own canonical cents are the payable (CASE 1) and its audited
+     marker, if any, is the one that applies — so the Job badge can never say
+     something different from the Invoice row for the same money. With no issued
+     invoice record, the job's own stored commercial value is the payable
+     (CASE 2).
+
+     rel_job_line_items is NEVER consulted: SNS-00128 carries lines
+     reconstructing to R16,044.80 against an agreed R24,963.62, and a stale
+     representation must not redefine a debt.
+
+     `ctx` is optional — { accInvoices, jobs } — so every existing caller that
+     passes only (job, quotes) keeps exactly the behaviour it had. */
+  const _issued = (ctx && Array.isArray(ctx.accInvoices))
+    ? resolveJobInvoiceRecord(job, ctx.accInvoices, (ctx.jobs || []))
+    : null;
+  const _settleRec    = _issued || null;
+  const invTotalCents = _issued ? sgrCanonicalPayableCents(_issued) : sgrToCents0(job.value);
+  const paidC         = sgrPaidCents(merged);
+  // The raw value is still handed to the zero-value test (2026-09-18): a value
+  // that FAILED to hydrate must never be mistaken for a genuine sponsored
+  // R0.00, and `parseFloat(x)||0` would launder exactly that.
+  const invTotal      = _issued ? sgrRands(invTotalCents) : job.value;
+  const totalPaid     = sgrRands(paidC);
   // Status is derived ONLY from recorded payments — a stored 'paid' flag is never
   // trusted on its own. An invoice can show Fully Paid only when payments recorded
   // in the Payments tab cover the full invoice value.
@@ -10172,8 +11024,13 @@ function reconcileJobInvoice(job, quotes){
   // can no longer read 'partial' because the re-derived value*1.15 carried a
   // fraction of a cent. Both callers of this function — Sales → Invoices and
   // Accounting → getJobInvoices() — therefore now agree by construction.
-  const invoiceStatus = deriveSettlementStatus(invTotal, totalPaid);
-  return { payments: merged, invoiceStatus, totalPaid };
+  // 2026-09-22: exact integer cents on both sides. `invTotal` (the raw stored
+  // value) is passed so the zero-value branch can tell a genuine R0.00 from a
+  // value that never hydrated.
+  const invoiceStatus = sgrSettleRecordCents(_settleRec, invTotalCents, paidC, invTotal);
+  return { payments: merged, invoiceStatus, totalPaid,
+           totalCents: invTotalCents, paidCents: paidC, issuedInvoice: _issued,
+           outstandingCents: sgrOutstandingForRecordCents(_settleRec, invTotalCents, paidC) };
 }
 
 /* ═══════════════════════════════════════════
@@ -10331,7 +11188,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       };
     }
     // Pull through any deposit / partial recorded on the linked quote / proforma
-    const rec = reconcileJobInvoice(job, myQuotes);
+    const rec = reconcileJobInvoice(job, myQuotes, { accInvoices: myAccInvoices, jobs: myJobs });
     // ── 2026-09-14 (discount presentation consistency) ──────────────────────
     // The discount this row must show, derived by the SAME shared construction
     // Accounting's job-invoice rows and this row's own View modal use, from the
@@ -10345,8 +11202,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
             _discountView:{ pct:_disc.discPct, amt:_disc.discAmt }};
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const manualInvItems = myAccInvoices.filter(i=>i.status!=='void').map(i=>{
-    const sub=(i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-    const vat=(i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+    // 2026-09-22 (ONE-CENT RECONCILIATION): canonical cents from the invoice's
+    // own lines — one total, the one the issued document states.
+    const _mc=sgrInvoiceCents(i.lineItems);
+    // 2026-09-22 (CORRECTED): a job-linked invoice settles from the linked
+    // Job's stored commercial value; a standalone one from its own lines.
+    const totalC=sgrCanonicalPayableCents(i);
+    const sub=sgrRands(_mc.subC);
+    const vat=sgrRands(_mc.vatC);
     // ── 2026-09-14 (Accounting ↔ Sales settlement consistency) ──────────────
     // This row used to echo the STORED status verbatim while Accounting's own
     // row for the same record laid a derived "is it actually settled?" test
@@ -10360,7 +11223,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // kept as rows must not regress to Pending — and a stored 'partial' with no
     // payment rows still reads Partly Paid. Nothing that shows Paid today stops
     // showing Paid.
-    const _settled = deriveSettlementStatus(sub+vat, sumPaymentAmounts(i.payments));
+    const _settled = sgrSettleRecordCents(i, totalC, sgrPaidCents(i.payments), sgrRands(totalC));
     // ── 2026-09-18 (zero-value settlement) ──────────────────────────────────
     // A zero total means "settled" only on an invoice that has actually been
     // ISSUED with lines proving R0.00 is the final amount due — a sponsored /
@@ -10370,7 +11233,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // due" there means "nothing entered yet" — a blank new invoice must never
     // announce itself as Fully Paid), and a record whose lineItems never
     // hydrated, which invoiceIsZeroValue refuses to accept as proof of a zero.
-    const _settledForDisplay = (toCents(sub+vat)<=0 && !(i.status!=='draft' && invoiceIsZeroValue(i)))
+    const _settledForDisplay = (totalC<=0 && !(i.status!=='draft' && invoiceIsZeroValue(i)))
                              ? 'pending' : _settled;
     const normStatus = (i.status==='paid' || _settledForDisplay==='paid') ? 'paid'
                      : (_settledForDisplay==='partial' || i.status==='partial') ? 'partial'
@@ -10384,7 +11247,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // field is written to the record and the invoice still owns no discount of
     // its own: this is a display projection built fresh on every render.
     const _discountView = invoiceDiscountView(i);
-    return {id:i.id,invoiceNum:i.number,invoiceStatus:normStatus,client:i.contactName||'',value:sub+vat,invoiceDate:i.date,invoiceDue:i.dueDate,paidAt:i.paidDate,reference:i.reference,payments:i.payments||[],num:'manual',co:i.co??null,_isManual:true,_discountView};
+    return {id:i.id,invoiceNum:i.number,invoiceStatus:normStatus,client:i.contactName||'',value:sgrRands(totalC),_totalCents:totalC,invoiceDate:i.date,invoiceDue:i.dueDate,paidAt:i.paidDate,reference:i.reference,payments:i.payments||[],num:'manual',co:i.co??null,_isManual:true,_discountView};
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const invoicedJobs = numSort([...jobInvItems,...manualInvItems], 'invoiceNum').reverse(); // newest-first by default
   const _invSearch = searchInv.trim().toLowerCase();
@@ -10568,7 +11431,15 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         const _quoteNotesAfter = q.notes == null ? '' : String(q.notes);
         const _quoteNotesChanged = _quoteNotesAfter !== _quoteNotesBefore;
         const jobsUpdater = prev=>prev.map(j=>j.id===linkedJob.id
-          ? {...j, lines:q.lines, discount:q.discount||'', setupFee:q.setupFee||'', value:_afterDisc*1.15,
+          ? {...j, lines:q.lines, discount:q.discount||'', setupFee:q.setupFee||'',
+             /* 2026-09-22 (ONE-CENT RECONCILIATION): job.value is written as the
+                CANONICAL cents of the document this job will issue, not as the
+                raw float `afterDisc * 1.15`. That float and the
+                `afterDisc + afterDisc*0.15` the printed invoice used were one
+                cent apart on 1.56% of values, which is how a customer could pay
+                the exact TOTAL DUE and still read Partly Paid. Same inputs, same
+                commercial amount, now stated once. */
+             value: sgrRands(sgrDocumentCents(q.lines, q.discount, q.setupFee).totalC),
              client:q.client, contact:q.contact||'', email:q.email||'', tel:q.tel||'',
              address:q.address||'', vatNum:q.vatNum||'',
              salesperson:q.salesperson||'', preparedBy:q.preparedBy||'', poRef:q.poRef||'', reference:q.reference||'',
@@ -10621,7 +11492,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         return {
           ...j,
           lines: q.lines, discount: q.discount||'', setupFee: q.setupFee||'',
-          value: _afterDisc*1.15,
+          // 2026-09-22: canonical cents — see the note on the other cascade.
+          value: sgrRands(sgrDocumentCents(q.lines, q.discount, q.setupFee).totalC),
           client: q.client, contact: q.contact||'', email: q.email||'',
           tel: q.tel||'', address: q.address||'', vatNum: q.vatNum||'',
           salesperson: q.salesperson||'', preparedBy: q.preparedBy||'',
@@ -11108,6 +11980,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const _qDiscAmt  = _qSub*(_qDiscPct/100);
     const _qSetupFee = parseFloat(q.setupFee)||0;
     const _qAfterDisc= _qSub - _qDiscAmt + _qSetupFee;
+    // 2026-09-22: the ONE canonical total of this quote's document, in cents.
+    const _qCanonC   = sgrDocumentCents(q.lines, q.discount, q.setupFee).totalC;
     // If this quote already has its own tax invoice (createInvoiceFromQuote,
     // before any job existed), THAT record's payments are the source of
     // truth from this point on (see resolvePaymentSource) — any payment
@@ -11126,7 +12000,12 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       address: q.address||'', vatNum: q.vatNum||'',
       desc:'From Quote '+q.num+' \u2014 '+q.lines.map(function(l){return l.desc;}).filter(Boolean).slice(0,2).join(', '),
       status: _depositPaid ? 'deposit_received' : 'quote_approved', co:q.co,
-      value: _qAfterDisc*1.15,
+      // 2026-09-22 (ONE-CENT RECONCILIATION): the new job's value is the
+      // CANONICAL total of the document it will issue, in cents — the same
+      // number buildInvoiceHtml prints and the same number settlement compares
+      // a payment against. Previously `_qAfterDisc*1.15`, one of the two float
+      // expressions that disagreed by a cent.
+      value: sgrRands(_qCanonC),
       stage: _depositPaid ? 5 : (STATUS_TO_STAGE['quote_approved']||4), breakdown:null,
       lines: q.lines, quoteNum: q.num, notes: q.notes||'',
       setupFee: q.setupFee||'', discount: q.discount||'',
@@ -11153,7 +12032,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // every positive total the outcome is byte-identical to the line it
       // replaces; a genuine R0.00 conversion is seeded 'paid', and no payment
       // row is created for it.
-      invoiceStatus: deriveSettlementStatus(_qAfterDisc*1.15, sumPaymentAmounts(_paymentsForNewJob)),
+      invoiceStatus: sgrSettlementStatusCents(_qCanonC, sgrPaidCents(_paymentsForNewJob), sgrRands(_qCanonC)),
     };
     const nextJobs = [newJob,...jobs];
 
@@ -11623,9 +12502,18 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // source (buildStatement only reads accInvoices/accBills/credit notes) —
     // so this never double-counts a quote deposit.
     const carriedPayments = (quote.payments||[]).map(p=>({...p}));
-    const totalIncl = (sub-discAmt+setupFee)*1.15;
-    const paidSoFar  = carriedPayments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-    const status = (paidSoFar>=totalIncl && totalIncl>0) ? 'paid' : (paidSoFar>0 ? 'partial' : 'sent');
+    /* 2026-09-22 (ONE-CENT RECONCILIATION). The seeded status used to compare
+       the carried payments against `(sub-discAmt+setupFee)*1.15` — a float
+       total this invoice's OWN lineItems never state. It now compares against
+       the canonical cents of the lines actually being written, through the one
+       shared settlement rule, so the invoice is born with the status every
+       screen will independently derive for it. */
+    const _newInvTotalC = sgrInvoiceCents(lineItems).totalC;
+    const _newInvPaidC  = sgrPaidCents(carriedPayments);
+    const totalIncl = sgrRands(_newInvTotalC);
+    const paidSoFar = sgrRands(_newInvPaidC);
+    const _seeded = sgrSettlementStatusCents(_newInvTotalC, _newInvPaidC, totalIncl);
+    const status = _seeded==='pending' ? 'sent' : _seeded;
 
     // If this quote already carries a legacy proformaNum, that EXACT number
     // must become the invoice number instead of a fresh reservation
@@ -11689,13 +12577,23 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // the invoice view. Jobs with no linked invoice keep using job.payments
     // exactly as before.
     const paySource = resolvePaymentSource({ job, accInvoices, quotes });
-    const invTotal = paySource.kind==='invoice'
-      ? (paySource.record.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0)
-      : (parseFloat(job.value)||0); // already incl. VAT
+    /* 2026-09-22 (ONE-CENT RECONCILIATION): the ONE canonical cents total —
+       the resolved invoice record's own lines when this job's payments live on
+       an invoice, otherwise this job's OWN document (its lines, discount and
+       setup fee), which is literally what buildInvoiceHtml prints as TOTAL DUE.
+       job.value is now only the fallback for a job with no lines at all. */
+    // 2026-09-22 (CORRECTED): whether payments live on the invoice record or on
+    // the job, THIS job's stored commercial value is the authority — a linked
+    // invoice's lines are its representation, not its price.
+    const invTotalC = sgrCanonicalPayableCents(paySource.kind==='invoice' ? paySource.record : job);
+    const invTotal = sgrRands(invTotalC);
     const [payments, setPayments] = useState(()=>ensurePaymentIds(paySource.payments));
-    const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-    const balance = invTotal - totalPaid;
-    const overpayment = totalPaid > invTotal ? totalPaid - invTotal : 0;
+    const paidC = sgrPaidCents(payments);
+    const totalPaid = sgrRands(paidC);
+    const _settleRec = paySource.kind==='invoice' ? paySource.record : null;
+    const balanceC = sgrOutstandingForRecordCents(_settleRec, invTotalC, paidC);
+    const balance = sgrRands(balanceC);
+    const overpayment = sgrRands(paidC > invTotalC ? paidC - invTotalC : 0);
     const [date,   setDate]   = useState(new Date().toISOString().slice(0,10));
     const [method, setMethod] = useState('EFT');
     const [amount, setAmount] = useState('');
@@ -11888,12 +12786,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       try {
         if(paySource.kind==='invoice'){
-          const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':paySource.record.status;
-          const paidDate=newTotal>=invTotal?(paySource.record.paidDate||date||new Date().toISOString().slice(0,10)):(paySource.record.paidDate||null);
+          // 2026-09-22: the ONE settlement rule, exact integer cents.
+          const newStatus=sgrStatusForPayments(_settleRec, invTotalC, updated, paySource.record.status);
+          const paidDate=newStatus==='paid'?(paySource.record.paidDate||date||new Date().toISOString().slice(0,10)):(paySource.record.paidDate||null);
           await persist(updated, null, {status:newStatus, paidDate}, creditNotesOverride);
         } else {
-          const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
-          const paidAt=newTotal>=invTotal?(date||new Date().toISOString().slice(0,10)):job.paidAt||null;
+          const newStatus=sgrStatusForPayments(_settleRec, invTotalC, updated, 'pending');
+          const paidAt=newStatus==='paid'?(date||new Date().toISOString().slice(0,10)):job.paidAt||null;
           // A recorded deposit / payment auto-advances the lifecycle to Deposit
           // Received (stage 5) the first time money comes in, never regressing a job
           // that is already further along.
@@ -11962,11 +12861,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       const jobPayload = applyIfOwned(job.payments, pid, arr => deletePaymentFromSource(arr, pid));
       try {
         if(paySource.kind==='invoice'){
-          const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'sent';
-          await persist(updated, null, {status:newStatus, paidDate:newTotal>=invTotal?paySource.record.paidDate:null}, creditNotesOverride);
+          const newStatus=sgrStatusForPayments(_settleRec, invTotalC, updated, 'sent');
+          await persist(updated, null, {status:newStatus, paidDate:newStatus==='paid'?paySource.record.paidDate:null}, creditNotesOverride);
         } else {
-          const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
-          await persist(updated, {invoiceStatus:newStatus, paidAt:newTotal>=invTotal?job.paidAt:null}, null, creditNotesOverride, quotesOverride, jobPayload);
+          const newStatus=sgrStatusForPayments(_settleRec, invTotalC, updated, 'pending');
+          await persist(updated, {invoiceStatus:newStatus, paidAt:newStatus==='paid'?job.paidAt:null}, null, creditNotesOverride, quotesOverride, jobPayload);
         }
       } catch(e) {}
     }
@@ -12010,11 +12909,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       const jobPayload = applyIfOwned(job.payments, pid, arr => updatePaymentInSource(arr, pid, patch));
       try {
         if(paySource.kind==='invoice'){
-          const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':paySource.record.status;
-          await persist(updated, null, {status:newStatus, paidDate:newTotal>=invTotal?paySource.record.paidDate:null});
+          const newStatus=sgrStatusForPayments(_settleRec, invTotalC, updated, paySource.record.status);
+          await persist(updated, null, {status:newStatus, paidDate:newStatus==='paid'?paySource.record.paidDate:null});
         } else {
-          const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'pending';
-          await persist(updated, {invoiceStatus:newStatus, paidAt:newTotal>=invTotal?job.paidAt:null}, null, null, quotesOverride, jobPayload);
+          const newStatus=sgrStatusForPayments(_settleRec, invTotalC, updated, 'pending');
+          await persist(updated, {invoiceStatus:newStatus, paidAt:newStatus==='paid'?job.paidAt:null}, null, null, quotesOverride, jobPayload);
         }
       } catch(e) {}
     }
@@ -12244,10 +13143,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         ):(
           <div className="space-y-2">
             {displayed.map(q=>{
-              const sub=q.lines.reduce((s,l)=>s+(l.subtotal||0),0);
-              const disc=parseFloat(q.discount)||0; const discAmt=sub*(disc/100);
-              const setup=parseFloat(q.setupFee)||0;
-              const total=(sub-discAmt+setup)*1.15;
+              // 2026-09-22: canonical cents — the figure this row shows is the
+              // figure the quote document states.
+              const _rc=sgrDocumentCents(q.lines,q.discount,q.setupFee);
+              const sub=sgrRands(_rc.subC); const disc=parseFloat(q.discount)||0;
+              const discAmt=sgrRands(_rc.discC);
+              const setup=sgrRands(_rc.setupC);
+              const total=sgrRands(_rc.totalC);
               const co=companies.find(c=>c.id===q.co)||{short:'?'};
               return (
                 <div key={q.id} onClick={()=>setViewQuote(q)}
@@ -12325,11 +13227,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                 </div>
               )}
               {shownAccepted.map(q=>{
-                const sub=q.lines.reduce((s,l)=>s+(l.subtotal||0),0);
+                // 2026-09-22: canonical cents.
+                const _rc=sgrDocumentCents(q.lines,q.discount,q.setupFee);
+                const sub=sgrRands(_rc.subC);
                 const disc=parseFloat(q.discount)||0;
-                const discAmt=sub*(disc/100);
-                const setup=parseFloat(q.setupFee)||0;
-                const total=(sub-discAmt+setup)*1.15;
+                const discAmt=sgrRands(_rc.discC);
+                const setup=sgrRands(_rc.setupC);
+                const total=sgrRands(_rc.totalC);
                 const co=companies.find(c=>c.id===q.co)||{short:'?'};
                 const linkedJob=resolveJobForQuote(q, jobs);
                 // A job inherited invoice (from this quote's own invoice-from-quote
@@ -12419,10 +13323,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                 // Total of accepted (converted) quotes — uses the same formula as
                 // Dashboard › Quotes Accepted so the two figures always tie up.
                 const acceptedTotal=acceptedQuotes.reduce((s,q)=>{
-                  const sub=(q.lines||[]).reduce((t,l)=>t+(l.subtotal||0),0);
-                  const disc=parseFloat(q.discount)||0;
-                  const setup=parseFloat(q.setupFee)||0;
-                  return s+(sub-sub*(disc/100)+setup)*1.15;
+                  // 2026-09-22: canonical cents, summed as cents.
+                  return s+sgrRands(sgrDocumentCents(q.lines,q.discount,q.setupFee).totalC);
                 },0);
                 return (
                   <div className="bg-white rounded-2xl border-2 border-emerald-200 px-5 py-4 flex items-center justify-between flex-wrap gap-2">
@@ -12496,8 +13398,17 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
               const isPartial = j.invoiceStatus==='partial';
               const hasWriteOff = !!j.writeOff;
               const jPayments = j.payments||[];
-              const totalPaid = jPayments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-              const balance   = (j.value||0) - totalPaid;
+              /* 2026-09-22 (ONE-CENT RECONCILIATION): this row showed
+                 `j.value − totalPaid` as a RAW float subtraction, so a settled
+                 invoice could display a balance of "R 0,01" — or an "R 0,00"
+                 that was really four tenths of a cent — from float residue
+                 alone. Both sides are canonical cents now. `_totalCents` rides
+                 on the manual-invoice projection above; a job row resolves its
+                 own canonical document total. */
+              const _rowTotalC = (j._totalCents != null) ? j._totalCents : sgrCanonicalPayableCents(j);
+              const _rowPaidC  = sgrPaidCents(jPayments);
+              const totalPaid = sgrRands(_rowPaidC);
+              const balance   = sgrRands(sgrOutstandingForRecordCents(j, _rowTotalC, _rowPaidC));
               const statusBadge = isPaid
                 ? 'bg-emerald-100 text-emerald-700 border-emerald-200'
                 : isPartial
@@ -12602,7 +13513,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                             📧 Email
                           </button>
                           {manualRec.status!=='paid'&&(
-                            <button onClick={()=>guardAction('markInvPaid:'+relKey(manualRec), ()=>markCanonicalInvoicePaid(manualRec, { setAccInvoices, onJsonFallback: saveManualInvoiceFromSales }))}
+                            <button onClick={()=>guardAction('markInvPaid:'+relKey(manualRec), ()=>markCanonicalInvoicePaid(manualRec, { jobs, setAccInvoices, onJsonFallback: saveManualInvoiceFromSales }))}
                               className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#dcfce7',color:'#059669'}}>
                               ✓ Paid
                             </button>
@@ -15876,9 +16787,8 @@ function RevenueChart({ jobs=[], accInvoices=[] }) {
     });
     (accInvoices||[]).forEach(inv=>{
       if(inv.status==='void')return;
-      const sub=(inv.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-      const vat=(inv.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
-      const val=sub+vat;
+      // 2026-09-22: canonical cents.
+      const val=sgrRands(sgrInvoiceCents(inv.lineItems).totalC);
       if(!val)return;
       const d=inv.date?new Date(inv.date):null;
       if(!d)return;
@@ -16077,9 +16987,8 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
             const accInv = visibleAccInvoices
               .filter(i=>i.status!=='void' && inCurrentMonth(i.date))
               .reduce((s,i)=>{
-                const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-                const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);
-                return s+sub+vat;
+                // 2026-09-22: canonical cents.
+                return s+sgrRands(sgrInvoiceCents(i.lineItems).totalC);
               },0);
             const total = jobInv + accInv;
             return 'R ' + total.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
@@ -16123,7 +17032,9 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
 
       {/* Quotes Made / Quotes Accepted metric cards */}
       {isAdmin&&(()=>{
-        const qTotal = q => { const sub=q.lines.reduce((s,l)=>s+(l.subtotal||0),0); const disc=parseFloat(q.discount)||0; const setup=parseFloat(q.setupFee)||0; return (sub-sub*(disc/100)+setup)*1.15; };
+        // 2026-09-22: canonical cents, so these metric cards tie up with the
+        // documents they count.
+        const qTotal = q => sgrRands(sgrDocumentCents(q.lines, q.discount, q.setupFee).totalC);
         // This-month scope: quotes dated in the current calendar month.
         // Company-scoped: visibleQuotes only (see belongsToUserCompany()).
         const allQuotes      = visibleQuotes.filter(q=>inCurrentMonth(q.date));
@@ -16175,10 +17086,12 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
                     QUO-00099 never sorts above QUO-00100. Sorts a COPY —
                     numSort() spreads its input, so `quotes` is never mutated. */}
                 {numSort(visibleQuotes,'num').reverse().map(q=>{
-                  const sub=q.lines.reduce((s,l)=>s+(l.subtotal||0),0);
+                  // 2026-09-22: canonical cents.
+                  const _rc=sgrDocumentCents(q.lines,q.discount,q.setupFee);
+                  const sub=sgrRands(_rc.subC);
                   const disc=parseFloat(q.discount)||0;
-                  const setup=parseFloat(q.setupFee)||0;
-                  const total=(sub-sub*(disc/100)+setup)*1.15;
+                  const setup=sgrRands(_rc.setupC);
+                  const total=sgrRands(_rc.totalC);
                   return (
                     <tr key={q.id} className="border-b border-gray-50 hover:bg-blue-50">
                       <td className="py-2.5 text-xs font-mono text-gray-500">{q.num}</td>
@@ -16329,7 +17242,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   // (total, paid) pair, so one transaction cannot read Pending here and Fully
   // Paid two screens away. Read-only — nothing is stored or recomputed, no
   // historical row is rewritten, and no payment is created.
-  const _jobSettlement = reconcileJobInvoice(job, quotes).invoiceStatus;
+  const _jobSettlement = reconcileJobInvoice(job, quotes, { accInvoices, jobs }).invoiceStatus;
   // ── POST-MIGRATION STABILIZATION (2026-08-24) — BUG 5 ────────────────────
   // BUSINESS RULE CORRECTION: "payment status must NOT hard-block Job
   // progression." Some clients pay a deposit upfront, some during production,
@@ -16969,11 +17882,13 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
       {/* ─── SOURCE QUOTE — pricing document, hidden from Manufacturing (no Rand values) ─── */}
       {job.quoteNum&&!isFactory&&(()=>{
         const srcQ=resolveQuoteForJob(job, quotes);
-        const sub=srcQ?(srcQ.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0):0;
+        // 2026-09-22: canonical cents.
+        const _rc=srcQ?sgrDocumentCents(srcQ.lines,srcQ.discount,srcQ.setupFee):{subC:0,discC:0,setupC:0,totalC:0};
+        const sub=sgrRands(_rc.subC);
         const disc=srcQ?parseFloat(srcQ.discount)||0:0;
-        const discAmt=sub*(disc/100);
-        const setup=srcQ?parseFloat(srcQ.setupFee)||0:0;
-        const total=(sub-discAmt+setup)*1.15;
+        const discAmt=sgrRands(_rc.discC);
+        const setup=sgrRands(_rc.setupC);
+        const total=sgrRands(_rc.totalC);
         return (
           <div className="bg-white rounded-2xl border border-brand-100 overflow-hidden">
             <div className="px-5 py-4 border-b border-brand-50 bg-brand-50/30 flex flex-wrap items-start justify-between gap-2">
@@ -22836,11 +23751,16 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
 
   // ── Payment History Modal (manual/accounting invoice payments) ──
   function PaymentHistoryModal({ inv, onClose, accInvoices, setAccInvoices, forceSaveSections, creditNotes, setCreditNotes, isAdmin, user, quotes, jobs, customers, onOpenJob, onOpenCustomer, onViewInvoice, onSaved, fmtAmt, fmtDate }) {
-    const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
+    // 2026-09-22 (ONE-CENT RECONCILIATION): canonical cents from the invoice's
+    // own lines — the amount its issued document states.
+    const invTotalC = sgrCanonicalPayableCents(inv);
+    const invTotal = sgrRands(invTotalC);
     const [payments, setPayments] = useState(()=>ensurePaymentIds(inv.payments||[]));
-    const totalPaid = payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-    const balance = invTotal-totalPaid;
-    const overpayment = totalPaid>invTotal ? totalPaid-invTotal : 0;
+    const paidC = sgrPaidCents(payments);
+    const totalPaid = sgrRands(paidC);
+    const balanceC = sgrOutstandingForRecordCents(inv, invTotalC, paidC);
+    const balance = sgrRands(balanceC);
+    const overpayment = sgrRands(paidC>invTotalC ? paidC-invTotalC : 0);
     const [date,   setDate]   = useState(new Date().toISOString().slice(0,10));
     const [method, setMethod] = useState('EFT');
     const [amount, setAmount] = useState('');
@@ -22948,8 +23868,9 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
       const newP={id:Date.now(),date,method,amount:amt,notes:notes.trim()};
       const updated=[...payments,newP];
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':inv.status;
-      const paidDate=newTotal>=invTotal?(date||new Date().toISOString().slice(0,10)):inv.paidDate||null;
+      // 2026-09-22: the ONE settlement rule, exact integer cents.
+      const newStatus=sgrStatusForPayments(inv, invTotalC, updated, inv.status);
+      const paidDate=newStatus==='paid'?(date||new Date().toISOString().slice(0,10)):inv.paidDate||null;
       try {
         await persist(updated, {status:newStatus, paidDate}, creditNotesOverride);
       } catch(e) { return; }
@@ -22992,9 +23913,9 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
       }
       const updated=deletePaymentFromSource(payments, pid);
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':'sent';
+      const newStatus=sgrStatusForPayments(inv, invTotalC, updated, 'sent');
       try {
-        await persist(updated, {status:newStatus, paidDate:newTotal>=invTotal?inv.paidDate:null}, creditNotesOverride);
+        await persist(updated, {status:newStatus, paidDate:newStatus==='paid'?inv.paidDate:null}, creditNotesOverride);
       } catch(e) {}
     }
 
@@ -23024,9 +23945,9 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
       }
       const updated = updatePaymentInSource(payments, pid, patch);
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':inv.status;
+      const newStatus=sgrStatusForPayments(inv, invTotalC, updated, inv.status);
       try {
-        await persist(updated, {status:newStatus, paidDate:newTotal>=invTotal?inv.paidDate:null});
+        await persist(updated, {status:newStatus, paidDate:newStatus==='paid'?inv.paidDate:null});
       } catch(e) {}
     }
 
@@ -23663,7 +24584,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
     return deleteCanonicalInvoice(id, { accInvoices, setAccInvoices, setJobs });
   }
   async function markInvPaid(inv){
-    return markCanonicalInvoicePaid(inv, { setAccInvoices, onJsonFallback: saveInvoice });
+    return markCanonicalInvoicePaid(inv, { jobs, setAccInvoices, onJsonFallback: saveInvoice });
   }
   function deleteBill(id){ if(window.confirm('Delete this bill?')) setAccBills(prev=>prev.filter(b=>b.id!==id)); }
   // CUTOVER BLOCKER COMPLETION — relational payments are separate rel_payments
@@ -23800,7 +24721,9 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   // Credit = payments received + credit notes (reduce the balance)
   // Running balance = Σdebit − Σcredit  →  customer = what they owe us, supplier = what we owe them.
   const norm = s => String(s||'').trim().toLowerCase();
-  const inclTotal = li => (li||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
+  // 2026-09-22: canonical cents, so a statement's running balance closes at
+  // exactly R0.00 on a settled account.
+  const inclTotal = li => sgrRands(sgrInvoiceCents(li).totalC);
   function buildStatement(name, type, fromStr, toStr){
     const ev = [];
     const fromT = fromStr ? new Date(fromStr).getTime() : -Infinity;
@@ -24014,11 +24937,20 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
     const invoiceRows = (invoiceList||accInvoices).filter(i=>!['paid','void'].includes(i.status)).map(i=>{
       const issued = new Date(i.date||i.dueDate);
       const days = Math.floor((today-issued)/(1000*60*60*24));
-      const subtotal = (i.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-      const vat = (i.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
-      const total = subtotal+vat;
-      const paid = (i.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-      const balance = total-paid;
+      // 2026-09-22 (ONE-CENT RECONCILIATION): canonical cents on both sides,
+      // so a settled invoice can never be aged for a cent that does not exist.
+      const _ac = sgrInvoiceCents(i.lineItems);
+      // 2026-09-22 (CORRECTED): aged against the SETTLEMENT payable — the
+      // linked Job's commercial value where there is one — so a settled
+      // transaction can never be aged for a cent it does not owe. An audited
+      // historical rounding settlement ages at R0.00.
+      const _agTotalC = sgrCanonicalPayableCents(i);
+      const subtotal = sgrRands(_ac.subC);
+      const vat = sgrRands(_ac.vatC);
+      const total = sgrRands(_agTotalC);
+      const _paidC = sgrPaidCents(i.payments);
+      const paid = sgrRands(_paidC);
+      const balance = sgrRands(sgrOutstandingForRecordCents(i, _agTotalC, _paidC));
       const lastPayment = (i.payments||[]).slice().sort((a,b)=>new Date(b.date||0)-new Date(a.date||0))[0]||null;
       // Aging bucket based on days outstanding since the invoice was issued
       const bucket = days<=30 ? '1–30' : days<=60 ? '31–60' : days<=90 ? '61–90' : '90+';
@@ -24224,7 +25156,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
       // j.value is incl. VAT — the excl.-VAT conversion, and everything built on
       // it, now happens inside the shared jobInvoiceLineItems() below.
       // Pull through any deposit / partial recorded on the linked quote / proforma
-      const rec = reconcileJobInvoice(j, quotes);
+      const rec = reconcileJobInvoice(j, quotes, { accInvoices, jobs });
       // Derive status from recorded payments only (legacy paid flags are not trusted)
       let status = 'sent';
       if(rec.invoiceStatus==='paid') status = 'paid';
@@ -24250,6 +25182,13 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
       // discount entirely. One construction, one result, both screens.
       const { lineItems, discPct, discAmt } = jobInvoiceLineItems(j);
       return {
+        // 2026-09-22 (CORRECTED): the JOB's stored commercial value rides on
+        // the projection, so this page's row total, balance, overdue test and
+        // status all read the same integer the settlement rule used above. A
+        // single 15%-taxed GL line cannot always reproduce an arbitrary
+        // inclusive value to the cent (see sgrExVatCentsFor), and the stored
+        // value is never restated to make it.
+        _totalCents: rec.totalCents,
         id: 'job-'+j.id,
         number: invNum,
         date: invDate,
@@ -24396,14 +25335,16 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
     setAccInvoices(prev=>prev.map(inv=>{
       const extra = invoiceExtra[inv.id];
       if(!extra) return inv;
-      const invTotal=(inv.lineItems||[]).reduce((s,l)=>{const sub=parseFloat(l.qty||1)*parseFloat(l.unitAmount||0);return s+sub+(l.taxType==='15%'?sub*0.15:0);},0);
+      // 2026-09-22: canonical cents.
+      const invTotalC=sgrCanonicalPayableCents(inv);
+      const invTotal=sgrRands(invTotalC);
       const cnForInv = Object.keys(links).find(cnId=>(links[cnId].invoices||[]).some(t=>t.id===inv.id));
       const noteNum = cnForInv ? (cnotes.find(c=>String(c.id)===String(cnForInv))||{}).number : '';
       const newP={id:Date.now()+Math.round(Math.random()*10000), date:today, method:'Credit', amount:extra, notes:`Auto-applied from ${noteNum||'available customer credit'}`};
       const updated=[...(inv.payments||[]),newP];
       const newTotal=updated.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
-      const newStatus=newTotal>=invTotal?'paid':newTotal>0?'partial':inv.status;
-      const paidDate=newTotal>=invTotal?(inv.paidDate||today):(inv.paidDate||null);
+      const newStatus=sgrStatusForPayments(inv, invTotalC, updated, inv.status);
+      const paidDate=newStatus==='paid'?(inv.paidDate||today):(inv.paidDate||null);
       return {...inv, payments:updated, status:newStatus, paidDate};
     }));
     setCreditNotes(prev=>prev.map(c=>noteExtra[c.id]?{...c,used:(parseFloat(c.used)||0)+noteExtra[c.id]}:c));
@@ -24435,9 +25376,10 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   function exportInvoiceListCSV(){
     const rows=[['Invoice Number','Date','Due Date','Customer','Source','Job/Ref','Excl. VAT','VAT','Total (Incl. VAT)','Status']];
     allInvoices.forEach(inv=>{
-      const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-      const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
-      rows.push([inv.number||'', inv.date||'', inv.dueDate||'', inv.contactName||'', inv.source==='job'?'Job':'Manual', inv.source==='job'?(inv.jobNum||''):(inv.reference||''), sub.toFixed(2), vat.toFixed(2), (sub+vat).toFixed(2), inv.status||'']);
+      // 2026-09-22: canonical cents, so an export ties back to the documents.
+      const _rc=sgrInvoiceCents(inv.lineItems);
+      const sub=sgrRands(_rc.subC), vat=sgrRands(_rc.vatC);
+      rows.push([inv.number||'', inv.date||'', inv.dueDate||'', inv.contactName||'', inv.source==='job'?'Job':'Manual', inv.source==='job'?(inv.jobNum||''):(inv.reference||''), sub.toFixed(2), vat.toFixed(2), sgrRands(_rc.totalC).toFixed(2), inv.status||'']);
     });
     if(rows.length<2){ alert('No invoices to export.'); return; }
     downloadCSV(rows, 'signacore-invoices-'+new Date().toISOString().slice(0,10)+'.csv');
@@ -24631,8 +25573,9 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                 </tr></thead>
                 <tbody>
                   {allInvoices.slice(0,10).map(inv=>{
-                    const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-                    const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+                    // 2026-09-22: canonical cents.
+                    const _rc=sgrInvoiceCents(inv.lineItems);
+                    const sub=sgrRands(_rc.subC), vat=sgrRands(_rc.vatC);
                     return <tr key={inv.id} className="border-b border-gray-50 hover:bg-blue-50 cursor-pointer" onClick={()=>setAccTab('invoices')}>
                       <td className="px-4 py-2 font-mono text-gray-600">{inv.number}</td>
                       <td className="px-4 py-2 text-gray-700 font-semibold">{inv.contactName}</td>
@@ -24766,20 +25709,32 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                 </thead>
                 <tbody>
                   {displayedAccInvoices.map(inv=>{
-                    const sub=(inv.lineItems||[]).reduce((s,l)=>s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);
-                    const vat=(inv.lineItems||[]).reduce((s,l)=>l.taxType==='15%'?s+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):s,0);
+                    // 2026-09-22 (ONE-CENT RECONCILIATION): canonical cents from the
+                    // invoice's own lines — one total for this row, its balance,
+                    // its overdue test and its status.
+                    const _rc=sgrInvoiceCents(inv.lineItems);
+                    // 2026-09-22 (CORRECTED): `_totalCents` rides on the
+                    // job-sourced projection; a canonical invoice record
+                    // resolves its own linked Job here. Either way the row, its
+                    // balance, its overdue test and its status read the SAME
+                    // integer the settlement rule used.
+                    const _rowTotalC=(inv._totalCents != null) ? inv._totalCents
+                                    : sgrCanonicalPayableCents(inv);
+                    const sub=sgrRands(_rc.subC);
+                    const vat=sgrRands(_rc.vatC);
                     // Display-only: how much is still owed on this invoice —
                     // same total (sub+vat) and payments already used elsewhere
                     // in this row, just subtracted. Never changes inv.status
                     // or any stored/calculated payment value.
-                    const paidSoFar = sumPaymentAmounts(inv.payments);
+                    const _rowPaidC = sgrPaidCents(inv.payments);
+                    const paidSoFar = sgrRands(_rowPaidC);
                     // 2026-09-14: the balance is stated in CENTS — the precision
                     // the invoice was issued at and the customer pays at — so a
                     // fraction of a cent left over from 4-dp line arithmetic is
                     // never shown as a debt of "R 0.00".
                     // 2026-09-18: hoisted above the overdue test below, which
                     // now needs it. The computation is unchanged.
-                    const outstanding = settlementOutstanding(sub+vat, paidSoFar);
+                    const outstanding = sgrRands(sgrOutstandingForRecordCents(inv, _rowTotalC, _rowPaidC));
                     const today=new Date(); const due=new Date(inv.dueDate||inv.date);
                     // 2026-09-18 (ZERO-VALUE SETTLEMENT): overdue means the due
                     // date has passed AND money is still owed. This test asked
@@ -24809,7 +25764,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                     // stays outstanding instead of being forgiven. Never touches
                     // inv.status, invoiceStatus, or any stored payment.
                     const isEffectivelyPaid = inv.status==='partial'
-                      && deriveSettlementStatus(sub+vat, paidSoFar)==='paid';
+                      && sgrSettleRecordCents(inv, _rowTotalC, _rowPaidC, sgrRands(_rowTotalC))==='paid';
                     return(
                       <tr key={inv.id} className={`border-b border-gray-50 transition-colors ${isJob?'hover:bg-purple-50 bg-purple-50/30':'hover:bg-blue-50'}`}>
                         <td className="px-4 py-2.5 text-xs font-mono text-gray-600">
