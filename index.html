@@ -5009,6 +5009,18 @@ function sgrCustomerVatLookup(clientName, customers){
   const c = customers.find(c=>norm(c.companyName)===norm(clientName));
   return c ? (c.vatNumber||'') : '';
 }
+// Fallback lookup (2026-09-22): the full client address is already printed on
+// the Quotation (q.address) and is copied onto the job/invoice when a quote is
+// converted, but historical jobs created before the address was captured have
+// no job.address. Same trim+lowercase name match as sgrCustomerVatLookup above,
+// so the printed Tax Invoice / Proforma always falls back to the saved
+// Customer record rather than showing nothing.
+function sgrCustomerAddressLookup(clientName, customers){
+  if(!clientName || !Array.isArray(customers)) return '';
+  const norm = s=>(s||'').trim().toLowerCase();
+  const c = customers.find(c=>norm(c.companyName)===norm(clientName));
+  return c ? (c.address||'') : '';
+}
 function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
   const co = companies.find(c=>c.id===job.co)||{name:'Signacore',short:'SGR'};
   const legal = sgrCompanyLegal(co);
@@ -5038,6 +5050,9 @@ function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
   // Prefer whatever VAT number is already stored on the job/invoice; fall
   // back to the saved Customer record so historical jobs pick it up too.
   const billVatNum = job.vatNum || sgrCustomerVatLookup(job.client, customers);
+  // Full client address on the printed invoice, matching the Quotation's
+  // "Quoted To" block (job.address is copied from q.address on conversion).
+  const billAddress = job.address || sgrCustomerAddressLookup(job.client, customers);
   const fmt = n=>'R\u00a0'+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const rows = lines.map((l,i)=>{
     const sz = lineSizeText(l);
@@ -5068,7 +5083,7 @@ function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
 '.tagline{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}'+
 '.tagline .co{font-family:\'Barlow Condensed\',Arial,sans-serif;font-size:0.8rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:#06065c}'+
 '.tagline .reg{font-size:8px;color:#4b5563;letter-spacing:0.05em}'+
-'.parties{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}'+
+'.parties{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;align-items:stretch}'+
 '.box{border-radius:6px;padding:10px 13px}'+
 '.box-to{background:#f0f4ff;border:1px solid #c7d2fe;border-left:3px solid #0000ff}'+
 '.box-from{background:#f8f9ff;border:1px solid #e0e7ff}'+
@@ -5148,6 +5163,7 @@ function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
 (billVatNum?'<p>VAT Reg: '+billVatNum+'</p>':'')+
 (job.email?'<p>'+job.email+'</p>':'')+
 (job.tel?'<p>Tel: '+job.tel+'</p>':'')+
+(billAddress?'<p style="white-space:pre-line;margin-top:3px">'+escapeHtml(billAddress)+'</p>':'')+
 '</div>'+
 '<div class="box box-from">'+
 '<div class="lbl">Remit To</div>'+
@@ -5217,7 +5233,7 @@ function printInvoice(job, companies, logoDataUrl, customers) {
 /* ═══════════════════════════════════════════
    PRINT PROFORMA INVOICE (from quote)
 ═══════════════════════════════════════════ */
-function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
+function buildProformaHtml(quote, proformaNum, companies, logoDataUrl, customers) {
   const co = companies.find(c=>c.id===quote.co)||{name:'Signacore',short:'SGR'};
   const legal = sgrCompanyLegal(co);
   const lines = quote.lines||[];
@@ -5235,6 +5251,10 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
      deposit terms: nothing is copied into a proforma-specific field, no
      payment record is read, and the proforma total is untouched. */
   const _depInfo = quoteDepositInfo(quote, total);
+  // Full client address on the printed proforma, matching the Quotation's
+  // "Quoted To" block. `customers` is optional — callers that don't pass it
+  // simply get the address already stored on the quote/job, as before.
+  const billAddress = quote.address || sgrCustomerAddressLookup(quote.client, customers);
   const fmt = n=>'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const today = new Date().toISOString().slice(0,10);
   const due = new Date(Date.now()+30*864e5).toISOString().slice(0,10);
@@ -5263,7 +5283,7 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
 ".tagline{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}"+
 ".tagline .co{font-family:'Barlow Condensed',Arial,sans-serif;font-size:0.8rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:#06065c}"+
 ".tagline .reg{font-size:8px;color:#4b5563;letter-spacing:0.05em}"+
-".parties{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}"+
+".parties{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;align-items:stretch}"+
 ".box{border-radius:6px;padding:10px 13px}.box-to{background:#f0f4ff;border:1px solid #c7d2fe;border-left:3px solid #0000ff}"+
 ".box-from{background:#f8f9ff;border:1px solid #e0e7ff}"+
 ".box .lbl{font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:4px;color:#4b5563}"+
@@ -5308,6 +5328,7 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
 (quote.vatNum?'<p>VAT Reg: '+quote.vatNum+'</p>':'')+
 (quote.email?'<p>'+quote.email+'</p>':'')+
 (quote.tel?'<p>Tel: '+quote.tel+'</p>':'')+
+(billAddress?'<p style="white-space:pre-line;margin-top:3px">'+escapeHtml(billAddress)+'</p>':'')+
 '</div>'+
 '<div class="box box-from"><div class="lbl">Remit To</div><div class="nm">Signacore</div>'+
 '<p>21 Voortrekker St, Mossdustria, Mossel Bay</p>'+
@@ -5343,8 +5364,8 @@ function buildProformaHtml(quote, proformaNum, companies, logoDataUrl) {
   return html;
 }
 
-function printProformaWindow(quote, proformaNum, companies, logoDataUrl) {
-  const html = buildProformaHtml(quote, proformaNum, companies, logoDataUrl);
+function printProformaWindow(quote, proformaNum, companies, logoDataUrl, customers) {
+  const html = buildProformaHtml(quote, proformaNum, companies, logoDataUrl, customers);
   sgrOpenPrintPreview(html, 'Proforma '+(proformaNum||quote.num||''), proformaNum||quote.num);
 }
 
@@ -5425,7 +5446,7 @@ function buildManualInvoiceHtml(inv, companies, logoDataUrl) {
 '.tagline{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}'+
 '.tagline .co{font-family:\'Barlow Condensed\',Arial,sans-serif;font-size:0.8rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:#06065c}'+
 '.tagline .reg{font-size:8px;color:#4b5563;letter-spacing:0.05em}'+
-'.parties{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}'+
+'.parties{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;align-items:stretch}'+
 '.box{border-radius:6px;padding:10px 13px}'+
 '.box-to{background:#f0f4ff;border:1px solid #c7d2fe;border-left:3px solid #0000ff}'+
 '.box-from{background:#f8f9ff;border:1px solid #e0e7ff}'+
@@ -9493,7 +9514,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
             <button onClick={async ()=>{
                 const num = await ensureProformaNumber(quote, quotes, forceSaveSections, onUpdate);
                 if (!num) return; // reservation/save failed — ensureProformaNumber already alerted; nothing to print
-                printProformaWindow(quote,num,companies,logoDataUrl);
+                printProformaWindow(quote,num,companies,logoDataUrl,customers);
               }}
               className="flex items-center gap-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded-xl px-4 py-2.5 font-bold">
               📄 Proforma Invoice
@@ -17139,7 +17160,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                  resolver - nothing is written, copied or persisted. Unresolved
                  source quote -> existing standard/R5,000 rules, as before. */
               const _srcQ = findSourceQuoteForJob(job, quotes);
-              printProformaWindow({ ...job, depositPct: _srcQ ? _srcQ.depositPct : null }, job.invoiceNum||('PRO-'+String(job.num||'')), companies, logoDataUrl);
+              printProformaWindow({ ...job, depositPct: _srcQ ? _srcQ.depositPct : null }, job.invoiceNum||('PRO-'+String(job.num||'')), companies, logoDataUrl, customers);
             }}
             className="flex items-center gap-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded-xl px-4 py-2.5 font-bold">
             📄 Print Proforma Invoice
