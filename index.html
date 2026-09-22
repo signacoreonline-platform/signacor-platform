@@ -15998,18 +15998,32 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   const convPct        = monthQuotes.length>0 ? Math.round(monthConverted.length/monthQuotes.length*100) : 0;
   const convColor      = convPct>=75 ? '#10b981' : convPct>=50 ? '#0000ff' : convPct>=25 ? '#f59e0b' : '#ED0101';
   const convMsg        = convPct>=75 ? '🔥 Outstanding — keep it up!' : convPct>=50 ? '💪 Strong — push for more' : convPct>=25 ? '📈 Building momentum' : '🚀 Let’s win more quotes';
-  // ── Salesman of the Month ── salesperson with the highest total value of JOBS CREATED this month
-  // Totals reflect the value (incl. VAT) of jobs created for each salesperson during the month.
-  const _spTotals = {};
+  /* ── Salesman of the Month (2026-09-22) ──────────────────────────────────
+     Now the salesperson who HANDLES THE MAJORITY OF THE JOBS created this
+     month — ranked by job COUNT, not by Rand value as before. A single large
+     job no longer outranks a colleague who actually ran most of the month's
+     work. Ties on count fall back to the higher total value, then to the name,
+     so the winner is stable across renders instead of depending on object key
+     order. Same scope as before: company-visible jobs, created this month
+     (inCurrentMonth(j.id)), with a salesperson captured. Presentation only —
+     nothing is stored or written back. */
+  const _spStats = {};
   visibleJobs.filter(j=>(j.salesperson||'').trim() && inCurrentMonth(j.id)).forEach(j=>{
     const name = (j.salesperson||'').trim();
-    _spTotals[name] = (_spTotals[name]||0) + (parseFloat(j.value)||0);
+    if (!_spStats[name]) _spStats[name] = { count:0, value:0 };
+    _spStats[name].count += 1;
+    _spStats[name].value += (parseFloat(j.value)||0);
   });
-  const _spTop          = Object.entries(_spTotals).sort((a,b)=>b[1]-a[1])[0];
-  const topSalesman     = _spTop ? _spTop[0] : '—';
-  const topSalesmanTotal= _spTop ? _spTop[1] : 0;
-  const topSalesmanSub  = _spTop
-    ? 'R ' + topSalesmanTotal.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2}) + ' · ' + _curMonthLabel
+  const _spTop = Object.entries(_spStats).sort((a,b)=>
+    (b[1].count - a[1].count) || (b[1].value - a[1].value) || a[0].localeCompare(b[0])
+  )[0];
+  const topSalesman      = _spTop ? _spTop[0] : '—';
+  const topSalesmanJobs  = _spTop ? _spTop[1].count : 0;
+  const topSalesmanTotal = _spTop ? _spTop[1].value : 0;
+  const topSalesmanSub   = _spTop
+    ? topSalesmanJobs + ' job' + (topSalesmanJobs!==1?'s':'') + ' · R '
+      + topSalesmanTotal.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2})
+      + ' · ' + _curMonthLabel
     : 'No jobs created this month';
 
   return (
@@ -16155,7 +16169,12 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
                 </tr>
               </thead>
               <tbody>
-                {visibleQuotes.map(q=>{
+                {/* Highest quote number at the top, lowest at the bottom
+                    (2026-09-22). Same numeric-aware helper + .reverse() idiom
+                    the Sales, Accounting and Credit Note lists already use, so
+                    QUO-00099 never sorts above QUO-00100. Sorts a COPY —
+                    numSort() spreads its input, so `quotes` is never mutated. */}
+                {numSort(visibleQuotes,'num').reverse().map(q=>{
                   const sub=q.lines.reduce((s,l)=>s+(l.subtotal||0),0);
                   const disc=parseFloat(q.discount)||0;
                   const setup=parseFloat(q.setupFee)||0;
