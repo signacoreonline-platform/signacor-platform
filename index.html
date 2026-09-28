@@ -27478,6 +27478,13 @@ function App() {
     // an always-current view without a separate round trip.
     if (data && typeof data === 'object') {
       data._relationalAuthoritativeSections = (result && Array.isArray(result.relationalAuthoritativeSections)) ? result.relationalAuthoritativeSections : [];
+      // 2026-09-28: normalise category (`category` -> `cat`) HERE, on the raw
+      // server object, so the displayed state AND serverBaselineRef are built
+      // from the exact same values. Normalising only the displayed copy made
+      // the autosave diff see a phantom "inventory changed" and trip
+      // assertNoUnwiredRelationalSections ("Save failed — Cannot save inventory").
+      if (Array.isArray(data.inventory))  data.inventory  = withItemCat(data.inventory);
+      if (Array.isArray(data.quickRates)) data.quickRates = withItemCat(data.quickRates);
     }
     return data;
   }
@@ -27518,7 +27525,15 @@ function App() {
       if (errBody && errBody.conflict) err.conflict = errBody;
       throw err;
     }
-    return res.json().catch(() => null);
+    const confirmed = await res.json().catch(() => null);
+    // 2026-09-28: same category normalisation as fetchFromServer — the saved
+    // data returned here becomes serverBaselineRef, so it must match the
+    // shape held in React state or autosave sees a phantom inventory change.
+    if (confirmed && confirmed.data && typeof confirmed.data === 'object') {
+      if (Array.isArray(confirmed.data.inventory))  confirmed.data.inventory  = withItemCat(confirmed.data.inventory);
+      if (Array.isArray(confirmed.data.quickRates)) confirmed.data.quickRates = withItemCat(confirmed.data.quickRates);
+    }
+    return confirmed;
   }
 
   // Save-ordering stamp used to compare two platform_state snapshots.
@@ -27538,7 +27553,7 @@ function App() {
       relationalAuthoritativeSectionsRef.current = dbData._relationalAuthoritativeSections;
     }
     if (Array.isArray(dbData.jobs))             setJobs(dbData.jobs);
-    if (Array.isArray(dbData.inventory))        setInventory(withItemCat(dbData.inventory));
+    if (Array.isArray(dbData.inventory))        setInventory(dbData.inventory);
     if (Array.isArray(dbData.quotes))           setQuotes(dbData.quotes);
     if (Array.isArray(dbData.customers))        setCustomers(dbData.customers);
     if (Array.isArray(dbData.suppliers))        setSuppliers(dbData.suppliers);
@@ -27555,7 +27570,7 @@ function App() {
     if (Array.isArray(dbData.accBills))         setAccBills(dbData.accBills);
     if (Array.isArray(dbData.completeProducts)) setCompleteProducts(dbData.completeProducts);
     if (Array.isArray(dbData.payrollRecords))   setPayrollRecords(dbData.payrollRecords);
-    if (Array.isArray(dbData.quickRates))       setQuickRates(withItemCat(dbData.quickRates));
+    if (Array.isArray(dbData.quickRates))       setQuickRates(dbData.quickRates);
     if (Array.isArray(dbData.proposedProjects)) setProposedProjects(dbData.proposedProjects);
     if (Array.isArray(dbData.creditNotes))      setCreditNotes(dbData.creditNotes);
     if (Array.isArray(dbData.userAccounts) && dbData.userAccounts.length) setUserAccounts(dbData.userAccounts);
