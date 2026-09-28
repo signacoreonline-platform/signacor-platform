@@ -96,7 +96,9 @@
     "test:discount-display-consistency": "node test/discount-display-consistency.test.js",
     "diagnose:settlement-status-mismatch": "node scripts/diagnose-settlement-status-mismatch.js",
     "test:sales-invoice-list-discount": "node test/sales-invoice-list-discount.render.test.js",
-    "diagnose:job-invoice-discount": "node scripts/diagnose-job-invoice-discount.js"
+    "diagnose:job-invoice-discount": "node scripts/diagnose-job-invoice-discount.js",
+    "test:inventory-persistence-frontend": "node test/inventory-persistence.frontend.test.js",
+    "test:inventory-persistence": "ts-node --transpile-only test/relational.inventory-persistence.stress.ts"
   },
   "dependencies": {
     "@types/archiver": "^6.0.4",

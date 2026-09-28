@@ -220,8 +220,274 @@ function withItemCat(list) {
   return list.map(i => {
     if (!i || typeof i !== 'object') return i;
     const c = (i.category != null && i.category !== '') ? i.category : i.cat;
+    // No category under either name: leave the record byte-for-byte as served
+    // (rewriting null -> undefined only manufactured a phantom diff).
+    if (c == null || c === '') return i;
     return (c === i.cat && (i.category === undefined || i.category === c)) ? i : { ...i, cat: c, category: c };
   });
+}
+// 2026-09-28 INVENTORY PERSISTENCE INVESTIGATION: the ONE normaliser every
+// server read goes through — the full GET (fetchFromServer), the PUT
+// response (saveToServer) AND the targeted relational refresh
+// (fetchRelationalSectionsNow). The morning fix covered only the first two;
+// the targeted refresh — which runs right after every inventory create/edit
+// and whenever another session changes inventory — still delivered items
+// with `category` but no `cat`, so a newly created category vanished from the
+// chips/filter/dropdown seconds after it was saved. Mutates `data` in place.
+function normaliseItemCatSections(data) {
+  if (!data || typeof data !== 'object') return data;
+  if (Array.isArray(data.inventory))  data.inventory  = withItemCat(data.inventory);
+  if (Array.isArray(data.quickRates)) data.quickRates = withItemCat(data.quickRates);
+  return data;
+}
+// 2026-09-28 INVENTORY PERSISTENCE INVESTIGATION — sticky relational authority.
+// applyRelationalReadOverlay (backend platformState.ts) is best-effort: when a
+// cut-over section's relational read THROWS it serves that section's FROZEN
+// pre-cutover JSON copy and omits it from `relationalAuthoritativeSections`.
+// Adopting that one answer verbatim did two harmful things at once:
+//   (a) the frozen copy replaced live inventory on screen — every item created
+//       after the cutover (a new category and its items) disappeared; and
+//   (b) isRelationalAuthoritative('inventory') flipped to false, so the next
+//       Add/Edit Stock Item took the JSON branch; the PUT route then STRIPS the
+//       cut-over section and still answers 200, so the edit was written nowhere
+//       while the UI believed it was saved.
+// A section that is cut over does not stop being cut over mid-session (the
+// same rule mergeAndSave already applies via relationalCutOverSeenRef), so the
+// session's answer is the UNION of everything the server has declared. A page
+// reload re-derives it from scratch, so a genuine rollback is still honoured.
+// `baselineData` supplies the last AUTHORITATIVE copy for any known section the
+// server omitted this time; with no such copy the served data is left as is.
+//
+// FINAL HARDENING: `failedSections` is the server's explicit
+// `relationalReadFailedSections` (platformState.ts) — sections that ARE cut
+// over but whose relational read threw on this request, so what was served
+// for them is the frozen JSON copy. That closes the first-load gap (a session
+// that has never yet been told the section is relational): such a section is
+// authoritative from now on, its frozen copy is never used, and when there is
+// no last-good copy to keep the section is reported in
+// `data._relationalUnavailableSections` so the caller can refuse to present
+// frozen data as live. Sections whose last-good copy was kept are listed in
+// `data._relationalRetainedSections` so the UI can say so.
+function adoptRelationalAuthority(data, declared, baselineData, failedSections) {
+  const declaredList = Array.isArray(declared) ? declared.slice() : [];
+  const failedList = Array.isArray(failedSections) ? failedSections.slice() : [];
+  const seen = relationalCutOverSeenRef.current;
+  for (const k of declaredList.concat(failedList)) { if (seen.indexOf(k) === -1) seen.push(k); }
+  const omitted = seen.filter(k => declaredList.indexOf(k) === -1);
+  const retained = [], unavailable = [];
+  if (data && typeof data === 'object' && omitted.length) {
+    for (const k of omitted) {
+      if (baselineData && Array.isArray(baselineData[k])) {
+        data[k] = baselineData[k];
+        retained.push(k);
+        console.warn('[relational-authority] the server did not confirm "' + k + '" as relational-authoritative on this read (its relational read failed and a frozen JSON copy was served) — keeping the last authoritative copy instead of the frozen one.');
+      } else if (failedList.indexOf(k) !== -1) {
+        delete data[k];
+        unavailable.push(k);
+      }
+    }
+  }
+  if (data && typeof data === 'object') {
+    // Non-enumerable: read-only metadata for the caller, never copied into a
+    // baseline/payload by spread, Object.assign or JSON.stringify.
+    Object.defineProperty(data, '_relationalRetainedSections', { value: retained, enumerable: false, configurable: true, writable: true });
+    Object.defineProperty(data, '_relationalUnavailableSections', { value: unavailable, enumerable: false, configurable: true, writable: true });
+  }
+  return seen.slice();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   2026-09-28 FINAL INVENTORY HARDENING — relational Inventory write helpers.
+   Shared by Quote → Job conversion (stock deduction) and Bulk Import so that,
+   once "inventory" is relational-authoritative, neither ever routes an
+   Inventory change through platform_state. Each takes the relational API as a
+   parameter (always `relationalApi` in the app) so the exact shipped code can
+   be exercised against a real server in tests.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// Stock consumed by a quote's lines, per inventory item. Same rule as the JSON
+// conversion path (lines with an itemId; qty summed per item; an item that no
+// longer exists is skipped; nothing is deducted for a non-positive total),
+// matching ids as strings so a numeric id and its string form are one item.
+function computeStockConsumption(lines, inventory) {
+  const byId = new Map();
+  for (const l of (lines || [])) {
+    if (!l || l.itemId === null || l.itemId === undefined || l.itemId === '') continue;
+    const inv = (inventory || []).find(i => i && (String(i.id) === String(l.itemId) || parseInt(l.itemId) === i.id));
+    if (!inv) continue;
+    const key = String(inv.id);
+    const cur = byId.get(key) || { item: inv, qty: 0 };
+    cur.qty += (parseFloat(l.qty) || 0);
+    byId.set(key, cur);
+  }
+  return Array.from(byId.values()).filter(c => c.qty > 0);
+}
+
+// Deducts each consumption through POST /inventory/:id/adjust — an atomic
+// server-side `stock_qty = GREATEST(0, stock_qty + delta)` guarded by the
+// item's row_version. A stale version is refused (409) and reported, never
+// retried and never overwritten: a delta can only ever apply on top of the
+// quantity the server actually holds.
+async function deductInventoryRelational(consumption, api) {
+  const applied = [], failed = [];
+  for (const c of (consumption || [])) {
+    const it = c.item || {};
+    if (it._relId === null || it._relId === undefined) {
+      failed.push({ id: it.id, sku: it.sku, name: it.name, qty: c.qty, error: 'this item has no server record id' });
+      continue;
+    }
+    try {
+      const res = await api.adjustInventoryStock(it._relId, it._relRowVersion, -c.qty);
+      applied.push({ id: it.id, sku: it.sku, name: it.name, qty: c.qty, newStock: res.newStock, rowVersion: res.rowVersion });
+    } catch (e) {
+      failed.push({ id: it.id, sku: it.sku, name: it.name, qty: c.qty, status: e && e.status, error: (e && e.message) || 'unknown error' });
+    }
+  }
+  return { applied, failed };
+}
+
+// Bulk Import through the relational API. Mirrors the JSON importer's rules:
+//   "add"     — a row whose SKU (case-insensitive) matches an existing item
+//               updates that item's CSV fields; otherwise a new item is created.
+//               A CSV row carries no supplier, so an existing item's supplier
+//               link is never touched and new items have none. A SKU that only
+//               matches a removed (inactive) item updates AND restores it, so an
+//               imported row can never be saved yet invisible.
+//   "replace" — the same upserts; then every other ACTIVE item is removed
+//               (soft delete). Removals run ONLY if every row saved, so a
+//               failed import can never also strip the existing inventory.
+// Every write is acknowledged individually; failures are collected and
+// reported, never hidden, and nothing is retried.
+async function importInventoryRowsRelational(rows, mode, currentInventory, api) {
+  const pool = (currentInventory || []).map(i => ({ ...i }));
+  const report = { created: [], updated: [], restored: [], removed: [], failed: [], removalsSkipped: false, mode: mode };
+  const changed = new Map();   // String(id) -> resulting local record
+  const touched = new Set();   // String(id) of every item this import wrote
+  const norm = v => String(v || '').trim().toLowerCase();
+  for (const row of (rows || [])) {
+    const cat = row.cat || 'General';
+    const fields = { sku: row.sku, name: row.name, category: cat, unit: row.unit, cost: row.cost, sell: row.sell, stock: row.stock, reorder: row.reorder };
+    const matches = pool.filter(i => norm(i.sku) === norm(row.sku));
+    const match = matches.find(i => i.active !== false) || matches[0] || null;
+    try {
+      if (match) {
+        if (match._relId === null || match._relId === undefined) throw new Error('existing item ' + (match.sku || match.id) + ' has no server record id — reload and try again');
+        const reactivate = match.active === false;
+        const res = await api.updateInventoryItem(match._relId, match._relRowVersion, reactivate ? { ...fields, active: true } : fields);
+        const next = { ...match, sku: row.sku, name: row.name, cat: cat, category: cat, unit: row.unit, cost: row.cost, sell: row.sell, stock: row.stock, reorder: row.reorder, active: true, _relRowVersion: res.rowVersion };
+        pool[pool.indexOf(match)] = next;
+        changed.set(String(next.id), next); touched.add(String(next.id));
+        (reactivate ? report.restored : report.updated).push(row.sku);
+      } else {
+        const res = await api.createInventoryItem({ ...fields, supplierId: null });
+        const next = { id: res.id, sku: row.sku, name: row.name, cat: cat, category: cat, unit: row.unit, cost: row.cost, sell: row.sell, stock: row.stock, reorder: row.reorder, supplierId: null, active: true, _relId: res.id, _relRowVersion: res.rowVersion };
+        pool.push(next);
+        changed.set(String(next.id), next); touched.add(String(next.id));
+        report.created.push(row.sku);
+      }
+    } catch (e) {
+      report.failed.push({ sku: row.sku, op: match ? 'update' : 'create', error: (e && e.message) || 'unknown error' });
+    }
+  }
+  if (mode === 'replace') {
+    if (report.failed.length) {
+      report.removalsSkipped = true;
+    } else {
+      for (const it of pool.slice()) {
+        if (it.active === false || touched.has(String(it.id))) continue;
+        try {
+          if (it._relId === null || it._relId === undefined) throw new Error('no server record id');
+          await api.deleteInventoryItem(it._relId, it._relRowVersion);
+          const next = { ...it, active: false };
+          pool[pool.indexOf(it)] = next;
+          changed.set(String(next.id), next);
+          report.removed.push(it.sku || String(it.id));
+        } catch (e) {
+          report.failed.push({ sku: it.sku || String(it.id), op: 'remove', error: (e && e.message) || 'unknown error' });
+        }
+      }
+    }
+  }
+  const ok = report.created.length + report.updated.length + report.restored.length;
+  const lines = [];
+  lines.push((report.failed.length ? '⚠ Import finished WITH ERRORS.' : '✅ Import saved to the server.'));
+  lines.push(ok + ' of ' + (rows || []).length + ' row' + ((rows || []).length !== 1 ? 's' : '') + ' saved: ' + report.created.length + ' created, ' + report.updated.length + ' updated' + (report.restored.length ? ', ' + report.restored.length + ' restored' : '') + '.');
+  if (mode === 'replace') {
+    lines.push(report.removalsSkipped
+      ? 'Replace mode: NO existing items were removed, because not every row saved.'
+      : report.removed.length + ' other item' + (report.removed.length !== 1 ? 's' : '') + ' removed.');
+  }
+  if (report.failed.length) {
+    lines.push('');
+    lines.push(report.failed.length + ' NOT saved:');
+    for (const f of report.failed.slice(0, 25)) lines.push('  • ' + f.sku + ' (' + f.op + '): ' + f.error);
+    if (report.failed.length > 25) lines.push('  … and ' + (report.failed.length - 25) + ' more.');
+  }
+  return { report, changed: Array.from(changed.values()), message: lines.join('\n') };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   2026-09-28 MID-SESSION CUTOVER SAFETY — confirm Inventory's persistence mode
+   BEFORE any Inventory mutation.
+
+   The gap this closes: a tab opened while Inventory was still JSON keeps
+   `isRelationalAuthoritative('inventory') === false` until it next reloads. If
+   Inventory is switched to relational in the meantime, that tab's next
+   Add/Edit/Delete/Import went down the JSON branch; the server stripped the
+   inventory array from the platform_state PUT and still answered 200 — the
+   change showed on screen, was written nowhere, and vanished on refresh.
+
+   Now every Inventory mutation first asks this function:
+     - already known relational (sticky for the session) → 'relational', no
+       network round trip;
+     - otherwise ask the server NOW (GET /api/freshness — the existing
+       authority source; its `cutOver` list reads the cutover flags directly and
+       does not depend on any relational read succeeding):
+         · still JSON → 'json' (the JSON path is still correct);
+         · now relational → adopted immediately and permanently for this
+           session; a create proceeds relationally ('relational'); a change to
+           an EXISTING item stops (null) because this tab's copy has no server
+           record ids yet — the list is refreshed and the user repeats it;
+         · no answer → null: nothing is changed and the user is told.
+   The caller must return without touching Inventory whenever null comes back.
+   ═══════════════════════════════════════════════════════════════════════════ */
+async function confirmInventoryWriteMode(opts) {
+  const needsExisting = !!(opts && opts.existing);
+  if (isRelationalAuthoritative('inventory')) return 'relational';
+  if (relationalCutOverSeenRef.current.indexOf('inventory') !== -1) {
+    relationalAuthoritativeSectionsRef.current = relationalCutOverSeenRef.current.slice();
+    return 'relational';
+  }
+  let fresh = null;
+  try { fresh = await fetchFreshnessTokens(); } catch (e) { fresh = null; }
+  if (!fresh || !Array.isArray(fresh.cutOver)) {
+    alert('Nothing was changed.\n\nThe server could not confirm how Inventory is currently stored (connection problem?). Please try again in a moment.');
+    return null;
+  }
+  if (fresh.cutOver.indexOf('inventory') === -1) return 'json';
+  adoptRelationalAuthority(null, fresh.cutOver, null);
+  relationalAuthoritativeSectionsRef.current = relationalCutOverSeenRef.current.slice();
+  requestRelationalRefresh('inventory authority changed to relational');
+  if (needsExisting) {
+    alert('Nothing was changed.\n\nInventory storage was upgraded on the server while this page was open. The Inventory list is being refreshed from the server — please repeat your change in a moment.');
+    return null;
+  }
+  return 'relational';
+}
+
+// Called when the server reports that a platform_state save IGNORED (or
+// refused) a section this client had actually changed, because that section
+// is now relational. The change was NOT persisted: say so, never retry it
+// through JSON, adopt the authority for the rest of the session, and pull the
+// authoritative copy so the unsaved local change is replaced by what the
+// server really holds (which also clears the pending autosave diff).
+function reportIgnoredRelationalWrite(sections) {
+  const list = (sections || []).filter(Boolean);
+  if (!list.length) return;
+  adoptRelationalAuthority(null, list, null);
+  relationalAuthoritativeSectionsRef.current = relationalCutOverSeenRef.current.slice();
+  requestRelationalRefresh('ignored relational write: ' + list.join(','));
+  alert('⚠ Your latest ' + list.join(', ') + ' change was NOT saved.\n\n' + list.join(', ') + ' storage was upgraded on the server while this page was open, so that change could not be written. The list is being refreshed from the server — please redo the change (it will now be saved directly).');
 }
 
 // 2026-08-23 SAVE-AUTHORITY AUDIT FIX — shared autosave/baseline desync.
@@ -526,7 +792,9 @@ async function fetchRelationalSectionsNow(sectionNames) {
   const res = await fetch(API_RELATIONAL_SECTIONS_URL + '?names=' + qs, { headers: { ...authHeaders() } });
   if (res.status === 401) { forceLogoutExpiredSession(); throw new Error('Session expired — please log in again.'); }
   if (!res.ok) throw new Error('targeted read HTTP ' + res.status);
-  return res.json();
+  const body = await res.json();
+  if (body && body.data) normaliseItemCatSections(body.data);
+  return body;
 }
 
 /* Sections this client is allowed to refresh through the targeted relational
@@ -7601,9 +7869,10 @@ VIN-3M-RD,3M Vinyl Red Gloss 1.37m,Vinyl,25,8,m,310,490
 INK-EP-YL,Epson Yellow Ink 700ml,Ink,6,4,unit,1250,1800
 SUB-COREX-4,Corex 4mm 1.22x2.44m,Substrate,20,5,sheet,95,180`;
 
-function BulkImportModal({ inventory, onClose, onImport }) {
+function BulkImportModal({ inventory, onClose, onImport, onImportRows, resolveImportMode }) {
   const [csv,setCsv]=useState(''); const [preview,setPreview]=useState(null);
   const [mode,setMode]=useState('add'); const [error,setError]=useState('');
+  const [busy,setBusy]=useState(false); // in-flight lock for the relational import
   function parse() {
     setError('');
     const lines=csv.trim().split('\n').filter(l=>l.trim());
@@ -7619,7 +7888,33 @@ function BulkImportModal({ inventory, onClose, onImport }) {
     if (rows.length===0){setError('No valid rows found. Check column order matches the example.');return;}
     setPreview(rows);
   }
-  function confirmImport() {
+  async function confirmImport() {
+    // 2026-09-28 FINAL INVENTORY HARDENING: when Inventory is relational the
+    // page supplies onImportRows, which saves every row through the relational
+    // API (importInventoryRowsRelational) and returns the server-acknowledged
+    // report. The success message is only ever built from that report.
+    // MID-SESSION CUTOVER SAFETY: which path to use is decided HERE, at
+    // confirm time, from the server's current answer — never from whatever
+    // the page believed when the modal was rendered.
+    if (busy) return;
+    let importMode = onImportRows ? 'relational' : 'json';
+    if (resolveImportMode) {
+      setBusy(true);
+      try { importMode = await resolveImportMode(); } finally { setBusy(false); }
+      if (!importMode) return; // nothing changed; the user has been told why
+    }
+    if (importMode === 'relational' && onImportRows) {
+      if (!preview || preview.length === 0) { alert('Nothing to import — please preview first.'); return; }
+      if (mode==='replace' && !window.confirm('Replace entire inventory?\n\nAfter ALL '+preview.length+' rows have been saved, every other current stock item will be removed. If any row fails, nothing is removed.\n\nContinue?')) return;
+      setBusy(true);
+      let message;
+      try { message = await onImportRows(preview, mode); }
+      catch (e) { setBusy(false); alert('Import failed: ' + ((e && e.message) || e) + '\n\nRows saved before the failure (if any) are listed on the Inventory page; nothing else was changed.'); return; }
+      setBusy(false);
+      onClose();
+      alert(message);
+      return;
+    }
     try {
       if (!preview || preview.length === 0) { alert('Nothing to import — please preview first.'); return; }
       if (mode==='replace') { onImport(preview); }
@@ -7668,7 +7963,7 @@ function BulkImportModal({ inventory, onClose, onImport }) {
               </div>
               <div className="flex gap-3">
                 <button onClick={()=>setPreview(null)} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Back</button>
-                <button type="button" onClick={confirmImport} className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl py-2.5 text-sm font-bold">Confirm Import</button>
+                <button type="button" onClick={confirmImport} disabled={busy} className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed">{busy?'Importing…':'Confirm Import'}</button>
               </div>
             </div>
         }
@@ -8347,6 +8642,7 @@ function SaveAsInventoryModal({ line, inventory, setInventory, onClose, onSaved 
       notes: f.notes || '',
       active: true,
     };
+    if (!(await confirmInventoryWriteMode({ existing: false }))) return; // MID-SESSION CUTOVER SAFETY
     if (isRelationalAuthoritative('inventory')) {
       setSavingItem(true);
       try {
@@ -11920,6 +12216,26 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       }
       return;
     }
+    // 2026-09-28 FINAL INVENTORY HARDENING — stock deduction when Inventory is
+    // relational but this conversion takes the JSON jobs/quotes path below
+    // (quotes/jobs not both cut over). Inventory is never sent through
+    // platform_state here: the job/quote save below carries NO inventory, and
+    // the deduction is applied afterwards through the relational stock-adjust
+    // API (deductInventoryRelational — version-checked, atomic per item).
+    // Checked BEFORE anything is reserved or written: if any consumed item has
+    // no server record, nothing happens at all.
+    // MID-SESSION CUTOVER SAFETY: a conversion that consumes stock confirms
+    // Inventory's persistence mode before anything is reserved or saved.
+    if(!restore && (q.lines||[]).some(l=>l && l.itemId!=null && l.itemId!=='')){
+      if(!(await confirmInventoryWriteMode({ existing: true }))) return;
+    }
+    const invRelational = !restore && isRelationalAuthoritative('inventory');
+    const stockConsumption = invRelational ? computeStockConsumption(q.lines, inventory) : [];
+    const unlinkedStock = stockConsumption.filter(c => c.item._relId === null || c.item._relId === undefined);
+    if(unlinkedStock.length){
+      alert('Job could NOT be created.\n\nThese stock items on the quote have no server record, so their stock cannot be deducted safely:\n'+unlinkedStock.map(c=>'  • '+(c.item.sku||'')+' '+(c.item.name||'')).join('\n')+'\n\nNothing was changed. Please reload the page and try again.');
+      return;
+    }
     // Converting a quote only creates the JOB — it is not itself the
     // creation of a final tax invoice, so no invoice number is assigned
     // here (not from a proforma, not from the old max()+1 generator). The
@@ -12063,6 +12379,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         const consumed = linkedLines.filter(l=>parseInt(l.itemId)===inv.id).reduce((s,l)=>s+(parseFloat(l.qty)||0),0);
         return consumed>0 ? {...inv, stock:Math.max(0,inv.stock-consumed)} : inv;
       });
+      // FINAL HARDENING: nothing consumed → keep the SAME array, so an
+      // untouched (possibly stale) local inventory is never sent with the save.
+      if(nextInventory.every((inv,ix)=>inv===inventory[ix])) nextInventory = inventory;
       lowItems = nextInventory.filter(inv=>inv.stock<=inv.reorder);
       if(lowItems.length>0){
         const bySupplier = {};
@@ -12140,7 +12459,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       return;
     }
     const saveOverrides = { jobs:nextJobs, quotes:nextQuotes };
-    if(nextInventory!==inventory) saveOverrides.inventory = nextInventory;
+    if(nextInventory!==inventory && !invRelational) saveOverrides.inventory = nextInventory;
     if(nextPurchaseOrders!==purchaseOrders) saveOverrides.purchaseOrders = nextPurchaseOrders;
     if(quoteInvoice) saveOverrides.accInvoices = nextAccInvoices;
     try{
@@ -12152,7 +12471,24 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
 
     // Save confirmed durable — now safe to reflect it in the UI.
     setJobs(nextJobs);
-    if(nextInventory!==inventory) setInventory(nextInventory);
+    if(nextInventory!==inventory && !invRelational) setInventory(nextInventory);
+    // Relational stock deduction (see invRelational above). Runs only after the
+    // job is durably saved; each item is adjusted through the server and only
+    // the server's acknowledged quantity/version is shown. Anything that could
+    // not be deducted is reported by name — the job exists, the stock change
+    // did not happen, and nothing pretends otherwise.
+    if(invRelational && stockConsumption.length){
+      const ded = await deductInventoryRelational(stockConsumption, relationalApi);
+      if(ded.applied.length){
+        const byId = new Map(ded.applied.map(a=>[String(a.id), a]));
+        const inventoryUpdater = prev=>prev.map(i=>{ const a=byId.get(String(i.id)); return a ? {...i, stock:a.newStock, _relRowVersion:a.rowVersion} : i; });
+        setInventory(inventoryUpdater);
+        syncRelationalBaseline('inventory', inventoryUpdater);
+      }
+      if(ded.failed.length){
+        setTimeout(()=>alert('⚠ Job '+jobNum+' WAS created, but stock was NOT deducted for '+ded.failed.length+' item'+(ded.failed.length>1?'s':'')+':\n'+ded.failed.map(f=>'  • '+(f.sku||'')+' '+(f.name||'')+' — '+f.qty+' not deducted ('+f.error+')').join('\n')+'\n\nPlease adjust these quantities in Inventory.'),50);
+      }
+    }
     if(nextPurchaseOrders!==purchaseOrders) setPurchaseOrders(nextPurchaseOrders);
     setQuotes(nextQuotes);
     if(quoteInvoice) setAccInvoices(nextAccInvoices);
@@ -21619,6 +21955,7 @@ function QuickRatesModal({ quickRates, setQuickRates, suppliers, inventory, setI
   // Inventory row needs to go through the relational API when "inventory" is
   // cut over, mirroring InventoryPage's own saveItem/adjustInventoryStock use.
   async function moveToInventory(item) {
+    if (!(await confirmInventoryWriteMode({ existing: false }))) return; // MID-SESSION CUTOVER SAFETY
     if (isRelationalAuthoritative('inventory')) {
       try {
         const patch = { sku: item.sku, name: item.name, category: item.cat, unit: item.unit, cost: item.cost, sell: item.sell, stock: item.stock, reorder: item.reorder, supplierId: item.supplierId||null };
@@ -21641,6 +21978,7 @@ function QuickRatesModal({ quickRates, setQuickRates, suppliers, inventory, setI
   }
 
   async function mergeIntoInventory(qrItem, invTargetId) {
+    if (!(await confirmInventoryWriteMode({ existing: true }))) return; // MID-SESSION CUTOVER SAFETY
     if (isRelationalAuthoritative('inventory')) {
       const target = (inventory||[]).find(i=>i.id===invTargetId);
       if (target && target._relId!=null) {
@@ -21658,6 +21996,9 @@ function QuickRatesModal({ quickRates, setQuickRates, suppliers, inventory, setI
         setPendingMove(null);
         return;
       }
+      // FINAL HARDENING: relational Inventory never falls back to a JSON stock change.
+      alert('The stock could not be merged: the target inventory item has no server record id.\n\nNothing was changed. Please reload the page and try again.');
+      return;
     }
     setInventory(prev=>prev.map(i=>{
       if(i.id!==invTargetId) return i;
@@ -21939,6 +22280,7 @@ function QuickRatesPanel({ quickRates, setQuickRates, suppliers, inventory, setI
   // Inventory row this promotes/merges into must go through the relational
   // API once "inventory" is cut over.
   async function moveToInventory(item) {
+    if (!(await confirmInventoryWriteMode({ existing: false }))) return; // MID-SESSION CUTOVER SAFETY
     if (isRelationalAuthoritative('inventory')) {
       try {
         const patch = { sku: item.sku, name: item.name, category: item.cat, unit: item.unit, cost: item.cost, sell: item.sell, stock: item.stock, reorder: item.reorder, supplierId: item.supplierId||null };
@@ -21959,6 +22301,7 @@ function QuickRatesPanel({ quickRates, setQuickRates, suppliers, inventory, setI
     setPendingMove(null);
   }
   async function mergeIntoInventory(qrItem, invTargetId) {
+    if (!(await confirmInventoryWriteMode({ existing: true }))) return; // MID-SESSION CUTOVER SAFETY
     if (isRelationalAuthoritative('inventory')) {
       const target = (inventory||[]).find(i=>i.id===invTargetId);
       if (target && target._relId!=null) {
@@ -21976,6 +22319,9 @@ function QuickRatesPanel({ quickRates, setQuickRates, suppliers, inventory, setI
         setPendingMove(null);
         return;
       }
+      // FINAL HARDENING: relational Inventory never falls back to a JSON stock change.
+      alert('The stock could not be merged: the target inventory item has no server record id.\n\nNothing was changed. Please reload the page and try again.');
+      return;
     }
     setInventory(prev=>prev.map(i=>i.id!==invTargetId?i:{...i,stock:(Number(i.stock)||0)+(Number(qrItem.stock)||0)}));
     setQuickRates(prev=>prev.filter(x=>x.id!==qrItem.id));
@@ -22235,6 +22581,7 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
   async function removeItem(id) { return guardAction('removeInventoryItem:'+id, () => removeItem__impl(id)); }  // 2026-08-24 concurrency guard — see guardAction
   async function removeItem__impl(id) {
     if(!window.confirm('Remove this stock item?')) return;
+    if(!(await confirmInventoryWriteMode({ existing: true }))) return; // MID-SESSION CUTOVER SAFETY
     const item = inventory.find(i=>i.id===id);
     if(item && item._relId!=null && isRelationalAuthoritative('inventory')){
       try {
@@ -22245,6 +22592,11 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
       } catch(e){
         alert(describeSaveConflictError(e, 'inventory item'));
       }
+      return;
+    }
+    // FINAL HARDENING: relational Inventory never falls back to a JSON delete.
+    if(isRelationalAuthoritative('inventory')){
+      alert('This stock item could not be removed: it has no server record id.\n\nNothing was changed. Please reload the page and try again.');
       return;
     }
     setInventory(prev=>prev.filter(i=>i.id!==id));
@@ -22260,6 +22612,8 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
   // transactional/row-version protection as the authoritative backstop.
   async function saveItem(item) { return guardAction('saveItem:'+relKey(item), () => saveItem__impl(item)); }  // 2026-08-24 concurrency guard — see guardAction
   async function saveItem__impl(item) {
+    // MID-SESSION CUTOVER SAFETY: confirm Inventory's persistence mode first.
+    if(!(await confirmInventoryWriteMode({ existing: !!inventory.find(x=>x.id===item.id) }))) return;
     if(isRelationalAuthoritative('inventory')){
       try {
         const isNew = !inventory.find(x=>x.id===item.id);
@@ -22285,6 +22639,40 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
     }
     setInventory(prev => prev.find(x=>x.id===item.id) ? prev.map(x=>x.id===item.id?item:x) : [...prev, item]);
     setShowAddItem(false); setEditItem(null);
+  }
+  // 2026-09-28 INVENTORY PERSISTENCE INVESTIGATION: Bulk Import is a JSON-only
+  // write (it replaces/extends the local `inventory` array). Once "inventory"
+  // is relational-authoritative the server can no longer accept that write —
+  // the imported rows would show on screen, every autosave would then be
+  // refused ("Cannot save inventory"), and the rows would vanish on the next
+  // refresh. Refuse up front, with nothing changed, instead of presenting
+  // items that were never persisted.
+  // JSON (pre-cutover) import only. Kept as a hard stop: if a JSON list ever
+  // reaches here while Inventory is relational, nothing is applied.
+  function importInventory(list) {
+    if(isRelationalAuthoritative('inventory')){
+      alert('Bulk import could not use the server path.\n\nNothing was imported and nothing was changed. Please reload the page and try again.');
+      return;
+    }
+    setInventory(list);
+  }
+  // Relational import: every row is written through the relational API and
+  // only server-acknowledged results are applied locally (then confirmed by
+  // the post-mutation refresh). Returns the report shown to the user.
+  async function importInventoryRelational(rows, mode) {
+    const result = await importInventoryRowsRelational(rows, mode, inventory, relationalApi);
+    if(result.changed.length){
+      const byId = new Map(result.changed.map(i=>[String(i.id), i]));
+      const inventoryUpdater = prev=>{
+        const seenIds = new Set();
+        const out = prev.map(i=>{ const c=byId.get(String(i.id)); if(c){ seenIds.add(String(i.id)); return c; } return i; });
+        for(const c of result.changed){ if(!seenIds.has(String(c.id))) out.push(c); }
+        return out;
+      };
+      setInventory(inventoryUpdater);
+      syncRelationalBaseline('inventory', inventoryUpdater);
+    }
+    return result.message;
   }
   function getSupplierName(supplierId) {
     if(!supplierId) return null;
@@ -22623,8 +23011,8 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
 
   return (
     <div className="p-4 space-y-4">
-      {showImport&&<BulkImportModal inventory={inventory} onClose={()=>setShowImport(false)} onImport={setInventory}/>}
-      {(showAddItem||editItem||copyItem)&&<AddEditInventoryItemModal item={copyItem||editItem} suppliers={suppliers||[]} allCats={cats} onClose={()=>{setShowAddItem(false);setEditItem(null);setCopyItem(null);}} onSave={it=>{saveItem(it);setCopyItem(null);}}/>}
+      {showImport&&<BulkImportModal inventory={inventory} onClose={()=>setShowImport(false)} onImport={importInventory} onImportRows={importInventoryRelational} resolveImportMode={()=>confirmInventoryWriteMode({ existing: true })}/>}
+      {(showAddItem||editItem||copyItem)&&<AddEditInventoryItemModal item={copyItem||editItem} suppliers={suppliers||[]} allCats={cats} onClose={()=>{setShowAddItem(false);setEditItem(null);setCopyItem(null);}} onSave={async it=>{await saveItem(it);setCopyItem(null);}}/>}
       {editCP&&<EditCompleteProductModal cp={editCP} completeProducts={completeProducts||[]} setCompleteProducts={setCompleteProducts} quotes={quotes||[]} setQuotes={setQuotes} onClose={()=>setEditCP(null)}/>}
       {showQuickRates&&<QuickRatesModal quickRates={quickRates||[]} setQuickRates={setQuickRates} suppliers={suppliers||[]} inventory={inventory} setInventory={setInventory} inventoryCats={cats} onClose={()=>setShowQuickRates(false)}/>}
 
@@ -27477,14 +27865,28 @@ function App() {
     // relationalAuthoritativeSectionsRef so the systemic safety guard has
     // an always-current view without a separate round trip.
     if (data && typeof data === 'object') {
-      data._relationalAuthoritativeSections = (result && Array.isArray(result.relationalAuthoritativeSections)) ? result.relationalAuthoritativeSections : [];
+      data._relationalAuthoritativeSections = adoptRelationalAuthority(
+        data,
+        (result && Array.isArray(result.relationalAuthoritativeSections)) ? result.relationalAuthoritativeSections : [],
+        serverBaselineRef.current,
+        (result && Array.isArray(result.relationalReadFailedSections)) ? result.relationalReadFailedSections : []
+      );
+      // A cut-over section the server could not read and for which this
+      // session holds no last-good copy: never show the frozen copy as live.
+      // Failing the read makes hydration retry (and, if it keeps failing, show
+      // its error screen with Retry) instead of hydrating stale Inventory.
+      if (data._relationalUnavailableSections.length) {
+        throw new Error('The server could not load ' + data._relationalUnavailableSections.join(', ') + ' just now. Nothing has been changed — please retry in a moment.');
+      }
+      if (data._relationalRetainedSections.length && typeof setApiMsg === 'function') {
+        setApiMsg('⚠ Could not refresh ' + data._relationalRetainedSections.join(', ') + ' from the server — showing the last saved copy');
+      }
       // 2026-09-28: normalise category (`category` -> `cat`) HERE, on the raw
       // server object, so the displayed state AND serverBaselineRef are built
       // from the exact same values. Normalising only the displayed copy made
       // the autosave diff see a phantom "inventory changed" and trip
       // assertNoUnwiredRelationalSections ("Save failed — Cannot save inventory").
-      if (Array.isArray(data.inventory))  data.inventory  = withItemCat(data.inventory);
-      if (Array.isArray(data.quickRates)) data.quickRates = withItemCat(data.quickRates);
+      normaliseItemCatSections(data);
     }
     return data;
   }
@@ -27501,7 +27903,7 @@ function App() {
   // property carries the parsed body, so callers can distinguish "state
   // moved on, refresh and retry" from an ordinary failure instead of
   // treating every rejected save the same way.
-  async function saveToServer(payload) {
+  async function saveToServer(payload, changedSectionsSent) {
     const res = await fetch(API_STATE_URL, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -27523,6 +27925,11 @@ function App() {
         : (detail || ('HTTP ' + res.status));
       const err = new Error(message);
       if (errBody && errBody.conflict) err.conflict = errBody;
+      // MID-SESSION CUTOVER: the server refused a save whose only content was
+      // now-relational sections. Nothing was written — make that explicit.
+      if (errBody && errBody.type === 'relational_authoritative' && Array.isArray(errBody.sections)) {
+        reportIgnoredRelationalWrite(errBody.sections);
+      }
       throw err;
     }
     const confirmed = await res.json().catch(() => null);
@@ -27530,8 +27937,21 @@ function App() {
     // data returned here becomes serverBaselineRef, so it must match the
     // shape held in React state or autosave sees a phantom inventory change.
     if (confirmed && confirmed.data && typeof confirmed.data === 'object') {
-      if (Array.isArray(confirmed.data.inventory))  confirmed.data.inventory  = withItemCat(confirmed.data.inventory);
-      if (Array.isArray(confirmed.data.quickRates)) confirmed.data.quickRates = withItemCat(confirmed.data.quickRates);
+      normaliseItemCatSections(confirmed.data);
+    }
+    // The server stripped these sections because they are cut over — learn
+    // that now so routing never again sends them down the JSON path.
+    if (confirmed && Array.isArray(confirmed.relationalAuthoritativeSectionsIgnored) && confirmed.relationalAuthoritativeSectionsIgnored.length) {
+      const ignored = confirmed.relationalAuthoritativeSectionsIgnored;
+      // Sections this save actually CHANGED (a partial save sends only those;
+      // the full-state path passes its `changed` list explicitly). Ignoring an
+      // unchanged section is harmless; ignoring a changed one lost a change.
+      const sentChanged = Array.isArray(changedSectionsSent) ? changedSectionsSent
+        : (payload && payload._partial ? Object.keys(payload).filter(k => Array.isArray(payload[k])) : []);
+      const lostChanges = ignored.filter(k => sentChanged.indexOf(k) !== -1);
+      adoptRelationalAuthority(null, ignored, null);
+      relationalAuthoritativeSectionsRef.current = relationalCutOverSeenRef.current.slice();
+      if (lostChanges.length) reportIgnoredRelationalWrite(lostChanges);
     }
     return confirmed;
   }
@@ -27757,6 +28177,14 @@ function App() {
       return;
     }
     if (!fresh || typeof fresh !== 'object') return;
+    // MID-SESSION CUTOVER: the freshness answer carries the server's current
+    // cutover flags — adopt any newly cut-over section at once (sticky; a
+    // section is never dropped here), so a routine 25s check closes the window
+    // in which this tab would still route a now-relational section to JSON.
+    if (Array.isArray(fresh.cutOver) && fresh.cutOver.length) {
+      adoptRelationalAuthority(null, fresh.cutOver, null);
+      relationalAuthoritativeSectionsRef.current = relationalCutOverSeenRef.current.slice();
+    }
 
     const nextTokens = (fresh.sections && typeof fresh.sections === 'object') ? fresh.sections : {};
     const prevTokens = freshnessTokensRef.current;
@@ -28244,7 +28672,7 @@ function App() {
       return true;
     }
 
-    const confirmed = await saveToServer(payload);
+    const confirmed = await saveToServer(payload, changed ? Object.keys(changed).filter(k => changed[k]) : null);
     // 2026-08-20 hardening: prefer the AUTHORITATIVE data the server just
     // confirmed writing (includes anything its own additive merge preserved
     // that this payload never mentioned) over the locally-built `payload` —
@@ -28518,6 +28946,25 @@ function App() {
     const RETRY_MAX_MS  = 15000;
 
     async function attemptHydration(attempt) {
+      // 2026-09-28 INVENTORY PERSISTENCE INVESTIGATION — hydration baseline.
+      // "Did this session change anything DURING the load window?" must be
+      // answered against the state as it stood when THIS load began — not
+      // against the raw `_saved` cache. The state initialisers deliberately
+      // transform `_saved` (inventory: withItemCat normalisation + injection of
+      // any INITIAL_INVENTORY seed ids missing from the cache; userAccounts:
+      // the same default-merge), so `current` never equalled `_saved` for those
+      // sections even though nobody had touched anything. Hydration therefore
+      // classed inventory as "locally changed", SKIPPED the server's inventory
+      // and kept the browser's cached copy — every item created since that
+      // cache (in this or any other browser) vanished after reload/login, seed
+      // items could reappear, and the stale copy then either blocked every
+      // autosave ("Cannot save inventory", inventory cut over) or, in JSON
+      // mode, was diffed against the server baseline as a deletion of the
+      // missing items (_deletedIds). On the very first attempt this is null
+      // (the snapshot effect has not run yet — the app shell is not rendered
+      // until hydration completes), which correctly means "apply the server
+      // state in full".
+      const loadWindowStart = currentSnapshotRef.current;
       try {
         const dbData = await fetchFromServer();
         // Superseded by a newer attempt (token changed / manual retry) while
@@ -28537,7 +28984,7 @@ function App() {
           // is the authoritative source of truth once confirmed (fallback
           // seed data is never treated as a competing "newer" source).
           const current       = currentSnapshotRef.current;
-          const startSnapshot = _saved;
+          const startSnapshot = loadWindowStart;
           if (current && startSnapshot) {
             const changedLocally   = locallyChangedSections(current, startSnapshot);
             const hasLocalChanges  = changedLocally && Object.values(changedLocally).some(Boolean);

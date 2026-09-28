@@ -652,12 +652,18 @@ function assertNoDuplicateIds(existingData: Record<string, any> | null, finalDat
 // nothing here ever seeds a rel_* table from platform_state.data.
 async function applyRelationalReadOverlay(
   data: Record<string, any>
-): Promise<{ data: Record<string, any>; relationalAuthoritativeSections: string[] }> {
+): Promise<{ data: Record<string, any>; relationalAuthoritativeSections: string[]; relationalReadFailedSections: string[] }> {
   const cutOver = await cutOverSections();
-  if (cutOver.size === 0) return { data, relationalAuthoritativeSections: [] };
+  if (cutOver.size === 0) return { data, relationalAuthoritativeSections: [], relationalReadFailedSections: [] };
 
   const out = { ...data };
   const applied: string[] = [];
+  // 2026-09-28 FINAL INVENTORY HARDENING: cut-over sections whose relational
+  // read threw on THIS request. Their array below is the frozen JSON copy, so
+  // the client must be told explicitly — omission alone is indistinguishable
+  // from "not cut over", which is what let a client that had not yet seen the
+  // section route its writes to JSON (stripped by PUT, answered 200).
+  const failed: string[] = [];
   for (const section of cutOver) {
     const jsonKey = SECTION_JSON_KEY[section];
     if (!jsonKey) continue; // e.g. 'payments' — no standalone JSON key, see read.ts
@@ -671,9 +677,10 @@ async function applyRelationalReadOverlay(
       // section (the last frozen JSON copy) rather than serving a 500 or
       // an empty array. This is a degraded-but-safe read, never a wipe.
       console.error(`[platform-state] relational read overlay FAILED for "${section}" — falling back to frozen JSON copy for "${jsonKey}":`, err);
+      failed.push(jsonKey);
     }
   }
-  return { data: out, relationalAuthoritativeSections: applied };
+  return { data: out, relationalAuthoritativeSections: applied, relationalReadFailedSections: failed };
 }
 
 // GET /api/platform-state — returns { data, updated_at } (updated_at also
@@ -694,6 +701,7 @@ router.get('/', async (_req: Request, res: Response): Promise<void> => {
       res.json({
         data: overlay.data, updated_at: null,
         ...(overlay.relationalAuthoritativeSections.length ? { relationalAuthoritativeSections: overlay.relationalAuthoritativeSections } : {}),
+        ...(overlay.relationalReadFailedSections.length ? { relationalReadFailedSections: overlay.relationalReadFailedSections } : {}),
       });
       return;
     }
@@ -703,6 +711,7 @@ router.get('/', async (_req: Request, res: Response): Promise<void> => {
     res.json({
       data: overlay.data, updated_at: row.updated_at,
       ...(overlay.relationalAuthoritativeSections.length ? { relationalAuthoritativeSections: overlay.relationalAuthoritativeSections } : {}),
+      ...(overlay.relationalReadFailedSections.length ? { relationalReadFailedSections: overlay.relationalReadFailedSections } : {}),
     });
   } catch (err) {
     console.error('GET /api/platform-state failed:', err);
@@ -760,6 +769,30 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
       }
       if (strippedCutOverSections.length > 0) {
         console.warn(`[platform-state] Ignored relational-authoritative section(s) from this save (JSON can no longer write these): ${strippedCutOverSections.join(', ')}`);
+      }
+    }
+
+    // 2026-09-28 MID-SESSION CUTOVER DEFENCE. A PARTIAL save only ever carries
+    // the sections its client changed, so a partial whose ONLY content was
+    // cut-over sections is a stale client trying to write them through JSON
+    // (e.g. a tab opened before Inventory was switched to relational). Stripping
+    // it and answering 200 would tell that client its change was saved when
+    // nothing was written. Refuse it instead — before any lock, backup or
+    // write — so even an older client shows "Save failed". A partial that ALSO
+    // carries genuine JSON-owned sections is unaffected: those are saved as
+    // before and the ignored sections are reported in
+    // relationalAuthoritativeSectionsIgnored (the current frontend treats that
+    // report as a failed write for the sections it had changed).
+    if (strippedCutOverSections.length > 0 && data._partial === true) {
+      const remainingPayloadKeys = Object.keys(data).filter((k) => !k.startsWith('_') && k !== 'v' && k !== 'savedAt');
+      if (remainingPayloadKeys.length === 0) {
+        res.status(409).json({
+          conflict: true,
+          type: 'relational_authoritative',
+          sections: strippedCutOverSections,
+          error: `Not saved: ${strippedCutOverSections.join(', ')} ${strippedCutOverSections.length === 1 ? 'is' : 'are'} now stored in the relational database and can no longer be saved this way. Nothing was changed. Please reload and redo the change.`,
+        });
+        return;
       }
     }
 

@@ -207,6 +207,12 @@ function buildHarness(src: string, token: string): Harness {
   const state = { gets: 0 };
 
   const extracted = [
+    // Module-level helpers fetchFromServer/saveToServer call (2026-09-28:
+    // category normalisation + sticky relational authority). Extracted only
+    // when present so this harness also runs against older index.html files.
+    ...['withItemCat', 'normaliseItemCatSections', 'adoptRelationalAuthority']
+      .filter((n) => new RegExp(`function\\s+${n}\\s*\\(`).test(src))
+      .map((n) => extractFunction(src, n)),
     extractFunction(src, 'locallyChangedSections'),
     extractFunction(src, 'mergeSectionArray'),
     extractFunction(src, 'mergeCreditNotes'),

@@ -366,8 +366,20 @@ async function testPlatformStateWriteIsolation() {
       body: JSON.stringify({ data: { jobs: [seedJob, seedJob2, seedJob3], _partial: true } }),
     });
     const putBody3 = await putRes3.json();
-    ok(putRes3.ok, 'the save itself is still accepted (only the cut-over section is ignored, not the whole request)', `HTTP ${putRes3.status}`);
-    ok(Array.isArray(putBody3.relationalAuthoritativeSectionsIgnored) && putBody3.relationalAuthoritativeSectionsIgnored.includes('jobs'), 'the response reports "jobs" as an ignored relational-authoritative section', JSON.stringify(putBody3.relationalAuthoritativeSectionsIgnored));
+    // 2026-09-28 MID-SESSION CUTOVER DEFENCE: a partial save whose ONLY content
+    // is a cut-over section no longer answers 200 (that told a stale client its
+    // write had been saved when nothing was written) — it is refused 409
+    // `relational_authoritative`, naming the section. A save that ALSO carries
+    // a JSON-owned section is still accepted with only the cut-over part
+    // ignored — proven just below.
+    ok(putRes3.status === 409 && putBody3.type === 'relational_authoritative' && (putBody3.sections || []).includes('jobs'), 'a save carrying ONLY the cut-over section is refused (409 relational_authoritative, naming "jobs") instead of a false 200', `HTTP ${putRes3.status} ${JSON.stringify(putBody3)}`);
+    const putRes3b = await fetch(`${baseWithAuthority}/api/platform-state`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenWithAuthority}` },
+      body: JSON.stringify({ data: { jobs: [seedJob, seedJob2, seedJob3], savedCalcs: [], _partial: true } }),
+    });
+    const putBody3b = await putRes3b.json();
+    ok(putRes3b.ok, 'a save that also carries a JSON-owned section is still accepted (only the cut-over section is ignored, not the whole request)', `HTTP ${putRes3b.status}`);
+    ok(Array.isArray(putBody3b.relationalAuthoritativeSectionsIgnored) && putBody3b.relationalAuthoritativeSectionsIgnored.includes('jobs'), 'the response reports "jobs" as an ignored relational-authoritative section', JSON.stringify(putBody3b.relationalAuthoritativeSectionsIgnored));
     const getRes3 = await fetch(`${baseWithAuthority}/api/platform-state`, { headers: { Authorization: `Bearer ${tokenWithAuthority}` } });
     const getBody3 = await getRes3.json();
     ok(!(getBody3.data.jobs || []).some((j: any) => j.id === seedJob3.id), 'seedJob3 was NOT persisted into platform_state — the cut-over section genuinely could not be overwritten via this path');

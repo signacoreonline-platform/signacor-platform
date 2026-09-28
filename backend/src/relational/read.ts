@@ -337,13 +337,41 @@ export async function buildSuppliersJson(): Promise<any[]> {
 }
 
 // ── INVENTORY / QUICK RATES (same shape, two tables) ──────────────────────
-function mapItemRow(r: any): any {
+// 2026-09-28 INVENTORY PERSISTENCE INVESTIGATION — category field mapping.
+//
+// The dashboard (index.html: InventoryPage, AddEditInventoryItemModal, the
+// category chips/filter, the calculator stock picker, the stock-count PDF)
+// reads an item's category ONLY from `cat` — the original JSON field name.
+// This row mapper used to emit the relational column as `category` and let
+// `cat` come solely from the `...legacyBase(r)` spread, i.e. from the frozen
+// pre-cutover legacy_data blob. Two defects followed, on every relational
+// read (full GET overlay AND the targeted /relational/sections refresh):
+//   1. Items created AFTER the cutover have legacy_data = '{}', so they came
+//      back with NO `cat` at all: a newly created category vanished from the
+//      chips/filter/dropdown and its items showed as uncategorised.
+//   2. Backfilled items whose category was later EDITED came back with the
+//      OLD legacy `cat`, and the next unrelated edit of that item posted the
+//      stale value back (`category: item.cat`) — a silent data regression.
+// Fixed at the one shared point: the relational column is authoritative, the
+// legacy value is only a fallback, and BOTH names carry the same value so
+// every consumer (old or new frontend, full backups) sees one category.
+function resolveItemCategory(r: any): string | null {
+  const legacy = legacyBase(r);
+  const col = r.category;
+  if (col !== null && col !== undefined && col !== '') return col;
+  if (legacy.cat !== null && legacy.cat !== undefined && legacy.cat !== '') return legacy.cat;
+  if (legacy.category !== null && legacy.category !== undefined && legacy.category !== '') return legacy.category;
+  return col ?? null;
+}
+export function mapItemRow(r: any): any {
+  const category = resolveItemCategory(r);
   return {
     ...legacyBase(r),
     id: restoreId(r.source_id),
     sku: r.sku ?? legacyBase(r).sku ?? null,
     name: r.name,
-    category: r.category ?? legacyBase(r).category ?? null,
+    cat: category,
+    category,
     unit: r.unit ?? legacyBase(r).unit ?? null,
     cost: num(r.cost),
     sell: num(r.sell),
