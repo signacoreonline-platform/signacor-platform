@@ -210,6 +210,19 @@ const relationalCutOverSeenRef = { current: [] };
 function isRelationalAuthoritative(section) {
   return relationalAuthoritativeSectionsRef.current.indexOf(section) !== -1;
 }
+// 2026-09-28 INVENTORY CATEGORY FIX: the relational read (read.ts mapItemRow)
+// returns an item's category as `category`, but the dashboard reads `cat`.
+// Items created after the cut-over have no legacy `cat`, so their category
+// appeared blank after every reload/poll. Map `category` -> `cat` on load
+// (the relational column wins when present), keeping both fields in sync.
+function withItemCat(list) {
+  if (!Array.isArray(list)) return list;
+  return list.map(i => {
+    if (!i || typeof i !== 'object') return i;
+    const c = (i.category != null && i.category !== '') ? i.category : i.cat;
+    return (c === i.cat && (i.category === undefined || i.category === c)) ? i : { ...i, cat: c, category: c };
+  });
+}
 
 // 2026-08-23 SAVE-AUTHORITY AUDIT FIX — shared autosave/baseline desync.
 //
@@ -21221,7 +21234,7 @@ function AddEditInventoryItemModal({ item, suppliers, onClose, onSave, allCats }
     if (busy) return;
     setBusy(true);
     try {
-      const {_catNew:_cn, ...clean} = f; await onSave({ ...clean, id:f.id||Date.now(), stock:Number(f.stock), reorder:Number(f.reorder), cost:Number(f.cost), sell:Number(f.sell), supplierId:f.supplierId||null });
+      const {_catNew:_cn, ...clean} = f; await onSave({ ...clean, category:clean.cat, id:f.id||Date.now(), stock:Number(f.stock), reorder:Number(f.reorder), cost:Number(f.cost), sell:Number(f.sell), supplierId:f.supplierId||null });
     } finally { setBusy(false); }
   }
   return (
@@ -21294,7 +21307,7 @@ function AddEditQuickRateModal({ item, suppliers, allCats, onClose, onSave }) {
   function handleSave() {
     if(!f.name.trim()||!f.sku.trim()) return alert('SKU and item name are required.');
     const {_catNew:_cn, ...clean} = f;
-    onSave({ ...clean, id:f.id||Date.now(), stock:Number(f.stock), reorder:Number(f.reorder), cost:Number(f.cost), sell:Number(f.sell), supplierId:f.supplierId||null });
+    onSave({ ...clean, category:clean.cat, id:f.id||Date.now(), stock:Number(f.stock), reorder:Number(f.reorder), cost:Number(f.cost), sell:Number(f.sell), supplierId:f.supplierId||null });
   }
   return (
     <div className="fixed inset-0 bg-black/40 z-[60] flex items-center justify-end pr-4 py-4" onClick={e=>e.target===e.currentTarget&&onClose()}>
@@ -27128,7 +27141,7 @@ function App() {
   const [jobs,         setJobs]         = useState(_saved ? _saved.jobs      : INITIAL_JOBS);
   const [inventory,    setInventory]    = useState(()=>{
     if(!_saved) return INITIAL_INVENTORY;
-    const saved = _saved.inventory || [];
+    const saved = withItemCat(_saved.inventory || []);
     const savedIds = new Set(saved.map(i=>i.id));
     const newItems = INITIAL_INVENTORY.filter(i=>!savedIds.has(i.id));
     return newItems.length ? [...saved, ...newItems] : saved;
@@ -27159,7 +27172,7 @@ function App() {
   const [accBills,         setAccBills]         = useState(_saved ? (_saved.accBills||[])           : []);
   const [completeProducts, setCompleteProducts] = useState(_saved ? (_saved.completeProducts||[])  : []);
   const [payrollRecords,   setPayrollRecords]   = useState(_saved ? (_saved.payrollRecords||[])    : []);
-  const [quickRates,       setQuickRates]       = useState(_saved ? (_saved.quickRates||[])        : INITIAL_QUICK_RATES);
+  const [quickRates,       setQuickRates]       = useState(_saved ? withItemCat(_saved.quickRates||[]) : INITIAL_QUICK_RATES);
   const [proposedProjects, setProposedProjects] = useState(_saved ? (_saved.proposedProjects||[])  : []);
   const [creditNotes,      setCreditNotes]      = useState(_saved ? (_saved.creditNotes||[])         : []);
   // Login accounts — Admin-editable via the "User Roles" page (see
@@ -27525,7 +27538,7 @@ function App() {
       relationalAuthoritativeSectionsRef.current = dbData._relationalAuthoritativeSections;
     }
     if (Array.isArray(dbData.jobs))             setJobs(dbData.jobs);
-    if (Array.isArray(dbData.inventory))        setInventory(dbData.inventory);
+    if (Array.isArray(dbData.inventory))        setInventory(withItemCat(dbData.inventory));
     if (Array.isArray(dbData.quotes))           setQuotes(dbData.quotes);
     if (Array.isArray(dbData.customers))        setCustomers(dbData.customers);
     if (Array.isArray(dbData.suppliers))        setSuppliers(dbData.suppliers);
@@ -27542,7 +27555,7 @@ function App() {
     if (Array.isArray(dbData.accBills))         setAccBills(dbData.accBills);
     if (Array.isArray(dbData.completeProducts)) setCompleteProducts(dbData.completeProducts);
     if (Array.isArray(dbData.payrollRecords))   setPayrollRecords(dbData.payrollRecords);
-    if (Array.isArray(dbData.quickRates))       setQuickRates(dbData.quickRates);
+    if (Array.isArray(dbData.quickRates))       setQuickRates(withItemCat(dbData.quickRates));
     if (Array.isArray(dbData.proposedProjects)) setProposedProjects(dbData.proposedProjects);
     if (Array.isArray(dbData.creditNotes))      setCreditNotes(dbData.creditNotes);
     if (Array.isArray(dbData.userAccounts) && dbData.userAccounts.length) setUserAccounts(dbData.userAccounts);
