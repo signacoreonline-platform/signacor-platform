@@ -21,6 +21,11 @@ import fullBackupRoutes from './routes/fullBackup';
 // RELIABILITY PHASE 1 (2026-08-26): metadata-only change detection for
 // relational sections — see backend/src/routes/freshness.ts.
 import freshnessRoutes from './routes/freshness';
+// 2026-10-07: versioned server-to-server integration API (first client: Sally,
+// the AI Sales Assistant). Separate machine identities with hashed, revocable
+// secrets and scopes — see backend/src/integration/README.md. Fail-closed:
+// every route answers 503 until INTEGRATION_API_ENABLED=true is set.
+import integrationRoutes from './integration/router';
 import { errorHandler, notFound } from './middleware/errorHandler';
 import { ALL_SECTIONS, isSectionCutOver } from './relational/cutover';
 
@@ -75,6 +80,8 @@ app.get('/health', async (_req: Request, res: Response) => {
     // platformState.ts's merge/conflict logic changes, so a deploy can be
     // confirmed live (GET /health) before users are told to resume work.
     platformStateSafetyVersion: '2026-08-20-id-map-stale-safe-v1',
+    // Non-sensitive boolean only (no client names, no scopes).
+    integrationApiEnabled: process.env.INTEGRATION_API_ENABLED === 'true',
     relational: {
       masterSwitchEnabled: relationalAuthorityMasterSwitch,
       cutOverSections: relationalSections,
@@ -99,6 +106,7 @@ app.use('/api/quote-conversions', quoteConversionsRoutes);
 app.use('/api/relational', relationalApiRoutes);
 app.use('/api/full-backup', fullBackupRoutes);
 app.use('/api/freshness', freshnessRoutes);
+app.use('/api/v1/integration', integrationRoutes);
 
 // ── Error handling ────────────────────────────────────────────
 app.use(notFound);
