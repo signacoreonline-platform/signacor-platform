@@ -14,8 +14,12 @@
  *     declined or converted through this API;
  *   - totals and VAT are calculated by relational/services.ts (createQuote /
  *     updateQuoteWithJobSync, used as-is) and read back from the database;
+ *   - customers (customer:create / customer:update only): allow-listed contact
+ *     and billing fields, a deterministic duplicate check that never merges,
+ *     optimistic concurrency on update, written to the customers authority
+ *     (platform_state) with a backup first; never notes, ids or deletes;
  *   - every mutation needs an Idempotency-Key, so a retry can never create a
- *     second quote.
+ *     second quote or a second customer.
  */
 import { Router, Response, NextFunction } from 'express';
 import { query } from '../db/pool';
@@ -222,7 +226,10 @@ router.get('/status', op('status', async (req, res) => {
     sections,
     capabilities: {
       quoteDrafts: sections.quotes === 'relational' && ctx.scopes.includes('quote:create'),
-      customerWrites: false,
+      customerCreate: sections.customers === 'platform_state' && ctx.scopes.includes('customer:create'),
+      customerUpdate: sections.customers === 'platform_state' && ctx.scopes.includes('customer:update'),
+      customerWrites: sections.customers === 'platform_state' && (ctx.scopes.includes('customer:create') || ctx.scopes.includes('customer:update')),
+      customerDeletes: false,
       priceOverrides: false,
       quoteStatusChanges: false,
       jobConversion: false,
@@ -249,6 +256,131 @@ router.get('/customers/:id', requireScope('customer:read'), op('customer.get', a
   const c = items.find((x: any) => x && String(x.id) === id);
   if (!c) throw new IntegrationError(404, 'NOT_FOUND', 'Customer not found in Signacore.');
   res.json({ customer: data.customerDetail(c), dataSource: source, asOf: new Date().toISOString() });
+}));
+
+// ── CUSTOMER WRITES (narrow: create + allow-listed field update) ───────────
+// No delete, merge, re-id, notes or status. Duplicates are never merged: a
+// possible duplicate is refused with the candidates, and only an explicit
+// acknowledgement of EACH candidate (allowDuplicateOf + X-Confirmed-By) lets a
+// separate record be created — exactly the decision the dashboard asks a person
+// to make in AddEditCustomerModal.
+const CUSTOMER_WRITE_FIELDS = ['companyName', 'contactPerson', 'email', 'phone', 'address', 'vatNumber'];
+const CUSTOMER_FORBIDDEN = ['id', 'notes', 'tel', 'customerId', 'companyCode', 'status', 'deleted', 'mergeInto'];
+const EMAIL_RE = /^[^\s@<>()",;]+@[^\s@<>()",;]+\.[^\s@<>()",;]{2,}$/;
+const PHONE_RE = /^[0-9+()\-./\s]{3,50}$/;
+const VAT_RE = /^[A-Za-z0-9 ./-]{1,30}$/;
+const CUSTOMER_ID_RE = /^[A-Za-z0-9._-]{1,40}$/;
+
+function assertCustomerKeys(body: Record<string, unknown>, allowed: string[], where: string): void {
+  const forbidden = Object.keys(body).filter((k) => CUSTOMER_FORBIDDEN.includes(k));
+  if (forbidden.length) {
+    throw new IntegrationError(403, 'FIELD_NOT_PERMITTED',
+      `${where} may not set ${forbidden.join(', ')} — customer ids, internal notes and status are controlled by Signacore.`, { fields: forbidden });
+  }
+  assertOnlyKeys(body, allowed, where);
+}
+
+function parseCustomerFields(body: Record<string, unknown>, { requireName }: { requireName: boolean }): data.CustomerFieldsIn {
+  const out: data.CustomerFieldsIn = {};
+  const companyName = optText(body.companyName, 'companyName', 200);
+  if (companyName === null || (requireName && !companyName)) throw bad('"companyName" (the company / trading name) is required and cannot be empty.');
+  if (companyName !== undefined) out.companyName = companyName;
+  const contactPerson = optText(body.contactPerson, 'contactPerson', 120);
+  if (contactPerson !== undefined) out.contactPerson = contactPerson;
+  const email = optText(body.email, 'email', 254);
+  if (email && !EMAIL_RE.test(email)) throw bad('"email" is not a valid email address.');
+  if (email !== undefined) out.email = email;
+  const phone = optText(body.phone, 'phone', 50);
+  if (phone && !PHONE_RE.test(phone)) throw bad('"phone" may only contain digits, spaces and + ( ) - . /');
+  if (phone !== undefined) out.phone = phone;
+  const address = optText(body.address, 'address', 1000);
+  if (address !== undefined) out.address = address;
+  const vatNumber = optText(body.vatNumber, 'vatNumber', 30);
+  if (vatNumber && !VAT_RE.test(vatNumber)) throw bad('"vatNumber" may only contain letters, digits, spaces and . / -');
+  if (vatNumber !== undefined) out.vatNumber = vatNumber;
+  return out;
+}
+
+function parseAllowDuplicateOf(req: IntegrationRequest, raw: unknown): string[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.length > 10 || raw.some((x) => typeof x !== 'string' || !CUSTOMER_ID_RE.test(x))) {
+    throw bad('"allowDuplicateOf" must be a list of up to 10 Signacore customer ids.');
+  }
+  if (raw.length && !req.integration!.confirmedBy) {
+    throw new IntegrationError(428, 'CONFIRMATION_REQUIRED', 'Saving a customer that matches an existing one needs an explicit confirmation (X-Confirmed-By).');
+  }
+  return raw as string[];
+}
+
+function possibleDuplicate(candidates: unknown[]): IntegrationError {
+  return new IntegrationError(409, 'POSSIBLE_DUPLICATE',
+    'This looks like a customer that already exists in Signacore. Choose the existing customer, or confirm that a separate customer is intended.',
+    { candidates });
+}
+
+router.post('/customers', requireScope('customer:create'), op('customer.create', async (req, res) => {
+  const ctx = req.integration!;
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body as Record<string, unknown> : {};
+  assertCustomerKeys(body, ['externalRef', ...CUSTOMER_WRITE_FIELDS, 'allowDuplicateOf'], 'A customer');
+  if (body.externalRef !== undefined && (typeof body.externalRef !== 'string' || !EXTERNAL_REF_RE.test(body.externalRef))) {
+    throw bad('"externalRef" must be a short reference such as a Sally enquiry or customer number.');
+  }
+  const fields = parseCustomerFields(body, { requireName: true });
+  const allowDuplicateOf = parseAllowDuplicateOf(req, body.allowDuplicateOf);
+  await data.requireCustomersWritable();
+  const key = requireIdempotencyKey(req);
+  const externalRef = (body.externalRef as string | undefined) ?? null;
+
+  const recover = async () => {
+    // The ownership row is written in the SAME transaction as the customer, so
+    // finding it proves this exact request created this exact customer.
+    const id = await data.findCustomerCreatedByKey(ctx.clientId, key);
+    if (!id) return null;
+    const { items, source } = await data.loadSection('customers');
+    const c = items.find((x: any) => x && String(x.id) === id);
+    if (!c) return null;
+    res.locals.targetType = 'customer'; res.locals.targetId = id;
+    return { status: 201, body: { customer: data.customerDetail(c), created: true, dataSource: source } };
+  };
+
+  await idempotent(req, res, 'customer.create', 'customers', recover, async () => {
+    const result = await data.createCustomerJson(ctx.clientId, key, externalRef, fields, { allowDuplicateOf });
+    if ('duplicates' in result) throw possibleDuplicate(result.duplicates); // nothing was written
+    // ── COMMITTED (customer + ownership record in one transaction). ──
+    res.locals.targetType = 'customer'; res.locals.targetId = result.customer.id;
+    return { status: 201, body: { customer: data.customerDetail(result.customer), created: true, dataSource: 'platform_state' }, committed: true };
+  });
+}));
+
+router.patch('/customers/:id', requireScope('customer:update'), op('customer.update', async (req, res) => {
+  const ctx = req.integration!;
+  const id = String(req.params.id);
+  if (!CUSTOMER_ID_RE.test(id)) throw bad('Invalid customer id.');
+  res.locals.targetType = 'customer'; res.locals.targetId = id;
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body as Record<string, unknown> : {};
+  assertCustomerKeys(body, ['expectedVersion', ...CUSTOMER_WRITE_FIELDS, 'allowDuplicateOf'], 'A customer update');
+  if (typeof body.expectedVersion !== 'string' || !/^[a-f0-9]{32}$/.test(body.expectedVersion)) {
+    throw bad('"expectedVersion" (the customer "version" from the last read) is required.');
+  }
+  const expectedVersion = body.expectedVersion;
+  const patch = parseCustomerFields(body, { requireName: false });
+  if (!Object.keys(patch).length) throw bad('Nothing to update.');
+  const allowDuplicateOf = parseAllowDuplicateOf(req, body.allowDuplicateOf);
+  await data.requireCustomersWritable();
+
+  const recover = async () => {
+    // A stuck update is proven applied only if the record now holds exactly the requested values.
+    const { items, source } = await data.loadSection('customers');
+    const matches = items.filter((x: any) => x && String(x.id) === id);
+    if (matches.length !== 1 || !data.customerMatchesPatch(matches[0], patch)) return null;
+    return { status: 200, body: { customer: data.customerDetail(matches[0]), dataSource: source } };
+  };
+
+  await idempotent(req, res, 'customer.update', `customers/${id}`, recover, async () => {
+    const result = await data.updateCustomerJson(ctx.clientId, id, expectedVersion, patch, { allowDuplicateOf });
+    if ('duplicates' in result) throw possibleDuplicate(result.duplicates); // nothing was written
+    return { status: 200, body: { customer: data.customerDetail(result.customer), dataSource: 'platform_state' }, committed: true };
+  });
 }));
 
 // ── PRODUCTS / INVENTORY / PRICING ─────────────────────────────────────────

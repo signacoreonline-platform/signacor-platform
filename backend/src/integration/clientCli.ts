@@ -5,19 +5,30 @@
  *   node dist/integration/clientCli.js rotate --client-id sally
  *   node dist/integration/clientCli.js revoke --client-id sally
  *   node dist/integration/clientCli.js set-scopes --client-id sally --scopes customer:read,product:read
+ *   node dist/integration/clientCli.js add-scopes --client-id sally --scopes customer:create,customer:update
  *   node dist/integration/clientCli.js list
  *
  * `create` and `rotate` print the secret ONCE. Only its SHA-256 hash is
- * stored; if it is lost, rotate. Default scopes = the full Sally set in
- * scopes.ts (which is already the Sales-Assistant subset).
+ * stored; if it is lost, rotate. Default scopes (no --scopes) = DEFAULT_SCOPES
+ * in scopes.ts: the read + draft-quote set. Customer writes (customer:create,
+ * customer:update) are never granted by default — a person must name them.
  */
 import pool from '../db/pool';
-import { KNOWN_SCOPES, isKnownScope } from './scopes';
+import { KNOWN_SCOPES, DEFAULT_SCOPES, MASTER_DATA_WRITE_SCOPES, isKnownScope } from './scopes';
 import { generateSecret, hashSecret } from './keys';
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
   return i > -1 ? process.argv[i + 1] : undefined;
+}
+
+function parseScopes(raw: string | undefined): string[] {
+  return (raw || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+function reportMasterDataScopes(scopes: string[]): void {
+  const writes = scopes.filter((s) => (MASTER_DATA_WRITE_SCOPES as readonly string[]).includes(s));
+  if (writes.length) console.log(`  NOTE: this client can now CHANGE Signacore customer master data (${writes.join(', ')}).`);
 }
 
 async function main(): Promise<void> {
@@ -37,7 +48,8 @@ async function main(): Promise<void> {
     if (!company) throw new Error('--company-code is required (the Signacore company whose quotes this client may create/read).');
     const co = await pool.query('SELECT 1 FROM rel_companies WHERE code = $1', [company]);
     if (!co.rowCount) throw new Error(`Company code "${company}" does not exist in rel_companies.`);
-    const scopes = (arg('scopes') || KNOWN_SCOPES.join(',')).split(',').map((s) => s.trim()).filter(Boolean);
+    const named = parseScopes(arg('scopes'));
+    const scopes = named.length ? named : [...DEFAULT_SCOPES];
     const unknown = scopes.filter((s) => !isKnownScope(s));
     if (unknown.length) throw new Error(`Unknown scopes: ${unknown.join(', ')}. Allowed: ${KNOWN_SCOPES.join(', ')}`);
     const secret = generateSecret();
@@ -46,6 +58,7 @@ async function main(): Promise<void> {
       [clientId, name, hashSecret(secret), scopes, company, by]
     );
     printSecret(clientId, secret, scopes);
+    reportMasterDataScopes(scopes);
     return;
   }
   if (cmd === 'rotate') {
@@ -64,14 +77,29 @@ async function main(): Promise<void> {
     return;
   }
   if (cmd === 'set-scopes') {
-    const scopes = (arg('scopes') || '').split(',').map((s) => s.trim()).filter(Boolean);
+    const scopes = parseScopes(arg('scopes'));
     const unknown = scopes.filter((s) => !isKnownScope(s));
     if (unknown.length) throw new Error(`Unknown scopes: ${unknown.join(', ')}`);
     const r = await pool.query(`UPDATE integration_clients SET scopes = $2 WHERE client_id = $1`, [clientId, scopes]);
     console.log(r.rowCount ? `Scopes for ${clientId}: ${scopes.join(', ') || '(none)'}` : 'No such client.');
+    if (r.rowCount) reportMasterDataScopes(scopes);
     return;
   }
-  throw new Error('Usage: create | rotate | revoke | set-scopes | list');
+  if (cmd === 'add-scopes') {
+    // Adds the named scopes to whatever the client already has (nothing else changes; the secret is untouched).
+    const add = parseScopes(arg('scopes'));
+    if (!add.length) throw new Error('--scopes is required.');
+    const unknown = add.filter((s) => !isKnownScope(s));
+    if (unknown.length) throw new Error(`Unknown scopes: ${unknown.join(', ')}. Allowed: ${KNOWN_SCOPES.join(', ')}`);
+    const cur = await pool.query(`SELECT scopes FROM integration_clients WHERE client_id = $1`, [clientId]);
+    if (!cur.rowCount) throw new Error('No such client.');
+    const scopes = [...new Set([...(cur.rows[0].scopes as string[] || []), ...add])];
+    await pool.query(`UPDATE integration_clients SET scopes = $2 WHERE client_id = $1`, [clientId, scopes]);
+    console.log(`Scopes for ${clientId}: ${scopes.join(', ')}`);
+    reportMasterDataScopes(add);
+    return;
+  }
+  throw new Error('Usage: create | rotate | revoke | set-scopes | add-scopes | list');
 }
 
 function printSecret(clientId: string, secret: string, scopes: string[]): void {

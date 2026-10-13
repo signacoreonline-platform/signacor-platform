@@ -5,7 +5,8 @@ separate from dashboard users. The first client is **Sally**, Signacore's AI Sal
 
 * Off by default. Every route answers `503 INTEGRATION_DISABLED` until `INTEGRATION_API_ENABLED=true`.
 * Separate from the dashboard's JWT login. An integration secret is accepted only here, and a JWT is never accepted here.
-* No route deletes, sends, approves, declines or converts anything. None changes prices, discounts or setup fees, and none touches invoices, payments, purchasing, customers (writes), HR or users.
+* No route deletes, sends, approves, declines or converts anything. None changes prices, discounts or setup fees, and none touches invoices, payments, purchasing, HR or users.
+* The only master-data writes are **customer create** and **customer update** (allow-listed fields), and only for a client that was explicitly granted `customer:create` / `customer:update`.
 
 ## Authentication
 
@@ -32,8 +33,22 @@ company code `2`. The CLI itself takes any company code, for future clients.
 node dist/integration/clientCli.js create --client-id sally --name "Sally AI Sales Assistant" --company-code 2
 node dist/integration/clientCli.js rotate --client-id sally
 node dist/integration/clientCli.js revoke --client-id sally
+node dist/integration/clientCli.js set-scopes --client-id sally --scopes customer:read,product:read
+node dist/integration/clientCli.js add-scopes --client-id sally --scopes customer:create,customer:update
 node dist/integration/clientCli.js list
 ```
+
+`create` without `--scopes` grants `DEFAULT_SCOPES` (the read + draft-quote set). **Customer writes are never
+granted by default**: an existing client (e.g. Sally) only gets them when a person runs, on the server shell
+(`npm run integration:client -- …` is the same command through npm):
+
+```
+node dist/integration/clientCli.js add-scopes --client-id sally --scopes customer:create,customer:update
+node dist/integration/clientCli.js list
+```
+
+Rotation is not needed for a scope change — the secret is untouched. To withdraw them again, run `set-scopes`
+with the list you want to keep (e.g. `customer:read,product:read,inventory:read,pricing:read,quote:read,quote:create,quote:update`).
 
 ## Scopes
 
@@ -41,7 +56,9 @@ The full list is in `scopes.ts`. A stored scope that the code doesn't know grant
 
 | Scope | Allows |
 |---|---|
-| `customer:read` | Customer search and detail (no internal notes) |
+| `customer:read` | Customer search and detail (no internal notes). Detail includes a `version` token |
+| `customer:create` | Create a customer: allow-listed fields, duplicate check, idempotent. **Opt-in only** |
+| `customer:update` | Change allow-listed fields of a customer with `expectedVersion`. **Opt-in only** |
 | `product:read` | Inventory item and quick-rate search and detail |
 | `inventory:read` | Stock on hand, reorder level, stock status |
 | `pricing:read` | Selling price ex VAT (**never cost or margin**) |
@@ -63,13 +80,19 @@ The API uses the platform's existing double gate (`RELATIONAL_AUTHORITY_ENABLED=
 Quote writes require `quotes` to be relational. They go through `relational/services.ts`
 (`createQuote`, `updateQuoteWithJobSync`), used unchanged.
 
+Customer writes require `customers` to be **platform_state** (JSON) authoritative — which it always is today:
+`customers` is hard-blocked from relational cutover. If that ever changes, the API refuses customer writes
+(`409 SECTION_NOT_WRITABLE`) instead of writing the frozen JSON copy.
+
 ## Endpoints
 
 | Method | Path | Scope | Notes |
 |---|---|---|---|
 | GET | `/status` | any | Client, scopes, per-section authority, capabilities |
 | GET | `/customers?q=` | customer:read | 2–100 chars. Matches name, contact, email, phone digits, VAT no. and id; ranked; max 25 |
-| GET | `/customers/:id` | customer:read | Adds billing address |
+| GET | `/customers/:id` | customer:read | Adds billing address and `version` |
+| POST | `/customers` | customer:create | See below |
+| PATCH | `/customers/:id` | customer:update | `{expectedVersion, companyName?, contactPerson?, email?, phone?, address?, vatNumber?, allowDuplicateOf?}` |
 | GET | `/products?q=&category=&source=` | product:read | `ref` is `inv:<id>` or `qr:<id>`. Adds `pricing` with pricing:read and `stock` with inventory:read |
 | GET | `/products/:ref` | product:read | |
 | GET | `/inventory/:ref` | inventory:read | `in_stock` / `low` / `out_of_stock` / `not_tracked`. Reserved and available-to-promise are `null` (not modelled) |
@@ -130,6 +153,46 @@ request is recovered, a retry can create the quote again. A request with a **dif
 for the same `externalRef` is stopped by the duplicate guard above. That guard only sees quotes
 whose ownership was recorded.
 
+### `POST /customers` and `PATCH /customers/:id`
+
+```json
+{
+  "externalRef": "SAL-C-0012",
+  "companyName": "Protea Bakery", "contactPerson": "Anelda", "email": "anelda@protea.co.za",
+  "phone": "021 555 0199", "address": "9 Main Road, Paarl", "vatNumber": "4999999999",
+  "allowDuplicateOf": []
+}
+```
+
+These are exactly the fields of the dashboard's customer form (`AddEditCustomerModal`): Company / Trading
+Name (required), Contact Person, VAT Number, Email Address, Telephone (`tel` in storage, `phone` here) and
+Address. There is no account number, status, separate billing address or payment terms in the live model.
+
+* **Storage.** The record is written to `platform_state.data.customers` in the dashboard's own shape
+  (`id: Date.now()`, blanks as `""`, `notes: ""`). The `platform_state` row is locked, the previous state is
+  copied to `platform_state_backups` first (a failed backup aborts the write), only the `customers` array is
+  replaced and `updated_at` is bumped (so a dashboard tab with a stale copy gets its normal 409).
+* **Never written:** `notes` (internal), `id`, status or any company field → `403 FIELD_NOT_PERMITTED`.
+  Unknown fields → `400`. No delete, merge or re-id route exists.
+
+**Validating live:** because there is no customer delete (here or in the dashboard UI), a customer created
+during validation stays. Use one deliberately named internal customer that may remain (for example
+"SIGNACORE INTERNAL TEST - SALLY") and reuse it, or validate `PATCH` only against an existing designated
+internal/test customer. There is no `customer:delete` scope.
+* **Duplicates are never merged.** A customer sharing an exact normalised company name, email, VAT number
+  or phone (last 9 digits) with an existing one is refused with `409 POSSIBLE_DUPLICATE` and
+  `details.candidates` (each with `matchedOn`). The caller asks a person to pick the existing customer, or
+  repeats the request with **every** candidate id in `allowDuplicateOf` plus `X-Confirmed-By`.
+* **Concurrency (update).** `expectedVersion` is the `version` from the last read (a hash of the id and the
+  allow-listed fields). If it differs → `409 STALE_VERSION`. A customer id shared by two historical records
+  is never edited (`409 AMBIGUOUS_CUSTOMER_ID`).
+* **Idempotency.** As for quotes. A create's ownership row in `integration_records` (record_type
+  `customer`, with the Idempotency-Key) is written in the **same transaction** as the customer, so a request
+  stuck in progress is recovered exactly from it. A stuck update is treated as applied only if the record
+  already holds exactly the requested values.
+* **Company boundary.** Signacore customers are shared by all companies (the record has no company field);
+  quotes, which are company-scoped, are unaffected by customer writes.
+
 ## Errors
 
 `{ "error": { "code": "…", "message": "…", "details": { … } } }`
@@ -141,7 +204,7 @@ whose ownership was recorded.
 | `NOT_FOUND` | 404 |
 | `VALIDATION_ERROR` | 400 |
 | `UNKNOWN_PRODUCT`, `UNKNOWN_CUSTOMER`, `PRICE_NOT_SET`, `PRODUCT_INACTIVE`, `BUSINESS_RULE`, `IDEMPOTENCY_KEY_REUSED` | 422 |
-| `DUPLICATE_QUOTE`, `STALE_VERSION`, `QUOTE_NOT_EDITABLE`, `SECTION_NOT_RELATIONAL`, `IDEMPOTENCY_IN_PROGRESS` | 409 |
+| `DUPLICATE_QUOTE`, `STALE_VERSION`, `QUOTE_NOT_EDITABLE`, `SECTION_NOT_RELATIONAL`, `IDEMPOTENCY_IN_PROGRESS`, `POSSIBLE_DUPLICATE`, `AMBIGUOUS_CUSTOMER_ID`, `SECTION_NOT_WRITABLE` | 409 |
 | `IDEMPOTENCY_KEY_REQUIRED`, `CONFIRMATION_REQUIRED` | 428 |
 | `RATE_LIMITED` | 429 |
 | `INTEGRATION_DISABLED`, `SECTION_UNAVAILABLE`, `SECTION_AUTHORITY_MISMATCH`, `UNAVAILABLE` | 503 |
@@ -160,7 +223,7 @@ idempotency key. It never records bodies or secrets. The quotes themselves show
 
 ## Tests
 
-`npm run test:integration-api` needs `DATABASE_URL` set to a migrated `*_test` database. It refuses
-any other database. The suite has the original 95 checks, plus regression checks for the
+`npm run test:integration-api` and `npm run test:integration-customers` need `DATABASE_URL` set to a
+migrated `*_test` database (including migration 017). They refuse any other database. The suite has the original 95 checks, plus regression checks for the
 idempotency acquisition race, `editableByClient` on quotes with a proforma, ownership recovery
 after a failed ownership record, and mixed-case credential query keys.

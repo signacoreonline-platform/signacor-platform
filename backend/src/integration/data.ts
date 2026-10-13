@@ -11,10 +11,15 @@
  * fails, this API REFUSES instead of falling back to the frozen JSON copy —
  * an assistant quoting from stale stock or prices is worse than no answer.
  *
- * Writes: only quotes, only through relational/services.ts (createQuote /
- * updateQuote, used as-is), and only when 'quotes' is cut over.
+ * Writes:
+ *  - quotes: only through relational/services.ts (createQuote / updateQuote,
+ *    used as-is), and only when 'quotes' is cut over;
+ *  - customers: only create + allow-listed field update of platform_state
+ *    customers (the customers authority), and only while 'customers' is NOT
+ *    cut over — see "Customer writes" below.
  */
-import { query } from '../db/pool';
+import crypto from 'crypto';
+import pool, { query } from '../db/pool';
 import { isSectionCutOver, CutoverSection } from '../relational/cutover';
 import { getAuthoritativeJson, SECTION_JSON_KEY, restoreId } from '../relational/read';
 import { IntegrationError } from './errors';
@@ -71,7 +76,24 @@ export function customerSummary(c: any) {
   };
 }
 export function customerDetail(c: any) {
-  return { ...customerSummary(c), address: str(c.address) };
+  return { ...customerSummary(c), address: str(c.address), version: customerVersion(c) };
+}
+
+/**
+ * Optimistic-concurrency token for a JSON customer record (platform_state has
+ * no row_version). It is the SHA-256 of the record's id and its allow-listed
+ * contact/billing fields — exactly the fields an integration client can see
+ * and change — so a dashboard edit to any of them makes a stale update fail,
+ * while an edit to the internal `notes` field (never visible to, never written
+ * by, the integration) does not block Sally.
+ */
+export function customerVersion(c: any): string {
+  const view = {
+    id: String(c?.id ?? ''),
+    companyName: str(c?.companyName), contactPerson: str(c?.contactPerson), email: str(c?.email),
+    tel: str(c?.tel ?? c?.phone), address: str(c?.address), vatNumber: str(c?.vatNumber),
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(view)).digest('hex').slice(0, 32);
 }
 
 const digits = (s: unknown) => String(s ?? '').replace(/\D+/g, '');
@@ -97,6 +119,248 @@ export function searchCustomers(items: any[], q: string, limit: number) {
   }
   scored.sort((a, b) => b.score - a.score || String(a.c.companyName || '').localeCompare(String(b.c.companyName || '')));
   return scored.slice(0, limit).map((s) => ({ ...customerSummary(s.c), matchScore: s.score }));
+}
+
+// ── Customer writes (customer:create / customer:update) ────────────────────
+// Customers are platform_state-authoritative (they are one of the sections
+// permanently hard-blocked from relational cutover — see index.html's
+// CustomersPage.handleSave and relational/cutoverCli.ts). Integration writes
+// therefore go to the SAME storage the dashboard uses: platform_state.data
+// .customers, with the same record shape the dashboard's AddEditCustomerModal
+// produces ({ id: Date.now(), companyName, contactPerson, vatNumber, address,
+// email, tel, notes }) and the same safety rules as PUT /api/platform-state:
+//   - the single platform_state row is locked (SELECT … FOR UPDATE);
+//   - the full previous state is copied to platform_state_backups FIRST (a
+//     failed backup aborts the write);
+//   - ONLY the `customers` array is replaced (jsonb_set) — no other section is
+//     rewritten, so a concurrent dashboard save of another section is safe;
+//   - updated_at is bumped, so a dashboard tab holding a stale copy of the
+//     customer gets the dashboard's normal "changed elsewhere" 409;
+//   - no new duplicate id can be created, and a customer id that already has
+//     duplicate copies (historical collisions) is never edited.
+// Nothing here deletes, merges or re-ids a customer, and `notes` (internal) is
+// never read back to the client or written.
+
+/** Fields an integration client may set on a customer, in the dashboard's own names. */
+export interface CustomerFieldsIn {
+  companyName?: string;
+  contactPerson?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  address?: string | null;
+  vatNumber?: string | null;
+}
+
+const normName = (s: unknown) => String(s ?? '').trim().toLowerCase().replace(/[\s.,'"()-]+/g, ' ').replace(/\s+/g, ' ').trim();
+const normEmail = (s: unknown) => String(s ?? '').trim().toLowerCase();
+const normVat = (s: unknown) => String(s ?? '').replace(/[\s./-]+/g, '').toLowerCase();
+/** Last 9 digits, so "+27 82 555 0101" and "082 555 0101" compare equal. */
+const normPhone = (s: unknown) => { const d = digits(s); return d.length >= 7 ? d.slice(-9) : ''; };
+
+export type DuplicateSignal = 'company_name' | 'email' | 'vat_number' | 'phone';
+
+/**
+ * Deterministic duplicate detection on the authoritative customer list. A
+ * candidate is any existing customer sharing at least one exact, normalised
+ * signal (company name, email, VAT number, phone). Never merges — the caller
+ * decides. Mirrors (and tightens) the dashboard's own "matching name / email /
+ * VAT / phone" warning in AddEditCustomerModal.
+ */
+export function duplicateCandidates(items: any[], input: CustomerFieldsIn, excludeId?: string) {
+  const name = normName(input.companyName);
+  const email = normEmail(input.email);
+  const vat = normVat(input.vatNumber);
+  const phone = normPhone(input.phone);
+  const out: Array<ReturnType<typeof customerSummary> & { matchedOn: DuplicateSignal[] }> = [];
+  for (const c of items) {
+    if (!c || c.id === undefined || c.id === null) continue;
+    if (excludeId !== undefined && String(c.id) === excludeId) continue;
+    const matchedOn: DuplicateSignal[] = [];
+    if (name && normName(c.companyName) === name) matchedOn.push('company_name');
+    if (email && normEmail(c.email) === email) matchedOn.push('email');
+    if (vat.length >= 4 && normVat(c.vatNumber) === vat) matchedOn.push('vat_number');
+    if (phone && normPhone(c.tel ?? c.phone) === phone) matchedOn.push('phone');
+    if (matchedOn.length) out.push({ ...customerSummary(c), matchedOn });
+  }
+  out.sort((a, b) => b.matchedOn.length - a.matchedOn.length || String(a.companyName || '').localeCompare(String(b.companyName || '')));
+  return out.slice(0, 10);
+}
+
+function arrayCounts(data: Record<string, any>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const [k, v] of Object.entries(data || {})) if (Array.isArray(v)) counts[k] = v.length;
+  return counts;
+}
+
+export type CustomerWriteResult = { customer: any } | { duplicates: ReturnType<typeof duplicateCandidates> };
+
+type LockedCustomers = { customers: any[]; client: import('pg').PoolClient };
+
+/**
+ * Runs `fn` with the platform_state row locked. If `fn` returns `next`, the
+ * previous state is backed up and ONLY data.customers is replaced with `next`,
+ * then `afterWrite` runs in the same transaction (e.g. the ownership record).
+ * Any throw rolls everything back — nothing is half-written.
+ */
+async function withCustomersLocked<T>(
+  clientId: string, reason: string,
+  fn: (ctx: LockedCustomers) => Promise<{ next: any[] | null; result: T; afterWrite?: (c: import('pg').PoolClient) => Promise<void> }>
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await client.query('SELECT data FROM platform_state WHERE id = 1 FOR UPDATE');
+    if (!r.rowCount) throw new IntegrationError(503, 'SECTION_UNAVAILABLE', 'Signacore customer data is temporarily unavailable.');
+    const data: Record<string, any> = r.rows[0].data || {};
+    const customers = Array.isArray(data.customers) ? data.customers : [];
+    const out = await fn({ customers, client });
+    if (out.next) {
+      const serialized = JSON.stringify(data);
+      await client.query(
+        `INSERT INTO platform_state_backups (data, reason, data_size_bytes, record_counts, source)
+         VALUES ($1::jsonb, $2, $3, $4::jsonb, $5)`,
+        [serialized, reason, Buffer.byteLength(serialized, 'utf8'), JSON.stringify(arrayCounts(data)), `integration:${clientId}`]
+      );
+      await client.query(
+        `DELETE FROM platform_state_backups WHERE id IN (SELECT id FROM platform_state_backups ORDER BY created_at DESC OFFSET 100)`
+      ).catch(() => undefined);
+      await client.query(
+        `UPDATE platform_state SET data = jsonb_set(data, '{customers}', $1::jsonb, true), updated_at = NOW() WHERE id = 1`,
+        [JSON.stringify(out.next)]
+      );
+      if (out.afterWrite) await out.afterWrite(client);
+    }
+    await client.query('COMMIT');
+    return out.result;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/** Refuses customer writes unless customers are (still) platform_state-authoritative. */
+export async function requireCustomersWritable(): Promise<void> {
+  const a = await sectionAuthority('customers');
+  if (a !== 'platform_state') {
+    throw new IntegrationError(409, 'SECTION_NOT_WRITABLE',
+      'Customers are not writable through the integration API on this server (customer data is not in its JSON authority state).');
+  }
+}
+
+function newCustomerId(existing: any[]): number {
+  const taken = new Set(existing.map((c) => String(c?.id)));
+  let id = Date.now();
+  while (taken.has(String(id))) id += 1;
+  return id;
+}
+
+/** Same blank-as-'' shape the dashboard's AddEditCustomerModal saves. */
+function textOrBlank(v: string | null | undefined): string {
+  return v === null || v === undefined ? '' : String(v);
+}
+
+export async function findCustomerCreatedByKey(clientId: string, key: string): Promise<string | null> {
+  const r = await query(
+    `SELECT record_id FROM integration_records WHERE client_id = $1 AND record_type = 'customer' AND idempotency_key = $2 LIMIT 1`,
+    [clientId, key]
+  );
+  return r.rows[0] ? String(r.rows[0].record_id) : null;
+}
+
+/**
+ * Creates one customer. The duplicate check is repeated INSIDE the lock, so two
+ * concurrent creates of the same company cannot both pass it. The ownership
+ * record (with the idempotency key) is written in the SAME transaction as the
+ * customer, so a stale in-progress request can always be recovered exactly.
+ */
+export async function createCustomerJson(
+  clientId: string, key: string, externalRef: string | null, input: CustomerFieldsIn, opts: { allowDuplicateOf: string[] }
+): Promise<CustomerWriteResult> {
+  return withCustomersLocked<CustomerWriteResult>(clientId, 'before-integration-customer-create', async ({ customers }) => {
+    const dupes = duplicateCandidates(customers, input);
+    const unacknowledged = dupes.filter((d) => !opts.allowDuplicateOf.includes(d.id));
+    if (unacknowledged.length) return { next: null, result: { duplicates: dupes } };
+    const record = {
+      id: newCustomerId(customers),
+      companyName: String(input.companyName || '').trim(),
+      contactPerson: textOrBlank(input.contactPerson),
+      vatNumber: textOrBlank(input.vatNumber),
+      address: textOrBlank(input.address),
+      email: textOrBlank(input.email),
+      tel: textOrBlank(input.phone),
+      notes: '',
+    };
+    return {
+      next: [record, ...customers], // the dashboard also prepends new customers
+      result: { customer: record },
+      afterWrite: async (c) => {
+        await c.query(
+          `INSERT INTO integration_records (client_id, record_type, record_id, external_ref, idempotency_key)
+           VALUES ($1, 'customer', $2, $3, $4) ON CONFLICT (client_id, record_type, record_id) DO NOTHING`,
+          [clientId, record.id, externalRef, key]
+        );
+      },
+    };
+  });
+}
+
+/**
+ * Updates the allow-listed fields of one customer, only if its current version
+ * still equals `expectedVersion`. Every other property of the record (notes,
+ * id, anything the dashboard added) is preserved exactly.
+ */
+export async function updateCustomerJson(
+  clientId: string, id: string, expectedVersion: string, patch: CustomerFieldsIn, opts: { allowDuplicateOf: string[] }
+): Promise<CustomerWriteResult> {
+  return withCustomersLocked<CustomerWriteResult>(clientId, 'before-integration-customer-update', async ({ customers }) => {
+    const matches = customers.filter((c: any) => c && String(c.id) === id);
+    if (!matches.length) throw new IntegrationError(404, 'NOT_FOUND', 'Customer not found in Signacore.');
+    if (matches.length > 1) {
+      throw new IntegrationError(409, 'AMBIGUOUS_CUSTOMER_ID',
+        'This customer id is shared by more than one Signacore record (a historical collision). Edit it in Signacore itself.');
+    }
+    const current = matches[0];
+    if (customerVersion(current) !== expectedVersion) {
+      throw new IntegrationError(409, 'STALE_VERSION', 'The customer changed in Signacore since it was last read. Reload it and try again.');
+    }
+    const merged = {
+      companyName: patch.companyName !== undefined ? patch.companyName : current.companyName,
+      email: patch.email !== undefined ? patch.email : current.email,
+      vatNumber: patch.vatNumber !== undefined ? patch.vatNumber : current.vatNumber,
+      phone: patch.phone !== undefined ? patch.phone : (current.tel ?? current.phone),
+    };
+    const identityChanged = ['companyName', 'email', 'vatNumber', 'phone'].some((k) => (patch as any)[k] !== undefined);
+    if (identityChanged) {
+      const dupes = duplicateCandidates(customers, merged, id);
+      const unacknowledged = dupes.filter((d) => !opts.allowDuplicateOf.includes(d.id));
+      if (unacknowledged.length) return { next: null, result: { duplicates: dupes } };
+    }
+    const updated = { ...current };
+    if (patch.companyName !== undefined) updated.companyName = String(patch.companyName || '').trim();
+    if (patch.contactPerson !== undefined) updated.contactPerson = textOrBlank(patch.contactPerson);
+    if (patch.email !== undefined) updated.email = textOrBlank(patch.email);
+    if (patch.phone !== undefined) updated.tel = textOrBlank(patch.phone);
+    if (patch.address !== undefined) updated.address = textOrBlank(patch.address);
+    if (patch.vatNumber !== undefined) updated.vatNumber = textOrBlank(patch.vatNumber);
+    if (customerVersion(updated) === customerVersion(current)) {
+      return { next: null, result: { customer: current } }; // nothing actually changes — no write, no backup
+    }
+    return { next: customers.map((c: any) => (c === current ? updated : c)), result: { customer: updated } };
+  });
+}
+
+/** True when `c` already carries exactly the values `patch` asks for (used to recover a stuck update). */
+export function customerMatchesPatch(c: any, patch: CustomerFieldsIn): boolean {
+  const same = (a: unknown, b: unknown) => String(a ?? '').trim() === String(b ?? '').trim();
+  if (patch.companyName !== undefined && !same(c.companyName, patch.companyName)) return false;
+  if (patch.contactPerson !== undefined && !same(c.contactPerson, patch.contactPerson)) return false;
+  if (patch.email !== undefined && !same(c.email, patch.email)) return false;
+  if (patch.phone !== undefined && !same(c.tel ?? c.phone, patch.phone)) return false;
+  if (patch.address !== undefined && !same(c.address, patch.address)) return false;
+  if (patch.vatNumber !== undefined && !same(c.vatNumber, patch.vatNumber)) return false;
+  return true;
 }
 
 // ── Products (inventory items + quick rates) ───────────────────────────────

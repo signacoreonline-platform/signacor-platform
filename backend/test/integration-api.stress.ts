@@ -119,10 +119,15 @@ async function main() {
   ok(r.status === 403 && r.body.error.code === 'FORBIDDEN_SCOPE', 'client without product:read gets 403', r.body);
   r = await call('POST', '/quotes', { client: 'limited-test', secret: LIMITED_SECRET, body: {}, headers: { 'Idempotency-Key': 'limited-key-001' } });
   ok(r.status === 403, 'client without quote:create cannot create quotes');
-  for (const [m, p] of [['DELETE', '/quotes/1'], ['POST', '/quotes/1/convert-to-job'], ['PATCH', '/quotes/1/status'], ['POST', '/customers'], ['POST', '/payments']]) {
+  for (const [m, p] of [['DELETE', '/quotes/1'], ['POST', '/quotes/1/convert-to-job'], ['PATCH', '/quotes/1/status'], ['DELETE', '/customers/1700000000001'], ['POST', '/payments']]) {
     r = await call(m, p, { body: {}, headers: { 'Idempotency-Key': 'escalation-key-1' } });
     ok(r.status === 404, `no privileged route exists: ${m} ${p}`, r.status);
   }
+  // Customer writes exist (2026-10) but need their own explicitly granted scopes; this client does not hold them.
+  r = await call('POST', '/customers', { body: { companyName: 'Escalation Test' }, headers: { 'Idempotency-Key': 'escalation-key-2' } });
+  ok(r.status === 403 && r.body.error.code === 'FORBIDDEN_SCOPE', 'customer create needs customer:create (not granted to this client)', r.body);
+  r = await call('PATCH', '/customers/1700000000001', { body: { expectedVersion: '0'.repeat(32), email: 'x@y.test' }, headers: { 'Idempotency-Key': 'escalation-key-3' } });
+  ok(r.status === 403 && r.body.error.code === 'FORBIDDEN_SCOPE', 'customer update needs customer:update (not granted to this client)', r.body);
 
   console.log('\n— customers');
   r = await call('GET', '/customers?q=acme');
