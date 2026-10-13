@@ -50,6 +50,11 @@ node dist/integration/clientCli.js list
 Rotation is not needed for a scope change — the secret is untouched. To withdraw them again, run `set-scopes`
 with the list you want to keep (e.g. `customer:read,product:read,inventory:read,pricing:read,quote:read,quote:create,quote:update`).
 
+**Running the CLI from a workstation** (e.g. Windows PowerShell, with `DATABASE_URL` set to Render's *External*
+database URL): the CLI uses its own connection (`cliDb.ts`), not the backend's shared pool, with a 15000 ms
+connect timeout. Override it with `INTEGRATION_CLI_DB_CONNECT_TIMEOUT_MS` (whole milliseconds, 1000–120000; any
+other value stops the CLI with an error). The backend server's own pool (`db/pool.ts`, 2000 ms) is unchanged.
+
 ## Scopes
 
 The full list is in `scopes.ts`. A stored scope that the code doesn't know grants nothing.

@@ -12,8 +12,14 @@
  * stored; if it is lost, rotate. Default scopes (no --scopes) = DEFAULT_SCOPES
  * in scopes.ts: the read + draft-quote set. Customer writes (customer:create,
  * customer:update) are never granted by default — a person must name them.
+ *
+ * Can also be run from a workstation against Render's EXTERNAL database URL
+ * (DATABASE_URL). It uses its own connection (cliDb.ts), not the backend's
+ * shared pool: the connect timeout defaults to 15000 ms and can be set with
+ * INTEGRATION_CLI_DB_CONNECT_TIMEOUT_MS (1000–120000).
  */
-import pool from '../db/pool';
+import type { Pool } from 'pg';
+import { createCliPool } from './cliDb';
 import { KNOWN_SCOPES, DEFAULT_SCOPES, MASTER_DATA_WRITE_SCOPES, isKnownScope } from './scopes';
 import { generateSecret, hashSecret } from './keys';
 
@@ -31,7 +37,10 @@ function reportMasterDataScopes(scopes: string[]): void {
   if (writes.length) console.log(`  NOTE: this client can now CHANGE Signacore customer master data (${writes.join(', ')}).`);
 }
 
+let pool: Pool;
+
 async function main(): Promise<void> {
+  pool = createCliPool(); // throws a clear error for a missing DATABASE_URL or an invalid timeout
   const cmd = process.argv[2];
   const clientId = arg('client-id');
   const by = process.env.USER || process.env.USERNAME || 'cli';
@@ -114,4 +123,4 @@ function printSecret(clientId: string, secret: string, scopes: string[]): void {
 
 main()
   .catch((e) => { console.error(`Error: ${e.message}`); process.exitCode = 1; })
-  .finally(() => pool.end());
+  .finally(() => (pool ? pool.end() : undefined));
