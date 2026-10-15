@@ -6050,10 +6050,18 @@ function sgrCustomerAddressLookup(clientName, customers){
    rule exists here, so "Hennies Witbank" never matches "Hennies Witbank Signs",
    "Hennies" or "Witbank". */
 const SGR_LEGAL_SUFFIX_RE = /(?:[\s,]+|(?=\())\(?\s*pty\s*\.?\s*\)?[\s,.]*(?:ltd|limited)\s*\.?\s*$/;
+/* APOSTROPHES (2026-10-15, follow-up 2). In this SECOND-choice comparison
+   only, a straight (') or curly (\u2019) apostrophe is insignificant, so an
+   invoice issued to "Hennie's Witbank" resolves to the renamed customer
+   "Hennies Witbank (PTY) Ltd". Only those two characters are removed - every
+   other letter, word and space must still be identical, and the exact-name
+   first choice above is untouched. */
 function sgrLegalNameBase(name){
   const n = (name==null?'':String(name)).trim().toLowerCase();
+  const hadSuffix = SGR_LEGAL_SUFFIX_RE.test(n);
   const stripped = n.replace(SGR_LEGAL_SUFFIX_RE, '').replace(/[\s,.]+$/, '').trim();
-  return { norm: n, base: stripped, hadSuffix: stripped !== n && SGR_LEGAL_SUFFIX_RE.test(n) };
+  const base = stripped.replace(/['\u2019]/g, '').trim();
+  return { norm: n, base: base, hadSuffix: hadSuffix };
 }
 function sgrResolveInvoiceCustomer(clientName, customers){
   if(!clientName || !Array.isArray(customers)) return null;

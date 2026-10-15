@@ -47,6 +47,18 @@
  *   L9   unmatched historical invoice still uses its stored details
  *   L10  invoice number / date / lines / money unchanged; stored record untouched
  *
+ * APOSTROPHE FOLLOW-UP (P1–P10) — actual case: invoice "Hennie's Witbank",
+ * customer "Hennies Witbank (PTY) Ltd"
+ *   P1   "Hennie's Witbank" resolves to "Hennies Witbank (PTY) Ltd"
+ *   P2   straight ' and curly ’ apostrophes both work
+ *   P3   current company name prints        P4  current address prints
+ *   P5   current contact / email / tel / VAT print
+ *   P6   Hennies Witbank Signs (Pty) Ltd does not match
+ *   P7   partial / fuzzy names do not match
+ *   P8   duplicate normalised matches -> no match (stored details used)
+ *   P9   exact matching still has priority
+ *   P10  invoice financial / reference fields unchanged; record untouched
+ *
  * Pure source + sandbox evaluation of index.html — no database, no server,
  * no network.
  *
@@ -503,6 +515,68 @@ ok(/Voortrekker/.test(printBt), '[18] printInvoice (Print + Preview window + Dow
   const mhb = billedTo(A.__rec.previews[0].html);
   ok(/Hennies Witbank \(Pty\) Ltd/.test(mhb) && /Mandela/.test(mhb), '[L3/L4] Accounting invoice under the old name prints the current customer');
   ok(JSON.stringify(henInv) === JSON.stringify(henInvSnap), '[L10] stored accInvoices record not modified');
+
+  /* ══════════════════════════════════════════════════════════════════════
+     P1–P10  apostrophe-insensitive SECOND-choice comparison (actual case)
+     ══════════════════════════════════════════════════════════════════ */
+  section("P1–P10. Actual case: \"Hennie's Witbank\" -> \"Hennies Witbank (PTY) Ltd\"");
+  // Fixture values are test data only — nothing is hard-coded in index.html.
+  const HW = { id: 1750000000123.4, companyName: 'Hennies Witbank (PTY) Ltd', contactPerson: 'Current Contact',
+    email: 'current@hennieswitbank.co.za', tel: '013 690 1234',
+    address: 'Stand 12, Corridor Hill, Langa Cres. Witbank, Mpumalanga, 1035', vatNumber: '4730000001' };
+  const HW_INV_JOB = { ...deep(JOB), client: "Hennie's Witbank", contact: 'Stored Contact', email: 'stored@old.co.za',
+    tel: '013 000 0001', address: 'Stored Old Address', vatNum: '', invoiceNum: 'INV-00300', quoteNum: 'SQ-00300',
+    reference: 'PO-300' };
+  const HW_SNAP = deep(HW_INV_JOB);
+
+  eq(R("Hennie's Witbank", [HW, CUST_AFTER, HEN_SIGNS]), HW, "[P1] \"Hennie's Witbank\" resolves to \"Hennies Witbank (PTY) Ltd\"");
+  eq(R('Hennie’s Witbank', [HW]), HW, '[P2] curly apostrophe (’) works');
+  eq(R("Hennie's Witbank", [HW]), HW, "[P2] straight apostrophe (') works");
+  eq(R('Hennies Witbank', [{ ...HW, companyName: "Hennie's Witbank (Pty) Ltd" }]) !== null, true, '[P2] apostrophe on the CUSTOMER side works too');
+
+  const hwHtml = A.buildInvoiceHtml(HW_INV_JOB, COMPANIES, null, [HW, HEN_SIGNS]);
+  const hwBt = billedTo(hwHtml);
+  ok(/<div class="nm">Hennies Witbank \(PTY\) Ltd<\/div>/.test(hwBt), '[P3] Billed To prints "Hennies Witbank (PTY) Ltd"', hwBt);
+  ok(/Stand 12, Corridor Hill, Langa Cres\. Witbank, Mpumalanga, 1035/.test(hwBt) && !/Stored Old Address/.test(hwBt),
+     '[P4] current customer address prints');
+  ok(/Attn: Current Contact/.test(hwBt) && /current@hennieswitbank\.co\.za/.test(hwBt) && /Tel: 013 690 1234/.test(hwBt)
+     && /VAT Reg: 4730000001/.test(hwBt) && !/Stored /.test(hwBt), '[P5] current contact / email / tel / VAT print');
+
+  const HW_SIGNS = { ...HEN_SIGNS, companyName: 'Hennies Witbank Signs (Pty) Ltd' };
+  eq(R("Hennie's Witbank", [HW_SIGNS]), null, "[P6] \"Hennie's Witbank\" does NOT match \"Hennies Witbank Signs (Pty) Ltd\"");
+  eq(R("Hennie's", [HW]), null, "[P7] \"Hennie's\" does NOT match \"Hennies Witbank (PTY) Ltd\"");
+  eq(R('Witbank', [HW]), null, '[P7] "Witbank" does NOT match');
+  eq(R('Hennies Witbank Holdings', [HW]), null, '[P7] "Hennies Witbank Holdings" does NOT match');
+  eq(R("Hennie's Witbanks", [HW]), null, '[P7] a one-letter difference other than the apostrophe does NOT match');
+  eq(R("Hennie s Witbank", [HW]), null, '[P7] apostrophe replaced by a space does NOT match');
+  eq(R('Hennie`s Witbank', [HW]), null, '[P7] other characters (backtick) are not treated as apostrophes');
+  eq(R("Hennie's Witbank", [{ ...HW, companyName: 'Hennies Witbank' }]), null,
+     '[P7] apostrophe-only difference with NO legal suffix stays unmatched (second choice still requires the suffix)');
+
+  const HW_DUP = { ...HW, id: 1750000000999.1, companyName: 'Hennies Witbank Pty Ltd', address: 'Duplicate Record Address' };
+  eq(R("Hennie's Witbank", [HW, HW_DUP]), null, '[P8] two customers normalising to the same base -> no match');
+  const dupHw = billedTo(A.buildInvoiceHtml(HW_INV_JOB, COMPANIES, null, [HW, HW_DUP]));
+  ok(/<div class="nm">Hennie's Witbank<\/div>/.test(dupHw) && /Stored Old Address/.test(dupHw) && !/Stand 12|Duplicate Record/.test(dupHw),
+     '[P8] ambiguous -> invoice prints its stored details');
+
+  const HW_EXACT = { ...HW, id: 1750000000555.5, companyName: "Hennie's Witbank", address: 'Exact Apostrophe Record' };
+  eq(R("Hennie's Witbank", [HW, HW_EXACT]), HW_EXACT, '[P9] exact "Hennie\'s Witbank" customer wins over the normalised match');
+  eq(R("Hennie's Witbank", [HW_EXACT, { ...HW_EXACT, id: 1 }, HW]), null, '[P9] ambiguous exact name never falls through');
+
+  const hwNone = A.buildInvoiceHtml(HW_INV_JOB, COMPANIES, null, []);
+  eq(invTitle(hwHtml), 'INV-00300', '[P10] invoice number unchanged');
+  ok(/2026-09-01/.test(hwHtml) && /2026-10-01/.test(hwHtml), '[P10] invoice date and due date unchanged');
+  eq(itemTable(hwHtml), itemTable(hwNone), '[P10] line items, quantities and prices identical');
+  eq(moneyOnly(hwHtml), moneyOnly(hwNone), '[P10] subtotal / discount / setup fee / VAT / total / payments / quote ref identical');
+  ok(/<tr><td>Reference:<\/td><td>INV-00300 \/ Hennie's Witbank<\/td><\/tr>/.test(hwHtml), '[P10] Reference row keeps the stored client name');
+  ok(JSON.stringify(HW_INV_JOB) === JSON.stringify(HW_SNAP), '[P10] stored invoice/job object (client, numbers, lines, payments) not modified');
+  const hwAcc = { ...deep(INV_MANUAL), id: 700, number: 'INV-00301', contactName: 'Hennie’s Witbank', contactEmail: 'stored@old.co.za' };
+  const hwAccSnap = deep(hwAcc);
+  A.__rec.previews.length = 0;
+  A.printManualInvoice(hwAcc, COMPANIES, null, { quotes: [], jobs: [], accInvoices: [hwAcc], customers: [HW] });
+  const hwAccBt = billedTo(A.__rec.previews[0].html);
+  ok(/Hennies Witbank \(PTY\) Ltd/.test(hwAccBt) && /Stand 12, Corridor Hill/.test(hwAccBt), '[P3/P4] Accounting invoice (curly apostrophe) prints current name + address');
+  ok(JSON.stringify(hwAcc) === JSON.stringify(hwAccSnap), '[P10] stored accInvoices record not modified');
 
   console.log('\n' + (failures ? ('PASSED: ' + passed + '   FAILED: ' + failures) : ('ALL ' + passed + ' CHECKS PASSED')));
   process.exit(failures ? 1 : 0);
