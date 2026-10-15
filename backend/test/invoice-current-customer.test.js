@@ -34,6 +34,19 @@
  *   19     no input record is mutated; money identical with/without customers
  *   20     settlement/rounding code paths are not referenced by the change
  *
+ *
+ * LEGAL-SUFFIX FOLLOW-UP (L1–L10)
+ *   L1   "Hennies Witbank" resolves uniquely to "Hennies Witbank (Pty) Ltd"
+ *   L2   (Pty) Ltd / Pty Ltd / (Pty) Limited / Pty Limited variants resolve
+ *   L3   the CURRENT customer company name prints in Billed To
+ *   L4   address / contact / email / tel / VAT still refresh
+ *   L5   "Hennies Witbank" does NOT match "Hennies Witbank Signs"
+ *   L6   partial / fuzzy matches remain prohibited
+ *   L7   two customers with the same suffix-normalised base -> no match
+ *   L8   exact matching still has priority
+ *   L9   unmatched historical invoice still uses its stored details
+ *   L10  invoice number / date / lines / money unchanged; stored record untouched
+ *
  * Pure source + sandbox evaluation of index.html — no database, no server,
  * no network.
  *
@@ -85,6 +98,14 @@ function extractFunction(src, name) {
   if (at < 0) at = src.indexOf('\nasync function ' + name + '(');
   if (at < 0) throw new Error('could not locate top-level function ' + name + ' in index.html');
   const start = at + 1;
+  // Top-level functions in index.html close with a "}" in column 0. Prefer
+  // that boundary (robust against regex literals such as /'/g that confuse
+  // the masking counter); fall back to brace counting if it does not parse.
+  const col0 = src.indexOf('\n}', start);
+  if (col0 > 0) {
+    const cand = src.slice(start, col0 + 2);
+    try { new Function(cand); return cand; } catch (e) { /* fall through */ }
+  }
   const win = src.slice(start, start + 60000);
   const wm = maskForCounting(win);
   // skip the parameter list first — destructured params contain braces
@@ -124,6 +145,7 @@ const MODULE_SRC = SRC.slice(SRC.lastIndexOf('/*', MOD_A), MOD_B + '/* END SGR-C
 const CONSTS = [
   'HOLDINGS_CO_ID', 'HOLDINGS_CO_KEY', 'QUOTE_DEFAULT_DEPOSIT_PCT',
   'SGR_INV_SETUP_FEE_DESC', 'SGR_INV_DISCOUNT_RE', 'SGR_INV_ADJ_EPSILON', 'SGR_INV_MONEY_TOLERANCE',
+  'SGR_LEGAL_SUFFIX_RE',
 ];
 const FNS = [
   // document plumbing
@@ -133,7 +155,7 @@ const FNS = [
   'normalizeQuoteDepositPct', 'fmtQuoteDepositPct', 'quoteDepositInfo', 'quoteDepositTermsInfo',
   // customer lookups (old + new)
   'sgrCustomerVatLookup', 'sgrCustomerAddressLookup',
-  'sgrResolveInvoiceCustomer', 'sgrInvoiceWithCurrentCustomer',
+  'sgrLegalNameBase', 'sgrResolveInvoiceCustomer', 'sgrInvoiceWithCurrentCustomer',
   // linkage used by the accInvoices printable adapter
   'companyTagOf', 'sameCompany', 'jobHasId', 'findCustomerByName', 'invoiceBelongsToJob',
   'resolveJobsForQuote', 'resolveJobForQuote', 'resolveQuoteForJob', 'resolveQuoteForInvoice',
@@ -156,7 +178,11 @@ const STUBS = `
   function downloadFile(c, f){ __rec.downloads.push(f); }
 `;
 const pieces = [STUBS];
-for (const c of CONSTS) pieces.push(extractConst(SRC, MASKED, c));
+for (const c of CONSTS) {
+  // single-line regex constants are taken verbatim from their own line
+  const line = new RegExp('^const\\s+' + c + '\\s*=\\s*/.*;\\s*$', 'm').exec(SRC);
+  pieces.push(line ? line[0] : extractConst(SRC, MASKED, c));
+}
 pieces.push(MODULE_SRC);
 for (const f of FNS) pieces.push(extractFunction(SRC, f));
 pieces.push('return { __rec, sgrDocumentCents, sgrInvoiceCents, ' + FNS.join(',') + ' };');
@@ -259,7 +285,7 @@ ok(/Attn: Thandi Mokoena/.test(bt) && !/Jan Botha/.test(bt), '[12] contact perso
 ok(/accounts@acme\.co\.za/.test(bt) && !/jan@acme/.test(bt), '[12] email refreshed');
 ok(/Tel: 044 999 2222/.test(bt), '[12] telephone refreshed');
 ok(/VAT Reg: 4990123456/.test(bt), '[12] VAT number refreshed');
-ok(/<div class="nm">Acme Signs CC<\/div>/.test(bt), '[12] Billed To name is the invoice\'s own client name');
+ok(/<div class="nm">Acme Signs CC<\/div>/.test(bt), '[12] Billed To name is the resolved customer\'s company name');
 // relational-shaped customer rows carry `phone` rather than `tel`
 const relShaped = { companyName: 'Acme Signs CC', phone: '044 777 0000' };
 ok(/Tel: 044 777 0000/.test(billedTo(A.buildInvoiceHtml(JOB, COMPANIES, null, [relShaped]))),
@@ -391,7 +417,7 @@ ok(/Voortrekker/.test(printBt), '[18] printInvoice (Print + Preview window + Dow
   const out = A.sgrInvoiceWithCurrentCustomer(JOB_OLD_ADDR, [CUST_AFTER]);
   ok(out !== JOB_OLD_ADDR, '[19] resolver returns a copy, never the stored record');
   const changed = Object.keys(out).filter(k => JSON.stringify(out[k]) !== JSON.stringify(JOB_OLD_ADDR[k]));
-  ok(changed.every(k => ['contact', 'email', 'tel', 'address', 'vatNum'].includes(k)),
+  ok(changed.every(k => ['contact', 'email', 'tel', 'address', 'vatNum', '_billToName'].includes(k)),
      '[19] only customer-block keys differ on the copy', changed);
   ['num', 'invoiceNum', 'invoiceDate', 'invoiceDue', 'invoiceStatus', 'lines', 'discount', 'setupFee', 'payments', 'co', 'quoteNum', 'client']
     .forEach(k => ok(JSON.stringify(out[k]) === JSON.stringify(JOB_OLD_ADDR[k]), '[19] ' + k + ' carried through unchanged'));
@@ -403,6 +429,80 @@ ok(/Voortrekker/.test(printBt), '[18] printInvoice (Print + Preview window + Dow
   const resolverSrc = extractFunction(SRC, 'sgrResolveInvoiceCustomer') + extractFunction(SRC, 'sgrInvoiceWithCurrentCustomer');
   ok(!/sgrSettle|sgrLegacy|legacyRoundingSettlement|rel_payments|sgrDocumentCents|sgrInvoiceCents|setCustomers|setJobs|setAccInvoices|relationalApi|fetch\(/.test(resolverSrc),
      '[20] resolver touches no settlement, rounding, persistence or API code');
+
+  /* ══════════════════════════════════════════════════════════════════════
+     L1–L10  legal-suffix equivalence (Hennies Witbank -> (Pty) Ltd)
+     ══════════════════════════════════════════════════════════════════ */
+  section('L1–L10. Renamed customer: trailing legal-suffix equivalence only');
+  const R = A.sgrResolveInvoiceCustomer;
+  const HEN = { id: 900.5, companyName: 'Hennies Witbank (Pty) Ltd', contactPerson: 'Pieter Hennie',
+    email: 'accounts@hennies.co.za', tel: '013 656 0000', address: '5 Mandela St\nWitbank 1035', vatNumber: '4220111222' };
+  const HEN_SIGNS = { id: 901.5, companyName: 'Hennies Witbank Signs', contactPerson: 'X', email: 'x@signs.co.za',
+    tel: '013 000 0000', address: 'Signs Rd', vatNumber: '4000000000' };
+  const HEN_JOB = { ...deep(JOB), client: 'Hennies Witbank', contact: 'Old Contact', email: 'old@hennies.co.za',
+    tel: '013 111 1111', address: 'Old Witbank Address', vatNum: '', invoiceNum: 'INV-00200' };
+  const HEN_JOB_SNAP = deep(HEN_JOB);
+
+  eq(R('Hennies Witbank', [HEN, HEN_SIGNS, CUST_AFTER]), HEN, '[L1] "Hennies Witbank" resolves uniquely to "Hennies Witbank (Pty) Ltd"');
+  ['Hennies Witbank (Pty) Ltd', 'Hennies Witbank Pty Ltd', 'Hennies Witbank (Pty) Limited', 'Hennies Witbank Pty Limited',
+   'Hennies Witbank (PTY) LTD', 'Hennies Witbank (Pty) Ltd.', 'Hennies Witbank, (Pty) Ltd', 'Hennies Witbank (Pty.) Ltd',
+   'Hennies Witbank(Pty) Ltd', '  hennies witbank  (pty)  ltd  ']
+    .forEach(v => eq(R(v, [{ ...HEN, companyName: 'Hennies Witbank' }]) !== null, true, '[L2] "' + v + '" -> customer "Hennies Witbank"'));
+  eq(R('Hennies Witbank Pty Ltd', [HEN]), HEN, '[L2] "Pty Ltd" invoice name -> "(Pty) Ltd" customer');
+
+  const henHtml = A.buildInvoiceHtml(HEN_JOB, COMPANIES, null, [HEN, HEN_SIGNS]);
+  const hbt = billedTo(henHtml);
+  ok(/<div class="nm">Hennies Witbank \(Pty\) Ltd<\/div>/.test(hbt), '[L3] Billed To prints the CURRENT company name "Hennies Witbank (Pty) Ltd"', hbt);
+  ok(/5 Mandela St\nWitbank 1035/.test(hbt) && /Attn: Pieter Hennie/.test(hbt) && /accounts@hennies\.co\.za/.test(hbt)
+     && /Tel: 013 656 0000/.test(hbt) && /VAT Reg: 4220111222/.test(hbt) && !/Old /.test(hbt),
+     '[L4] current address / contact / email / tel / VAT all print');
+  ok(!/Signs Rd|x@signs/.test(hbt), '[L4] nothing borrowed from "Hennies Witbank Signs"');
+
+  eq(R('Hennies Witbank', [HEN_SIGNS]), null, '[L5] "Hennies Witbank" does NOT match "Hennies Witbank Signs"');
+  eq(R('Hennies Witbank Signs', [HEN]), null, '[L5] "Hennies Witbank Signs" does NOT match "Hennies Witbank (Pty) Ltd"');
+  eq(R('Hennies', [HEN]), null, '[L6] "Hennies" does NOT match "Hennies Witbank (Pty) Ltd"');
+  eq(R('Witbank', [HEN]), null, '[L6] "Witbank" does NOT match "Hennies Witbank (Pty) Ltd"');
+  eq(R('Hennies', [{ ...HEN, companyName: 'Hennies Witbank' }]), null, '[L6] "Hennies" does NOT match "Hennies Witbank"');
+  eq(R('Hennies (Pty) Ltd', [{ ...HEN, companyName: 'Hennies Witbank' }]), null, '[L6] suffix on a shorter name does not match a longer name');
+  eq(R('Hennies Witbank CC', [HEN]), null, '[L6] other suffixes (CC) are not treated as equivalent');
+  eq(R('Hennies Witbank Holdings (Pty) Ltd', [HEN]), null, '[L6] extra words before the suffix do not match');
+  eq(R('(Pty) Ltd', [{ ...HEN, companyName: 'Pty Ltd' }]), null, '[L6] a name that is only a suffix never matches');
+  eq(R('Pieter Hennie', [HEN]), null, '[L6] contact-person name still does not link');
+  eq(R('Hennies Witbank', [{ ...HEN, companyName: 'Hennies Witbank.' }]), null, '[L6] punctuation alone (no legal suffix) is not a second-choice match');
+
+  const HEN_DUP = { ...HEN, id: 902.5, companyName: 'Hennies Witbank Pty Limited', address: 'Second Record Address' };
+  eq(R('Hennies Witbank', [HEN, HEN_DUP]), null, '[L7] two customers with the same base name -> no match');
+  const dupBt = billedTo(A.buildInvoiceHtml(HEN_JOB, COMPANIES, null, [HEN, HEN_DUP]));
+  ok(/<div class="nm">Hennies Witbank<\/div>/.test(dupBt) && /Old Witbank Address/.test(dupBt) && !/Mandela|Second Record/.test(dupBt),
+     '[L7] ambiguous base name -> invoice prints its stored details');
+
+  const HEN_EXACT = { ...HEN, id: 903.5, companyName: 'Hennies Witbank', address: 'Exact Record Address' };
+  eq(R('Hennies Witbank', [HEN, HEN_EXACT]), HEN_EXACT, '[L8] exact name wins over a suffix-equivalent customer');
+  eq(R('Hennies Witbank (Pty) Ltd', [HEN_EXACT, HEN]), HEN, '[L8] exact name wins in the other direction too');
+  eq(R('Hennies Witbank', [HEN_EXACT, { ...HEN_EXACT, id: 904.5 }, HEN]), null,
+     '[L8] an AMBIGUOUS exact name never falls through to the suffix rule');
+
+  const unBt = billedTo(A.buildInvoiceHtml({ ...HEN_JOB, client: 'Hennies Middelburg' }, COMPANIES, null, [HEN]));
+  ok(/<div class="nm">Hennies Middelburg<\/div>/.test(unBt) && /Old Witbank Address/.test(unBt) && /old@hennies/.test(unBt),
+     '[L9] unmatched historical invoice prints its stored name and details');
+
+  const henNoCust = A.buildInvoiceHtml(HEN_JOB, COMPANIES, null, []);
+  eq(invTitle(henHtml), 'INV-00200', '[L10] invoice number unchanged');
+  ok(/2026-09-01/.test(henHtml) && /2026-10-01/.test(henHtml), '[L10] invoice / due dates unchanged');
+  eq(itemTable(henHtml), itemTable(henNoCust), '[L10] line items identical');
+  eq(moneyOnly(henHtml), moneyOnly(henNoCust), '[L10] every money / document byte outside the customer block identical');
+  ok(/<tr><td>Reference:<\/td><td>INV-00200 \/ Hennies Witbank<\/td><\/tr>/.test(henHtml),
+     '[L10] payment Reference row keeps the stored invoice name');
+  ok(JSON.stringify(HEN_JOB) === JSON.stringify(HEN_JOB_SNAP), '[L10] stored invoice/job object not modified');
+  const henCopy = A.sgrInvoiceWithCurrentCustomer(HEN_JOB, [HEN]);
+  eq(henCopy.client, 'Hennies Witbank', '[L10] the copy\'s client (stored name) is not rewritten');
+  const henInv = { ...deep(INV_MANUAL), id: 600, number: 'INV-00201', contactName: 'Hennies Witbank', contactEmail: 'old@hennies.co.za' };
+  const henInvSnap = deep(henInv);
+  A.__rec.previews.length = 0;
+  A.printManualInvoice(henInv, COMPANIES, null, { quotes: [], jobs: [], accInvoices: [henInv], customers: [HEN] });
+  const mhb = billedTo(A.__rec.previews[0].html);
+  ok(/Hennies Witbank \(Pty\) Ltd/.test(mhb) && /Mandela/.test(mhb), '[L3/L4] Accounting invoice under the old name prints the current customer');
+  ok(JSON.stringify(henInv) === JSON.stringify(henInvSnap), '[L10] stored accInvoices record not modified');
 
   console.log('\n' + (failures ? ('PASSED: ' + passed + '   FAILED: ' + failures) : ('ALL ' + passed + ' CHECKS PASSED')));
   process.exit(failures ? 1 : 0);

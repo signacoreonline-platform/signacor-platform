@@ -6026,7 +6026,9 @@ function sgrCustomerAddressLookup(clientName, customers){
    the read layer), so the strongest existing link is the invoice's own
    client / contactName against Customer.companyName - the SAME trim+lowercase
    exact match sgrCustomerVatLookup / sgrCustomerAddressLookup above already
-   use. It is STRICTER than they are: it must match exactly ONE customer. No
+   use. It is STRICTER than they are: it must match exactly ONE customer
+   (with a trailing "(Pty) Ltd"-type suffix equivalence as a second choice -
+   see SGR_LEGAL_SUFFIX_RE below). No
    match, or two customers sharing that name, returns null and the invoice
    keeps printing its stored snapshot exactly as before - it is never attached
    to a guessed customer, and fuzzy/substring matching is never used here.
@@ -6038,13 +6040,41 @@ function sgrCustomerAddressLookup(clientName, customers){
    is modified. Invoice number, dates, lines, discount, setup fee, VAT, totals,
    payments, _sgrTotals and settlement state are carried through untouched.
    ═══════════════════════════════════════════════════════════════════════════ */
+/* LEGAL-SUFFIX EQUIVALENCE (2026-10-15, follow-up). A customer renamed to its
+   registered name ("Hennies Witbank" -> "Hennies Witbank (Pty) Ltd") must still
+   resolve for invoices issued under the old name. This is NOT fuzzy matching:
+   the ONLY difference tolerated is a trailing South African private-company
+   suffix - "(Pty) Ltd", "Pty Ltd", "(Pty) Limited", "Pty Limited", with
+   optional dots/commas/spacing around it. The rest of the name must be
+   identical (trim + case-insensitive). No contains / startsWith / word-overlap
+   rule exists here, so "Hennies Witbank" never matches "Hennies Witbank Signs",
+   "Hennies" or "Witbank". */
+const SGR_LEGAL_SUFFIX_RE = /(?:[\s,]+|(?=\())\(?\s*pty\s*\.?\s*\)?[\s,.]*(?:ltd|limited)\s*\.?\s*$/;
+function sgrLegalNameBase(name){
+  const n = (name==null?'':String(name)).trim().toLowerCase();
+  const stripped = n.replace(SGR_LEGAL_SUFFIX_RE, '').replace(/[\s,.]+$/, '').trim();
+  return { norm: n, base: stripped, hadSuffix: stripped !== n && SGR_LEGAL_SUFFIX_RE.test(n) };
+}
 function sgrResolveInvoiceCustomer(clientName, customers){
   if(!clientName || !Array.isArray(customers)) return null;
   const norm = s=>(s==null?'':String(s)).trim().toLowerCase();
   const n = norm(clientName);
   if(!n) return null;
+  // 1st choice - exact name, exactly one customer (unchanged rule).
   const hits = customers.filter(c=>c && norm(c.companyName)===n);
-  return hits.length===1 ? hits[0] : null;
+  if(hits.length===1) return hits[0];
+  if(hits.length>1) return null;            // ambiguous exact name: never guess
+  // 2nd choice - ONLY when nothing matched exactly: the same name once a
+  // trailing (Pty) Ltd-type suffix is set aside on either side. Still must
+  // be exactly one customer.
+  const inv = sgrLegalNameBase(clientName);
+  if(!inv.base) return null;
+  const legal = customers.filter(c=>{
+    if(!c) return false;
+    const cn = sgrLegalNameBase(c.companyName);
+    return cn.base && cn.base===inv.base && (cn.hadSuffix || inv.hadSuffix);
+  });
+  return legal.length===1 ? legal[0] : null;
 }
 function sgrInvoiceWithCurrentCustomer(doc, customers){
   if(!doc) return doc;
@@ -6058,6 +6088,10 @@ function sgrInvoiceWithCurrentCustomer(doc, customers){
     tel:     pick(has(cust.tel) ? cust.tel : cust.phone, doc.tel),
     address: pick(cust.address, doc.address),
     vatNum:  pick(cust.vatNumber, doc.vatNum),
+    // Display-only name for the "Billed To" block: the CURRENT Customer company
+    // name. doc.client itself (the stored name, used in the payment Reference
+    // row and as the lookup key) is left exactly as stored.
+    _billToName: pick(has(cust.companyName) ? String(cust.companyName).trim() : '', doc.client),
   };
 }
 function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
@@ -6213,7 +6247,7 @@ function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
 '<div class="parties">'+
 '<div class="box box-to">'+
 '<div class="lbl">Billed To</div>'+
-'<div class="nm">'+job.client+'</div>'+
+'<div class="nm">'+(job._billToName||job.client)+'</div>'+
 (job.contact?'<p>Attn: '+job.contact+'</p>':'')+
 (billVatNum?'<p>VAT Reg: '+billVatNum+'</p>':'')+
 (job.email?'<p>'+job.email+'</p>':'')+
