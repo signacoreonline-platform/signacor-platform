@@ -8923,6 +8923,9 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   // ── Save a custom quote line as a standard inventory item ──
   const [savedLineIds, setSavedLineIds] = useState({});
   const [saveStdItemLine, setSaveStdItemLine] = useState(null);
+  // Snapshot of a line's content at save time — if the line is edited afterwards,
+  // the "Save as Standard Item" button re-appears so the new variant can be saved too.
+  function stdItemLineSig(l){ return `${(l&&l.desc)||''}|${(l&&l.unit)||''}|${Number(l&&l.unitPrice)||0}`; }
   function saveLineAsStandardItem(line) {
     if (!setInventory) return;
     setSaveStdItemLine(line);
@@ -9503,9 +9506,10 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
                             </div>
                           </div>
                         )}
-                        {/* ── Save as standard item button — shown on any custom line with a filled description ── */}
-                        {!line.itemId && !line.cpLinked && line.desc && line.desc.trim().length>2 && setInventory && (
-                          savedLineIds[line.id]
+                        {/* ── Save as standard item button — shown on ANY editable line with a filled description,
+                             including lines picked from Inventory (so an edited existing item can be saved as a new one) ── */}
+                        {!line.cpLinked && line.desc && line.desc.trim().length>2 && setInventory && (
+                          savedLineIds[line.id] === stdItemLineSig(line)
                             ? <div className="mt-1.5 flex items-center gap-1 text-xs text-green-600 font-semibold px-1">
                                 ✅ Saved to inventory
                               </div>
@@ -9789,7 +9793,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
         inventory={inventory}
         setInventory={setInventory}
         onClose={()=>setSaveStdItemLine(null)}
-        onSaved={lineId=>{ setSavedLineIds(prev=>({...prev,[lineId]:true})); setSaveStdItemLine(null); }}
+        onSaved={lineId=>{ const sig=stdItemLineSig(saveStdItemLine); setSavedLineIds(prev=>({...prev,[lineId]:sig})); setSaveStdItemLine(null); }}
       />}
     </Modal>
   );
