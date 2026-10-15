@@ -6005,7 +6005,64 @@ function sgrCustomerAddressLookup(clientName, customers){
   const c = customers.find(c=>norm(c.companyName)===norm(clientName));
   return c ? (c.address||'') : '';
 }
+/* ═══════════════════════════════════════════════════════════════════════════
+   INVOICE "BILLED TO" = CURRENT LINKED CUSTOMER (2026-10-15)
+
+   THE BUG. An invoice document printed the customer details SNAPSHOT that was
+   copied onto the job (q.contact/email/tel/address/vatNum -> job.* on quote
+   conversion) or onto the accInvoices record (contactName/contactEmail), and
+   only consulted the Customer record when the snapshot field was EMPTY (and
+   then only for address + VAT). So once a customer's details were corrected
+   under Customers, every newly generated Invoice PDF still printed the old
+   snapshot - and the emailed .eml PDF never consulted Customers at all.
+
+   THE RULE NOW. When a NEW invoice document is generated, the customer-
+   information block resolves the CURRENT linked Customer record:
+       FINANCIAL CONTENT          = the invoice's own stored snapshot (untouched)
+       CUSTOMER DETAILS DISPLAYED = the current linked Customer record
+
+   THE LINK. Neither a job nor an accInvoices record carries a customer id on
+   the frontend (rel_*.customer_id exists in the database but is not exposed by
+   the read layer), so the strongest existing link is the invoice's own
+   client / contactName against Customer.companyName - the SAME trim+lowercase
+   exact match sgrCustomerVatLookup / sgrCustomerAddressLookup above already
+   use. It is STRICTER than they are: it must match exactly ONE customer. No
+   match, or two customers sharing that name, returns null and the invoice
+   keeps printing its stored snapshot exactly as before - it is never attached
+   to a guessed customer, and fuzzy/substring matching is never used here.
+
+   WHAT IT TOUCHES. Only contact / email / tel / address / vatNum on a shallow
+   COPY of the document object. A Customer field that is blank keeps the
+   stored value, so a document never loses a detail it used to show. Nothing
+   is written back: no invoice, job, quote, line, payment or customer record
+   is modified. Invoice number, dates, lines, discount, setup fee, VAT, totals,
+   payments, _sgrTotals and settlement state are carried through untouched.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function sgrResolveInvoiceCustomer(clientName, customers){
+  if(!clientName || !Array.isArray(customers)) return null;
+  const norm = s=>(s==null?'':String(s)).trim().toLowerCase();
+  const n = norm(clientName);
+  if(!n) return null;
+  const hits = customers.filter(c=>c && norm(c.companyName)===n);
+  return hits.length===1 ? hits[0] : null;
+}
+function sgrInvoiceWithCurrentCustomer(doc, customers){
+  if(!doc) return doc;
+  const cust = sgrResolveInvoiceCustomer(doc.client, customers);
+  if(!cust) return doc;
+  const has = v=>v!==undefined && v!==null && String(v).trim()!=='';
+  const pick = (current, stored)=>has(current) ? current : stored;
+  return { ...doc,
+    contact: pick(cust.contactPerson, doc.contact),
+    email:   pick(cust.email, doc.email),
+    tel:     pick(has(cust.tel) ? cust.tel : cust.phone, doc.tel),
+    address: pick(cust.address, doc.address),
+    vatNum:  pick(cust.vatNumber, doc.vatNum),
+  };
+}
 function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
+  // 2026-10-15: customer block = current linked Customer; money = untouched.
+  job = sgrInvoiceWithCurrentCustomer(job, customers);
   const co = companies.find(c=>c.id===job.co)||{name:'Signacore',short:'SGR'};
   const legal = sgrCompanyLegal(co);
   const lines = job.lines||[];
@@ -7538,7 +7595,11 @@ async function generateDocumentPdfFromHtml(type, data, companies, logoDataUrl) {
 /* ═══════════════════════════════════════════
    GENERATE BOTH PDFS + BUILD + DOWNLOAD .EML
 ═══════════════════════════════════════════ */
-async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMarkSent) {
+async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMarkSent, customers) {
+  // 2026-10-15: an emailed Tax Invoice (cover letter, PDF and To: address)
+  // uses the same current-Customer rule as Print / Preview. Quote and
+  // Proforma are passed through exactly as before.
+  if (type !== 'quote' && type !== 'proforma') data = sgrInvoiceWithCurrentCustomer(data, customers);
   const isQuote    = type === 'quote';
   const isProforma = type === 'proforma';
   const refNum   = isQuote ? data.num : (isProforma ? (data._proformaNum||data.num) : (data.invoiceNum||data.num));
@@ -7586,7 +7647,7 @@ async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMa
 /* ═══════════════════════════════════════════
    EMAIL FLOW MODAL  (single-click .eml)
 ═══════════════════════════════════════════ */
-function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSent }) {
+function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSent, customers }) {
   const isQuote    = type === 'quote';
   const isProforma = type === 'proforma';
   const refNum   = isQuote ? data.num : (isProforma ? (data._proformaNum||data.num) : (data.invoiceNum||data.num));
@@ -7597,7 +7658,7 @@ function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSen
   async function handleGenerate() {
     setStatus('generating');
     try {
-      await generateAndEmailDocument(type, data, companies, logoDataUrl, onMarkSent);
+      await generateAndEmailDocument(type, data, companies, logoDataUrl, onMarkSent, customers);
       setStatus('done');
     } catch(e) {
       console.error('Email generation error:', e);
@@ -14019,7 +14080,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       {/* ── Email Invoice Modal ── */}
       {emailInvoiceJob&&(
         <EmailFlowModal
-          type="invoice" data={emailInvoiceJob} companies={companies} logoDataUrl={logoDataUrl}
+          type="invoice" data={emailInvoiceJob} companies={companies} logoDataUrl={logoDataUrl} customers={customers}
           onClose={()=>setEmailInvoiceJob(null)}
         />
       )}
@@ -18627,7 +18688,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 
       {showInvoiceEmail&&job&&(
         <EmailFlowModal
-          type="invoice" data={job} companies={companies} logoDataUrl={logoDataUrl}
+          type="invoice" data={job} companies={companies} logoDataUrl={logoDataUrl} customers={customers}
           onClose={()=>setShowInvoiceEmail(false)}
         />
       )}
