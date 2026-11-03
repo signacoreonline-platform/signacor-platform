@@ -14585,7 +14585,24 @@ function AddEditAssetModal({ asset, onClose, onSave, companies, employees }) {
   const [purDate, setPurDate] = useState(asset?.purDate||'');
   // Common
   const [notes,   setNotes]   = useState(asset?.notes||'');
+  // 2026-11-03: documents and accidents/incidents are editable directly on
+  // the vehicle form too (not only on the vehicle's detail tabs). They are
+  // saved together with the vehicle in the same confirmed save.
+  const [docs,      setDocs]      = useState(asset?.documents||[]);
+  const [incidents, setIncidents] = useState(asset?.incidents||[]);
+  const [newDocType,setNewDocType]= useState('registration');
+  const [incEdit,   setIncEdit]   = useState(null); // null | 'new' | incident record
+  const [recDirty,  setRecDirty]  = useState(false);
   const isVeh = isVehicleCat(cat);
+  async function addFormDocs(e){
+    const input=e.target;
+    const got=await vehReadFiles(input.files);
+    if(got.length){ setDocs(p=>[...got.map(d=>({...d, docType:newDocType})), ...p]); setRecDirty(true); }
+    input.value='';
+  }
+  function removeFormDoc(id){ if(window.confirm('Remove this document?')) { setDocs(p=>p.filter(d=>d.id!==id)); setRecDirty(true); } }
+  function saveFormIncident(rec){ setRecDirty(true); setIncidents(p=>p.some(r=>r.id===rec.id)?p.map(r=>r.id===rec.id?rec:r):[rec,...p]); return true; }
+  function removeFormIncident(id){ if(window.confirm('Delete this incident? This cannot be undone once you save.')) { setIncidents(p=>p.filter(r=>r.id!==id)); setRecDirty(true); } }
   const iCls = "w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 bg-white";
 
   async function submit(e) {
@@ -14631,9 +14648,9 @@ function AddEditAssetModal({ asset, onClose, onSave, companies, employees }) {
         odoReadings,
         maintenance: asset?.maintenance||[],
         tyres:       asset?.tyres||[],
-        documents:   asset?.documents||[],
+        documents:   docs,
         allocations: asset?.allocations||[],
-        incidents:   asset?.incidents||[],
+        incidents:   isVeh ? incidents : (asset?.incidents||[]),
         ...vehExtra,
       });
       // onSave's own handler (handleSave/handleUpdate) already alerts the
@@ -14753,6 +14770,61 @@ function AddEditAssetModal({ asset, onClose, onSave, companies, employees }) {
             </div>
 
             <div className="space-y-3">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <p className={VEH_SEC_CLS}>Accidents &amp; Incidents</p>
+                <button type="button" onClick={()=>setIncEdit('new')} className="text-xs border border-gray-200 rounded-lg px-3 py-1.5 text-gray-600 hover:bg-gray-50 font-semibold">⚠️ + Log accident / incident</button>
+              </div>
+              {incidents.length===0?<p className="text-xs text-gray-400">No accidents or incidents recorded.</p>:(
+                <div className="space-y-1.5">
+                  {incidents.slice().sort((a,b)=>(String(b.date||'')+(b.time||'')).localeCompare(String(a.date||'')+(a.time||''))).map(r=>{ const sm=vehIncidentStatusMeta(r.status); return (
+                    <div key={r.id} className="flex items-start gap-2 bg-gray-50 border border-gray-100 rounded-xl px-3 py-2">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs font-bold text-gray-800">📅 {r.date}{r.time?` · ${r.time}`:''}</span>
+                          <span className={`text-xs rounded-lg px-1.5 py-0.5 font-bold ${sm[2]}`}>{sm[1]}</span>
+                          <span className="text-xs text-gray-500">⚖️ {vehResponsibilityLabel(r, employees)}</span>
+                          {(r.photos||[]).length>0&&<span className="text-xs text-gray-400">📷 {(r.photos||[]).length}</span>}
+                        </div>
+                        <p className="text-xs text-gray-600 truncate mt-0.5">{r.location?`📍 ${r.location} — `:''}{r.description}</p>
+                      </div>
+                      <button type="button" onClick={()=>setIncEdit(r)} className="text-xs border border-gray-200 bg-white rounded-lg px-2 py-1 text-gray-500 font-semibold">✏️</button>
+                      <button type="button" onClick={()=>removeFormIncident(r.id)} className="text-xs text-red-400 hover:bg-red-50 rounded-lg px-2 py-1 font-semibold">✕</button>
+                    </div>
+                  );})}
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-3">
+              <p className={VEH_SEC_CLS}>Documents</p>
+              <div className="flex items-center gap-2 flex-wrap">
+                <select value={newDocType} onChange={e=>setNewDocType(e.target.value)} className="border border-gray-300 rounded-xl px-3 py-2 text-xs bg-white">
+                  {VEH_DOC_TYPES.map(([k,l])=><option key={k} value={k}>{l}</option>)}
+                </select>
+                <label className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold cursor-pointer">
+                  📎 Upload {vehDocTypeLabel(newDocType)}
+                  <input type="file" multiple accept={newDocType==='photo'?'image/*':'.pdf,.jpg,.jpeg,.png,.doc,.docx'} className="hidden" onChange={addFormDocs}/>
+                </label>
+              </div>
+              <p className="text-xs text-gray-400">Registration documents, licence discs, insurance documents, invoices, accident reports and vehicle photographs. Max 4 MB per file.</p>
+              {docs.length>0&&(
+                <div className="space-y-1.5">
+                  {docs.map(d=>(
+                    <div key={d.id} className="flex items-center gap-2 bg-gray-50 border border-gray-100 rounded-xl px-3 py-2">
+                      {/^image\//.test(d.type||'')?<img src={d.dataUrl} alt="" className="w-8 h-8 object-cover rounded-lg"/>:<span className="text-xl">📋</span>}
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-bold text-gray-700 truncate">{d.name}</p>
+                        <p className="text-xs text-gray-400">{vehDocTypeLabel(d.docType||'other')} · {((d.size||0)/1024).toFixed(0)} KB</p>
+                      </div>
+                      <button type="button" onClick={()=>vehOpenFile(d)} className="text-xs bg-white border border-gray-200 rounded-lg px-2 py-1 text-gray-600 font-semibold">View</button>
+                      <button type="button" onClick={()=>removeFormDoc(d.id)} className="text-xs text-red-400 hover:bg-red-50 rounded-lg px-2 py-1 font-semibold">✕</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-3">
               <p className={VEH_SEC_CLS}>Tracking</p>
               <div className="grid grid-cols-2 gap-3">
                 <div><VehLbl opt>Tracking Device Fitted</VehLbl>
@@ -14801,7 +14873,9 @@ function AddEditAssetModal({ asset, onClose, onSave, companies, employees }) {
           <button type="button" onClick={onClose} disabled={saving} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50 disabled:opacity-50">Cancel</button>
           <button type="submit" disabled={saving} className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-60">{saving?'Saving…':(isEdit?'Save Changes':'Add Asset')}</button>
         </div>
+        {isVeh&&recDirty&&<p className="text-xs text-amber-600 font-semibold text-center">Documents / incidents are saved when you click {isEdit?'Save Changes':'Add Asset'}.</p>}
       </form>
+      {incEdit&&<VehIncidentModal onClose={()=>setIncEdit(null)} onSave={saveFormIncident} employees={employees} initial={incEdit==='new'?null:incEdit}/>}
     </Modal>
   );
 }
@@ -15040,8 +15114,8 @@ function TyreModal({ onClose, onSave }) {
 /* ═══════════════════════════════════════════
    ASSETS — DETAIL VIEW
 ═══════════════════════════════════════════ */
-function AssetDetail({ asset, onBack, onUpdate, companies, employees, suppliers }) {
-  const [tab,setTab]=useState('overview');
+function AssetDetail({ asset, onBack, onUpdate, companies, employees, suppliers, initialTab }) {
+  const [tab,setTab]=useState(initialTab||'overview');
   const [showEdit,setShowEdit]=useState(false);
   const [showOdo,setShowOdo]=useState(false);
   const [showMaint,setShowMaint]=useState(false);
@@ -15407,6 +15481,8 @@ function AssetsPage({ assets, setAssets, forceSaveSections, companies, employees
   const [catTab,    setCatTab]    = useState('vehicle');
   const [selected,  setSelected]  = useState(null);
   const [showAdd,   setShowAdd]   = useState(false);
+  const [openTab,   setOpenTab]   = useState('overview');
+  const openAsset = (a, t) => { setOpenTab(t||'overview'); setSelected(a); };
 
   // 2026-08-18 (production stabilisation, Section 12): asset saves/updates
   // — including document uploads, which go through handleUpdate — used to
@@ -15455,7 +15531,7 @@ function AssetsPage({ assets, setAssets, forceSaveSections, companies, employees
     const live = assets.find(a=>a.id===selected.id)||selected;
     return (
       <div className="p-4 md:p-6 max-w-4xl mx-auto">
-        <AssetDetail asset={live} onBack={()=>setSelected(null)} onUpdate={handleUpdate} companies={companies} employees={employees} suppliers={suppliers}/>
+        <AssetDetail asset={live} onBack={()=>{setSelected(null);setOpenTab('overview');}} onUpdate={handleUpdate} companies={companies} employees={employees} suppliers={suppliers} initialTab={openTab}/>
       </div>
     );
   }
@@ -15496,7 +15572,7 @@ function AssetsPage({ assets, setAssets, forceSaveSections, companies, employees
           </div>
           <div className="divide-y divide-gray-100">
             {vehReminders.map((r,i)=>(
-              <button key={i} onClick={()=>setSelected(r.asset)} className="w-full flex items-center gap-3 py-2 px-2 text-left hover:bg-gray-50 rounded-lg">
+              <button key={i} onClick={()=>openAsset(r.asset)} className="w-full flex items-center gap-3 py-2 px-2 text-left hover:bg-gray-50 rounded-lg">
                 <span className={`text-xs font-bold rounded-lg px-2 py-0.5 flex-shrink-0 ${r.level==='overdue'?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700'}`}>{r.level==='overdue'?'Overdue':'Due soon'}</span>
                 <span className="text-xs font-black text-gray-800 w-24 flex-shrink-0 truncate">{r.asset.reg||r.asset.name}</span>
                 <span className="text-xs text-gray-600 flex-1">{r.text}</span>
@@ -15525,7 +15601,7 @@ function AssetsPage({ assets, setAssets, forceSaveSections, companies, employees
             const rem = isVeh ? vehicleReminders(a) : [];
             const resp = isVeh ? vehEmpLabel(employees, a.responsibleEmpId, a.responsibleEmpName) : '';
             return (
-              <div key={a.id} onClick={()=>setSelected(a)}
+              <div key={a.id} onClick={()=>openAsset(a)}
                 className={`bg-white rounded-2xl border border-gray-200 p-4 cursor-pointer hover:border-brand-300 hover:shadow-sm transition-all group ${isVeh&&VEH_INACTIVE.includes(a.vehStatus)?'opacity-60':''}`}>
                 <div className="flex items-start gap-3">
                   <div className="w-10 h-10 rounded-xl bg-brand-50 flex items-center justify-center text-xl flex-shrink-0">{catM.icon}</div>
@@ -15549,9 +15625,14 @@ function AssetsPage({ assets, setAssets, forceSaveSections, companies, employees
                 <div className="flex gap-2 mt-3 text-xs text-gray-400 flex-wrap">
                   <span className="bg-gray-50 rounded-lg px-2 py-1">📎 {(a.documents||[]).length} doc{(a.documents||[]).length!==1?'s':''}</span>
                   <span className="bg-gray-50 rounded-lg px-2 py-1">🔧 {(a.maintenance||[]).length} service{(a.maintenance||[]).length!==1?'s':''}</span>
-                  {isVeh&&(a.incidents||[]).length>0&&<span className="bg-gray-50 rounded-lg px-2 py-1">⚠️ {(a.incidents||[]).length} incident{(a.incidents||[]).length!==1?'s':''}</span>}
                   {isVeh&&<span className="bg-gray-50 rounded-lg px-2 py-1">🛞 {(a.tyres||[]).length} tyre log{(a.tyres||[]).length!==1?'s':''}</span>}
                 </div>
+                {isVeh&&(
+                  <div className="flex gap-2 mt-2">
+                    <button type="button" onClick={e=>{e.stopPropagation();openAsset(a,'incidents');}} className="flex-1 text-xs border border-gray-200 rounded-lg px-2 py-1.5 text-gray-600 hover:bg-amber-50 hover:border-amber-200 font-semibold">⚠️ Incidents ({(a.incidents||[]).length})</button>
+                    <button type="button" onClick={e=>{e.stopPropagation();openAsset(a,'documents');}} className="flex-1 text-xs border border-gray-200 rounded-lg px-2 py-1.5 text-gray-600 hover:bg-brand-50 hover:border-brand-200 font-semibold">📄 Documents ({(a.documents||[]).length})</button>
+                  </div>
+                )}
               </div>
             );
           })}
