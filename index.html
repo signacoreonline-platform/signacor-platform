@@ -14321,9 +14321,218 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
 }
 
 /* ═══════════════════════════════════════════
+   ASSETS — VEHICLE HELPERS (2026-11-03)
+   Priority vehicle fields, linked records (service & repairs, driver
+   allocations, accidents & incidents), typed document uploads and basic
+   reminders. Everything lives on the existing asset object inside
+   platform_state.data.assets — no new storage, no backend change.
+   Every new field is optional; existing vehicles keep working unchanged
+   (a vehicle with no vehStatus reads as Active).
+═══════════════════════════════════════════ */
+const VEH_CATEGORIES = [['car','Car'],['bakkie','Bakkie'],['van','Van'],['truck','Truck'],['trailer','Trailer'],['other','Other']];
+const vehCategoryLabel = k => (VEH_CATEGORIES.find(x=>x[0]===k)||[null,''])[1];
+const VEH_STATUSES = [
+  { key:'active',      label:'Active',      cls:'bg-green-100 text-green-700' },
+  { key:'spare',       label:'Spare',       cls:'bg-blue-100 text-blue-700'   },
+  { key:'workshop',    label:'In Workshop', cls:'bg-amber-100 text-amber-700' },
+  { key:'sold',        label:'Sold',        cls:'bg-gray-100 text-gray-500'   },
+  { key:'written_off', label:'Written Off', cls:'bg-red-100 text-red-600'     },
+];
+const vehStatusMeta = s => VEH_STATUSES.find(x=>x.key===s) || VEH_STATUSES[0];
+const VEH_INACTIVE = ['sold','written_off'];
+const VEH_DOC_TYPES = [
+  ['registration','Registration document'],['licence_disc','Licence disc'],['insurance','Insurance document'],
+  ['invoice','Invoice'],['accident_report','Accident report'],['photo','Vehicle photograph'],['other','Other'],
+];
+const vehDocTypeLabel = k => (VEH_DOC_TYPES.find(x=>x[0]===k)||VEH_DOC_TYPES[VEH_DOC_TYPES.length-1])[1];
+const VEH_INCIDENT_STATUSES = [
+  ['open','Open','bg-red-100 text-red-700'],['investigating','Under investigation','bg-amber-100 text-amber-700'],
+  ['claim_submitted','Claim submitted','bg-blue-100 text-blue-700'],['repairing','Being repaired','bg-violet-100 text-violet-700'],
+  ['closed','Closed','bg-green-100 text-green-700'],
+];
+const vehIncidentStatusMeta = k => VEH_INCIDENT_STATUSES.find(x=>x[0]===k) || VEH_INCIDENT_STATUSES[0];
+const VEH_RESPONSIBILITY = [['pending','Pending investigation'],['undetermined','Undetermined'],['employee','Employee'],['third_party','Third party']];
+const VEH_REMIND_DAYS = 30;     // flag dates due within 30 days
+const VEH_REMIND_KM   = 1000;   // flag services due within 1 000 km
+const VEH_MAX_FILE_BYTES = 4*1024*1024;
+
+function vehToday(){ const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+const vehNum = v => { if(v===''||v==null) return null; const n=parseFloat(v); return Number.isFinite(n)?n:null; };
+const vehKm  = n => (n==null ? '—' : Math.round(n).toLocaleString('en-ZA')+' km');
+const vehEmpName = e => e ? ([e.firstName,e.lastName].filter(Boolean).join(' ').trim() || e.name || ('Employee #'+e.id)) : '';
+function vehEmpLabel(employees, id, fallback){
+  if(id==null||id==='') return fallback||'';
+  const e=(employees||[]).find(x=>String(x.id)===String(id));
+  return e ? vehEmpName(e) : (fallback||'');
+}
+function vehOwnerLabel(a, companies){
+  if(a.ownerCompanyId!=null && a.ownerCompanyId!==''){
+    const c=(companies||[]).find(x=>String(x.id)===String(a.ownerCompanyId));
+    if(c) return c.name;
+  }
+  return a.ownerName||'';
+}
+function vehResponsibilityLabel(r, employees){
+  if(r.responsibility==='employee') return vehEmpLabel(employees, r.responsibleEmpId, r.responsibleName) || 'Employee';
+  if(r.responsibility==='third_party') return 'Third party'+(r.responsibleName?': '+r.responsibleName:'');
+  if(r.responsibility==='undetermined') return 'Undetermined';
+  return 'Pending investigation';
+}
+
+// Latest RECORDED odometer: the most recent date wins; on the same date the
+// higher reading wins. Sources: the ODO log (which the vehicle form's
+// "current odometer" also writes to), service/repair records and the
+// vehicle's last-service kilometres.
+function vehLatestOdo(a){
+  const pts=[];
+  (a.odoReadings||[]).forEach(r=>{ const n=vehNum(r&&r.reading); if(n!=null&&n>0) pts.push({date:(r&&r.date)||'',reading:n,src:'ODO log'}); });
+  (a.maintenance||[]).forEach(r=>{ const n=vehNum(r&&r.odo); if(n!=null&&n>0) pts.push({date:(r&&r.date)||'',reading:n,src:'Service record'}); });
+  const ls=vehNum(a.lastServiceKm); if(ls!=null&&ls>0) pts.push({date:a.lastServiceDate||'',reading:ls,src:'Last service'});
+  if(!pts.length) return null;
+  pts.sort((x,y)=> String(y.date).localeCompare(String(x.date)) || (y.reading-x.reading));
+  return pts[0];
+}
+
+function vehDaysUntil(d){
+  if(!d || !/^\d{4}-\d{2}-\d{2}/.test(d)) return null;
+  const t=vehToday();
+  const a=Date.UTC(+d.slice(0,4),+d.slice(5,7)-1,+d.slice(8,10));
+  const b=Date.UTC(+t.slice(0,4),+t.slice(5,7)-1,+t.slice(8,10));
+  return Math.round((a-b)/86400000);
+}
+const vehDays = n => n+' day'+(Math.abs(n)===1?'':'s');
+
+// Basic reminders: licence renewal, insurance renewal and service.
+// Service is due on date OR kilometres, whichever comes first, against the
+// latest recorded odometer. Sold / written-off vehicles are not flagged.
+function vehicleReminders(a){
+  if(!a || !isVehicleCat(a.cat) || VEH_INACTIVE.includes(a.vehStatus)) return [];
+  const out=[];
+  const dateCheck=(kind,label,d)=>{
+    const n=vehDaysUntil(d); if(n==null) return;
+    if(n<0) out.push({kind,level:'overdue',short:label+' overdue',text:`${label} overdue by ${vehDays(-n)} (${d})`});
+    else if(n<=VEH_REMIND_DAYS) out.push({kind,level:'soon',short:label+' due',text:n===0?`${label} due today (${d})`:`${label} due in ${vehDays(n)} (${d})`});
+  };
+  dateCheck('licence','Licence renewal',a.licExp);
+  dateCheck('insurance','Insurance renewal',a.insRenewal);
+
+  const parts=[]; let level=null;
+  const sd=vehDaysUntil(a.nextServiceDate);
+  if(sd!=null){
+    if(sd<0){ level='overdue'; parts.push(`date passed ${vehDays(-sd)} ago (${a.nextServiceDate})`); }
+    else if(sd<=VEH_REMIND_DAYS){ level='soon'; parts.push(sd===0?`due today (${a.nextServiceDate})`:`due in ${vehDays(sd)} (${a.nextServiceDate})`); }
+  }
+  const nk=vehNum(a.nextServiceKm); const lo=vehLatestOdo(a);
+  if(nk!=null && nk>0 && lo){
+    const left=nk-lo.reading;
+    if(left<=0){ level='overdue'; parts.push(`${vehKm(-left)} past the ${vehKm(nk)} service (odometer ${vehKm(lo.reading)})`); }
+    else if(left<=VEH_REMIND_KM){ if(level!=='overdue') level='soon'; parts.push(`${vehKm(left)} to the ${vehKm(nk)} service (odometer ${vehKm(lo.reading)})`); }
+  }
+  if(level) out.push({kind:'service',level,short:'Service '+(level==='overdue'?'overdue':'due'),text:`Service ${level==='overdue'?'overdue':'due soon'} — ${parts.join('; ')}`});
+  return out;
+}
+
+// Reads an uploaded file as a data URL. Photos are scaled to max 1600px and
+// re-encoded as JPEG (only when that is actually smaller) so vehicle photos
+// don't bloat the shared platform_state save.
+function vehReadFile(file){
+  return new Promise((resolve,reject)=>{
+    const done=(dataUrl,size,type)=>resolve({ id:Date.now()+Math.random(), name:file.name, size, type, dataUrl, uploadedAt:vehToday() });
+    const reader=new FileReader();
+    reader.onerror=()=>reject(new Error('Could not read '+file.name));
+    reader.onload=ev=>{
+      const src=ev.target.result;
+      if(!/^image\/(jpeg|png|webp)$/i.test(file.type||'')) return done(src,file.size,file.type);
+      const img=new Image();
+      img.onload=()=>{
+        try{
+          const sc=Math.min(1,1600/Math.max(img.width||1,img.height||1));
+          if(sc>=1 && file.size<=600*1024) return done(src,file.size,file.type);
+          const c=document.createElement('canvas');
+          c.width=Math.max(1,Math.round(img.width*sc)); c.height=Math.max(1,Math.round(img.height*sc));
+          const ctx=c.getContext('2d'); ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,c.width,c.height); ctx.drawImage(img,0,0,c.width,c.height);
+          const out=c.toDataURL('image/jpeg',0.82);
+          const bytes=Math.round((out.length-out.indexOf(',')-1)*3/4);
+          if(bytes>=file.size) return done(src,file.size,file.type);
+          done(out,bytes,'image/jpeg');
+        }catch(_){ done(src,file.size,file.type); }
+      };
+      img.onerror=()=>done(src,file.size,file.type);
+      img.src=src;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+async function vehReadFiles(fileList){
+  const ok=[], tooBig=[];
+  for(const f of Array.from(fileList||[])){
+    try{ const d=await vehReadFile(f); if(d.size>VEH_MAX_FILE_BYTES) tooBig.push(f.name); else ok.push(d); }
+    catch(e){ tooBig.push(f.name); }
+  }
+  if(tooBig.length) alert('These files were NOT attached (larger than 4 MB, or unreadable):\n\n'+tooBig.join('\n')+'\n\nPlease reduce the file size (e.g. save the PDF at a lower quality) and try again.');
+  return ok;
+}
+function vehOpenFile(d){
+  if(!d||!d.dataUrl) return;
+  const w=window.open('','_blank'); if(!w) return;
+  const safeName=String(d.name||'File').replace(/[<>&"]/g,'');
+  const body=/^image\//.test(d.type||'')
+    ? `<img src="${d.dataUrl}" style="max-width:100%;display:block;margin:auto;">`
+    : `<iframe src="${d.dataUrl}" style="width:100%;height:100vh;border:none;"></iframe>`;
+  w.document.write(`<title>${safeName}</title><body style="margin:0;background:#f3f4f6;">${body}</body>`);
+  w.document.close();
+}
+
+const VehLbl = ({ children, opt, req }) => (
+  <label className="block text-xs font-semibold text-gray-500 mb-1">{children}{req?' *':''}{opt&&<span className="ml-1 font-normal text-gray-400">(optional)</span>}</label>
+);
+const VEH_SEC_CLS = "text-xs font-black text-gray-400 uppercase tracking-widest";
+
+function VehEmpSelect({ value, onChange, employees, fallbackName, required, placeholder, className }){
+  const list=(employees||[]).slice().sort((a,b)=>vehEmpName(a).localeCompare(vehEmpName(b)));
+  const v=value==null?'':String(value);
+  const known=v==='' || list.some(e=>String(e.id)===v);
+  return (
+    <select value={v} onChange={e=>onChange(e.target.value)} required={required} className={className}>
+      <option value="">{placeholder||'Select employee…'}</option>
+      {!known&&<option value={v}>{fallbackName||'Former employee'} (not in staff records)</option>}
+      {list.map(e=><option key={e.id} value={String(e.id)}>{vehEmpName(e)}{e.jobTitle?` — ${e.jobTitle}`:''}</option>)}
+    </select>
+  );
+}
+
+function VehReminderPills({ items, compact }){
+  if(!items||!items.length) return null;
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {items.map((r,i)=>(
+        <span key={i} className={`text-xs font-bold rounded-lg px-2 py-0.5 ${r.level==='overdue'?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700'}`}>
+          {r.level==='overdue'?'⛔':'⏰'} {compact?r.short:r.text}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function VehFileChips({ files, onRemove }){
+  if(!files||!files.length) return null;
+  return (
+    <div className="flex flex-wrap gap-2">
+      {files.map(f=>(
+        <span key={f.id} className="flex items-center gap-1.5 bg-gray-50 border border-gray-200 rounded-lg px-2 py-1 text-xs text-gray-600">
+          {/^image\//.test(f.type||'')?<img src={f.dataUrl} alt="" className="w-6 h-6 object-cover rounded"/>:<span>📋</span>}
+          <button type="button" onClick={()=>vehOpenFile(f)} className="max-w-[140px] truncate hover:text-brand-600">{f.name}</button>
+          {onRemove&&<button type="button" onClick={()=>onRemove(f.id)} className="text-red-400 hover:text-red-600 font-bold">✕</button>}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════
    ASSETS — ADD / EDIT MODAL
 ═══════════════════════════════════════════ */
-function AddEditAssetModal({ asset, onClose, onSave }) {
+function AddEditAssetModal({ asset, onClose, onSave, companies, employees }) {
   const isEdit = !!asset;
   // 2026-08-18 (production stabilisation, Section 12): onSave is now the
   // confirmed-save handler (AssetsPage.handleSave / handleUpdate), which is
@@ -14346,6 +14555,29 @@ function AddEditAssetModal({ asset, onClose, onSave }) {
   const [vin,     setVin]     = useState(asset?.vin||'');
   const [licExp,  setLicExp]  = useState(asset?.licExp||'');
   const [rwExp,   setRwExp]   = useState(asset?.rwExp||'');
+  const [rwNA,    setRwNA]    = useState(!!asset?.rwNA);
+  // Vehicle — priority fields (2026-11-03). All optional.
+  const _lo = asset ? vehLatestOdo(asset) : null;
+  const _s  = v => (v==null ? '' : String(v));
+  const [vehCategory, setVehCategory] = useState(asset?.vehCategory||'');
+  const [vehStatus,   setVehStatus]   = useState(asset?.vehStatus||'active');
+  const [ownerSel,    setOwnerSel]    = useState((asset&&asset.ownerCompanyId!=null&&asset.ownerCompanyId!=='') ? ('co:'+asset.ownerCompanyId) : (asset?.ownerName ? 'other' : ''));
+  const [ownerName,   setOwnerName]   = useState(asset?.ownerName||'');
+  const [respEmp,     setRespEmp]     = useState(_s(asset?.responsibleEmpId));
+  const [odoNow,      setOdoNow]      = useState(_lo ? String(_lo.reading) : '');
+  const [odoNowDate,  setOdoNowDate]  = useState((_lo&&_lo.date) || vehToday());
+  const [lastSvcDate, setLastSvcDate] = useState(asset?.lastServiceDate||'');
+  const [lastSvcKm,   setLastSvcKm]   = useState(_s(asset?.lastServiceKm));
+  const [nextSvcDate, setNextSvcDate] = useState(asset?.nextServiceDate||'');
+  const [nextSvcKm,   setNextSvcKm]   = useState(_s(asset?.nextServiceKm));
+  const [insurer,     setInsurer]     = useState(asset?.insurer||'');
+  const [insPolicy,   setInsPolicy]   = useState(asset?.insPolicy||'');
+  const [insRenewal,  setInsRenewal]  = useState(asset?.insRenewal||'');
+  const [insContact,  setInsContact]  = useState(asset?.insContact||'');
+  const [tracking,    setTracking]    = useState(asset?.trackingFitted||'');
+  const [trackProvider,setTrackProvider]=useState(asset?.trackProvider||'');
+  const [trackRef,    setTrackRef]    = useState(asset?.trackRef||'');
+  const [trackContact,setTrackContact]= useState(asset?.trackContact||'');
   // Equipment fields
   const [serial,  setSerial]  = useState(asset?.serial||'');
   const [mfr,     setMfr]     = useState(asset?.mfr||'');
@@ -14362,15 +14594,47 @@ function AddEditAssetModal({ asset, onClose, onSave }) {
     setSaving(true);
     setErr('');
     try {
+      let odoReadings = asset?.odoReadings||[];
+      let vehExtra = {};
+      if (isVeh) {
+        const kmOrNull = v => { const n=vehNum(v); return (n!=null&&n>=0)?n:null; };
+        // "Current odometer" is recorded into the ODO log, so there is one
+        // odometer history and "latest recorded odometer" has one meaning.
+        const n = kmOrNull(odoNow);
+        if (n!=null && n>0) {
+          const d = odoNowDate || vehToday();
+          if (!_lo || _lo.reading!==n || (_lo.date||'')!==d) {
+            odoReadings = [{ id:Date.now(), date:d, reading:n, notes:'Recorded on vehicle form' }, ...odoReadings];
+          }
+        }
+        const emp = (employees||[]).find(x=>String(x.id)===respEmp);
+        const coId = ownerSel.startsWith('co:') ? ownerSel.slice(3) : null;
+        const co = coId!=null ? (companies||[]).find(c=>String(c.id)===coId) : null;
+        vehExtra = {
+          vehCategory, vehStatus,
+          ownerCompanyId: co ? co.id : (coId!=null ? (asset?.ownerCompanyId ?? coId) : null),
+          ownerName: ownerSel==='other' ? ownerName.trim() : (co ? co.name : (coId!=null ? (asset?.ownerName||'') : '')),
+          responsibleEmpId: respEmp ? (emp ? emp.id : (asset?.responsibleEmpId ?? respEmp)) : null,
+          responsibleEmpName: respEmp ? (emp ? vehEmpName(emp) : (asset?.responsibleEmpName||'')) : '',
+          lastServiceDate: lastSvcDate, lastServiceKm: kmOrNull(lastSvcKm),
+          nextServiceDate: nextSvcDate, nextServiceKm: kmOrNull(nextSvcKm),
+          insurer: insurer.trim(), insPolicy: insPolicy.trim(), insRenewal, insContact: insContact.trim(),
+          trackingFitted: tracking, trackProvider: trackProvider.trim(), trackRef: trackRef.trim(), trackContact: trackContact.trim(),
+          rwNA,
+        };
+      }
       const ok = await onSave({
         ...(asset||{}), id:asset?.id||Date.now(),
         cat, name:name.trim()||reg||serial||'Asset',
-        reg, make, model, year, color, vin, licExp, rwExp,
+        reg, make, model, year, color, vin, licExp, rwExp: (isVeh&&rwNA) ? '' : rwExp,
         serial, mfr, modelNo, purDate, notes,
-        odoReadings: asset?.odoReadings||[],
+        odoReadings,
         maintenance: asset?.maintenance||[],
         tyres:       asset?.tyres||[],
         documents:   asset?.documents||[],
+        allocations: asset?.allocations||[],
+        incidents:   asset?.incidents||[],
+        ...vehExtra,
       });
       // onSave's own handler (handleSave/handleUpdate) already alerts the
       // user with the specific reason on failure — this modal just needs to
@@ -14403,25 +14667,109 @@ function AddEditAssetModal({ asset, onClose, onSave }) {
 
         {/* Vehicle fields */}
         {isVeh && (
-          <div className="space-y-3">
-            <p className="text-xs font-black text-gray-400 uppercase tracking-widest">Vehicle Details</p>
-            <div className="grid grid-cols-2 gap-3">
-              <div><label className="block text-xs font-semibold text-gray-500 mb-1">Registration *</label>
-                <input value={reg} onChange={e=>setReg(e.target.value.toUpperCase())} required={isVeh} className={iCls} placeholder="e.g. CA 123-456"/></div>
-              <div><label className="block text-xs font-semibold text-gray-500 mb-1">Colour</label>
-                <input value={color} onChange={e=>setColor(e.target.value)} className={iCls} placeholder="e.g. White"/></div>
-              <div><label className="block text-xs font-semibold text-gray-500 mb-1">Make</label>
-                <input value={make} onChange={e=>setMake(e.target.value)} className={iCls} placeholder="e.g. Toyota"/></div>
-              <div><label className="block text-xs font-semibold text-gray-500 mb-1">Model</label>
-                <input value={model} onChange={e=>setModel(e.target.value)} className={iCls} placeholder="e.g. Hilux 2.4 GD-6"/></div>
-              <div><label className="block text-xs font-semibold text-gray-500 mb-1">Year</label>
-                <input value={year} onChange={e=>setYear(e.target.value)} className={iCls} placeholder="e.g. 2021"/></div>
-              <div><label className="block text-xs font-semibold text-gray-500 mb-1">VIN Number</label>
-                <input value={vin} onChange={e=>setVin(e.target.value.toUpperCase())} className={iCls} placeholder="17-char VIN"/></div>
-              <div><label className="block text-xs font-semibold text-gray-500 mb-1">Licence Expiry</label>
-                <input type="date" value={licExp} onChange={e=>setLicExp(e.target.value)} className={iCls}/></div>
-              <div><label className="block text-xs font-semibold text-gray-500 mb-1">Roadworthy Expiry</label>
-                <input type="date" value={rwExp} onChange={e=>setRwExp(e.target.value)} className={iCls}/></div>
+          <div className="space-y-5">
+            <div className="space-y-3">
+              <p className={VEH_SEC_CLS}>Vehicle Details</p>
+              <div className="grid grid-cols-2 gap-3">
+                <div><VehLbl req>Registration</VehLbl>
+                  <input value={reg} onChange={e=>setReg(e.target.value.toUpperCase())} required={isVeh} className={iCls} placeholder="e.g. CA 123-456"/></div>
+                <div><VehLbl opt>Vehicle Category</VehLbl>
+                  <select value={vehCategory} onChange={e=>setVehCategory(e.target.value)} className={iCls}>
+                    <option value="">Select…</option>
+                    {VEH_CATEGORIES.map(([k,l])=><option key={k} value={k}>{l}</option>)}
+                  </select></div>
+                <div><VehLbl>Status</VehLbl>
+                  <select value={vehStatus} onChange={e=>setVehStatus(e.target.value)} className={iCls}>
+                    {VEH_STATUSES.map(s=><option key={s.key} value={s.key}>{s.label}</option>)}
+                  </select></div>
+                <div><VehLbl opt>Colour</VehLbl>
+                  <input value={color} onChange={e=>setColor(e.target.value)} className={iCls} placeholder="e.g. White"/></div>
+                <div><VehLbl opt>Make</VehLbl>
+                  <input value={make} onChange={e=>setMake(e.target.value)} className={iCls} placeholder="e.g. Toyota"/></div>
+                <div><VehLbl opt>Model</VehLbl>
+                  <input value={model} onChange={e=>setModel(e.target.value)} className={iCls} placeholder="e.g. Hilux 2.4 GD-6"/></div>
+                <div><VehLbl opt>Year</VehLbl>
+                  <input value={year} onChange={e=>setYear(e.target.value)} className={iCls} placeholder="e.g. 2021"/></div>
+                <div><VehLbl opt>VIN Number</VehLbl>
+                  <input value={vin} onChange={e=>setVin(e.target.value.toUpperCase())} className={iCls} placeholder="17-char VIN"/></div>
+                <div><VehLbl opt>Licence Expiry</VehLbl>
+                  <input type="date" value={licExp} onChange={e=>setLicExp(e.target.value)} className={iCls}/></div>
+                <div><VehLbl opt>Roadworthy Expiry</VehLbl>
+                  <input type="date" value={rwNA?'':rwExp} onChange={e=>setRwExp(e.target.value)} disabled={rwNA} className={iCls+(rwNA?' bg-gray-50 text-gray-300':'')}/>
+                  <label className="flex items-center gap-1.5 mt-1 text-xs text-gray-500 cursor-pointer">
+                    <input type="checkbox" checked={rwNA} onChange={e=>setRwNA(e.target.checked)}/> Not applicable
+                  </label></div>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <p className={VEH_SEC_CLS}>Ownership &amp; Driver</p>
+              <div className="grid grid-cols-2 gap-3">
+                <div><VehLbl opt>Company / Registered Owner</VehLbl>
+                  <select value={ownerSel} onChange={e=>setOwnerSel(e.target.value)} className={iCls}>
+                    <option value="">Select…</option>
+                    {(companies||[]).map(c=><option key={c.id} value={'co:'+c.id}>{c.name}</option>)}
+                    {ownerSel.startsWith('co:') && !(companies||[]).some(c=>'co:'+c.id===ownerSel) && <option value={ownerSel}>{asset?.ownerName||'Previous company'}</option>}
+                    <option value="other">Other (e.g. finance house)…</option>
+                  </select>
+                  {ownerSel==='other'&&<input value={ownerName} onChange={e=>setOwnerName(e.target.value)} className={iCls+' mt-2'} placeholder="Registered owner name"/>}</div>
+                <div><VehLbl opt>Responsible Employee</VehLbl>
+                  <VehEmpSelect value={respEmp} onChange={setRespEmp} employees={employees} fallbackName={asset?.responsibleEmpName} className={iCls}/>
+                  {(employees||[]).length===0&&<p className="text-xs text-gray-400 mt-1">No staff records yet — add employees under HR.</p>}</div>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <p className={VEH_SEC_CLS}>Odometer &amp; Service</p>
+              <div className="grid grid-cols-2 gap-3">
+                <div><VehLbl opt>Current Odometer (km)</VehLbl>
+                  <input type="number" min="0" value={odoNow} onChange={e=>setOdoNow(e.target.value)} className={iCls} placeholder="e.g. 145230"/></div>
+                <div><VehLbl opt>Date Recorded</VehLbl>
+                  <input type="date" value={odoNowDate} onChange={e=>setOdoNowDate(e.target.value)} className={iCls}/></div>
+                <div><VehLbl opt>Last Service Date</VehLbl>
+                  <input type="date" value={lastSvcDate} onChange={e=>setLastSvcDate(e.target.value)} className={iCls}/></div>
+                <div><VehLbl opt>Last Service (km)</VehLbl>
+                  <input type="number" min="0" value={lastSvcKm} onChange={e=>setLastSvcKm(e.target.value)} className={iCls} placeholder="km"/></div>
+                <div><VehLbl opt>Next Service Due Date</VehLbl>
+                  <input type="date" value={nextSvcDate} onChange={e=>setNextSvcDate(e.target.value)} className={iCls}/></div>
+                <div><VehLbl opt>Next Service Due (km)</VehLbl>
+                  <input type="number" min="0" value={nextSvcKm} onChange={e=>setNextSvcKm(e.target.value)} className={iCls} placeholder="km"/></div>
+              </div>
+              <p className="text-xs text-gray-400">A service is flagged on the due date or due kilometres — whichever comes first — using the latest recorded odometer.</p>
+            </div>
+
+            <div className="space-y-3">
+              <p className={VEH_SEC_CLS}>Insurance</p>
+              <div className="grid grid-cols-2 gap-3">
+                <div><VehLbl opt>Insurer</VehLbl>
+                  <input value={insurer} onChange={e=>setInsurer(e.target.value)} className={iCls} placeholder="e.g. Santam"/></div>
+                <div><VehLbl opt>Policy Number</VehLbl>
+                  <input value={insPolicy} onChange={e=>setInsPolicy(e.target.value)} className={iCls}/></div>
+                <div><VehLbl opt>Insurance Renewal Date</VehLbl>
+                  <input type="date" value={insRenewal} onChange={e=>setInsRenewal(e.target.value)} className={iCls}/></div>
+                <div><VehLbl opt>Insurance / Roadside Contact No.</VehLbl>
+                  <input type="tel" value={insContact} onChange={e=>setInsContact(e.target.value)} className={iCls} placeholder="e.g. 0860 123 456"/></div>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <p className={VEH_SEC_CLS}>Tracking</p>
+              <div className="grid grid-cols-2 gap-3">
+                <div><VehLbl opt>Tracking Device Fitted</VehLbl>
+                  <select value={tracking} onChange={e=>setTracking(e.target.value)} className={iCls}>
+                    <option value="">Not recorded</option>
+                    <option value="yes">Yes</option>
+                    <option value="no">No</option>
+                  </select></div>
+                {tracking==='yes'&&<>
+                  <div><VehLbl opt>Tracking Provider</VehLbl>
+                    <input value={trackProvider} onChange={e=>setTrackProvider(e.target.value)} className={iCls} placeholder="e.g. Tracker, Netstar"/></div>
+                  <div><VehLbl opt>Device Reference</VehLbl>
+                    <input value={trackRef} onChange={e=>setTrackRef(e.target.value)} className={iCls}/></div>
+                  <div><VehLbl opt>Tracking Contact No.</VehLbl>
+                    <input type="tel" value={trackContact} onChange={e=>setTrackContact(e.target.value)} className={iCls}/></div>
+                </>}
+              </div>
             </div>
           </div>
         )}
@@ -14445,7 +14793,7 @@ function AddEditAssetModal({ asset, onClose, onSave }) {
           </div>
         )}
 
-        <div><label className="block text-xs font-semibold text-gray-500 mb-1">Notes</label>
+        <div>{isVeh?<VehLbl opt>Notes</VehLbl>:<label className="block text-xs font-semibold text-gray-500 mb-1">Notes</label>}
           <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} className={iCls+' resize-none'} placeholder="Any additional information..."/></div>
 
         {err && <div className="bg-red-50 border border-red-200 text-red-700 text-xs font-semibold rounded-xl px-3 py-2">{err}</div>}
@@ -14479,32 +14827,182 @@ function OdoModal({ onClose, onSave }) {
   );
 }
 
-function MaintenanceModal({ onClose, onSave, isVehicle }) {
-  const today = new Date().toISOString().slice(0,10);
-  const [date,setDate]=useState(today); const [type,setType]=useState(''); const [odo,setOdo]=useState('');
-  const [cost,setCost]=useState(''); const [provider,setProvider]=useState(''); const [notes,setNotes]=useState('');
+function MaintenanceModal({ onClose, onSave, isVehicle, initial, suppliers, asset }) {
+  const isEdit = !!initial;
+  const today = vehToday();
+  const [date,setDate]=useState(initial?.date||today); const [type,setType]=useState(initial?.type||''); const [odo,setOdo]=useState(initial&&initial.odo?String(initial.odo):'');
+  const [cost,setCost]=useState(initial&&initial.cost?String(initial.cost):''); const [provider,setProvider]=useState(initial?.provider||''); const [notes,setNotes]=useState(initial?.notes||'');
+  const [workDone,setWorkDone]=useState(initial?.workDone||'');
+  const [files,setFiles]=useState(initial?.attachments||[]);
+  const [useAsLast,setUseAsLast]=useState(!isEdit && !!isVehicle && (!asset?.lastServiceDate || today>=asset.lastServiceDate));
+  const [nextDate,setNextDate]=useState(''); const [nextKm,setNextKm]=useState('');
+  const [busy,setBusy]=useState(false);
   const iCls="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 bg-white";
-  const types = isVehicle
-    ? ['Oil & Filter Service','Major Service','Brake Service','Clutch Replacement','Gearbox Service','Diff Service','Cooling System','Electrical','Bodywork','Windscreen','Air Con Service','Other']
+  const baseTypes = isVehicle
+    ? ['Oil & Filter Service','Major Service','Brake Service','Clutch Replacement','Gearbox Service','Diff Service','Cooling System','Electrical','Bodywork','Windscreen','Air Con Service','Accident Repair','Other']
     : ['Preventive Service','Blade/Head Replacement','Ink System Service','Belt & Drive Service','Electronics/Software','Calibration','Cleaning','Other'];
-  function submit(e){ e.preventDefault(); onSave({id:Date.now(),date,type,odo:parseFloat(odo)||0,cost:parseFloat(cost)||0,provider,notes}); onClose(); }
+  const types = (type && !baseTypes.includes(type)) ? [type, ...baseTypes] : baseTypes;
+  async function addFiles(e){ const input=e.target; const got=await vehReadFiles(input.files); setFiles(p=>[...p,...got]); input.value=''; }
+  async function submit(e){
+    e.preventDefault(); if(busy) return; setBusy(true);
+    const rec={...(initial||{}), id:initial?.id||Date.now(), date, type, odo:parseFloat(odo)||0, cost:parseFloat(cost)||0, provider, notes,
+      ...(isVehicle?{ workDone, attachments:files }:{})};
+    try { const ok=await onSave(rec,{ useAsLast, nextDate, nextKm }); if(ok!==false) onClose(); }
+    finally { setBusy(false); }
+  }
   return (
     <Modal onClose={onClose}>
-      <ModalHeader title="🔧 Log Maintenance" onClose={onClose}/>
-      <form onSubmit={submit} className="px-6 py-5 space-y-3">
-        <div><label className="block text-xs font-semibold text-gray-500 mb-1">Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} required className={iCls}/></div>
-        <div><label className="block text-xs font-semibold text-gray-500 mb-1">Maintenance Type *</label>
+      <ModalHeader title={isVehicle?(isEdit?'🔧 Edit Service / Repair':'🔧 Log Service / Repair'):'🔧 Log Maintenance'} onClose={onClose}/>
+      <form onSubmit={submit} className="px-6 py-5 space-y-3 overflow-y-auto max-h-[80vh]">
+        <div><label className="block text-xs font-semibold text-gray-500 mb-1">Date *</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} required className={iCls}/></div>
+        <div><label className="block text-xs font-semibold text-gray-500 mb-1">{isVehicle?'Service / Repair Type *':'Maintenance Type *'}</label>
           <select value={type} onChange={e=>setType(e.target.value)} required className={iCls}>
             <option value="">Select type…</option>
             {types.map(t=><option key={t} value={t}>{t}</option>)}
           </select></div>
+        {isVehicle&&<div><VehLbl opt>Work Done</VehLbl><textarea value={workDone} onChange={e=>setWorkDone(e.target.value)} rows={2} className={iCls+' resize-none'} placeholder="e.g. Replaced front brake pads and discs"/></div>}
         <div className="grid grid-cols-2 gap-3">
-          {isVehicle&&<div><label className="block text-xs font-semibold text-gray-500 mb-1">ODO at Service (km)</label><input type="number" value={odo} onChange={e=>setOdo(e.target.value)} min="0" className={iCls} placeholder="km"/></div>}
-          <div className={isVehicle?'':'col-span-2'}><label className="block text-xs font-semibold text-gray-500 mb-1">Cost (R)</label><input type="number" value={cost} onChange={e=>setCost(e.target.value)} min="0" className={iCls} placeholder="0.00"/></div>
+          {isVehicle&&<div><VehLbl opt>Odometer (km)</VehLbl><input type="number" value={odo} onChange={e=>setOdo(e.target.value)} min="0" className={iCls} placeholder="km"/></div>}
+          <div className={isVehicle?'':'col-span-2'}>{isVehicle?<VehLbl opt>Cost (R)</VehLbl>:<label className="block text-xs font-semibold text-gray-500 mb-1">Cost (R)</label>}<input type="number" value={cost} onChange={e=>setCost(e.target.value)} min="0" step="0.01" className={iCls} placeholder="0.00"/></div>
         </div>
-        <div><label className="block text-xs font-semibold text-gray-500 mb-1">Service Provider</label><input value={provider} onChange={e=>setProvider(e.target.value)} className={iCls} placeholder="e.g. George Toyota"/></div>
-        <div><label className="block text-xs font-semibold text-gray-500 mb-1">Notes</label><textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} className={iCls+' resize-none'} placeholder="Parts replaced, work done, next due…"/></div>
-        <div className="flex gap-3 pt-1"><button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold">Cancel</button><button type="submit" className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold">Save Record</button></div>
+        <div>{isVehicle?<VehLbl opt>Supplier</VehLbl>:<label className="block text-xs font-semibold text-gray-500 mb-1">Service Provider</label>}
+          <input value={provider} onChange={e=>setProvider(e.target.value)} list={isVehicle?'veh-supplier-list':undefined} className={iCls} placeholder="e.g. George Toyota"/>
+          {isVehicle&&<datalist id="veh-supplier-list">{(suppliers||[]).filter(s=>s&&s.name).map(s=><option key={s.id} value={s.name}/>)}</datalist>}</div>
+        {isVehicle&&<div className="space-y-2"><VehLbl opt>Invoice Attachment</VehLbl>
+          <VehFileChips files={files} onRemove={id=>setFiles(p=>p.filter(f=>f.id!==id))}/>
+          <label className="inline-block text-xs border border-gray-200 rounded-lg px-3 py-1.5 text-gray-600 hover:bg-gray-50 font-semibold cursor-pointer">📎 Attach invoice
+            <input type="file" accept=".pdf,.jpg,.jpeg,.png" multiple className="hidden" onChange={addFiles}/></label></div>}
+        <div>{isVehicle?<VehLbl opt>Notes</VehLbl>:<label className="block text-xs font-semibold text-gray-500 mb-1">Notes</label>}<textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} className={iCls+' resize-none'} placeholder={isVehicle?'Anything else worth noting…':'Parts replaced, work done, next due…'}/></div>
+        {isVehicle&&!isEdit&&(
+          <div className="bg-gray-50 rounded-xl p-3 space-y-2">
+            <label className="flex items-center gap-2 text-xs font-semibold text-gray-600 cursor-pointer">
+              <input type="checkbox" checked={useAsLast} onChange={e=>setUseAsLast(e.target.checked)}/> Use as this vehicle's last service (date &amp; km)
+            </label>
+            <div className="grid grid-cols-2 gap-3">
+              <div><VehLbl opt>Next Service Due Date</VehLbl><input type="date" value={nextDate} onChange={e=>setNextDate(e.target.value)} className={iCls}/></div>
+              <div><VehLbl opt>Next Service Due (km)</VehLbl><input type="number" min="0" value={nextKm} onChange={e=>setNextKm(e.target.value)} className={iCls} placeholder="km"/></div>
+            </div>
+          </div>
+        )}
+        <div className="flex gap-3 pt-1"><button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold">Cancel</button><button type="submit" disabled={busy} className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-60">{busy?'Saving…':'Save Record'}</button></div>
+      </form>
+    </Modal>
+  );
+}
+
+function VehAllocationModal({ onClose, onSave, employees, initial, hasOpen }) {
+  const isEdit = !!initial;
+  const [empId,setEmpId]=useState(initial&&initial.empId!=null?String(initial.empId):'');
+  const [dateFrom,setDateFrom]=useState(initial?.dateFrom||vehToday());
+  const [dateTo,setDateTo]=useState(initial?.dateTo||'');
+  const [notes,setNotes]=useState(initial?.notes||'');
+  const [makeResp,setMakeResp]=useState(!isEdit);
+  const [closePrev,setClosePrev]=useState(!isEdit && !!hasOpen);
+  const [busy,setBusy]=useState(false); const [err,setErr]=useState('');
+  const iCls="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 bg-white";
+  async function submit(e){
+    e.preventDefault(); if(busy) return;
+    if(dateTo && dateTo<dateFrom){ setErr('Date returned cannot be before the date allocated.'); return; }
+    setBusy(true); setErr('');
+    const emp=(employees||[]).find(x=>String(x.id)===empId);
+    const rec={...(initial||{}), id:initial?.id||Date.now(),
+      empId: emp?emp.id:(initial?.empId ?? empId), empName: emp?vehEmpName(emp):(initial?.empName||''),
+      dateFrom, dateTo, notes};
+    try { const ok=await onSave(rec,{ makeResponsible: makeResp && !dateTo, closePrev }); if(ok!==false) onClose(); }
+    finally { setBusy(false); }
+  }
+  return (
+    <Modal onClose={onClose}>
+      <ModalHeader title={isEdit?'👤 Edit Driver Allocation':'👤 Allocate Driver'} onClose={onClose}/>
+      <form onSubmit={submit} className="px-6 py-5 space-y-3">
+        <div><VehLbl req>Employee</VehLbl>
+          <VehEmpSelect value={empId} onChange={setEmpId} employees={employees} fallbackName={initial?.empName} required className={iCls}/>
+          {(employees||[]).length===0&&<p className="text-xs text-gray-400 mt-1">No staff records yet — add employees under HR first.</p>}</div>
+        <div className="grid grid-cols-2 gap-3">
+          <div><VehLbl req>Date Allocated</VehLbl><input type="date" value={dateFrom} onChange={e=>setDateFrom(e.target.value)} required className={iCls}/></div>
+          <div><VehLbl opt>Date Returned</VehLbl><input type="date" value={dateTo} onChange={e=>setDateTo(e.target.value)} className={iCls}/></div>
+        </div>
+        <div><VehLbl opt>Notes</VehLbl><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls} placeholder="e.g. Keys and fuel card handed over"/></div>
+        {!isEdit&&(
+          <div className="bg-gray-50 rounded-xl p-3 space-y-1.5">
+            <label className="flex items-center gap-2 text-xs font-semibold text-gray-600 cursor-pointer"><input type="checkbox" checked={makeResp} onChange={e=>setMakeResp(e.target.checked)}/> Make this the vehicle's responsible employee</label>
+            {hasOpen&&<label className="flex items-center gap-2 text-xs font-semibold text-gray-600 cursor-pointer"><input type="checkbox" checked={closePrev} onChange={e=>setClosePrev(e.target.checked)}/> Mark the current open allocation as returned on the date allocated</label>}
+          </div>
+        )}
+        {err&&<div className="bg-red-50 border border-red-200 text-red-700 text-xs font-semibold rounded-xl px-3 py-2">{err}</div>}
+        <div className="flex gap-3 pt-1"><button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold">Cancel</button><button type="submit" disabled={busy} className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-60">{busy?'Saving…':'Save Allocation'}</button></div>
+      </form>
+    </Modal>
+  );
+}
+
+function VehIncidentModal({ onClose, onSave, employees, initial }) {
+  const isEdit = !!initial;
+  const [date,setDate]=useState(initial?.date||vehToday());
+  const [time,setTime]=useState(initial?.time||'');
+  const [location,setLocation]=useState(initial?.location||'');
+  const [description,setDescription]=useState(initial?.description||'');
+  const [driverEmpId,setDriverEmpId]=useState(initial&&initial.driverEmpId!=null?String(initial.driverEmpId):'');
+  const [driverName,setDriverName]=useState(initial&&initial.driverEmpId==null?(initial.driverName||''):'');
+  const [responsibility,setResponsibility]=useState(initial?.responsibility||'pending');
+  const [respEmpId,setRespEmpId]=useState(initial&&initial.responsibleEmpId!=null?String(initial.responsibleEmpId):'');
+  const [respName,setRespName]=useState(initial?.responsibility==='third_party'?(initial.responsibleName||''):'');
+  const [photos,setPhotos]=useState(initial?.photos||[]);
+  const [repairCost,setRepairCost]=useState(initial&&initial.repairCost?String(initial.repairCost):'');
+  const [claimRef,setClaimRef]=useState(initial?.claimRef||'');
+  const [status,setStatus]=useState(initial?.status||'open');
+  const [busy,setBusy]=useState(false);
+  const iCls="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400 bg-white";
+  async function addPhotos(e){ const input=e.target; const got=await vehReadFiles(input.files); setPhotos(p=>[...p,...got]); input.value=''; }
+  async function submit(e){
+    e.preventDefault(); if(busy) return; setBusy(true);
+    const dEmp=(employees||[]).find(x=>String(x.id)===driverEmpId);
+    const rEmp=(employees||[]).find(x=>String(x.id)===respEmpId);
+    const rec={...(initial||{}), id:initial?.id||Date.now(), date, time, location, description,
+      driverEmpId: driverEmpId ? (dEmp?dEmp.id:(initial?.driverEmpId ?? driverEmpId)) : null,
+      driverName: driverEmpId ? (dEmp?vehEmpName(dEmp):(initial?.driverName||'')) : driverName.trim(),
+      responsibility,
+      responsibleEmpId: responsibility==='employee' && respEmpId ? (rEmp?rEmp.id:(initial?.responsibleEmpId ?? respEmpId)) : null,
+      responsibleName: responsibility==='employee' ? (rEmp?vehEmpName(rEmp):(initial?.responsibleName||'')) : (responsibility==='third_party'?respName.trim():''),
+      photos, repairCost: parseFloat(repairCost)||0, claimRef: claimRef.trim(), status};
+    try { const ok=await onSave(rec); if(ok!==false) onClose(); }
+    finally { setBusy(false); }
+  }
+  return (
+    <Modal onClose={onClose} wide>
+      <ModalHeader title={isEdit?'⚠️ Edit Accident / Incident':'⚠️ Log Accident / Incident'} onClose={onClose}/>
+      <form onSubmit={submit} className="px-6 py-5 space-y-3 overflow-y-auto max-h-[80vh]">
+        <div className="grid grid-cols-2 gap-3">
+          <div><VehLbl req>Incident Date</VehLbl><input type="date" value={date} onChange={e=>setDate(e.target.value)} required className={iCls}/></div>
+          <div><VehLbl opt>Time</VehLbl><input type="time" value={time} onChange={e=>setTime(e.target.value)} className={iCls}/></div>
+        </div>
+        <div><VehLbl opt>Location</VehLbl><input value={location} onChange={e=>setLocation(e.target.value)} className={iCls} placeholder="e.g. N2 near York St off-ramp, George"/></div>
+        <div><VehLbl req>Description</VehLbl><textarea value={description} onChange={e=>setDescription(e.target.value)} required rows={3} className={iCls+' resize-none'} placeholder="What happened, damage to the vehicle, other parties involved…"/></div>
+        <div className="grid grid-cols-2 gap-3">
+          <div><VehLbl opt>Driver Involved</VehLbl>
+            <VehEmpSelect value={driverEmpId} onChange={setDriverEmpId} employees={employees} fallbackName={initial?.driverName} placeholder="Not an employee / unknown" className={iCls}/>
+            {!driverEmpId&&<input value={driverName} onChange={e=>setDriverName(e.target.value)} className={iCls+' mt-2'} placeholder="Driver name (if not on staff)"/>}</div>
+          <div><VehLbl>Person Responsible</VehLbl>
+            <select value={responsibility} onChange={e=>setResponsibility(e.target.value)} className={iCls}>
+              {VEH_RESPONSIBILITY.map(([k,l])=><option key={k} value={k}>{l}</option>)}
+            </select>
+            {responsibility==='employee'&&<div className="mt-2"><VehEmpSelect value={respEmpId} onChange={setRespEmpId} employees={employees} fallbackName={initial?.responsibleName} required className={iCls}/></div>}
+            {responsibility==='third_party'&&<input value={respName} onChange={e=>setRespName(e.target.value)} className={iCls+' mt-2'} placeholder="Third party name (optional)"/>}</div>
+        </div>
+        <div className="grid grid-cols-3 gap-3">
+          <div><VehLbl opt>Repair Cost (R)</VehLbl><input type="number" min="0" step="0.01" value={repairCost} onChange={e=>setRepairCost(e.target.value)} className={iCls} placeholder="0.00"/></div>
+          <div><VehLbl opt>Insurance Claim Ref.</VehLbl><input value={claimRef} onChange={e=>setClaimRef(e.target.value)} className={iCls}/></div>
+          <div><VehLbl>Status</VehLbl>
+            <select value={status} onChange={e=>setStatus(e.target.value)} className={iCls}>
+              {VEH_INCIDENT_STATUSES.map(([k,l])=><option key={k} value={k}>{l}</option>)}
+            </select></div>
+        </div>
+        <div className="space-y-2"><VehLbl opt>Photographs</VehLbl>
+          <VehFileChips files={photos} onRemove={id=>setPhotos(p=>p.filter(f=>f.id!==id))}/>
+          <label className="inline-block text-xs border border-gray-200 rounded-lg px-3 py-1.5 text-gray-600 hover:bg-gray-50 font-semibold cursor-pointer">📷 Add photos
+            <input type="file" accept="image/*" multiple className="hidden" onChange={addPhotos}/></label>
+          <p className="text-xs text-gray-400">Upload the accident report itself under Documents → Accident report.</p></div>
+        <div className="flex gap-3 pt-1"><button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold">Cancel</button><button type="submit" disabled={busy} className="flex-1 bg-brand-500 hover:bg-brand-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-60">{busy?'Saving…':'Save Incident'}</button></div>
       </form>
     </Modal>
   );
@@ -14542,18 +15040,49 @@ function TyreModal({ onClose, onSave }) {
 /* ═══════════════════════════════════════════
    ASSETS — DETAIL VIEW
 ═══════════════════════════════════════════ */
-function AssetDetail({ asset, onBack, onUpdate }) {
+function AssetDetail({ asset, onBack, onUpdate, companies, employees, suppliers }) {
   const [tab,setTab]=useState('overview');
   const [showEdit,setShowEdit]=useState(false);
   const [showOdo,setShowOdo]=useState(false);
   const [showMaint,setShowMaint]=useState(false);
+  const [editMaint,setEditMaint]=useState(null);
   const [showTyre,setShowTyre]=useState(false);
+  const [showAlloc,setShowAlloc]=useState(false);
+  const [editAlloc,setEditAlloc]=useState(null);
+  const [showInc,setShowInc]=useState(false);
+  const [editInc,setEditInc]=useState(null);
+  const [docType,setDocType]=useState('registration');
+  const [docFilter,setDocFilter]=useState('all');
   const isVeh = isVehicleCat(asset.cat);
   const catMeta = ASSET_CATS.find(c=>c.key===asset.cat)||ASSET_CATS[0];
 
   function addOdo(r){  onUpdate({...asset,odoReadings:[r,...(asset.odoReadings||[])]}); }
-  function addMaint(r){ onUpdate({...asset,maintenance:[r,...(asset.maintenance||[])]}); }
   function addTyre(r){  onUpdate({...asset,tyres:[r,...(asset.tyres||[])]}); }
+  const upsert = (list, rec) => (list||[]).some(r=>r.id===rec.id) ? list.map(r=>r.id===rec.id?rec:r) : [rec,...(list||[])];
+
+  // Service & repair (and equipment maintenance) records.
+  function saveMaint(rec, opts){
+    const next={...asset, maintenance:upsert(asset.maintenance, rec)};
+    if(isVeh && opts){
+      if(opts.useAsLast){ next.lastServiceDate=rec.date; if(rec.odo>0) next.lastServiceKm=rec.odo; }
+      if(opts.nextDate) next.nextServiceDate=opts.nextDate;
+      const nk=vehNum(opts.nextKm); if(nk!=null&&nk>0) next.nextServiceKm=nk;
+    }
+    return onUpdate(next);
+  }
+  function saveAlloc(rec, opts){
+    let list=asset.allocations||[];
+    const isNew=!list.some(r=>r.id===rec.id);
+    if(isNew && opts && opts.closePrev) list=list.map(r=>!r.dateTo?{...r,dateTo:rec.dateFrom}:r);
+    const next={...asset, allocations:upsert(list, rec)};
+    if(opts && opts.makeResponsible){ next.responsibleEmpId=rec.empId; next.responsibleEmpName=rec.empName; }
+    return onUpdate(next);
+  }
+  function saveIncident(rec){ return onUpdate({...asset, incidents:upsert(asset.incidents, rec)}); }
+  function delRecord(key, id, label){
+    if(!window.confirm(`Delete this ${label}? This cannot be undone.`)) return;
+    onUpdate({...asset,[key]:(asset[key]||[]).filter(r=>r.id!==id)});
+  }
 
   // 2026-08-18 (production stabilisation, Section 12): document uploads now
   // go through the confirmed-save `onUpdate` (AssetsPage.handleUpdate),
@@ -14565,28 +15094,49 @@ function AssetDetail({ asset, onBack, onUpdate }) {
   // "attached" in the UI. We still await it (rather than fire-and-forget)
   // so the file input can be reset on failure, letting the user immediately
   // retry the same file.
-  function handleDocUpload(e) {
-    const file = e.target.files[0];
-    if (!file) return;
+  // 2026-11-03: vehicle uploads carry a document type, and photos are
+  // compressed before saving (vehReadFiles).
+  async function handleDocUpload(e) {
     const inputEl = e.target;
-    const reader = new FileReader();
-    reader.onload = async ev => {
-      const doc = {id:Date.now(), name:file.name, size:file.size, type:file.type, dataUrl:ev.target.result};
-      const ok = await onUpdate({...asset, documents:[doc,...(asset.documents||[])]});
-      if (!ok && inputEl) inputEl.value = '';
-    };
-    reader.readAsDataURL(file);
+    if (!inputEl.files || !inputEl.files.length) return;
+    const got = await vehReadFiles(inputEl.files);
+    if (!got.length) { inputEl.value=''; return; }
+    const docs = got.map(d=>({...d, id:Date.now()+Math.random(), ...(isVeh?{docType}:{})}));
+    await onUpdate({...asset, documents:[...docs, ...(asset.documents||[])]});
+    if (inputEl) inputEl.value = '';
   }
   function removeDoc(id){ onUpdate({...asset,documents:(asset.documents||[]).filter(d=>d.id!==id)}); }
 
-  const latestOdo = (asset.odoReadings||[]).slice().sort((a,b)=>b.reading-a.reading)[0];
+  const latestOdo = isVeh ? vehLatestOdo(asset) : null;
+  const reminders = isVeh ? vehicleReminders(asset) : [];
+  const status = vehStatusMeta(asset.vehStatus);
+  const allocations = (asset.allocations||[]).slice().sort((a,b)=>String(b.dateFrom||'').localeCompare(String(a.dateFrom||'')));
+  const openAlloc = allocations.find(a=>!a.dateTo);
+  const incidents = (asset.incidents||[]).slice().sort((a,b)=>(String(b.date||'')+(b.time||'')).localeCompare(String(a.date||'')+(a.time||'')));
+  const respName = vehEmpLabel(employees, asset.responsibleEmpId, asset.responsibleEmpName);
+  const docs = (asset.documents||[]).filter(d=>docFilter==='all' || (d.docType||'other')===docFilter);
+  const linkedFiles = isVeh ? [
+    ...(asset.maintenance||[]).flatMap(r=>(r.attachments||[]).map(f=>({...f, from:`Invoice · ${r.type||'Service'} · ${r.date||''}`}))),
+    ...(asset.incidents||[]).flatMap(r=>(r.photos||[]).map(f=>({...f, from:`Incident photo · ${r.date||''}`}))),
+  ] : [];
   const tabs = [
     {key:'overview',   label:'Overview',     icon:'ℹ️'},
     ...(isVeh?[{key:'odo',label:'ODO Log',icon:'🔢'}]:[]),
-    {key:'maintenance',label:'Maintenance',  icon:'🔧'},
+    {key:'maintenance',label:isVeh?'Service & Repairs':'Maintenance',  icon:'🔧'},
+    ...(isVeh?[{key:'drivers',label:'Drivers',icon:'👤'},{key:'incidents',label:'Incidents',icon:'⚠️'}]:[]),
     ...(isVeh?[{key:'tyres',label:'Tyres',icon:'🛞'}]:[]),
     {key:'documents',  label:'Documents',    icon:'📄'},
   ];
+  const Field = ({l, v}) => (v!=null && v!=='') ? (<div><p className="text-xs text-gray-400 font-semibold">{l}</p><p className="text-sm font-bold text-gray-800 mt-0.5 break-words">{v}</p></div>) : null;
+  const Section = ({title, children}) => (<div className="space-y-2"><p className={VEH_SEC_CLS}>{title}</p><div className="grid grid-cols-2 sm:grid-cols-3 gap-4">{children}</div></div>);
+  const emptyBox = (icon, text) => (<div className="bg-white rounded-2xl border border-gray-200 p-8 text-center"><p className="text-2xl mb-2">{icon}</p><p className="text-gray-400 text-sm">{text}</p></div>);
+  const addBtn = (label, onClick) => (<div className="flex justify-end"><button onClick={onClick} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold">{label}</button></div>);
+  const rowBtns = (onEdit, onDel) => (
+    <div className="flex gap-1 flex-shrink-0">
+      {onEdit&&<button onClick={onEdit} className="text-xs border border-gray-200 rounded-lg px-2 py-1 text-gray-500 hover:bg-gray-50 font-semibold">✏️</button>}
+      <button onClick={onDel} className="text-xs text-red-400 hover:bg-red-50 rounded-lg px-2 py-1 font-semibold">✕</button>
+    </div>
+  );
 
   return (
     <div className="space-y-4">
@@ -14598,12 +15148,15 @@ function AssetDetail({ asset, onBack, onUpdate }) {
             <span className="text-xl">{catMeta.icon}</span>
             <h2 className="text-xl font-black text-gray-900">{isVeh?asset.reg:asset.name}</h2>
             {isVeh&&<span className="text-sm text-gray-400 font-medium">{[asset.make,asset.model,asset.year].filter(Boolean).join(' · ')}</span>}
+            {isVeh&&<span className={`text-xs rounded-lg px-2 py-0.5 font-bold ${status.cls}`}>{status.label}</span>}
             {!isVeh&&<span className="text-xs bg-brand-100 text-brand-700 rounded-lg px-2 py-0.5 font-bold">{catMeta.label}</span>}
           </div>
-          {isVeh&&latestOdo&&<p className="text-xs text-gray-400 mt-0.5">Latest ODO: <strong className="text-gray-700">{latestOdo.reading.toLocaleString()} km</strong> on {latestOdo.date}</p>}
+          {isVeh&&latestOdo&&<p className="text-xs text-gray-400 mt-0.5">Latest ODO: <strong className="text-gray-700">{vehKm(latestOdo.reading)}</strong>{latestOdo.date?` on ${latestOdo.date}`:''}</p>}
         </div>
         <button onClick={()=>setShowEdit(true)} className="text-xs border border-gray-200 rounded-lg px-3 py-1.5 text-gray-500 hover:bg-gray-50 font-semibold flex-shrink-0">✏️ Edit</button>
       </div>
+
+      {isVeh&&reminders.length>0&&<VehReminderPills items={reminders}/>}
 
       {/* Tabs */}
       <div className="flex gap-1 flex-wrap border-b border-gray-200">
@@ -14617,14 +15170,33 @@ function AssetDetail({ asset, onBack, onUpdate }) {
 
       {/* Tab: Overview */}
       {tab==='overview'&&(
-        <div className="bg-white rounded-2xl border border-gray-200 p-5 space-y-3">
-          {isVeh?(
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
-              {[['Registration',asset.reg],['Make',asset.make],['Model',asset.model],['Year',asset.year],['Colour',asset.color],['VIN',asset.vin],['Licence Expiry',asset.licExp],['Roadworthy Expiry',asset.rwExp]].map(([l,v])=>v?(
-                <div key={l}><p className="text-xs text-gray-400 font-semibold">{l}</p><p className="text-sm font-bold text-gray-800 mt-0.5">{v}</p></div>
-              ):null)}
-            </div>
-          ):(
+        <div className="bg-white rounded-2xl border border-gray-200 p-5 space-y-5">
+          {isVeh?(<>
+            <Section title="Vehicle Details">
+              <Field l="Registration" v={asset.reg}/><Field l="Category" v={vehCategoryLabel(asset.vehCategory)}/><Field l="Status" v={status.label}/>
+              <Field l="Make" v={asset.make}/><Field l="Model" v={asset.model}/><Field l="Year" v={asset.year}/>
+              <Field l="Colour" v={asset.color}/><Field l="VIN" v={asset.vin}/><Field l="Licence Expiry" v={asset.licExp}/>
+              <Field l="Roadworthy Expiry" v={asset.rwNA?'Not applicable':asset.rwExp}/>
+            </Section>
+            <Section title="Ownership & Driver">
+              <Field l="Company / Registered Owner" v={vehOwnerLabel(asset, companies)}/>
+              <Field l="Responsible Employee" v={respName}/>
+              <Field l="Currently Allocated To" v={openAlloc?(vehEmpLabel(employees, openAlloc.empId, openAlloc.empName)+' (since '+openAlloc.dateFrom+')'):''}/>
+            </Section>
+            <Section title="Odometer & Service">
+              <Field l="Latest Odometer" v={latestOdo?(vehKm(latestOdo.reading)+(latestOdo.date?' · '+latestOdo.date:'')):''}/>
+              <Field l="Last Service" v={[asset.lastServiceDate, vehNum(asset.lastServiceKm)?vehKm(vehNum(asset.lastServiceKm)):''].filter(Boolean).join(' · ')}/>
+              <Field l="Next Service Due" v={[asset.nextServiceDate, vehNum(asset.nextServiceKm)?vehKm(vehNum(asset.nextServiceKm)):''].filter(Boolean).join(' or ')}/>
+            </Section>
+            <Section title="Insurance">
+              <Field l="Insurer" v={asset.insurer}/><Field l="Policy Number" v={asset.insPolicy}/><Field l="Renewal Date" v={asset.insRenewal}/>
+              <Field l="Insurance / Roadside Contact" v={asset.insContact}/>
+            </Section>
+            <Section title="Tracking">
+              <Field l="Tracking Device Fitted" v={asset.trackingFitted==='yes'?'Yes':asset.trackingFitted==='no'?'No':''}/>
+              {asset.trackingFitted==='yes'&&<><Field l="Provider" v={asset.trackProvider}/><Field l="Device Reference" v={asset.trackRef}/><Field l="Contact Number" v={asset.trackContact}/></>}
+            </Section>
+          </>):(
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
               {[['Manufacturer',asset.mfr],['Model No.',asset.modelNo],['Serial No.',asset.serial],['Purchase Date',asset.purDate]].map(([l,v])=>v?(
                 <div key={l}><p className="text-xs text-gray-400 font-semibold">{l}</p><p className="text-sm font-bold text-gray-800 mt-0.5">{v}</p></div>
@@ -14638,15 +15210,15 @@ function AssetDetail({ asset, onBack, onUpdate }) {
       {/* Tab: ODO Log */}
       {tab==='odo'&&(
         <div className="space-y-3">
-          <div className="flex justify-end"><button onClick={()=>setShowOdo(true)} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold">+ Log Reading</button></div>
-          {(asset.odoReadings||[]).length===0?(<div className="bg-white rounded-2xl border border-gray-200 p-8 text-center"><p className="text-2xl mb-2">🔢</p><p className="text-gray-400 text-sm">No ODO readings logged yet</p></div>):(
+          {addBtn('+ Log Reading', ()=>setShowOdo(true))}
+          {(asset.odoReadings||[]).length===0?emptyBox('🔢','No ODO readings logged yet'):(
             <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
               <table className="w-full text-xs">
                 <thead className="bg-gray-50 border-b border-gray-200"><tr><th className="px-4 py-2.5 text-left font-semibold text-gray-400">Date</th><th className="px-4 py-2.5 text-right font-semibold text-gray-400">Reading (km)</th><th className="px-4 py-2.5 text-left font-semibold text-gray-400">Notes</th></tr></thead>
                 <tbody>{(asset.odoReadings||[]).slice().sort((a,b)=>new Date(b.date)-new Date(a.date)).map(r=>(
                   <tr key={r.id} className="border-t border-gray-100">
                     <td className="px-4 py-2.5 text-gray-600">{r.date}</td>
-                    <td className="px-4 py-2.5 text-right font-bold text-gray-800">{r.reading.toLocaleString()}</td>
+                    <td className="px-4 py-2.5 text-right font-bold text-gray-800">{(Number(r.reading)||0).toLocaleString()}</td>
                     <td className="px-4 py-2.5 text-gray-400">{r.notes||'—'}</td>
                   </tr>
                 ))}</tbody>
@@ -14656,25 +15228,30 @@ function AssetDetail({ asset, onBack, onUpdate }) {
         </div>
       )}
 
-      {/* Tab: Maintenance */}
+      {/* Tab: Maintenance / Service & Repairs */}
       {tab==='maintenance'&&(
         <div className="space-y-3">
-          <div className="flex justify-end"><button onClick={()=>setShowMaint(true)} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold">+ Log Maintenance</button></div>
-          {(asset.maintenance||[]).length===0?(<div className="bg-white rounded-2xl border border-gray-200 p-8 text-center"><p className="text-2xl mb-2">🔧</p><p className="text-gray-400 text-sm">No maintenance records yet</p></div>):(
+          {addBtn(isVeh?'+ Log Service / Repair':'+ Log Maintenance', ()=>setShowMaint(true))}
+          {(asset.maintenance||[]).length===0?emptyBox('🔧', isVeh?'No service or repair records yet':'No maintenance records yet'):(
             <div className="space-y-2">
               {(asset.maintenance||[]).slice().sort((a,b)=>new Date(b.date)-new Date(a.date)).map(r=>(
                 <div key={r.id} className="bg-white rounded-xl border border-gray-200 p-4">
                   <div className="flex items-start justify-between gap-2">
-                    <div>
+                    <div className="min-w-0">
                       <p className="text-sm font-bold text-gray-800">{r.type}</p>
                       <div className="flex flex-wrap gap-3 mt-1 text-xs text-gray-400">
                         <span>📅 {r.date}</span>
-                        {r.odo>0&&<span>🔢 {r.odo.toLocaleString()} km</span>}
+                        {r.odo>0&&<span>🔢 {Number(r.odo).toLocaleString()} km</span>}
                         {r.provider&&<span>🏪 {r.provider}</span>}
                       </div>
+                      {r.workDone&&<p className="text-xs text-gray-700 mt-1.5">{r.workDone}</p>}
                       {r.notes&&<p className="text-xs text-gray-500 mt-1.5">{r.notes}</p>}
+                      {(r.attachments||[]).length>0&&<div className="mt-2"><VehFileChips files={r.attachments}/></div>}
                     </div>
-                    {r.cost>0&&<span className="text-sm font-black text-gray-800 flex-shrink-0">{zar(r.cost)}</span>}
+                    <div className="flex flex-col items-end gap-1.5">
+                      {r.cost>0&&<span className="text-sm font-black text-gray-800 flex-shrink-0">{zar(r.cost)}</span>}
+                      {isVeh&&rowBtns(()=>setEditMaint(r), ()=>delRecord('maintenance', r.id, 'service record'))}
+                    </div>
                   </div>
                 </div>
               ))}
@@ -14683,11 +15260,69 @@ function AssetDetail({ asset, onBack, onUpdate }) {
         </div>
       )}
 
+      {/* Tab: Driver allocations */}
+      {tab==='drivers'&&(
+        <div className="space-y-3">
+          {addBtn('+ Allocate Driver', ()=>setShowAlloc(true))}
+          {allocations.length===0?emptyBox('👤','No driver allocations recorded yet'):(
+            <div className="bg-white rounded-2xl border border-gray-200 overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-gray-50 border-b border-gray-200"><tr>{['Employee','Date Allocated','Date Returned','Notes',''].map(h=><th key={h} className="px-3 py-2.5 text-left font-semibold text-gray-400">{h}</th>)}</tr></thead>
+                <tbody>{allocations.map(r=>(
+                  <tr key={r.id} className="border-t border-gray-100">
+                    <td className="px-3 py-2.5 font-bold text-gray-800">{vehEmpLabel(employees, r.empId, r.empName)||'—'}</td>
+                    <td className="px-3 py-2.5">{r.dateFrom||'—'}</td>
+                    <td className="px-3 py-2.5">{r.dateTo||<span className="text-green-600 font-bold">Current</span>}</td>
+                    <td className="px-3 py-2.5 text-gray-400">{r.notes||'—'}</td>
+                    <td className="px-3 py-2.5">{rowBtns(()=>setEditAlloc(r), ()=>delRecord('allocations', r.id, 'allocation'))}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Tab: Accidents & incidents */}
+      {tab==='incidents'&&(
+        <div className="space-y-3">
+          {addBtn('+ Log Accident / Incident', ()=>setShowInc(true))}
+          {incidents.length===0?emptyBox('⚠️','No accidents or incidents recorded'):(
+            <div className="space-y-2">
+              {incidents.map(r=>{ const sm=vehIncidentStatusMeta(r.status); const drv=vehEmpLabel(employees, r.driverEmpId, r.driverName); return (
+                <div key={r.id} className="bg-white rounded-xl border border-gray-200 p-4">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 space-y-1.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-sm font-bold text-gray-800">📅 {r.date}{r.time?` · ${r.time}`:''}</p>
+                        <span className={`text-xs rounded-lg px-2 py-0.5 font-bold ${sm[2]}`}>{sm[1]}</span>
+                      </div>
+                      {r.location&&<p className="text-xs text-gray-500">📍 {r.location}</p>}
+                      <p className="text-xs text-gray-700 whitespace-pre-wrap">{r.description}</p>
+                      <div className="flex flex-wrap gap-3 text-xs text-gray-400">
+                        <span>🚗 Driver: <strong className="text-gray-600">{drv||'—'}</strong></span>
+                        <span>⚖️ Responsible: <strong className={r.responsibility==='pending'||!r.responsibility?'text-amber-600':'text-gray-600'}>{vehResponsibilityLabel(r, employees)}</strong></span>
+                        {r.claimRef&&<span>🧾 Claim: {r.claimRef}</span>}
+                      </div>
+                      {(r.photos||[]).length>0&&<VehFileChips files={r.photos}/>}
+                    </div>
+                    <div className="flex flex-col items-end gap-1.5">
+                      {r.repairCost>0&&<span className="text-sm font-black text-gray-800">{zar(r.repairCost)}</span>}
+                      {rowBtns(()=>setEditInc(r), ()=>delRecord('incidents', r.id, 'incident'))}
+                    </div>
+                  </div>
+                </div>
+              );})}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Tab: Tyres */}
       {tab==='tyres'&&(
         <div className="space-y-3">
-          <div className="flex justify-end"><button onClick={()=>setShowTyre(true)} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold">+ Log Tyre Record</button></div>
-          {(asset.tyres||[]).length===0?(<div className="bg-white rounded-2xl border border-gray-200 p-8 text-center"><p className="text-2xl mb-2">🛞</p><p className="text-gray-400 text-sm">No tyre records yet</p></div>):(
+          {addBtn('+ Log Tyre Record', ()=>setShowTyre(true))}
+          {(asset.tyres||[]).length===0?emptyBox('🛞','No tyre records yet'):(
             <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
               <table className="w-full text-xs">
                 <thead className="bg-gray-50 border-b border-gray-200"><tr>{['Date','Position','Brand','Size','Tread (mm)','ODO (km)','Cost'].map(h=><th key={h} className="px-3 py-2.5 text-left font-semibold text-gray-400">{h}</th>)}</tr></thead>
@@ -14708,24 +15343,46 @@ function AssetDetail({ asset, onBack, onUpdate }) {
       {/* Tab: Documents */}
       {tab==='documents'&&(
         <div className="space-y-3">
-          <div className="flex justify-end">
+          <div className="flex justify-end items-center gap-2 flex-wrap">
+            {isVeh&&<select value={docType} onChange={e=>setDocType(e.target.value)} className="border border-gray-300 rounded-xl px-3 py-2 text-xs bg-white">
+              {VEH_DOC_TYPES.map(([k,l])=><option key={k} value={k}>{l}</option>)}
+            </select>}
             <label className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold cursor-pointer">
-              📎 Upload Document
-              <input type="file" accept=".pdf,.jpg,.jpeg,.png,.doc,.docx" className="hidden" onChange={handleDocUpload}/>
+              📎 Upload {isVeh?vehDocTypeLabel(docType):'Document'}
+              <input type="file" accept={isVeh&&docType==='photo'?'image/*':'.pdf,.jpg,.jpeg,.png,.doc,.docx'} multiple={isVeh} className="hidden" onChange={handleDocUpload}/>
             </label>
           </div>
-          {(asset.documents||[]).length===0?(<div className="bg-white rounded-2xl border border-gray-200 p-8 text-center"><p className="text-2xl mb-2">📄</p><p className="text-gray-400 text-sm">No documents uploaded yet</p><p className="text-gray-400 text-xs mt-1">Upload registration papers, service records, warranties…</p></div>):(
+          {isVeh&&(asset.documents||[]).length>0&&(
+            <div className="flex gap-1.5 flex-wrap">
+              {[['all','All'],...VEH_DOC_TYPES].map(([k,l])=>{ const n=k==='all'?(asset.documents||[]).length:(asset.documents||[]).filter(d=>(d.docType||'other')===k).length; if(k!=='all'&&n===0) return null; return (
+                <button key={k} onClick={()=>setDocFilter(k)} className={`text-xs rounded-lg px-2.5 py-1 border font-semibold ${docFilter===k?'bg-gray-900 text-white border-gray-900':'bg-white border-gray-200 text-gray-500'}`}>{l} · {n}</button>
+              );})}
+            </div>
+          )}
+          {(asset.documents||[]).length===0?(<div className="bg-white rounded-2xl border border-gray-200 p-8 text-center"><p className="text-2xl mb-2">📄</p><p className="text-gray-400 text-sm">No documents uploaded yet</p><p className="text-gray-400 text-xs mt-1">{isVeh?'Upload registration documents, licence discs, insurance documents, invoices, accident reports and photos…':'Upload registration papers, service records, warranties…'}</p></div>):(
             <div className="space-y-2">
-              {(asset.documents||[]).map(d=>(
+              {docs.map(d=>(
                 <div key={d.id} className="bg-white rounded-xl border border-gray-200 p-3 flex items-center gap-3">
-                  <span className="text-2xl">{d.type==='application/pdf'?'📋':'🖼️'}</span>
+                  {/^image\//.test(d.type||'')?<img src={d.dataUrl} alt="" className="w-10 h-10 object-cover rounded-lg"/>:<span className="text-2xl">{d.type==='application/pdf'?'📋':'🖼️'}</span>}
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-bold text-gray-700 truncate">{d.name}</p>
-                    <p className="text-xs text-gray-400">{(d.size/1024).toFixed(0)} KB</p>
+                    <p className="text-xs text-gray-400">{isVeh&&<span className="font-semibold text-gray-500">{vehDocTypeLabel(d.docType||'other')} · </span>}{((d.size||0)/1024).toFixed(0)} KB{d.uploadedAt?` · ${d.uploadedAt}`:''}</p>
                   </div>
-                  <button onClick={()=>{const w=window.open('','_blank');w.document.write(`<iframe src="${d.dataUrl}" style="width:100%;height:100vh;border:none;"></iframe>`);w.document.close();}}
+                  <button onClick={()=>vehOpenFile(d)}
                     className="text-xs bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg px-3 py-1.5 font-semibold">View</button>
                   <button onClick={()=>removeDoc(d.id)} className="text-xs text-red-400 hover:bg-red-50 rounded-lg px-2 py-1.5 font-semibold">✕</button>
+                </div>
+              ))}
+            </div>
+          )}
+          {linkedFiles.length>0&&(docFilter==='all'||docFilter==='invoice'||docFilter==='photo'||docFilter==='accident_report')&&(
+            <div className="space-y-2 pt-2">
+              <p className={VEH_SEC_CLS}>Attached to service &amp; incident records</p>
+              {linkedFiles.map(f=>(
+                <div key={f.id} className="bg-gray-50 rounded-xl border border-gray-100 p-3 flex items-center gap-3">
+                  {/^image\//.test(f.type||'')?<img src={f.dataUrl} alt="" className="w-10 h-10 object-cover rounded-lg"/>:<span className="text-2xl">📋</span>}
+                  <div className="flex-1 min-w-0"><p className="text-sm font-bold text-gray-700 truncate">{f.name}</p><p className="text-xs text-gray-400">{f.from}</p></div>
+                  <button onClick={()=>vehOpenFile(f)} className="text-xs bg-white hover:bg-gray-100 border border-gray-200 text-gray-700 rounded-lg px-3 py-1.5 font-semibold">View</button>
                 </div>
               ))}
             </div>
@@ -14733,10 +15390,12 @@ function AssetDetail({ asset, onBack, onUpdate }) {
         </div>
       )}
 
-      {showEdit&&<AddEditAssetModal asset={asset} onClose={()=>setShowEdit(false)} onSave={onUpdate}/>}
+      {showEdit&&<AddEditAssetModal asset={asset} onClose={()=>setShowEdit(false)} onSave={onUpdate} companies={companies} employees={employees}/>}
       {showOdo&&<OdoModal onClose={()=>setShowOdo(false)} onSave={addOdo}/>}
-      {showMaint&&<MaintenanceModal onClose={()=>setShowMaint(false)} onSave={addMaint} isVehicle={isVeh}/>}
+      {(showMaint||editMaint)&&<MaintenanceModal onClose={()=>{setShowMaint(false);setEditMaint(null);}} onSave={saveMaint} isVehicle={isVeh} initial={editMaint} suppliers={suppliers} asset={asset}/>}
       {showTyre&&<TyreModal onClose={()=>setShowTyre(false)} onSave={addTyre}/>}
+      {(showAlloc||editAlloc)&&<VehAllocationModal onClose={()=>{setShowAlloc(false);setEditAlloc(null);}} onSave={saveAlloc} employees={employees} initial={editAlloc} hasOpen={!!openAlloc}/>}
+      {(showInc||editInc)&&<VehIncidentModal onClose={()=>{setShowInc(false);setEditInc(null);}} onSave={saveIncident} employees={employees} initial={editInc}/>}
     </div>
   );
 }
@@ -14744,7 +15403,7 @@ function AssetDetail({ asset, onBack, onUpdate }) {
 /* ═══════════════════════════════════════════
    ASSETS — MAIN PAGE
 ═══════════════════════════════════════════ */
-function AssetsPage({ assets, setAssets, forceSaveSections }) {
+function AssetsPage({ assets, setAssets, forceSaveSections, companies, employees, suppliers }) {
   const [catTab,    setCatTab]    = useState('vehicle');
   const [selected,  setSelected]  = useState(null);
   const [showAdd,   setShowAdd]   = useState(false);
@@ -14786,12 +15445,17 @@ function AssetsPage({ assets, setAssets, forceSaveSections }) {
   ];
   const activeKeys = catGroups.find(g=>g.key===catTab)?.keys||['vehicle'];
   const displayed  = assets.filter(a=>activeKeys.includes(a.cat));
+  const vehReminders = catTab==='vehicle'
+    ? assets.filter(a=>isVehicleCat(a.cat)).flatMap(a=>vehicleReminders(a).map(r=>({...r, asset:a})))
+        .sort((x,y)=>(x.level==='overdue'?0:1)-(y.level==='overdue'?0:1))
+    : [];
+  const nOverdue = vehReminders.filter(r=>r.level==='overdue').length;
 
   if (selected) {
     const live = assets.find(a=>a.id===selected.id)||selected;
     return (
       <div className="p-4 md:p-6 max-w-4xl mx-auto">
-        <AssetDetail asset={live} onBack={()=>setSelected(null)} onUpdate={handleUpdate}/>
+        <AssetDetail asset={live} onBack={()=>setSelected(null)} onUpdate={handleUpdate} companies={companies} employees={employees} suppliers={suppliers}/>
       </div>
     );
   }
@@ -14823,6 +15487,26 @@ function AssetsPage({ assets, setAssets, forceSaveSections }) {
         ))}
       </div>
 
+      {/* Vehicle reminders */}
+      {vehReminders.length>0&&(
+        <div className={`bg-white rounded-2xl border p-4 space-y-2 ${nOverdue?'border-red-200':'border-amber-200'}`}>
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <p className="text-sm font-black text-gray-800">⏰ Vehicle Reminders</p>
+            <p className="text-xs text-gray-400">{nOverdue} overdue · {vehReminders.length-nOverdue} due within {VEH_REMIND_DAYS} days / {VEH_REMIND_KM.toLocaleString('en-ZA')} km</p>
+          </div>
+          <div className="divide-y divide-gray-100">
+            {vehReminders.map((r,i)=>(
+              <button key={i} onClick={()=>setSelected(r.asset)} className="w-full flex items-center gap-3 py-2 px-2 text-left hover:bg-gray-50 rounded-lg">
+                <span className={`text-xs font-bold rounded-lg px-2 py-0.5 flex-shrink-0 ${r.level==='overdue'?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700'}`}>{r.level==='overdue'?'Overdue':'Due soon'}</span>
+                <span className="text-xs font-black text-gray-800 w-24 flex-shrink-0 truncate">{r.asset.reg||r.asset.name}</span>
+                <span className="text-xs text-gray-600 flex-1">{r.text}</span>
+                <span className="text-gray-300">›</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Asset list */}
       {displayed.length===0?(
         <div className="bg-white rounded-2xl border border-gray-200 p-12 text-center">
@@ -14834,29 +15518,38 @@ function AssetsPage({ assets, setAssets, forceSaveSections }) {
         <div className="grid gap-3 sm:grid-cols-2">
           {displayed.map(a=>{
             const catM = ASSET_CATS.find(c=>c.key===a.cat)||ASSET_CATS[0];
-            const latestOdo = (a.odoReadings||[]).slice().sort((x,y)=>y.reading-x.reading)[0];
-            const lastMaint = (a.maintenance||[]).slice().sort((x,y)=>new Date(y.date)-new Date(x.date))[0];
             const isVeh = isVehicleCat(a.cat);
+            const latestOdo = isVeh ? vehLatestOdo(a) : null;
+            const lastMaint = (a.maintenance||[]).slice().sort((x,y)=>new Date(y.date)-new Date(x.date))[0];
+            const st = vehStatusMeta(a.vehStatus);
+            const rem = isVeh ? vehicleReminders(a) : [];
+            const resp = isVeh ? vehEmpLabel(employees, a.responsibleEmpId, a.responsibleEmpName) : '';
             return (
               <div key={a.id} onClick={()=>setSelected(a)}
-                className="bg-white rounded-2xl border border-gray-200 p-4 cursor-pointer hover:border-brand-300 hover:shadow-sm transition-all group">
+                className={`bg-white rounded-2xl border border-gray-200 p-4 cursor-pointer hover:border-brand-300 hover:shadow-sm transition-all group ${isVeh&&VEH_INACTIVE.includes(a.vehStatus)?'opacity-60':''}`}>
                 <div className="flex items-start gap-3">
                   <div className="w-10 h-10 rounded-xl bg-brand-50 flex items-center justify-center text-xl flex-shrink-0">{catM.icon}</div>
                   <div className="flex-1 min-w-0">
-                    <p className="font-black text-gray-900 text-sm">{isVeh?a.reg:a.name}</p>
-                    {isVeh&&<p className="text-xs text-gray-500 mt-0.5">{[a.make,a.model,a.year].filter(Boolean).join(' · ')||'Vehicle'}</p>}
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="font-black text-gray-900 text-sm">{isVeh?a.reg:a.name}</p>
+                      {isVeh&&<span className={`text-xs rounded-lg px-1.5 py-0.5 font-bold ${st.cls}`}>{st.label}</span>}
+                    </div>
+                    {isVeh&&<p className="text-xs text-gray-500 mt-0.5">{[vehCategoryLabel(a.vehCategory),a.make,a.model,a.year].filter(Boolean).join(' · ')||'Vehicle'}</p>}
                     {!isVeh&&<p className="text-xs text-gray-400 mt-0.5">{catM.label}{a.mfr?` · ${a.mfr}`:''}{a.serial?` · SN: ${a.serial}`:''}</p>}
                     <div className="flex flex-wrap gap-3 mt-2 text-xs text-gray-400">
-                      {isVeh&&latestOdo&&<span>🔢 {latestOdo.reading.toLocaleString()} km</span>}
+                      {isVeh&&resp&&<span>👤 {resp}</span>}
+                      {isVeh&&latestOdo&&<span>🔢 {vehKm(latestOdo.reading)}</span>}
                       {lastMaint&&<span>🔧 Last: {lastMaint.date}</span>}
                       {isVeh&&a.licExp&&<span className={new Date(a.licExp)<new Date()?'text-red-500 font-bold':'text-gray-400'}>🪪 Lic: {a.licExp}</span>}
                     </div>
+                    {rem.length>0&&<div className="mt-2"><VehReminderPills items={rem} compact/></div>}
                   </div>
                   <span className="text-gray-200 group-hover:text-brand-400 text-lg transition-colors">›</span>
                 </div>
-                <div className="flex gap-2 mt-3 text-xs text-gray-400">
+                <div className="flex gap-2 mt-3 text-xs text-gray-400 flex-wrap">
                   <span className="bg-gray-50 rounded-lg px-2 py-1">📎 {(a.documents||[]).length} doc{(a.documents||[]).length!==1?'s':''}</span>
                   <span className="bg-gray-50 rounded-lg px-2 py-1">🔧 {(a.maintenance||[]).length} service{(a.maintenance||[]).length!==1?'s':''}</span>
+                  {isVeh&&(a.incidents||[]).length>0&&<span className="bg-gray-50 rounded-lg px-2 py-1">⚠️ {(a.incidents||[]).length} incident{(a.incidents||[]).length!==1?'s':''}</span>}
                   {isVeh&&<span className="bg-gray-50 rounded-lg px-2 py-1">🛞 {(a.tyres||[]).length} tyre log{(a.tyres||[]).length!==1?'s':''}</span>}
                 </div>
               </div>
@@ -14864,7 +15557,7 @@ function AssetsPage({ assets, setAssets, forceSaveSections }) {
           })}
         </div>
       )}
-      {showAdd&&<AddEditAssetModal onClose={()=>setShowAdd(false)} onSave={handleSave}/>}
+      {showAdd&&<AddEditAssetModal onClose={()=>setShowAdd(false)} onSave={handleSave} companies={companies} employees={employees}/>}
     </div>
   );
 }
@@ -29615,7 +30308,7 @@ function App() {
     dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={accInvoices}/>,
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} onOpenJob={openJobRecord} forceSaveSections={forceSaveSections}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
-    assets:      <AssetsPage      assets={assets} setAssets={setAssets} forceSaveSections={forceSaveSections}/>,
+    assets:      <AssetsPage      assets={assets} setAssets={setAssets} forceSaveSections={forceSaveSections} companies={companies} employees={employees} suppliers={suppliers}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} forceSaveSections={forceSaveSections} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user}/>,
