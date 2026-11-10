@@ -75,6 +75,27 @@ ok(!/INSERT INTO rel_payments|UPDATE rel_payments|DELETE FROM/i.test(script), 'n
 ok(!/reserveDocumentNumber/.test(script), 'never reserves a new document number');
 ok(/createInvoiceForJob\(jobId\)/.test(script), 'issues the invoice through the deployed createInvoiceForJob writer');
 
+console.log('\n6. Cancelled invoices are listed, never counted');
+// eslint-disable-next-line no-new-func
+const cxl = new Function(extract('invoiceCancelledLabel') + '\nreturn invoiceCancelledLabel;')();
+ok(cxl({ status: 'void', cancelledByAdmin: true }) === 'Cancelled by Admin', 'an admin-cancelled record reads "Cancelled by Admin"');
+ok(cxl({ status: 'void' }) === 'Cancelled', 'any other void record reads "Cancelled"');
+ok(/const allInvoices = \[\.\.\.accInvoices\.filter\(i=>i && i\.status!=='void'\)/.test(html), 'Accounting allInvoices (exports/counts) still excludes void');
+ok(/numSort\(\[\.\.\.allInvoices, \.\.\.cancelledAccInvoices\], 'number'\)/.test(html), 'Accounting list displays the cancelled records');
+ok((html.match(/displayedAccInvoices\.filter\(i=>!i\._isCancelled\)\.reduce\(/g) || []).length === 3, 'Accounting totals row ignores cancelled records');
+ok(/const manualInvItems = myAccInvoices\.filter\(i=>i\.status!=='void'\)/.test(html), 'Sales money projection still excludes void');
+ok(/cancelledInvItems = myAccInvoices\.filter\(i=>i && i\.status==='void'\)[\s\S]{0,400}value:0, _totalCents:0/.test(html), 'Sales cancelled rows carry R0.00 and no payments');
+ok(/viewInvoiceRow\.status!=='void'/.test(html) && /viewInv\.status!=='void'/.test(html), 'a cancelled invoice cannot be opened for editing');
+
+console.log('\n7. record-cancelled-invoice script');
+const rc = fs.readFileSync(path.join(__dirname, '..', 'src', 'scripts', 'record-cancelled-invoice.ts'), 'utf8');
+ok(/"record:cancelled-invoice":/.test(pkg), 'registered as a manual npm script');
+ok(/const APPLY = argv\.includes\('--apply'\)/.test(rc) && /confirm !== requiredConfirm/.test(rc), 'dry run by default; --apply needs the exact --confirm');
+ok(rc.indexOf('INSERT INTO platform_state_backups') > 0 && rc.indexOf('INSERT INTO platform_state_backups') < rc.indexOf('INSERT INTO rel_invoices'), 'backs up before inserting');
+ok(!/UPDATE rel_|DELETE FROM|TRUNCATE|DROP /i.test(rc), 'never updates or deletes anything');
+ok(!/INSERT INTO rel_payments/.test(rc) && !/reserveDocumentNumber/.test(rc), 'no payment, no new document number');
+ok(/'void', \$10::date/.test(rc) && /\$7, NULL, \$8, NULL, \$9/.test(rc), "inserts status 'void' with job_id/quote_id NULL");
+
 console.log('\n============================================================');
 console.log(`PASSED: ${pass}   FAILED: ${fail}`);
 console.log('============================================================');

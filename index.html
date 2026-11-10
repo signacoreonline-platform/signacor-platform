@@ -4571,6 +4571,14 @@ const INVOICE_NO_ACCOUNTING_RECORD_REASON =
 // and a second copy would let the two screens colour the same status
 // differently. Single definition — AccountingPage reads this one.
 const STATUS_COLORS = { draft:'#6b7280', sent:'#2563eb', paid:'#059669', partial:'#f59e0b', overdue:'#dc2626', void:'#9ca3af', approved:'#d97706' };
+// 2026-11-10 — CANCELLED INVOICES. A void invoice is kept for the record and
+// shown in the invoice lists, but it is never money: every total, balance,
+// statement, aged-debtor, revenue and settlement path keeps excluding
+// status==='void' exactly as before. `cancelledByAdmin` / `replacedBy` live in
+// the record's legacy_data (spread onto the hydrated record by read.ts).
+function invoiceCancelledLabel(inv){
+  return (inv && inv.cancelledByAdmin) ? 'Cancelled by Admin' : 'Cancelled';
+}
 
 /* ═══════════════════════════════════════════
  SHARED READ-ONLY INVOICE VIEW (2026-08-24 invoice list consistency)
@@ -4631,7 +4639,7 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">INVOICE DATE</span><span>{fmtDate(inv.date)}</span></div>
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">DUE DATE</span><span>{fmtDate(inv.dueDate)}</span></div>
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">REFERENCE</span><span>{inv.reference||'—'}</span></div>
-            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">STATUS</span><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status}</span></div>
+            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">STATUS</span><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status==='void'?invoiceCancelledLabel(inv):inv.status}</span>{inv.status==='void'&&inv.replacedBy&&<span className="block text-xs text-gray-500 mt-1">Replaced by {inv.replacedBy}</span>}</div>
             {/* 2026-09-07: derived through invoiceDiscountView so an invoice
                 whose discount lives in its LINES (every invoice raised from a
                 quote or job) shows it here too, not only the legacy records
@@ -11716,7 +11724,15 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     const _discountView = invoiceDiscountView(i);
     return {id:i.id,invoiceNum:i.number,invoiceStatus:normStatus,client:i.contactName||'',value:sgrRands(totalC),_totalCents:totalC,invoiceDate:i.date,invoiceDue:i.dueDate,paidAt:i.paidDate,reference:i.reference,payments:i.payments||[],num:'manual',co:i.co??null,_isManual:true,_discountView};
   }).sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
-  const invoicedJobs = numSort([...jobInvItems,...manualInvItems], 'invoiceNum').reverse(); // newest-first by default
+  // 2026-11-10: cancelled (void) invoices are LISTED, never counted as money.
+  const cancelledInvItems = myAccInvoices.filter(i=>i && i.status==='void').map(i=>({
+    id:i.id, invoiceNum:i.number, invoiceStatus:'cancelled', _isCancelled:true,
+    _cancelLabel:invoiceCancelledLabel(i), _replacedBy:i.replacedBy||'', _cancelReason:i.cancelledReason||'',
+    client:i.contactName||'', value:0, _totalCents:0,
+    invoiceDate:i.date||i.issueDate||'', invoiceDue:i.dueDate||'', reference:i.reference,
+    payments:[], num:i.jobNum||'', co:i.co??null, _isManual:true, _discountView:{pct:0,amt:0},
+  }));
+  const invoicedJobs = numSort([...jobInvItems,...manualInvItems,...cancelledInvItems], 'invoiceNum').reverse(); // newest-first by default
   const _invSearch = searchInv.trim().toLowerCase();
   const displayedInvoices = (invFilter==='all' ? invoicedJobs : invoicedJobs.filter(j=>(j.invoiceStatus||'pending')===invFilter))
     .filter(j=>!_invSearch || [j.invoiceNum,j.client,j.reference,j.num].some(v=>(v||'').toString().toLowerCase().includes(_invSearch)));
@@ -13911,10 +13927,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         )}
         <div className="flex gap-2 flex-wrap">
           {[
-            {k:'all',    label:`All (${invoicedJobs.length})`},
+            {k:'all',    label:`All (${invoicedJobs.length-cancelledInvItems.length}${cancelledInvItems.length?` + ${cancelledInvItems.length} cancelled`:''})`},
             {k:'paid',   label:`✓ Fully Paid (${invoicedJobs.filter(j=>j.invoiceStatus==='paid').length})`},
             {k:'partial',label:`⏳ Partly Paid (${invoicedJobs.filter(j=>j.invoiceStatus==='partial').length})`},
             {k:'pending',label:`🕐 Pending (${invoicedJobs.filter(j=>!j.invoiceStatus||j.invoiceStatus==='pending').length})`},
+            ...(cancelledInvItems.length?[{k:'cancelled',label:`🚫 Cancelled (${cancelledInvItems.length})`}]:[]),
           ].map(({k,label})=>(
             <button key={k} onClick={()=>setInvFilter(k)}
               className={`text-xs rounded-lg px-3 py-1.5 border font-semibold transition-all ${invFilter===k?'bg-gray-900 text-white border-gray-900':'bg-white border-gray-200 text-gray-500 hover:border-gray-400'}`}>
@@ -13950,12 +13967,15 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
               const _rowPaidC  = sgrPaidCents(jPayments);
               const totalPaid = sgrRands(_rowPaidC);
               const balance   = sgrRands(sgrOutstandingForRecordCents(j, _rowTotalC, _rowPaidC));
-              const statusBadge = isPaid
+              const statusBadge = j._isCancelled
+                ? 'bg-gray-200 text-gray-700 border-gray-300'
+                : isPaid
                 ? 'bg-emerald-100 text-emerald-700 border-emerald-200'
                 : isPartial
                   ? 'bg-blue-100 text-blue-700 border-blue-200'
                   : 'bg-amber-100 text-amber-700 border-amber-200';
-              const statusLabel = isPaid ? '✓ Fully Paid' : isPartial ? '⏳ Partly Paid' : '🕐 Pending';
+              const isCancelled = !!j._isCancelled;
+              const statusLabel = isCancelled ? ('🚫 '+j._cancelLabel) : isPaid ? '✓ Fully Paid' : isPartial ? '⏳ Partly Paid' : '🕐 Pending';
               // The real accInvoices record behind this manual-invoice summary
               // row — Payments/Edit/Print/Email below all act on THIS record
               // (never a copy), the same single source of truth Accounting
@@ -13963,6 +13983,36 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
               // notice only in the defensive case it can't be found (e.g. a
               // race with a delete elsewhere) rather than acting on nothing.
               const manualRec = j._isManual ? myAccInvoices.find(i=>i.id===j.id) : null;
+              if(isCancelled){
+                return (
+                  <div key={'cx-'+j.id} id={'inv-row-'+j.id} className={`bg-gray-50 rounded-2xl border border-gray-200 p-4 flex items-center gap-4 opacity-80 ${invHighlight===j.id?'ring-2 ring-brand-300':''}`}>
+                    <div className="w-10 h-10 bg-gray-400 rounded-xl flex items-center justify-center text-white font-black text-xs flex-shrink-0">INV</div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 mb-1 flex-wrap">
+                        <span className="text-xs font-black text-gray-500 font-mono line-through">{j.invoiceNum}</span>
+                        <span className={`text-xs font-bold px-2 py-0.5 rounded-full border ${statusBadge}`}>{statusLabel}</span>
+                        {j._replacedBy&&<span className="text-xs font-semibold text-gray-600">→ replaced by <span className="font-mono">{j._replacedBy}</span></span>}
+                      </div>
+                      <p className="text-sm font-bold text-gray-500 truncate">{j.client}</p>
+                      <p className="text-xs text-gray-400 mt-0.5">
+                        {j.num?('Job: '+j.num+' · '):''}Invoice date: {j.invoiceDate||'—'}{j._cancelReason?(' · '+j._cancelReason):''}
+                      </p>
+                    </div>
+                    <div className="text-right flex-shrink-0">
+                      <p className="text-base font-black text-gray-400">{zar(0)}</p>
+                      <p className="text-xs text-gray-400">nothing due</p>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      {manualRec&&(
+                        <button onClick={()=>setViewInvoiceRow({...manualRec, source:'manual'})}
+                          className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#f3f4f6',color:'#374151'}}>
+                          👁 View
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              }
               // The discount this row states, as the projection derived it —
               // never re-derived here. Defaulted so a row built before the
               // projection carried one simply shows nothing.
@@ -14131,7 +14181,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       </>)}
 
       {viewInvoiceRow&&<ViewInvoiceModal inv={viewInvoiceRow} onClose={()=>setViewInvoiceRow(null)}
-        onEdit={viewInvoiceRow.source!=='job'?()=>{ const rec=myAccInvoices.find(i=>i.id===viewInvoiceRow.id)||viewInvoiceRow; setViewInvoiceRow(null); setEditManualInv(rec); setShowManualInvModal(true); }:null}
+        onEdit={(viewInvoiceRow.source!=='job'&&viewInvoiceRow.status!=='void')?()=>{ const rec=myAccInvoices.find(i=>i.id===viewInvoiceRow.id)||viewInvoiceRow; setViewInvoiceRow(null); setEditManualInv(rec); setShowManualInvModal(true); }:null}
         quotes={myQuotes} jobs={myJobs} accInvoices={myAccInvoices} customers={customers}
         companies={companies} logoDataUrl={logoDataUrl} onOpenQuote={null} onOpenJob={onOpenJob}
         onOpenCustomer={onOpenCustomer} onOpenJobPayments={(j)=>{setJobPayModal(j);setJobPayModalExternal(false);}}
@@ -26624,7 +26674,11 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   // by the (now clickable) status badges above the table. Display-only —
   // never changes allInvoices/exports/counts, which still reflect everything.
   const _invSearchAcc = invSearchAcc.trim().toLowerCase();
-  const displayedAccInvoices = numSort(allInvoices, 'number').reverse()
+  // 2026-11-10: cancelled (void) invoices are DISPLAYED in the list — never
+  // added to allInvoices, which still feeds exports, counts and totals.
+  const cancelledAccInvoices = accInvoices.filter(i=>i && i.status==='void')
+    .map(i=>({...i, source:'manual', _isCancelled:true}));
+  const displayedAccInvoices = numSort([...allInvoices, ...cancelledAccInvoices], 'number').reverse()
     .filter(i => invStatusFilterAcc==='all' || i.status===invStatusFilterAcc)
     .filter(i => !_invSearchAcc || [i.number, i.contactName, i.reference, i.jobNum].some(v=>(v||'').toString().toLowerCase().includes(_invSearchAcc)));
 
@@ -26781,7 +26835,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
       {editTxn&&<AllocationModal txn={editTxn} onSave={saveAllocation} onClose={()=>setEditTxn(null)}/>}
       {showAddAccount&&<AddAccountModal onClose={()=>setShowAddAccount(false)}/>}
       {showInvModal&&<InvoiceModal inv={editInv} onSave={saveInvoice} onClose={()=>{setShowInvModal(false);setEditInv(null);}} customers={customers} fmtAmt={fmtAmt}/>}
-      {viewInv&&<ViewInvoiceModal inv={viewInv} onClose={()=>setViewInv(null)} onEdit={viewInv.source!=='job'?()=>{setEditInv(viewInv);setShowInvModal(true);setViewInv(null);}:null} quotes={quotes} jobs={jobs} accInvoices={accInvoices} customers={customers} companies={companies} logoDataUrl={logoDataUrl} onOpenQuote={onOpenQuote} onOpenJob={onOpenJob} onOpenCustomer={onOpenCustomer} onOpenJobPayments={onOpenJobPayments} onOpenInvoicePayments={(i)=>{setPayModalInv(i);setShowPayModal(true);}} fmtDate={fmtDate} fmtAmt={fmtAmt}/>}
+      {viewInv&&<ViewInvoiceModal inv={viewInv} onClose={()=>setViewInv(null)} onEdit={(viewInv.source!=='job'&&viewInv.status!=='void')?()=>{setEditInv(viewInv);setShowInvModal(true);setViewInv(null);}:null} quotes={quotes} jobs={jobs} accInvoices={accInvoices} customers={customers} companies={companies} logoDataUrl={logoDataUrl} onOpenQuote={onOpenQuote} onOpenJob={onOpenJob} onOpenCustomer={onOpenCustomer} onOpenJobPayments={onOpenJobPayments} onOpenInvoicePayments={(i)=>{setPayModalInv(i);setShowPayModal(true);}} fmtDate={fmtDate} fmtAmt={fmtAmt}/>}
       {showBillModal&&<BillModal bill={editBill} onSave={saveBill} onClose={()=>{setShowBillModal(false);setEditBill(null);}}/>}
       {showPayModal&&payModalInv&&<PaymentHistoryModal inv={payModalInv} onClose={()=>{setShowPayModal(false);setPayModalInv(null);}}
         accInvoices={accInvoices} setAccInvoices={setAccInvoices} forceSaveSections={forceSaveSections}
@@ -27026,6 +27080,13 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                 style={{background:'#6b728022',color:'#374151'}}>
                 all: {allInvoices.length}
               </button>
+              {cancelledAccInvoices.length>0&&(
+                <button type="button" onClick={()=>setInvStatusFilterAcc('void')}
+                  className={`px-2 py-1 rounded-full font-bold border ${invStatusFilterAcc==='void'?'border-gray-500':'border-transparent'}`}
+                  style={{background:'#9ca3af22',color:'#4b5563'}}>
+                  🚫 cancelled: {cancelledAccInvoices.length}
+                </button>
+              )}
               {['draft','sent','partial','paid','overdue'].map(s=>(
                 <button key={s} type="button" onClick={()=>setInvStatusFilterAcc(s)}
                   className={`px-2 py-1 rounded-full font-bold border ${invStatusFilterAcc===s?'border-gray-500':'border-transparent'}`}
@@ -27134,7 +27195,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                     const isEffectivelyPaid = inv.status==='partial'
                       && sgrSettleRecordCents(inv, _rowTotalC, _rowPaidC, sgrRands(_rowTotalC))==='paid';
                     return(
-                      <tr key={inv.id} className={`border-b border-gray-50 transition-colors ${isJob?'hover:bg-purple-50 bg-purple-50/30':'hover:bg-blue-50'}`}>
+                      <tr key={inv.id} className={`border-b border-gray-50 transition-colors ${inv._isCancelled?'bg-gray-50 text-gray-400 opacity-80':isJob?'hover:bg-purple-50 bg-purple-50/30':'hover:bg-blue-50'}`}>
                         <td className="px-4 py-2.5 text-xs font-mono text-gray-600">
                           {inv.number}
                           {/* 2026-09-07: derived through invoiceDiscountView, and now
@@ -27162,7 +27223,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                         <td className="px-4 py-2.5 text-xs text-right font-black text-gray-800">{fmtAmt(sub+vat)}</td>
                         <td className="px-4 py-2.5 text-center">
                           <span className="px-2 py-0.5 rounded-full text-white text-xs font-bold whitespace-nowrap" style={{background:STATUS_COLORS[isEffectivelyPaid?'paid':inv.status]||'#6b7280'}}>
-                            {isEffectivelyPaid ? 'Paid' : (inv.status==='partial' ? `Outstanding: ${fmtAmt(outstanding)}` : inv.status)}
+                            {inv._isCancelled ? ('🚫 '+invoiceCancelledLabel(inv)+(inv.replacedBy?' → '+inv.replacedBy:'')) : isEffectivelyPaid ? 'Paid' : (inv.status==='partial' ? `Outstanding: ${fmtAmt(outstanding)}` : inv.status)}
                           </span>
                         </td>
                         <td className="px-4 py-2.5 text-center">
@@ -27194,6 +27255,11 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                               <span className="flex items-center gap-1 text-xs font-semibold text-gray-400">✓ Paid <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/></span>
                               <span className="flex items-center gap-1 text-xs font-semibold text-gray-400">✕ Delete <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/></span>
                             </div>
+                          ):inv._isCancelled?(
+                            <div className="flex items-center justify-center gap-1 flex-wrap">
+                              <button onClick={()=>setViewInv(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f3f4f6',color:'#374151'}}>👁 View</button>
+                              <span className="text-xs font-semibold text-gray-400" title="Cancelled invoices are kept for the record only — no payments, edits or deletion.">🔒 Record only</span>
+                            </div>
                           ):(
                             <div className="flex items-center justify-center gap-1 flex-wrap">
                               <button onClick={()=>setViewInv(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f0f4ff',color:'#4338ca'}}>👁 View</button>
@@ -27224,9 +27290,9 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                 <tfoot>
                   <tr className="border-t-2 border-gray-200" style={{background:'#f8f9ff'}}>
                     <td className="px-4 py-2.5 text-xs font-black text-gray-500 uppercase" colSpan="5">Totals</td>
-                    <td className="px-4 py-2.5 text-xs text-right font-black text-gray-800">{fmtAmt(displayedAccInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),s),0))}</td>
-                    <td className="px-4 py-2.5 text-xs text-right font-black text-blue-600">{fmtAmt(displayedAccInvoices.reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,s),0))}</td>
-                    <td className="px-4 py-2.5 text-xs text-right font-black" style={{color:'#06065c'}}>{fmtAmt(displayedAccInvoices.reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</td>
+                    <td className="px-4 py-2.5 text-xs text-right font-black text-gray-800">{fmtAmt(displayedAccInvoices.filter(i=>!i._isCancelled).reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),s),0))}</td>
+                    <td className="px-4 py-2.5 text-xs text-right font-black text-blue-600">{fmtAmt(displayedAccInvoices.filter(i=>!i._isCancelled).reduce((s,i)=>(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,s),0))}</td>
+                    <td className="px-4 py-2.5 text-xs text-right font-black" style={{color:'#06065c'}}>{fmtAmt(displayedAccInvoices.filter(i=>!i._isCancelled).reduce((s,i)=>{const sub=(i.lineItems||[]).reduce((t,l)=>t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)),0);const vat=(i.lineItems||[]).reduce((t,l)=>l.taxType==='15%'?t+(parseFloat(l.qty||1)*parseFloat(l.unitAmount||0)*0.15):t,0);return s+sub+vat;},0))}</td>
                     <td colSpan="2"></td>
                   </tr>
                 </tfoot>
