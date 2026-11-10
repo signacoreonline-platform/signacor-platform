@@ -208,6 +208,74 @@ router.put('/quotes/:id', async (req: AuthRequest, res: Response): Promise<void>
   } catch (err) { handleServiceError(err, res); }
 });
 
+// ── ADMIN REVISION OF A CONVERTED QUOTE (2026-11-10) ───────────────────────
+// The controlled Quote -> Job -> Invoice reconciliation workflow that the
+// CONVERTED-JOB FINANCIAL CONSISTENCY GUARD (services.ts) refers to as
+// "belongs to the planned Transaction Troubleshooter". A customer changes the
+// order after the quote has become a job (and possibly been invoiced); an
+// ADMIN edits the quote and the change is pulled through:
+//
+//   quote lines/discount/setup fee  ->  rel_quotes (+ recomputed totals)
+//                                   ->  rel_job_line_items REPLACED from the
+//                                       quote lines (explicit resyncJobLines)
+//                                   ->  rel_jobs.value recomputed
+//                                   ->  linked invoice lines rebuilt from the
+//                                       quote (syncLinkedInvoiceFromQuoteTx)
+//
+// ONE transaction (updateQuoteWithJobSync) — every existing guard still runs
+// unchanged and a refusal rolls back the quote, the job and the invoice
+// together. No rel_payments row is created, changed or deleted; only the
+// outstanding balance moves, through recomputeOwnerPaymentStatus.
+//
+// WHY A SEPARATE ROUTE and not a flag on PUT /quotes/:id: BLOCKER 2
+// (2026-08-24) deliberately strips `resyncJobLines` from that route because
+// the ordinary edit patch always carries `lines`. That stays true. This route
+// is the ONLY HTTP surface that can ask for a job-line resync, it is
+// admin-only (role read from the AUTHENTICATED session, never the body), and
+// it requires an explicit `confirmPullThrough: true` so a stray call can never
+// replace production lines by accident.
+router.put('/quotes/:id/admin-revise', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireCutOver('quotes', res)) || !(await requireCutOver('jobs', res))) return;
+  const actor = req.user;
+  if (!actor || actor.role !== 'admin') {
+    res.status(403).json({ conflict: false, type: 'forbidden', error: 'Only an admin can revise a quote that has already been converted to a job or invoiced.' });
+    return;
+  }
+  try {
+    const id = Number(req.params.id);
+    const expectedVersion = Number(req.body?.expectedVersion);
+    if (!Number.isFinite(id) || !Number.isFinite(expectedVersion)) {
+      res.status(400).json({ error: '"id" (path) and "expectedVersion" (body) must be numbers' }); return;
+    }
+    if (req.body?.confirmPullThrough !== true) {
+      res.status(400).json({ error: '"confirmPullThrough": true is required — this revision replaces the linked job\'s line items.' }); return;
+    }
+    const {
+      expectedVersion: _ev, expectedJobVersion, resyncJobLines: _rsjl, confirmPullThrough: _cpt,
+      expectedInvoiceVersion, ...patch
+    } = req.body || {};
+    if (!Array.isArray((patch as any).lines) || (patch as any).lines.length === 0) {
+      res.status(400).json({ error: 'An admin revision must carry the quote\'s full, non-empty "lines" array.' }); return;
+    }
+    const result = await updateQuoteWithJobSync(id, expectedVersion, patch, {
+      expectedJobVersion: expectedJobVersion !== undefined ? Number(expectedJobVersion) : undefined,
+      expectedInvoiceVersion: expectedInvoiceVersion !== undefined ? Number(expectedInvoiceVersion) : undefined,
+      resyncJobLines: true,
+    });
+    if (result.jobId === null) {
+      // Nothing to pull through to — the save itself is an ordinary quote
+      // edit and has committed; say so rather than pretend a revision ran.
+      res.json({ success: true, rowVersion: result.quoteRowVersion, jobId: null, jobRowVersion: null, invoiceSync: result.invoice, pulledThrough: false });
+      return;
+    }
+    console.log(`[admin-revise] quote ${id} revised by ${actor.email || actor.id}: job ${result.jobId} lines resynced; invoice ${result.invoice.invoiceNumber || '-'} ${result.invoice.reason}`);
+    res.json({
+      success: true, rowVersion: result.quoteRowVersion, jobId: result.jobId, jobRowVersion: result.jobRowVersion,
+      invoiceSync: result.invoice, pulledThrough: true,
+    });
+  } catch (err) { handleServiceError(err, res); }
+});
+
 // CUTOVER BLOCKER COMPLETION — "quote status actions" named blocker
 // (mark sent / approve / decline / admin reinstate). Deliberately its OWN
 // route rather than folded into PUT /quotes/:id above: that route calls

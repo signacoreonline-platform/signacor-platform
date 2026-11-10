@@ -918,6 +918,12 @@ const relationalApi = {
   updateCustomer(id, expectedVersion, patch) { return relationalFetch('/customers/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
   createQuote(data) { return relationalFetch('/quotes', { method: 'POST', body: JSON.stringify(data) }); },
   updateQuote(id, expectedVersion, patch) { return relationalFetch('/quotes/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
+  // ADMIN REVISION (2026-11-10) — admin-only. Same patch shape as updateQuote,
+  // but the server ALSO replaces the linked job's line items from the quote and
+  // rebuilds its invoice, in one transaction (api.ts PUT /quotes/:id/admin-revise).
+  // Payments are never touched. The role is checked server-side from the login
+  // session; confirmPullThrough must be sent explicitly.
+  reviseConvertedQuote(id, expectedVersion, patch) { return relationalFetch('/quotes/' + id + '/admin-revise', { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion, confirmPullThrough: true }, patch)) }); },
   // CUTOVER BLOCKER COMPLETION — "quote status actions" named blocker. A
   // deliberately SEPARATE endpoint from updateQuote above (see api.ts's
   // comment on PATCH /quotes/:id/status) — status transitions never go
@@ -2244,6 +2250,28 @@ function resolveJobsForQuote(quote, jobs){
 }
 function resolveJobForQuote(quote, jobs){
   return resolveJobsForQuote(quote, jobs)[0] || null;
+}
+// ── ADMIN REVISION OF AN ADVANCED QUOTE (2026-11-10) ──────────────────────
+// A quote is "advanced" once it has become a job (and possibly an invoice).
+// Editing it from then on is admin-only, and an admin's commercial change is
+// pulled through Quote -> Job -> Invoice by PUT /quotes/:id/admin-revise.
+function quoteIsAdvanced(quote, jobs){
+  if(!quote) return false;
+  if(quote.status==='converted' || (quote.convertedJobId!==null && quote.convertedJobId!==undefined)) return true;
+  return !!resolveJobForQuote(quote, jobs);
+}
+// What a quote/job is worth commercially, as a comparable string: the line
+// items, the discount and the setup fee — nothing else. Used to decide whether
+// an admin save actually changes money/content (only then are the job's lines
+// replaced), so a phone-number edit never touches production lines.
+function quoteCommercialSignature(doc){
+  if(!doc) return '';
+  const n = v => (v===''||v===null||v===undefined) ? '' : String(parseFloat(v));
+  return JSON.stringify({
+    lines: (doc.lines||[]).map(l=>[String(l&&l.desc||'').trim(), n(l&&l.qty), n(l&&l.unitPrice), String(l&&l.unit||''),
+      l&&l.itemId!=null?String(l.itemId):'', n(l&&l.sqmL), n(l&&l.sqmW), n(l&&l.pQty)]),
+    d: n(parseFloat(doc.discount)||0), s: n(parseFloat(doc.setupFee)||0),
+  });
 }
 // The source quote for a job. Stable id first (the quote that names THIS job
 // through convertedJobId), then the legacy same-company quoteNum fallback.
@@ -8855,8 +8883,13 @@ function SaveAsInventoryModal({ line, inventory, setInventory, onClose, onSaved 
 // their behaviour would change how 100+ existing inventory items behave.
 const UNIT_TYPE_OPTIONS = ['each','unit','m','m (linear)','m²','sheet','roll','panel','pack','box','litre','kg','set','hour','day','item','job','visit'];
 
-function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies, nextNum, preparedBy, customers, setCustomers, savedCalcs, completeProducts, existingQuote, quickRates, initialData, quotes, accInvoices, jobs }) {
+function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies, nextNum, preparedBy, customers, setCustomers, savedCalcs, completeProducts, existingQuote, quickRates, initialData, quotes, accInvoices, jobs, canAdminRevise }) {
   const eq = existingQuote;
+  // 2026-11-10 ADMIN REVISION: an existing quote that has already become a job.
+  const _revJob = eq ? resolveJobForQuote(eq, jobs||[]) : null;
+  const _revAdvanced = !!eq && quoteIsAdvanced(eq, jobs||[]);
+  const _revInvoiceNum = _revJob ? (_revJob.invoiceNum || '') : '';
+  const [pullThrough, setPullThrough] = useState(true);
   // Guards against a double-click/double-submit reserving two quote numbers
   // for the same click, and disables the Save button while the atomic
   // reservation call to the backend is in flight.
@@ -9219,6 +9252,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       payload.status = eq.status;
       payload.convertedJobId = eq.convertedJobId||null;
       payload.payments = eq.payments||[];
+      if(_revAdvanced && canAdminRevise && _revJob) payload._pullThrough = !!pullThrough;
     } else {
       // New quote (or Copy Quote, which also has no `eq`) — the number is
       // reserved atomically from the backend, immediately before saving,
@@ -9880,6 +9914,16 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
           )}
         </div>
 
+        {_revAdvanced && canAdminRevise && _revJob && (
+          <div className="bg-amber-50 border border-amber-300 rounded-xl px-3 py-2.5 space-y-1.5">
+            <p className="text-xs font-bold text-amber-800">🛠 Admin revision — this quote is already Job {_revJob.num||''}{_revInvoiceNum?(' and Invoice '+_revInvoiceNum):''}</p>
+            <label className="flex items-start gap-2 text-xs text-amber-900 cursor-pointer">
+              <input type="checkbox" className="mt-0.5" checked={pullThrough} onChange={e=>setPullThrough(e.target.checked)}/>
+              <span>Pull changes to items, discount and setup fee through to the job{_revInvoiceNum?' and its invoice':''}. The job's line items are <b>replaced</b> by these quote lines and the job value is recalculated{_revInvoiceNum?'; the invoice keeps its number and date, and its lines are rebuilt':''}. Payments are never changed — only the outstanding balance moves. Stock is not re-deducted.</span>
+            </label>
+            {!pullThrough && <p className="text-xs text-amber-700">Unticked: only contact/header details are saved. A price change will be refused because the job would no longer match.</p>}
+          </div>
+        )}
         {saveErr&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2">{saveErr}</p>}
         <div className="flex gap-3 pt-1 pb-1">
           <button type="button" onClick={onClose} disabled={saving} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed">Cancel</button>
@@ -10706,11 +10750,18 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
             className="flex items-center gap-1.5 text-xs bg-blue-700 hover:bg-blue-800 text-white rounded-xl px-4 py-2.5 font-bold">
             📧 Email to Customer
           </button>
-          {onEdit&&(
+          {onEdit&&(!quoteIsAdvanced(quote, jobs) || isAdmin) && (
             <button onClick={()=>onEdit(quote)}
+              title={quoteIsAdvanced(quote, jobs)?'Admin revision — changes are pulled through to the job and its invoice':undefined}
               className="flex items-center gap-1.5 text-xs bg-amber-500 hover:bg-amber-600 text-white rounded-xl px-4 py-2.5 font-bold">
-              ✏️ Edit Quote
+              {quoteIsAdvanced(quote, jobs) ? '🛠 Edit Quote (Admin revision)' : '✏️ Edit Quote'}
             </button>
+          )}
+          {onEdit&&quoteIsAdvanced(quote, jobs)&&!isAdmin&&(
+            <span className="flex items-center gap-1.5 text-xs bg-gray-100 text-gray-500 rounded-xl px-4 py-2.5 font-semibold"
+              title="This quote has already become a job. Only an admin can change it, so the job and invoice stay in step.">
+              🔒 Converted — admin edit only
+            </span>
           )}
           {/* ── Proforma Invoice / Email Proforma (2026-08-20: reservation
                 folded in, no separate step) ──
@@ -11718,6 +11769,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // click handler runs synchronously start-to-finish, so `quotes`/`jobs`
   // here are exactly what `prev` would have been.
   async function handleSave(q){
+    // 2026-11-10: the editor's "pull changes through" choice is a one-shot
+    // instruction for THIS save, never a stored quote field.
+    const _pullThroughReq = !!(q && q._pullThrough);
+    if(q && Object.prototype.hasOwnProperty.call(q, '_pullThrough')) delete q._pullThrough;
     // If editing an existing quote, update it; otherwise prepend as new
     const isEdit = !!(quotes||[]).find(x=>x.id===q.id);
     // Stage 2 Phase 4: a brand-new quote, when 'quotes' is
@@ -11819,7 +11874,31 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // Quote A while an unrelated Job B or Quote B changes elsewhere never
       // touches this call at all, so it can never be blocked by that.
       if(linkedJob && linkedJob._relRowVersion !== undefined) patch.expectedJobVersion = linkedJob._relRowVersion;
-      const result = await relationalApi.updateQuote(q._relId, q._relRowVersion, patch);
+      // ── ADMIN REVISION (2026-11-10) ─────────────────────────────────────
+      // An admin who left "Pull changes through" ticked, on a quote that has a
+      // linked job, goes through the admin-revise route — but ONLY when the
+      // commercial content (items / discount / setup fee) actually differs from
+      // the saved quote or from the job's own lines. Header-only edits keep
+      // using the ordinary route, so they can never replace production lines.
+      const _wantPull = _pullThroughReq;
+      const _commercialChanged = !!linkedJob && (
+        quoteCommercialSignature(q) !== quoteCommercialSignature(live||{}) ||
+        quoteCommercialSignature(q) !== quoteCommercialSignature(linkedJob)
+      );
+      const _adminRevise = isAdmin && _wantPull && !!linkedJob && _commercialChanged;
+      if(!isAdmin && linkedJob){
+        throw new Error('This quote has already been converted to a job, so only an admin can edit it. Nothing was saved.');
+      }
+      const result = _adminRevise
+        ? await relationalApi.reviseConvertedQuote(q._relId, q._relRowVersion, patch)
+        : await relationalApi.updateQuote(q._relId, q._relRowVersion, patch);
+      if(_adminRevise){
+        const _inv = result && result.invoiceSync;
+        const _why = _inv && _inv.reason;
+        if(_why==='ambiguous' || _why==='company-mismatch' || _why==='unresolved-history'){
+          alert('The quote and job '+(linkedJob.num||'')+' were updated, but the linked invoice was NOT changed ('+_why+(_inv.detail?': '+_inv.detail:'')+'). Please check the invoice manually.');
+        }
+      }
       const quotesUpdater = prev=>prev.map(x=>x.id===q.id
         ? {...q, status: live?live.status:x.status, convertedJobId: live?live.convertedJobId:x.convertedJobId, _relId: x._relId, _relRowVersion: result.rowVersion}
         : x);
@@ -12098,6 +12177,12 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     setViewQuote(updated);
   }
   function handleEditQuote(q){
+    // 2026-11-10: once a quote has become a job, only an admin may change it
+    // (an admin's change is pulled through to the job and its invoice).
+    if(quoteIsAdvanced(q, jobs) && !isAdmin){
+      alert('This quote has already been converted to a job, so only an admin can edit it.');
+      return;
+    }
     setViewQuote(null);
     // STAGE 3 FOLLOW-UP: capture the BASE snapshot (see editQuoteBaseRef's
     // definition above) at the exact moment editing begins — before any
@@ -14157,6 +14242,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       />}
       {/* ── Edit Quote modal ── */}
       {editQuote&&<CreateQuoteModal
+        canAdminRevise={isAdmin}
         onClose={()=>setEditQuote(null)} onSave={handleSave}
         inventory={inventory} setInventory={setInventory} companies={creatableCompanies(companies,user)}
         nextNum={editQuote.num} preparedBy={user.name}
