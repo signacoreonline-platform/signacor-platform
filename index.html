@@ -2233,6 +2233,54 @@ function jobHasId(job, wantedId){
   if(job.id===wantedId) return true;
   return job._relId!==null && job._relId!==undefined && Number(job._relId)===Number(wantedId);
 }
+/* ── RECORD IDENTITY (2026-11-10 — QUOTE SAVE DUPLICATE) ─────────────────────
+   A relational create/convert response carries its new id straight from
+   Postgres `RETURNING id` on a BIGSERIAL, which node-pg serialises as a STRING
+   ("412"). Every read (read.ts restoreId) returns the same id as a NUMBER
+   (412). A quote view opened before the post-save re-read kept "412", the
+   refreshed list held 412, and handleSave's `x.id === q.id` missed — so an edit
+   fell into the local-only "new quote" branch, added a second row, reported
+   success and sent nothing.
+
+   sgrRelRecordId is read.ts restoreId's own rule, applied on the client: a
+   purely numeric id becomes a number, anything else (a legacy JSON id that is
+   not numeric) is left exactly as it is. Stubs built from a create/convert
+   response use it, so they carry the id the next read will carry.
+
+   sgrSameRecord answers "are these two objects the same stored record?" by the
+   record's own id OR its relational PK (_relId), comparing each with its own
+   kind only (id to id, PK to PK) after that normalisation, and never across
+   companies (sameCompany — Holdings isolation is preserved). */
+function sgrRelRecordId(v){
+  if(v===null || v===undefined || typeof v==='number') return v;
+  const s = String(v).trim();
+  if(/^-?\d+(\.\d+)?$/.test(s)){ const n = Number(s); if(Number.isFinite(n)) return n; }
+  return v;
+}
+function sgrSameRecordId(a, b){
+  if(a===null || a===undefined || a==='' || b===null || b===undefined || b==='') return false;
+  return String(sgrRelRecordId(a)) === String(sgrRelRecordId(b));
+}
+function sgrSameRecord(a, b){
+  if(!a || !b || !sameCompany(a, b)) return false;
+  if(sgrSameRecordId(a.id, b.id)) return true;
+  return sgrSameRecordId(a._relId, b._relId);
+}
+/* Replace the ONE list row that is `match` with makeNext(row), and drop any
+   further rows that are the same stored record — so a session that already
+   holds a duplicate (from before this fix) collapses back to one row. */
+function sgrReplaceRecord(list, match, makeNext){
+  let done = false;
+  const out = [];
+  for(const x of (list||[])){
+    if(sgrSameRecord(x, match)){
+      if(done) continue;
+      done = true;
+      out.push(makeNext(x));
+    } else out.push(x);
+  }
+  return out;
+}
 // EVERY job this quote may legitimately resolve to — and, just as importantly,
 // the ONLY jobs a write originating on this quote may touch (see the payment
 // cascades in QuotesPage). Stable id first; legacy same-company number
@@ -7954,7 +8002,7 @@ function AddJobModal({ companies, onClose, onAdd }) {
           value: parseFloat(value) || 0,
           notes: notes.trim(),
         });
-        onAdd({ id: result.id, num: result.jobNumber, client: client.trim(), desc: desc.trim(),
+        onAdd({ id: sgrRelRecordId(result.id), num: result.jobNumber, client: client.trim(), desc: desc.trim(), createdAt: new Date().toISOString(),
                 status, co: parseInt(co), value: parseFloat(value)||0,
                 stage: STATUS_TO_STAGE[status]||0, breakdown: null, notes: notes.trim(),
                 payments: [], _relId: result.id, _relRowVersion: result.rowVersion });
@@ -9271,6 +9319,12 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       payload.convertedJobId = eq.convertedJobId||null;
       payload.payments = eq.payments||[];
       if(_revAdvanced && canAdminRevise && _revJob) payload._pullThrough = !!pullThrough;
+      // 2026-11-10: an EDIT names the stored record it edits, taken from the
+      // quote this editor was opened on (never from the edited form fields —
+      // the company field may have been changed in the form). handleSave
+      // resolves it in the live list by canonical identity and REFUSES the
+      // save if it cannot, instead of creating anything.
+      payload._sgrSave = { mode:'edit', of:{ id: eq.id, _relId: eq._relId, co: eq.co } };
     } else {
       // New quote (or Copy Quote, which also has no `eq`) — the number is
       // reserved atomically from the backend, immediately before saving,
@@ -9351,10 +9405,12 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
           // for every subsequent edit. Without this, editing a quote immediately
           // after creating it would call updateQuote(undefined, undefined, ...).
           payload = {
-            id: result.id, num: result.quoteNumber, status:'draft',
+            // 2026-11-10: the id the next read will carry (412, not "412").
+            id: sgrRelRecordId(result.id), num: result.quoteNumber, status:'draft',
             convertedJobId: null, payments: [],
             _relId: result.id, _relRowVersion: result.rowVersion,
             ...formFields,
+            _sgrSave: { mode:'create' },
           };
         } catch(saveError){
           setSaving(false);
@@ -9372,6 +9428,7 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
           id: Date.now(), num: reserved, status:'draft',
           convertedJobId: null, payments: [],
           ...formFields,
+          _sgrSave: { mode:'create' },
         };
       }
     }
@@ -11799,8 +11856,26 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // instruction for THIS save, never a stored quote field.
     const _pullThroughReq = !!(q && q._pullThrough);
     if(q && Object.prototype.hasOwnProperty.call(q, '_pullThrough')) delete q._pullThrough;
-    // If editing an existing quote, update it; otherwise prepend as new
-    const isEdit = !!(quotes||[]).find(x=>x.id===q.id);
+    // ── 2026-11-10 (QUOTE SAVE DUPLICATE) — explicit intent, canonical identity.
+    // The editor states whether this is a CREATE or an EDIT of a named record.
+    // An edit is resolved in the live list with sgrSameRecord (id or relational
+    // PK, string/number tolerant, same company), never with `x.id === q.id`,
+    // which missed whenever the editor's snapshot and the refreshed list held
+    // the same id as "412" and 412. An edit that cannot be resolved is REFUSED:
+    // nothing is sent, nothing local changes, and the editor (and its draft)
+    // stay open with the error — it can never quietly become a new row.
+    const _saveIntent = q && q._sgrSave;
+    if(q && Object.prototype.hasOwnProperty.call(q, '_sgrSave')) delete q._sgrSave;
+    const _isCreate = !!(_saveIntent && _saveIntent.mode==='create');
+    const _editOf = _isCreate ? null : ((_saveIntent && _saveIntent.of) || q);
+    const _liveRec = _isCreate ? null : ((quotes||[]).find(x=>sgrSameRecord(x, _editOf)) || null);
+    if(!_isCreate && !_liveRec){
+      const _msg = 'This quote could not be matched to a saved quote in the current list, so nothing was saved. Your changes are still in this editor. Close it, reopen the quote from the list and save again.';
+      const _err = new Error(_msg);
+      _err.body = { type:'business_rule', error:_msg };   // shown verbatim by classifySaveError, not as a network fault
+      throw _err;
+    }
+    const isEdit = !_isCreate;
     // Stage 2 Phase 4: a brand-new quote, when 'quotes' is
     // relational-authoritative, was already created via
     // relationalApi.createQuote() inside CreateQuoteModal.submit() (see
@@ -11813,7 +11888,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // job can already reference a quote number that didn't exist a moment
     // ago.
     if(!isEdit && isRelationalAuthoritative('quotes')){
-      const quotesUpdater = prev=>[q,...prev];
+      // One row per stored quote: if the post-save re-read already brought the
+      // server's own row in, keep that authoritative row instead of adding a
+      // second copy of the same record.
+      const quotesUpdater = prev=>(prev||[]).some(x=>sgrSameRecord(x, q)) ? prev : [q,...(prev||[])];
       setQuotes(quotesUpdater);
       syncRelationalBaseline('quotes', quotesUpdater);
       setEditQuote(null);
@@ -11856,7 +11934,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // propagate naturally means the modal's existing saveErr banner (via
       // describeSaveConflictError) is now the ONE place this message is
       // shown, and the modal — and this quote's local edits — stay open.
-      const live = (quotes||[]).find(x=>x.id===q.id);
+      const live = _liveRec;
+      // 2026-11-10: the record's relational identity and the editor's ORIGINAL
+      // row version come from the snapshot this editor was opened on, so a
+      // fresher list row can never make an older edit look current — the server
+      // still refuses it with a stale_record conflict if the quote has moved.
+      if(q._relId==null) q._relId = live._relId;
+      if(q._relRowVersion===undefined) q._relRowVersion = live._relRowVersion;
       // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 3. The linked job was
       // looked up ONLY by `j.quoteNum === q.num`. When that missed (a job whose
       // quoteNum never hydrated, or a restored conversion where two jobs share
@@ -11925,9 +12009,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           alert('The quote and job '+(linkedJob.num||'')+' were updated, but the linked invoice was NOT changed ('+_why+(_inv.detail?': '+_inv.detail:'')+'). Please check the invoice manually.');
         }
       }
-      const quotesUpdater = prev=>prev.map(x=>x.id===q.id
-        ? {...q, status: live?live.status:x.status, convertedJobId: live?live.convertedJobId:x.convertedJobId, _relId: x._relId, _relRowVersion: result.rowVersion}
-        : x);
+      // Reconciled into ONE row — the list's own row for this record keeps its
+      // id (the canonical one the reads use) and any stray duplicate of the
+      // same record is dropped.
+      const quotesUpdater = prev=>sgrReplaceRecord(prev, live, x=>(
+        {...q, id: x.id, status: live?live.status:x.status, convertedJobId: live?live.convertedJobId:x.convertedJobId, _relId: x._relId, _relRowVersion: result.rowVersion}));
       setQuotes(quotesUpdater);
       syncRelationalBaseline('quotes', quotesUpdater);
       if(result.jobId && linkedJob){
@@ -11973,7 +12059,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       setEditQuote(null);
       return;
     }
-    const live = (quotes||[]).find(x=>x.id===q.id);
+    const live = _liveRec;
     let nextQuotes;
     if(!live){
       nextQuotes = [q,...quotes];
@@ -11985,9 +12071,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // convertedJobId) but this save's payload doesn't reflect that, never
       // let it silently revert the conversion — only the fields this form
       // actually edits (client/contact/lines/etc.) should ever change here.
-      nextQuotes = quotes.map(x=>x.id===q.id?{...q, status:live.status, convertedJobId:live.convertedJobId}:x);
+      nextQuotes = sgrReplaceRecord(quotes, live, x=>({...q, id:x.id, status:live.status, convertedJobId:live.convertedJobId}));
     } else {
-      nextQuotes = quotes.map(x=>x.id===q.id?q:x);
+      nextQuotes = sgrReplaceRecord(quotes, live, x=>({...q, id:x.id}));
     }
 
     // ── Pull quote changes through to any linked (converted) job's invoice ──
@@ -12006,7 +12092,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         // correction as the relational branch above: an unchanged quote note
         // must never overwrite the job's own note, and a cleared quote note
         // must clear it rather than falling back to the job's previous text.
-        const _liveQ = (quotes||[]).find(x=>x.id===q.id);
+        const _liveQ = live;
         const _qNotesBefore = (_liveQ && _liveQ.notes != null) ? String(_liveQ.notes) : '';
         const _qNotesAfter = q.notes == null ? '' : String(q.notes);
         const _qNotesChanged = _qNotesAfter !== _qNotesBefore;
@@ -12043,7 +12129,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // anyway, so recordBase is simply omitted there.
     let recordBase;
     if(isEdit && editQuoteBaseRef.current){
-      recordBase = { quotes: { [String(q.id)]: editQuoteBaseRef.current.quote } };
+      recordBase = { quotes: { [String(live ? live.id : q.id)]: editQuoteBaseRef.current.quote } };
       if(jobsChanged && editQuoteBaseRef.current.job){
         recordBase.jobs = { [String(editQuoteBaseRef.current.job.id)]: editQuoteBaseRef.current.job };
       }
@@ -12080,7 +12166,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       try {
         const result = await relationalApi.updateQuoteStatus(updated._relId, updated._relRowVersion, updated.status);
         const applied = {...updated, _relRowVersion: result.rowVersion};
-        const quotesUpdater = prev=>prev.map(q=>q.id===applied.id?applied:q);
+        // 2026-11-10: canonical identity, one row (see sgrSameRecord).
+        const quotesUpdater = prev=>sgrReplaceRecord(prev, applied, x=>({...applied, id:x.id}));
         setQuotes(quotesUpdater);
         syncRelationalBaseline('quotes', quotesUpdater);
         setViewQuote(applied);
@@ -12376,7 +12463,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         // refreshes it from the authoritative relational read-overlay) would
         // call updateJob(undefined, undefined, ...) and fail.
         const stubJob = {
-          id: result.jobId, num: result.jobNumber, client: q.client,
+          id: sgrRelRecordId(result.jobId), num: result.jobNumber, client: q.client,
           contact: q.contact||'', email: q.email||'', tel: q.tel||'',
           address: q.address||'', vatNum: q.vatNum||'',
           // 2026-08-24 BUG 2: these four were dropped by BOTH this stub and the
@@ -12406,8 +12493,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           // job before the next authoritative read (its id is a plain PK).
           createdAt: new Date().toISOString(),
           _relId: result.jobId, _relRowVersion: result.jobRowVersion,
+          createdAt: new Date().toISOString(),
         };
-        const jobsUpdater = prev=>[stubJob, ...prev];
+        // One row per stored job, even if the re-read already brought it in.
+        const jobsUpdater = prev=>(prev||[]).some(j=>sgrSameRecord(j, stubJob)) ? prev : [stubJob, ...(prev||[])];
         // POST-MIGRATION STABILIZATION (2026-08-24) — BUG 3 ROOT CAUSE.
         // Converting bumps the QUOTE's row_version server-side (rel_quotes is
         // updated to status='converted' with the job link). This updater used
@@ -12422,8 +12511,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         // opaque error) for a conflict they had caused themselves one click
         // earlier. The endpoint now reports the new version and it is applied
         // here. `??` not `||` so a legitimate version of 0 is never discarded.
-        const quotesUpdater = prev=>prev.map(qx=>qx.id===q.id
-          ? {...qx, status:'converted', convertedJobId:result.jobId,
+        const quotesUpdater = prev=>prev.map(qx=>sgrSameRecord(qx, q)
+          ? {...qx, status:'converted', convertedJobId:sgrRelRecordId(result.jobId),
              _relRowVersion: (result.quoteRowVersion ?? qx._relRowVersion)}
           : qx);
         setJobs(jobsUpdater);
@@ -12431,7 +12520,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         setQuotes(quotesUpdater);
         syncRelationalBaseline('quotes', quotesUpdater);
         setViewQuote(null);
-        setConvertedInfo({jobId: result.jobId, jobNum: result.jobNumber, linkedInvoiceNum: null});
+        setConvertedInfo({jobId: sgrRelRecordId(result.jobId), jobNum: result.jobNumber, linkedInvoiceNum: null});
       } catch(saveErr){
         alert('Job could NOT be created.\n\n'+(saveErr&&saveErr.message?saveErr.message:'unknown error')+'\n\nNothing was changed. Please check your connection and try again.');
       }
@@ -18452,7 +18541,9 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   // POST-MIGRATION STABILIZATION (2026-08-24) — in-flight state for the inline
   // "Create Invoice" action below, which previously had none.
   const [creatingInvoice, setCreatingInvoice] = useState(false);
-  const job=jobs.find(j=>j.id===jobId);
+  // 2026-11-10: canonical identity — "Open Job" right after a conversion can
+  // hold the job id as "448" while the refreshed list holds 448.
+  const job=jobs.find(j=>sgrSameRecordId(j.id, jobId)) || jobs.find(j=>jobHasId(j, jobId));
   const [editingCosts, setEditingCosts]=useState(false);
   const [bd, setBd]=useState(null); // local copy of breakdown being edited
   const [editingNotes, setEditingNotes]=useState(false);
