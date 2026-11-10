@@ -684,6 +684,14 @@ export async function buildJobsJson(): Promise<any[]> {
       notes: r.notes ?? legacyBase(r).notes ?? null,
       lines: items.length ? items : (legacyBase(r).lines ?? []),
       payments,
+      // 2026-11-10 (DASHBOARD) — the job's real creation time. A job created
+      // on the server (convertQuoteToJob) has source_id = its own PK, so its
+      // `id` is an ordinary integer (SNS-00236 is 448), not the millisecond
+      // timestamp a JSON-era id encodes. The dashboard resolves "created" from
+      // a valid legacy timestamp id FIRST and only then from this column, so a
+      // backfilled job keeps its original date rather than its import date.
+      // Purely additive: nothing that already reads jobs changes.
+      createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
       _relId: r.id,
       _relRowVersion: r.row_version,
     });

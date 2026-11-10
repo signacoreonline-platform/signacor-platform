@@ -100,7 +100,7 @@ const WANTED = [
   'resolveQuoteForJob', 'resolveQuoteForInvoice',
   'invoiceIdentityKey', 'invoiceBelongsToJob', 'resolveJobInvoiceRecord',
   'sgrReportPaymentKey', 'sgrReportPaymentDate', 'sgrReportChainPayments',
-  'sgrReportLastPaid', 'sgrReportPaymentDocument', 'sgrPaymentsReportModel',
+  'sgrReportLastPaid', 'sgrReportPaymentDocument', 'sgrPaymentsReportModelScoped', 'sgrPaymentsReportModel',
 ];
 const pieces = ['"use strict";',
   extractConst(SRC, MASKED, 'UNIONTECH_ID'),

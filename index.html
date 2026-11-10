@@ -5638,8 +5638,14 @@ function getConsistencyIssues(quotes, jobs, accInvoices) {
 // One set of totals shared by Dashboard, Sales and Accounting — computed
 // from the exact same quotes/jobs/accInvoices arrays so the "overall
 // picture" can never drift between the three pages.
-function getBusinessSummary(quotes, jobs, accInvoices) {
+function getBusinessSummary(quotes, jobs, accInvoices, creditNotes) {
   const invoices = getAllInvoicesUnified(jobs, quotes, accInvoices);
+  // 2026-11-10: Outstanding is the REMAINING balance (payments and applied
+  // credits counted once through the canonical chain), drafts and voids
+  // excluded, less open customer credit — sgrDashboardOutstanding. It used to
+  // add the FULL amount of every invoice not marked paid, so a part-paid
+  // invoice (the 80%-deposit norm) was counted at 100%.
+  const _out = sgrDashboardOutstanding(sgrDashboardInvoiceRows(jobs, quotes, accInvoices), creditNotes);
   return {
     totalQuotes: (quotes||[]).length,
     approvedQuotes: (quotes||[]).filter(q=>q.status==='approved'||q.status==='converted').length,
@@ -5648,7 +5654,9 @@ function getBusinessSummary(quotes, jobs, accInvoices) {
     completedJobs: (jobs||[]).filter(j=>DONE_STATUSES.includes(j.status)).length,
     totalInvoices: invoices.length,
     paidInvoices: invoices.filter(i=>i.status==='paid').length,
-    outstandingValue: invoices.filter(i=>i.status!=='paid').reduce((s,i)=>s+(i.amount||0),0),
+    outstandingValue: sgrRands(_out.netC),
+    outstandingGrossValue: sgrRands(_out.grossC),
+    openCreditValue: sgrRands(_out.openCreditC),
     issues: getConsistencyIssues(quotes, jobs, accInvoices),
   };
 }
@@ -5693,8 +5701,8 @@ function RecordLinksPanel({ links=[], warnings=[] }) {
 
 // Shared "parallel picture" panel — identical on Dashboard, Sales and
 // Accounting because it's driven entirely by getBusinessSummary() above.
-function ConsistencyPanel({ quotes, jobs, accInvoices }) {
-  const summary = useMemo(()=>getBusinessSummary(quotes, jobs, accInvoices), [quotes, jobs, accInvoices]);
+function ConsistencyPanel({ quotes, jobs, accInvoices, creditNotes }) {
+  const summary = useMemo(()=>getBusinessSummary(quotes, jobs, accInvoices, creditNotes), [quotes, jobs, accInvoices, creditNotes]);
   const [open, setOpen] = useState(false);
   // ── Dismissed-warning tracking ──
   // Display-only: dismissing a warning never changes, fixes, relinks or
@@ -5735,7 +5743,9 @@ function ConsistencyPanel({ quotes, jobs, accInvoices }) {
         {stat('Completed Jobs', summary.completedJobs)}
         {stat('Invoices', summary.totalInvoices)}
         {stat('Paid', summary.paidInvoices, 'text-emerald-600')}
-        {stat('Outstanding', money(summary.outstandingValue), 'text-amber-600')}
+        <div title={'Remaining on issued invoices '+money(summary.outstandingGrossValue)+(summary.openCreditValue>0?' less open customer credit '+money(summary.openCreditValue):'')}>
+          {stat('Outstanding', (summary.outstandingValue<0?'− ':'')+money(summary.outstandingValue), 'text-amber-600')}
+        </div>
         <div className="flex-1 text-right">
           {visibleIssues.length>0 ? (
             <button onClick={()=>setOpen(o=>!o)} className="text-xs font-bold px-3 py-1.5 rounded-full bg-red-100 text-red-700 whitespace-nowrap">
@@ -12392,6 +12402,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           // the real defect for THIS symptom was this missing field).
           value: q.total,
           stage: STATUS_TO_STAGE['quote_approved']||4, payments: [],
+          // 2026-11-10: mirrors read.ts's createdAt so the Dashboard dates this
+          // job before the next authoritative read (its id is a plain PK).
+          createdAt: new Date().toISOString(),
           _relId: result.jobId, _relRowVersion: result.jobRowVersion,
         };
         const jobsUpdater = prev=>[stubJob, ...prev];
@@ -13647,7 +13660,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
 
       {/* Parallel Quotes / Jobs / Invoices picture — identical panel also shown
           on Dashboard and Accounting, driven by the same getBusinessSummary(). */}
-      <ConsistencyPanel quotes={myQuotes} jobs={myJobs} accInvoices={myAccInvoices}/>
+      <ConsistencyPanel quotes={myQuotes} jobs={myJobs} accInvoices={myAccInvoices} creditNotes={(creditNotes||[]).filter(c=>belongsToUserCompany(c,user))}/>
 
       {/* Sub-tabs */}
       <div className="flex gap-1 bg-gray-100 rounded-2xl p-1 w-fit">
@@ -18112,60 +18125,25 @@ function Header({ page, onMenu, onLogout, user, onSave, saveMsg, lastSaved, logo
 /* ═══════════════════════════════════════════
    CHARTS
 ═══════════════════════════════════════════ */
-function RevenueChart({ jobs=[], accInvoices=[] }) {
+function RevenueChart({ revenueByMonthC={} }) {
   const ref=useRef(null);
   useEffect(()=>{
-    // Build 6-month buckets from actual invoiced data.
-    // Revenue definition matches the "Monthly Revenue" KPI: job invoices (stage
-    // 7/8/9 or with an invoice number, value incl. VAT) plus manual accounting
-    // invoices, so the monthly bars reconcile with the headline figure.
-    // Window: anchored to start May 2026 and run 6 months forward (May–Oct
-    // 2026), so it always includes May even before the business has traded
-    // through it. Once "today" passes the anchor window (i.e. after Oct
-    // 2026), it becomes a normal trailing-6-months-ending-today window, so
-    // the chart keeps rolling forward month by month from then on.
-    const now=new Date();
+    // 2026-11-10: bars come from the SAME sgrDashboardRevenue result as the
+    // Monthly Revenue card (issued invoices by Johannesburg issue month), so
+    // the current-month bar always equals the card. Window unchanged: May–Oct
+    // 2026, then the trailing six months ending this month.
     const ANCHOR_MONTHS=6;
-    const anchorStart=new Date(2026,4,1); // May 2026
-    const anchorEnd=new Date(anchorStart.getFullYear(),anchorStart.getMonth()+ANCHOR_MONTHS-1,1); // Oct 2026
-    const nowMonthStart=new Date(now.getFullYear(),now.getMonth(),1);
-    const firstMonth = nowMonthStart<=anchorEnd
-      ? anchorStart
-      : new Date(now.getFullYear(),now.getMonth()-(ANCHOR_MONTHS-1),1);
+    const nowKey=sgrJhbNowMonthKey();
+    const firstKey = nowKey<='2026-10' ? '2026-05' : sgrMonthKeyShift(nowKey, -(ANCHOR_MONTHS-1));
     const months=[];
     for(let i=0;i<ANCHOR_MONTHS;i++){
-      const d=new Date(firstMonth.getFullYear(),firstMonth.getMonth()+i,1);
-      months.push({m:d.toLocaleString('default',{month:'short'}),year:d.getFullYear(),month:d.getMonth(),rev:0,cost:0});
+      const k=sgrMonthKeyShift(firstKey,i);
+      months.push({m:sgrMonthKeyLabel(k,{month:'short'}), rev:sgrRands(revenueByMonthC[k]||0)});
     }
-    // Same shared dedup rule as getAllInvoicesUnified (getManualInvoiceJobRefs)
-    // instead of a separate local Set — also correctly ignores void manual
-    // invoices, so a voided invoice can no longer suppress a job's real
-    // revenue bar here, nor still count as revenue itself below.
-    const manualRefs=getManualInvoiceJobRefs(accInvoices, jobs);
-    jobs.forEach(j=>{
-      if(!j.value)return;
-      if(!([7,8,9].includes(j.stage)||j.invoiceNum))return;
-      if(manualRefs.has(j.num))return; // avoid double-count with a linked manual invoice
-      const d=j.invoiceDate?new Date(j.invoiceDate):new Date(j.id); // prefer actual invoiceDate over creation timestamp
-      const bucket=months.find(b=>b.year===d.getFullYear()&&b.month===d.getMonth());
-      if(!bucket)return;
-      bucket.rev+=(j.value||0);
-    });
-    (accInvoices||[]).forEach(inv=>{
-      if(inv.status==='void')return;
-      // 2026-09-22: canonical cents.
-      const val=sgrRands(sgrInvoiceCents(inv.lineItems).totalC);
-      if(!val)return;
-      const d=inv.date?new Date(inv.date):null;
-      if(!d)return;
-      const bucket=months.find(b=>b.year===d.getFullYear()&&b.month===d.getMonth());
-      if(!bucket)return;
-      bucket.rev+=val;
-    });
     const hasData=months.some(b=>b.rev>0);
     const chart=new Chart(ref.current,{type:'bar',data:{labels:months.map(m=>m.m),datasets:[{label:'Revenue',data:months.map(m=>m.rev),backgroundColor:hasData?'#0000ffcc':'#cbd5e133',borderRadius:5}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`R ${ctx.raw.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2})}`}}},scales:{y:{ticks:{callback:v=>`R${(v/1000).toFixed(0)}k`,font:{size:10}},grid:{color:'#f1f5f9'}},x:{ticks:{font:{size:11}},grid:{display:false}}}}});
     return ()=>chart.destroy();
-  },[jobs,accInvoices]);
+  },[revenueByMonthC]);
   return <canvas ref={ref}/>;
 }
 
@@ -18211,7 +18189,7 @@ function MonthlyConversionStrip({ data }) {
 /* ═══════════════════════════════════════════
    DASHBOARD
 ═══════════════════════════════════════════ */
-function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, accInvoices }) {
+function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, accInvoices, creditNotes }) {
   const isAdmin = true; // All roles see full dashboard
   // UNIONTECH_ID is now a no-op sentinel — Signacore Holdings shows normally.
   // Company-context filter: Holdings users see only Holdings-tagged (co:1)
@@ -18221,10 +18199,16 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   const visibleJobs      = jobs.filter(j=>j.co!==UNIONTECH_ID && belongsToUserCompany(j,user));
   const visibleQuotes    = (quotes||[]).filter(q=>belongsToUserCompany(q,user));
   const visibleAccInvoices = (accInvoices||[]).filter(i=>belongsToUserCompany(i,user));
+  const visibleCreditNotes = (creditNotes||[]).filter(c=>belongsToUserCompany(c,user));
   // ── Current-month scope ── Dashboard financial figures reflect only this month.
+  // 2026-11-10: the month is the Africa/Johannesburg calendar month
+  // (sgrJhbMonthKey), whatever the browser's own time zone.
   const _now = new Date();
-  const _curMonthLabel = _now.toLocaleString('default',{month:'long',year:'numeric'});
-  const inCurrentMonth = d => { if(!d) return false; const dt=new Date(d); return !isNaN(dt) && dt.getFullYear()===_now.getFullYear() && dt.getMonth()===_now.getMonth(); };
+  const _curMonthKey = sgrJhbNowMonthKey();
+  const _curMonthLabel = sgrMonthKeyLabel(_curMonthKey);
+  const inCurrentMonth = d => sgrJhbMonthKey(d) === _curMonthKey;
+  // One canonical financial picture for every money figure on this page.
+  const _fin = sgrDashboardFinancials(visibleJobs, visibleQuotes, visibleAccInvoices, visibleCreditNotes);
   // ── Monthly Conversion History ── % of quotes converted, per month.
   // 12-pill window anchored to start May 2026 (so May/Jun real history stays
   // visible), running through Apr 2027. Months that haven't happened yet
@@ -18256,7 +18240,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   })();
   const active=visibleJobs.filter(j=>!['completed','invoiced'].includes(j.status)).length;
   // Gross margin: invoiced jobs invoiced in the current month
-  const invJobs=visibleJobs.filter(j=>j.status==='invoiced' && inCurrentMonth(j.invoiceDate||j.id));
+  const invJobs=visibleJobs.filter(j=>j.status==='invoiced' && inCurrentMonth(j.invoiceDate)); // never a row id as a date
   const rev=invJobs.reduce((s,j)=>s+j.value,0);
   const cost=invJobs.reduce((s,j)=>s+breakdownTotal(j.breakdown),0);
   const margin=rev>0?((rev-cost)/rev*100).toFixed(1):'0.0';
@@ -18274,33 +18258,27 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
   const convPct        = monthQuotes.length>0 ? Math.round(monthConverted.length/monthQuotes.length*100) : 0;
   const convColor      = convPct>=75 ? '#10b981' : convPct>=50 ? '#0000ff' : convPct>=25 ? '#f59e0b' : '#ED0101';
   const convMsg        = convPct>=75 ? '🔥 Outstanding — keep it up!' : convPct>=50 ? '💪 Strong — push for more' : convPct>=25 ? '📈 Building momentum' : '🚀 Let’s win more quotes';
-  /* ── Salesman of the Month (2026-09-22) ──────────────────────────────────
-     Now the salesperson who HANDLES THE MAJORITY OF THE JOBS created this
-     month — ranked by job COUNT, not by Rand value as before. A single large
-     job no longer outranks a colleague who actually ran most of the month's
-     work. Ties on count fall back to the higher total value, then to the name,
-     so the winner is stable across renders instead of depending on object key
-     order. Same scope as before: company-visible jobs, created this month
-     (inCurrentMonth(j.id)), with a salesperson captured. Presentation only —
-     nothing is stored or written back. */
-  const _spStats = {};
-  visibleJobs.filter(j=>(j.salesperson||'').trim() && inCurrentMonth(j.id)).forEach(j=>{
-    const name = (j.salesperson||'').trim();
-    if (!_spStats[name]) _spStats[name] = { count:0, value:0 };
-    _spStats[name].count += 1;
-    _spStats[name].value += (parseFloat(j.value)||0);
-  });
-  const _spTop = Object.entries(_spStats).sort((a,b)=>
-    (b[1].count - a[1].count) || (b[1].value - a[1].value) || a[0].localeCompare(b[0])
-  )[0];
-  const topSalesman      = _spTop ? _spTop[0] : '—';
-  const topSalesmanJobs  = _spTop ? _spTop[1].count : 0;
-  const topSalesmanTotal = _spTop ? _spTop[1].value : 0;
-  const topSalesmanSub   = _spTop
-    ? topSalesmanJobs + ' job' + (topSalesmanJobs!==1?'s':'') + ' · R '
-      + topSalesmanTotal.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2})
-      + ' · ' + _curMonthLabel
-    : 'No jobs created this month';
+  /* ── Salesman of the Month (2026-11-10) ──────────────────────────────────
+     Ranked by job COUNT (then value, then name) over company-visible jobs
+     CREATED in this Johannesburg month — see sgrSalesmanOfMonth. The creation
+     date comes from sgrJobCreatedMs: a legacy timestamp id first, then the
+     server's createdAt. It used to be inCurrentMonth(j.id), which silently
+     dropped every job created on the server since the relational cutover
+     (their id is a plain PK — SNS-00236 is 448 → 1 Jan 1970). Names group
+     case-insensitively; unassigned jobs are shown, never ranked. */
+  const _sp = sgrSalesmanOfMonth(visibleJobs, _curMonthKey);
+  const _spMoney = c => 'R ' + sgrRands(c).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const _spUnassigned = _sp.unassigned.count
+    ? ' · ' + _sp.unassigned.count + ' unassigned' : '';
+  const topSalesman      = _sp.winner ? _sp.winner.name : '—';
+  const topSalesmanSub   = _sp.winner
+    ? _sp.winner.count + ' job' + (_sp.winner.count!==1?'s':'') + ' · ' + _spMoney(_sp.winner.valueC)
+      + ' · ' + _curMonthLabel + _spUnassigned
+    : (_sp.unassigned.count ? 'No assigned jobs this month' + _spUnassigned : 'No jobs created this month');
+  // ── Revenue (incl. VAT) — ONE result for the card and the 6-month chart ──
+  const _revByMonthC = _fin.revenue.byMonthC;
+  const _revUndated  = _fin.revenue.undated;
+  const _recentJobs  = sgrRecentJobs(visibleJobs, 10);
 
   return (
     <div className="p-4 space-y-4">
@@ -18329,7 +18307,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
 
       {/* Parallel Quotes / Jobs / Invoices picture — identical panel also shown
           on Sales and Accounting, driven by the same getBusinessSummary(). */}
-      <ConsistencyPanel quotes={visibleQuotes} jobs={visibleJobs} accInvoices={visibleAccInvoices}/>
+      <ConsistencyPanel quotes={visibleQuotes} jobs={visibleJobs} accInvoices={visibleAccInvoices} creditNotes={visibleCreditNotes}/>
 
       {/* Monthly Conversion strip — sits directly below the hero banner */}
       {isAdmin&&<MonthlyConversionStrip data={monthlyConversion}/>}
@@ -18338,25 +18316,13 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
       <div className={`grid gap-3 ${isAdmin?'grid-cols-2 lg:grid-cols-4':'grid-cols-2 lg:grid-cols-3'}`}>
         {isAdmin&&<KpiCard icon="💰" label="Monthly Revenue"
           value={(() => {
-            // Total invoiced THIS MONTH (incl. VAT).
-            // Job invoices (j.value is already incl. VAT) + manual accounting invoices
-            // dated in the current month, excluding any job already linked to a
-            // manual invoice by reference. Uses the same shared dedup rule as
-            // getAllInvoicesUnified (getManualInvoiceJobRefs) — which also
-            // correctly ignores void manual invoices — instead of a separate
-            // local calculation, so a voided invoice can no longer (a) hide a
-            // job's real revenue here or (b) still count as revenue itself.
-            const manualRefs = getManualInvoiceJobRefs(visibleAccInvoices, visibleJobs);
-            const jobInv = visibleJobs
-              .filter(j=>([7,8,9].includes(j.stage)||j.invoiceNum) && !manualRefs.has(j.num) && inCurrentMonth(j.invoiceDate||j.id))
-              .reduce((s,j)=>s+(parseFloat(j.value)||0),0);
-            const accInv = visibleAccInvoices
-              .filter(i=>i.status!=='void' && inCurrentMonth(i.date))
-              .reduce((s,i)=>{
-                // 2026-09-22: canonical cents.
-                return s+sgrRands(sgrInvoiceCents(i.lineItems).totalC);
-              },0);
-            const total = jobInv + accInv;
+            // 2026-11-10: every ISSUED invoice dated (issue date, Johannesburg)
+            // in this month, at its canonical payable, each counted ONCE
+            // through the canonical invoice rows (sgrDashboardRevenue). Drafts
+            // and voids never count; a stage-7+ job with no invoice is not an
+            // invoice; credit notes are settlements, not reductions of what
+            // was invoiced. The 6-month chart reads the identical result.
+            const total = sgrRands(_revByMonthC[_curMonthKey]||0);
             return 'R ' + total.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
           })()}
           sub={_curMonthLabel+' (incl. VAT)'} accent="text-brand-500"/>}
@@ -18387,7 +18353,8 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
         {isAdmin&&(
           <div className="lg:col-span-3 bg-white rounded-2xl border border-gray-200 p-4">
             <h3 className="text-sm font-bold mb-3" style={{color:'#06065c'}}>Total Revenue — Last 6 Months</h3>
-            <div className="h-52"><RevenueChart jobs={visibleJobs} accInvoices={visibleAccInvoices}/></div>
+            <div className="h-52"><RevenueChart revenueByMonthC={_revByMonthC}/></div>
+            {_revUndated.count>0&&<p className="text-[10px] text-gray-400 mt-1">{_revUndated.count} issued invoice{_revUndated.count!==1?'s':''} with no issue date ({'R '+sgrRands(_revUndated.cents).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2})}) not placed in any month</p>}
           </div>
         )}
         <div className={`${isAdmin?'lg:col-span-2':''} bg-white rounded-2xl border border-gray-200 p-4`}>
@@ -18428,46 +18395,35 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
         );
       })()}
 
-      {/* Recent Quotes table — mirrors Sales > All */}
+      {/* Recent Jobs — 2026-11-10: the 10 newest company-visible JOBS by
+          resolved creation date (sgrRecentJobs). Every column is job data. It
+          used to list every quote under a "Recent Jobs" title. */}
       <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
         <div className="px-4 py-3 border-b border-gray-100" style={{background:'#06065c'}}>
           <h3 className="text-sm font-bold text-white" style={{fontFamily:'Barlow Condensed,sans-serif',letterSpacing:'0.06em',fontSize:'0.95rem'}}>RECENT JOBS</h3>
         </div>
         <div className="overflow-x-auto p-4">
-          {(!visibleQuotes||visibleQuotes.length===0)?(
-            <p className="text-xs text-gray-400 text-center py-6">No quotes yet — create one in Sales.</p>
+          {_recentJobs.length===0?(
+            <p className="text-xs text-gray-400 text-center py-6">No jobs yet — convert an accepted quote in Sales.</p>
           ):(
             <table className="w-full text-sm min-w-[480px]">
               <thead>
                 <tr className="border-b border-gray-100">
-                  {['Quote #','Client','Date','Status','Value (incl. VAT)'].map(h=>(
+                  {['Job #','Client','Created','Status','Value (incl. VAT)'].map(h=>(
                     <th key={h} className={`py-2 text-xs font-semibold text-gray-400 ${h==='Value (incl. VAT)'?'text-right':''}`}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {/* Highest quote number at the top, lowest at the bottom
-                    (2026-09-22). Same numeric-aware helper + .reverse() idiom
-                    the Sales, Accounting and Credit Note lists already use, so
-                    QUO-00099 never sorts above QUO-00100. Sorts a COPY —
-                    numSort() spreads its input, so `quotes` is never mutated. */}
-                {numSort(visibleQuotes,'num').reverse().map(q=>{
-                  // 2026-09-22: canonical cents.
-                  const _rc=sgrDocumentCents(q.lines,q.discount,q.setupFee);
-                  const sub=sgrRands(_rc.subC);
-                  const disc=parseFloat(q.discount)||0;
-                  const setup=sgrRands(_rc.setupC);
-                  const total=sgrRands(_rc.totalC);
-                  return (
-                    <tr key={q.id} className="border-b border-gray-50 hover:bg-blue-50">
-                      <td className="py-2.5 text-xs font-mono text-gray-500">{q.num}</td>
-                      <td className="py-2.5 text-xs font-medium text-gray-700">{q.client}</td>
-                      <td className="py-2.5 text-xs text-gray-400">{q.date||'—'}</td>
-                      <td className="py-2.5"><QuoteBadge status={q.status}/></td>
-                      <td className="py-2.5 text-xs font-bold text-gray-800 text-right">{zar(total)}</td>
-                    </tr>
-                  );
-                })}
+                {_recentJobs.map(({job:j, ms})=>(
+                  <tr key={j.id} className="border-b border-gray-50 hover:bg-blue-50">
+                    <td className="py-2.5 text-xs font-mono text-gray-500">{j.num||'—'}</td>
+                    <td className="py-2.5 text-xs font-medium text-gray-700">{j.client||'—'}</td>
+                    <td className="py-2.5 text-xs text-gray-400">{ms===null?'—':sgrJhbDateKey(ms)}</td>
+                    <td className="py-2.5"><Badge status={j.status}/></td>
+                    <td className="py-2.5 text-xs font-bold text-gray-800 text-right">{zar(sgrRands(sgrToCents0(j.value)))}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           )}
@@ -26861,7 +26817,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
         <div className="space-y-4">
           {/* Parallel Quotes / Jobs / Invoices picture — identical panel also
               shown on Dashboard and Sales, driven by the same getBusinessSummary(). */}
-          <ConsistencyPanel quotes={quotes} jobs={jobs} accInvoices={accInvoices}/>
+          <ConsistencyPanel quotes={(quotes||[]).filter(q=>belongsToUserCompany(q,user))} jobs={jobs} accInvoices={accInvoices} creditNotes={creditNotes}/>
 
           {/* KPI row 1 — financials */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -28110,9 +28066,18 @@ function sgrReportPaymentDocument(p, ownerKind, ctx){
   return quoteDoc || invDoc;
 }
 function sgrPaymentsReportModel(jobs, quotes, accInvoices, user){
-  const myJobs   = (jobs||[]).filter(j=>j && j.co!==UNIONTECH_ID && belongsToUserCompany(j,user));
-  const myQuotes = (quotes||[]).filter(q=>q && belongsToUserCompany(q,user));
-  const myInv    = (accInvoices||[]).filter(i=>i && i.status!=='void' && belongsToUserCompany(i,user));
+  // 2026-11-10: company scoping split from the model so the Dashboard and the
+  // shared Quotes/Jobs/Invoices panel (whose inputs are already scoped) run the
+  // identical rows. Same filters, same order — Reports is unchanged.
+  return sgrPaymentsReportModelScoped(
+    (jobs||[]).filter(j=>j && j.co!==UNIONTECH_ID && belongsToUserCompany(j,user)),
+    (quotes||[]).filter(q=>q && belongsToUserCompany(q,user)),
+    (accInvoices||[]).filter(i=>i && belongsToUserCompany(i,user)));
+}
+function sgrPaymentsReportModelScoped(scopedJobs, scopedQuotes, scopedInvoices){
+  const myJobs   = (scopedJobs||[]).filter(j=>j && j.co!==UNIONTECH_ID);
+  const myQuotes = (scopedQuotes||[]).filter(Boolean);
+  const myInv    = (scopedInvoices||[]).filter(i=>i && i.status!=='void');
   const rows = [], claimed = new Set(), chains = [];
   const finish = (row, settleRec, payableC, rawTotal, chain, ctx)=>{
     const payments = chain.payments, paidC = sgrPaidCents(payments);
@@ -28201,6 +28166,196 @@ function sgrPaymentsReportModel(jobs, quotes, accInvoices, user){
   const totalPendingC = rows.reduce((s,r)=>s+r._outstandingC,0);
   return { rows, paidRows, pendingRows, byDate, receipts, totalPaidC, invoiceCollectedC, totalPendingC, undatedReceipts };
 }
+
+/* BEGIN SGR-DASHBOARD-METRICS (2026-11-10) ─────────────────────────────────
+   The ONE set of rules the Dashboard (and the shared Quotes / Jobs / Invoices
+   panel on Dashboard, Sales and Accounting) uses for dates, the Salesman card,
+   revenue, the outstanding balance and Recent Jobs. Pure functions over arrays
+   the caller has ALREADY company-scoped — nothing here reads or writes state.
+
+   DATES — Africa/Johannesburg. South Africa is UTC+02:00 all year (no daylight
+   saving), so a fixed +2h shift is exact and needs no Intl support. A
+   'YYYY-MM-DD' calendar date (issue dates, quote dates) is taken as written —
+   never shifted — so an invoice dated the 1st is always in its own month.
+
+   A RELATIONAL ROW ID IS NEVER A DATE. A JSON-era record's id was Date.now()
+   (ms), so it encodes when it was created. A record created on the server
+   (convertQuoteToJob sets source_id = its own PK) has an ordinary integer id —
+   SNS-00236 is 448, which new Date() reads as 1 Jan 1970. Only an id inside a
+   plausible millisecond window is treated as a timestamp; anything else falls
+   through to the server's rel_jobs.created_at (read.ts → job.createdAt).
+   A backfilled job keeps its legacy timestamp id, which therefore wins over
+   its created_at (the import date).
+═══════════════════════════════════════════════════════════════════════════ */
+function sgrJhbDateKey(v){
+  if(v===null || v===undefined || v==='') return null;
+  let ms;
+  if(v instanceof Date) ms = v.getTime();
+  else if(typeof v === 'number') ms = v;
+  else {
+    const s = String(v).trim();
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    if(m){
+      const y=+m[1], mo=+m[2], d=+m[3];
+      const t = new Date(Date.UTC(y, mo-1, d));
+      return (t.getUTCFullYear()===y && t.getUTCMonth()===mo-1 && t.getUTCDate()===d) ? s : null;
+    }
+    ms = Date.parse(s);
+  }
+  if(!Number.isFinite(ms)) return null;
+  return new Date(ms + 2*3600*1000).toISOString().slice(0,10);
+}
+function sgrJhbMonthKey(v){ const k = sgrJhbDateKey(v); return k ? k.slice(0,7) : null; }
+function sgrJhbNowMonthKey(now){ return sgrJhbMonthKey(now===undefined || now===null ? Date.now() : now); }
+function sgrMonthKeyShift(key, delta){
+  const y = +key.slice(0,4), m = +key.slice(5,7) - 1 + delta;
+  const yy = y + Math.floor(m/12), mm = ((m%12)+12)%12;
+  return yy + '-' + String(mm+1).padStart(2,'0');
+}
+function sgrMonthKeyLabel(key, opts){
+  return new Date(+key.slice(0,4), +key.slice(5,7)-1, 1).toLocaleString('default', opts || {month:'long', year:'numeric'});
+}
+/* 2015-01-01 … 2100-01-01 in ms. Every database PK is far below the floor. */
+function sgrLegacyIdTimestampMs(id){
+  let n = null;
+  if(typeof id === 'number') n = id;
+  else if(typeof id === 'string' && /^\d+(\.\d+)?$/.test(id.trim())) n = Number(id.trim());
+  if(n===null || !Number.isFinite(n)) return null;
+  return (n >= 1420070400000 && n < 4102444800000) ? Math.floor(n) : null;
+}
+function sgrJobCreatedMs(j){
+  if(!j) return null;
+  const legacy = sgrLegacyIdTimestampMs(j.id);
+  if(legacy !== null) return legacy;
+  if(j.createdAt){
+    const ms = Date.parse(String(j.createdAt));
+    if(Number.isFinite(ms)) return ms;
+  }
+  return null;
+}
+
+/* SALESMAN OF THE MONTH — jobs CREATED in the Johannesburg month, ranked by
+   job COUNT, then value, then name. Names group after trimming, collapsing
+   inner spaces and ignoring case; the display name is a Title Cased spelling
+   when one exists, otherwise the spelling used most. Jobs with no salesperson are reported
+   as `unassigned` and never enter the ranking. Historical assignments are
+   read exactly as stored — nothing is inferred from the source quote. */
+function sgrSalespersonKey(name){
+  return String(name===null || name===undefined ? '' : name).trim().replace(/\s+/g,' ').toLowerCase();
+}
+function sgrIsTitleCased(s){ return s.split(' ').every(w=>!w || (w[0]===w[0].toUpperCase() && w[0]!==w[0].toLowerCase())); }
+function sgrSalesmanOfMonth(jobs, monthKey){
+  const groups = new Map();
+  const unassigned = { count:0, valueC:0 };
+  let undated = 0;
+  (jobs||[]).forEach(j=>{
+    if(!j) return;
+    const ms = sgrJobCreatedMs(j);
+    if(ms===null){ undated++; return; }
+    if(sgrJhbMonthKey(ms)!==monthKey) return;
+    const valueC = sgrToCents0(j.value);
+    const key = sgrSalespersonKey(j.salesperson);
+    if(!key){ unassigned.count++; unassigned.valueC += valueC; return; }
+    const display = String(j.salesperson).trim().replace(/\s+/g,' ');
+    if(!groups.has(key)) groups.set(key, { key, count:0, valueC:0, variants:new Map() });
+    const g = groups.get(key);
+    g.count++; g.valueC += valueC;
+    g.variants.set(display, (g.variants.get(display)||0) + 1);
+  });
+  const ranked = [...groups.values()].map(g=>{
+    const name = [...g.variants.entries()].sort((a,b)=>
+      ((sgrIsTitleCased(b[0])?1:0)-(sgrIsTitleCased(a[0])?1:0)) || (b[1]-a[1]) || a[0].localeCompare(b[0])
+    )[0][0];
+    return { key:g.key, name, count:g.count, valueC:g.valueC };
+  }).sort((a,b)=> (b.count-a.count) || (b.valueC-a.valueC) || a.name.localeCompare(b.name));
+  return { monthKey, winner: ranked[0] || null, ranked, unassigned, undated };
+}
+
+/* THE CANONICAL INVOICE ROWS — sgrPaymentsReportModelScoped's own rows, so the
+   dashboard sees exactly the invoices Reports sees: one row per issued
+   accounting invoice, plus one per job invoice no accounting record
+   represents (resolveJobInvoiceRecord — the same de-duplication Sales and
+   Accounting use). Void invoices never enter. A stage-7+ job with NO invoice
+   number is not an invoice and has no row. Each row already carries the
+   canonical payable (an issued invoice's own lines; a job-only invoice's
+   job.value), the chain's payments each counted once (quote ∪ job ∪ invoice,
+   by rel_payment identity — applied credit notes are 'Credit' payments in that
+   chain) and sgrOutstandingForRecordCents. */
+function sgrDashboardInvoiceRows(jobs, quotes, accInvoices){
+  const model = sgrPaymentsReportModelScoped(jobs||[], quotes||[], accInvoices||[]);
+  return model.rows.map(r=>{
+    const rec = r._isManual ? r._inv : (r._issued || null);
+    const issueDate = rec ? (rec.date || (r._isManual ? null : r.invoiceDate) || null) : (r.invoiceDate || null);
+    return {
+      number: rec ? (rec.number || r.invoiceNum) : r.invoiceNum,
+      co: r.co,
+      source: rec ? 'invoice' : 'job',
+      isDraft: !!(rec && rec.status === 'draft'),
+      issueDate,
+      monthKey: sgrJhbMonthKey(issueDate),
+      payableC: r._payableC,
+      paidC: r._paidC,
+      outstandingC: r._outstandingC,
+    };
+  });
+}
+/* REVENUE (incl. VAT) = the canonical payable of every ISSUED invoice, in the
+   Johannesburg month of its ISSUE DATE. Drafts are not issued and never count.
+   An invoice with no usable issue date is never guessed into a month (and a
+   row id is never read as one) — it is reported as `undated`. Credit notes are
+   not deducted: on this platform a credit note settles invoices as a 'Credit'
+   payment and never changes an invoice's total, so it reduces what is
+   OUTSTANDING, not what was invoiced. */
+function sgrDashboardRevenue(rows){
+  const byMonthC = {}; const undated = { count:0, cents:0 };
+  (rows||[]).forEach(r=>{
+    if(!r || r.isDraft) return;
+    if(!r.monthKey){ undated.count++; undated.cents += r.payableC||0; return; }
+    byMonthC[r.monthKey] = (byMonthC[r.monthKey]||0) + (r.payableC||0);
+  });
+  return { byMonthC, undated };
+}
+/* OUTSTANDING = the remaining balance of every issued, non-void, non-draft
+   invoice (Aged Debtors / Reports rule), less every open customer credit-note
+   balance (amount − used) — exactly how the Aged Debtors total nets credits.
+   A credit already applied is a payment in the chain AND has raised the
+   note's `used`, so it is counted once, on one side only. */
+function sgrDashboardOutstanding(rows, creditNotes){
+  let grossC = 0, openInvoices = 0;
+  (rows||[]).forEach(r=>{
+    if(!r || r.isDraft) return;
+    if(r.outstandingC > 0){ grossC += r.outstandingC; openInvoices++; }
+  });
+  let openCreditC = 0;
+  (creditNotes||[]).forEach(c=>{
+    if(!c || c.type !== 'customer') return;
+    const rem = sgrToCents0(c.amount) - sgrToCents0(c.used);
+    if(rem > 0) openCreditC += rem;
+  });
+  return { grossC, openCreditC, netC: grossC - openCreditC, openInvoices };
+}
+function sgrDashboardFinancials(jobs, quotes, accInvoices, creditNotes){
+  const rows = sgrDashboardInvoiceRows(jobs, quotes, accInvoices);
+  return { rows, revenue: sgrDashboardRevenue(rows), outstanding: sgrDashboardOutstanding(rows, creditNotes) };
+}
+
+/* RECENT JOBS — newest first by resolved creation date. Jobs with no
+   resolvable date follow every dated job, then everything ties on job number
+   (numeric-aware, highest first) and finally id, so the order is the same on
+   every render. */
+function sgrJobNumberValue(num){ const n = parseInt(String(num||'').replace(/\D/g,''),10); return Number.isFinite(n) ? n : -1; }
+function sgrRecentJobs(jobs, limit){
+  return (jobs||[]).filter(Boolean).map(j=>({ job:j, ms:sgrJobCreatedMs(j) }))
+    .sort((a,b)=>{
+      if(a.ms!==null && b.ms!==null && a.ms!==b.ms) return b.ms-a.ms;
+      if((a.ms===null) !== (b.ms===null)) return a.ms===null ? 1 : -1;
+      return (sgrJobNumberValue(b.job.num)-sgrJobNumberValue(a.job.num))
+        || String(b.job.num||'').localeCompare(String(a.job.num||''))
+        || String(b.job.id).localeCompare(String(a.job.id));
+    })
+    .slice(0, limit===undefined ? 10 : limit);
+}
+/* END SGR-DASHBOARD-METRICS */
 
 /* ═══════════════════════════════════════════
    REPORTS
@@ -30538,7 +30693,7 @@ function App() {
   const openStatementForContact = (contactName)=>{ setAccountingOpen({contact:contactName}); setPage('accounting'); };
 
   const pageMap = {
-    dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={accInvoices}/>,
+    dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={accInvoices} creditNotes={creditNotes}/>,
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} onOpenJob={openJobRecord} forceSaveSections={forceSaveSections}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets} forceSaveSections={forceSaveSections} companies={companies} employees={employees} suppliers={suppliers}/>,

@@ -1,0 +1,23 @@
+==============================================================
+ SIGNACORE — RECORD CANCELLED INVOICE  (APPLY)
+ INV-00219  "Cancelled by Admin"  -> replaced by INV-00223   (job SNS-00236, quote SQ-00304)
+==============================================================
+database signacore_db   at Tue Nov 10 2026 12:04:33 GMT+0200 (South Africa Standard Time)
+
+job          id 448  SNS-00236  company 2  "Hennie's Moreleta"  invoice_num INV-00223
+replacement  id 200  INV-00223  status sent  job_id 448  issued 2026-11-09
+INV-00219 held by: nobody — free
+invoice counter (company 2): last_number 223
+
+PRE-CHECKS PASSED. Would insert:
+   rel_invoices  INV-00219  company 2  status 'void'  issue_date 2026-11-09
+                 contact "Hennie's Moreleta"  reference "Cancelled by Admin — replaced by INV-00223"
+                 job/quote kept as text only: SNS-00236 / SQ-00304  (job_id, quote_id = NULL)
+   1 line  R0.00  "CANCELLED BY ADMIN — superseded by INV-00223 (Job SNS-00236 / Quote SQ-00304). No amount is due on this invoice."
+   legacy_data {"cancelledByAdmin":true,"replacedBy":"INV-00223","cancelledReason":"Order changed by the client after invoicing; re-invoiced","cancelledAt":"2026-11-10T10:04:35.731Z","cancelledVia":"src/scripts/record-cancelled-invoice.ts","originalJobNum":"SNS-00236","originalQuoteNum":"SQ-00304","note":"INV-00219 was deleted and re-issued as INV-00223. Recorded as cancelled so the number stays on file. The original line detail was not recoverable and is not reconstructed."}
+
+BACKUP   platform_state_backups id 1775  (Tue Nov 10 2026 12:04:35 GMT+0200 (South Africa Standard Time))
+INSERTED rel_invoices id 201  INV-00219  status void, 1 line, R0.00, no payments
+
+DONE. Refresh the dashboard: INV-00219 shows in Sales → Invoices and Accounting → Invoices as
+"🚫 Cancelled by Admin → INV-00223". It is not counted in any total or balance.
