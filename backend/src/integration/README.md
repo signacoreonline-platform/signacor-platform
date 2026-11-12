@@ -5,7 +5,7 @@ separate from dashboard users. The first client is **Sally**, Signacore's AI Sal
 
 * Off by default. Every route answers `503 INTEGRATION_DISABLED` until `INTEGRATION_API_ENABLED=true`.
 * Separate from the dashboard's JWT login. An integration secret is accepted only here, and a JWT is never accepted here.
-* No route deletes, sends, approves, declines or converts anything. None changes prices, discounts or setup fees, and none touches invoices, payments, purchasing, HR or users.
+* No route deletes, sends, approves, declines or converts anything. None changes prices, discounts or setup fees, and none writes invoices, payments or purchasing, or touches HR or users. (The owner read endpoints below only read accounting and purchasing records.)
 * The only master-data writes are **customer create** and **customer update** (allow-listed fields), and only for a client that was explicitly granted `customer:create` / `customer:update`.
 
 ## Authentication
@@ -197,6 +197,73 @@ internal/test customer. There is no `customer:delete` scope.
   already holds exactly the requested values.
 * **Company boundary.** Signacore customers are shared by all companies (the record has no company field);
   quotes, which are company-scoped, are unaffected by customer writes.
+
+## Owner read access — `/api/v1/integration/read/*` (CORE-AGENTS)
+
+A **read-only, multi-company** view of the operational and accounting records the owner sees in the dashboard,
+for CORE-AGENTS (Abe, Donald, Teddy). Added by migration `018_integration_read_clients.sql`.
+
+**The credential.** A *reader* is a separate integration client made with `create-reader`. It is read-only in three
+places: the database (`CHECK` constraints refuse a write scope on a read-only client, and refuse multi-company access on
+any client that is not read-only), authentication (write scopes are dropped and every non-GET request is answered
+`403 READ_ONLY_CLIENT`) and the read router (anything but GET is `405 READ_ONLY_ENDPOINT`). Sally's client is unchanged:
+it stays single-company and gains none of the new scopes.
+
+```
+node dist/integration/clientCli.js create-reader --client-id core-agents --name "CORE-AGENTS (owner read)" --companies 1,2,4
+node dist/integration/clientCli.js set-companies --client-id core-agents --companies 1,2      # narrow or widen the grant
+node dist/integration/clientCli.js set-scopes   --client-id core-agents --scopes sales:read,jobs:read,inventory:read
+node dist/integration/clientCli.js rotate       --client-id core-agents
+node dist/integration/clientCli.js revoke       --client-id core-agents
+```
+
+Without `--scopes`, a reader gets `OWNER_READ_SCOPES`. Each company code is checked against `rel_companies`.
+
+**Companies.** Every list, search, summary and record request is limited to the client's companies. `?company=1,2`
+narrows the set; a code outside the grant is refused with `403 COMPANY_NOT_AUTHORISED`, never trimmed or widened. A
+record ID or number from another company is `404`. When a document number exists in two companies (quote and invoice
+numbers are per company), a request without `?company=` is `409 AMBIGUOUS_REFERENCE`.
+
+A record with no company tag belongs to Signacore (code `2`), as in the dashboard (`belongsToUserCompany`). It is
+returned with `companyTagged: false`. Customers, suppliers and inventory are shared and carry no company.
+
+**Same numbers as the dashboard.** Records are read through `loadSection` (relational when cut over, JSON otherwise,
+refusal when inconsistent). The totals, VAT, discount, deposit, paid, outstanding, overdue and settlement status are
+calculated by `money.ts`, which ports the `index.html` functions on the backend's cents helpers. The test checks these
+results against the `index.html` originals.
+
+**Never invented.** SignaCore does not record when a quote was sent, quote revisions, installation or delivery dates,
+goods received, an expected arrival, or reserved stock. Those fields are `null`. "Paid" comes only from payment records
+or SignaCore's own stored status.
+
+**Never returned.** Supplier account numbers and notes, customer internal notes, users, password hashes, employees,
+payroll, bank transactions and the chart of accounts.
+
+| Scope | Endpoints |
+|---|---|
+| any read scope | `GET /read/companies`, `/read/sections`, `/read/summary` (each part needs its own scope) |
+| `customer:read` | `/read/customers` |
+| `sales:read` | `/read/quotes`, `/read/quotes/:ref`, `/read/enquiries` |
+| `jobs:read` | `/read/jobs`, `/read/jobs/:ref` |
+| `accounts:read` | `/read/invoices`, `/read/invoices/:ref`, `/read/payments`, `/read/credit-notes`, `/read/receivables`, `/read/bills` |
+| `purchasing:read` | `/read/suppliers`, `/read/purchase-orders` (`items=true` adds lines), `/read/purchase-orders/:ref`, `/read/supplier-prices?item=`; adds cost to `/read/inventory` |
+| `inventory:read` | `/read/inventory` (sell price with `pricing:read`) |
+
+**Lists and filters.**
+- Every list accepts `page`, `limit` (≤ 200), `q`, `status`, `from`/`to` (YYYY-MM-DD) and `company`. Some lists also accept `updatedSince`, but it is applied only where SignaCore keeps per-record timestamps, which means relational sections only; the response says when it was not applied.
+- Extra filters by list:
+  - jobs: `stage`, `pastDue=true`;
+  - invoices: `overdue`, `outstanding`, `includeVoid`;
+  - inventory: `lowStock`, `includeInactive`.
+
+Every response carries `dataSource` and `sectionUpdatedAt` per section, plus `asOf`.
+
+**Historical purchase orders.** These are not migrated to the relational tables (backfill PASS 6). The PO list follows
+the dashboard. When purchase orders are relational, `/read/supplier-prices` also includes the pre-migration PO lines,
+each labelled `source: "legacy_json"`.
+
+Tests: `npm run test:integration-read`. It runs the same dataset under JSON and relational authority and checks that
+both give the same answers.
 
 ## Errors
 

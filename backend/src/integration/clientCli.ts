@@ -8,6 +8,12 @@
  *   node dist/integration/clientCli.js add-scopes --client-id sally --scopes customer:create,customer:update
  *   node dist/integration/clientCli.js list
  *
+ * Read-only, multi-company client (CORE-AGENTS owner read access, migration 018):
+ *   node dist/integration/clientCli.js create-reader --client-id core-agents --name "CORE-AGENTS (owner read)" --companies 1,2,4
+ *   node dist/integration/clientCli.js set-companies --client-id core-agents --companies 1,2
+ * A reader gets OWNER_READ_SCOPES unless --scopes names a subset; it can never hold a write scope (CLI, API and DB
+ * all refuse) and every non-GET request it makes is refused.
+ *
  * `create` and `rotate` print the secret ONCE. Only its SHA-256 hash is
  * stored; if it is lost, rotate. Default scopes (no --scopes) = DEFAULT_SCOPES
  * in scopes.ts: the read + draft-quote set. Customer writes (customer:create,
@@ -20,7 +26,7 @@
  */
 import type { Pool } from 'pg';
 import { createCliPool } from './cliDb';
-import { KNOWN_SCOPES, DEFAULT_SCOPES, MASTER_DATA_WRITE_SCOPES, isKnownScope } from './scopes';
+import { KNOWN_SCOPES, DEFAULT_SCOPES, MASTER_DATA_WRITE_SCOPES, OWNER_READ_SCOPES, isKnownScope, isWriteScope } from './scopes';
 import { generateSecret, hashSecret } from './keys';
 
 function arg(name: string): string | undefined {
@@ -45,7 +51,7 @@ async function main(): Promise<void> {
   const clientId = arg('client-id');
   const by = process.env.USER || process.env.USERNAME || 'cli';
   if (cmd === 'list') {
-    const r = await pool.query(`SELECT client_id, display_name, company_code, scopes, is_active, revoked_at, created_at, rotated_at, last_used_at FROM integration_clients ORDER BY client_id`);
+    const r = await pool.query(`SELECT client_id, display_name, company_code, read_only, read_company_codes, scopes, is_active, revoked_at, created_at, rotated_at, last_used_at FROM integration_clients ORDER BY client_id`);
     console.table(r.rows);
     return;
   }
@@ -70,6 +76,30 @@ async function main(): Promise<void> {
     reportMasterDataScopes(scopes);
     return;
   }
+  if (cmd === 'create-reader') {
+    const name = arg('name') || clientId;
+    const companies = await parseCompanies(arg('companies'));
+    const named = parseScopes(arg('scopes'));
+    const scopes = named.length ? named : [...OWNER_READ_SCOPES];
+    const unknown = scopes.filter((s) => !isKnownScope(s));
+    if (unknown.length) throw new Error(`Unknown scopes: ${unknown.join(', ')}. Allowed: ${KNOWN_SCOPES.join(', ')}`);
+    const writes = scopes.filter(isWriteScope);
+    if (writes.length) throw new Error(`A read-only client cannot hold write scopes (${writes.join(', ')}). Use a separate client for writes.`);
+    const secret = generateSecret();
+    await pool.query(
+      `INSERT INTO integration_clients (client_id, display_name, secret_hash, scopes, company_code, read_only, read_company_codes, created_by)
+       VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7)`,
+      [clientId, name, hashSecret(secret), scopes, companies[0], companies, by]
+    );
+    printSecret(clientId, secret, scopes, companies);
+    return;
+  }
+  if (cmd === 'set-companies') {
+    const companies = await parseCompanies(arg('companies'));
+    const r = await pool.query(`UPDATE integration_clients SET read_company_codes = $2, company_code = $3 WHERE client_id = $1 AND read_only RETURNING client_id`, [clientId, companies, companies[0]]);
+    console.log(r.rowCount ? `${clientId} may now read companies: ${companies.join(', ')}` : 'No such read-only client (set-companies only applies to clients made with create-reader).');
+    return;
+  }
   if (cmd === 'rotate') {
     const secret = generateSecret();
     const r = await pool.query(
@@ -89,6 +119,7 @@ async function main(): Promise<void> {
     const scopes = parseScopes(arg('scopes'));
     const unknown = scopes.filter((s) => !isKnownScope(s));
     if (unknown.length) throw new Error(`Unknown scopes: ${unknown.join(', ')}`);
+    await refuseWritesForReader(clientId, scopes);
     const r = await pool.query(`UPDATE integration_clients SET scopes = $2 WHERE client_id = $1`, [clientId, scopes]);
     console.log(r.rowCount ? `Scopes for ${clientId}: ${scopes.join(', ') || '(none)'}` : 'No such client.');
     if (r.rowCount) reportMasterDataScopes(scopes);
@@ -102,21 +133,42 @@ async function main(): Promise<void> {
     if (unknown.length) throw new Error(`Unknown scopes: ${unknown.join(', ')}. Allowed: ${KNOWN_SCOPES.join(', ')}`);
     const cur = await pool.query(`SELECT scopes FROM integration_clients WHERE client_id = $1`, [clientId]);
     if (!cur.rowCount) throw new Error('No such client.');
+    await refuseWritesForReader(clientId, add);
     const scopes = [...new Set([...(cur.rows[0].scopes as string[] || []), ...add])];
     await pool.query(`UPDATE integration_clients SET scopes = $2 WHERE client_id = $1`, [clientId, scopes]);
     console.log(`Scopes for ${clientId}: ${scopes.join(', ')}`);
     reportMasterDataScopes(add);
     return;
   }
-  throw new Error('Usage: create | rotate | revoke | set-scopes | add-scopes | list');
+  throw new Error('Usage: create | create-reader | set-companies | rotate | revoke | set-scopes | add-scopes | list');
 }
 
-function printSecret(clientId: string, secret: string, scopes: string[]): void {
+/** Company codes the owner authorises, validated against rel_companies. */
+async function parseCompanies(raw: string | undefined): Promise<string[]> {
+  const list = [...new Set((raw || '').split(',').map((s) => s.trim()).filter(Boolean))];
+  if (!list.length) throw new Error('--companies is required, e.g. --companies 1,2,4 (only companies the owner authorises).');
+  for (const c of list) {
+    const co = await pool.query('SELECT 1 FROM rel_companies WHERE code = $1', [c]);
+    if (!co.rowCount) throw new Error(`Company code "${c}" does not exist in rel_companies.`);
+  }
+  return list;
+}
+
+async function refuseWritesForReader(clientId: string, scopes: string[]): Promise<void> {
+  const r = await pool.query(`SELECT read_only FROM integration_clients WHERE client_id = $1`, [clientId]);
+  const writes = scopes.filter(isWriteScope);
+  if (r.rows[0]?.read_only && writes.length) throw new Error(`${clientId} is read-only and cannot be given write scopes (${writes.join(', ')}).`);
+}
+
+function printSecret(clientId: string, secret: string, scopes: string[], companies?: string[]): void {
   console.log('');
-  console.log('  Integration client ready. Store these in the CALLING service\'s environment (e.g. Sally on Render):');
+  console.log(companies
+    ? '  Read-only client ready. Store these on the CORE-AGENTS Render services (core-agents, core-agents-scan, core-agents-briefing):'
+    : '  Integration client ready. Store these in the CALLING service\'s environment (e.g. Sally on Render):');
   console.log(`    SIGNACORE_CLIENT_ID=${clientId}`);
   console.log(`    SIGNACORE_API_KEY=${secret}`);
-  console.log(`  Scopes: ${scopes.join(', ')}`);
+  if (companies) console.log(`    SIGNACORE_COMPANY_CODES=${companies.join(',')}`);
+  console.log(`  Scopes: ${scopes.join(', ')}${companies ? ' (read-only)' : ''}`);
   console.log('  This secret is shown ONCE and is not stored. If lost, run "rotate".');
   console.log('');
 }

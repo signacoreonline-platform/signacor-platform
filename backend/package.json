@@ -12,6 +12,7 @@
     "integration:client": "node dist/integration/clientCli.js",
     "test:integration-api": "ts-node --transpile-only test/integration-api.stress.ts",
     "test:integration-customers": "ts-node --transpile-only test/integration-customers.stress.ts",
+    "test:integration-read": "ts-node --transpile-only test/integration-read.stress.ts",
     "db:migrate": "psql $DATABASE_URL -f ../database/schema.sql",
     "test:hardening": "ts-node --transpile-only test/hardening.stress.ts",
     "test:proforma-numbering": "ts-node --transpile-only test/proforma-numbering.stress.ts",

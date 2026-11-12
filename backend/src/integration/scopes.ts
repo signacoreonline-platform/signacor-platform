@@ -41,6 +41,11 @@ export const KNOWN_SCOPES = [
   'quote:read',
   'quote:create',
   'quote:update',
+  // Owner read access (CORE-AGENTS) — GET-only /read/* endpoints, see readRoutes.ts. Never imply any write.
+  'sales:read',       // quotes (all companies the client may read), enquiries recorded in SignaCore, customers list
+  'jobs:read',        // jobs, production stage, due dates, quote/invoice links, payment position
+  'accounts:read',    // invoices, credit notes, payments, receivables, supplier bills
+  'purchasing:read',  // suppliers, purchase orders, supplier unit-price history, inventory cost
 ] as const;
 export type Scope = (typeof KNOWN_SCOPES)[number];
 
@@ -54,6 +59,19 @@ export const DEFAULT_SCOPES: readonly Scope[] = [
   'quote:create',
   'quote:update',
 ];
+
+/** Every scope that writes anything. A read-only client may never hold one (also a DB CHECK, migration 018). */
+export const WRITE_SCOPES: readonly Scope[] = ['customer:create', 'customer:update', 'quote:create', 'quote:update'];
+
+/** What `clientCli create-reader` grants when --scopes is omitted: read only, nothing that writes. */
+export const OWNER_READ_SCOPES: readonly Scope[] = [
+  'customer:read', 'product:read', 'inventory:read', 'pricing:read', 'quote:read',
+  'sales:read', 'jobs:read', 'accounts:read', 'purchasing:read',
+];
+
+export function isWriteScope(s: string): boolean {
+  return (WRITE_SCOPES as readonly string[]).includes(s);
+}
 
 /** Scopes that change Signacore master data (listed separately by the CLI). */
 export const MASTER_DATA_WRITE_SCOPES: readonly Scope[] = ['customer:create', 'customer:update'];

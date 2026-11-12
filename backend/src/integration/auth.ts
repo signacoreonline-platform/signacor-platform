@@ -16,7 +16,7 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { query } from '../db/pool';
-import { effectiveScopes, Scope } from './scopes';
+import { effectiveScopes, isWriteScope, Scope } from './scopes';
 import { secretMatches } from './keys';
 import { IntegrationError, sendError } from './errors';
 
@@ -25,6 +25,10 @@ export interface IntegrationContext {
   displayName: string;
   scopes: Scope[];
   companyCode: string;
+  /** Read-only client: every non-GET request is refused before any route runs (migration 018). */
+  readOnly: boolean;
+  /** Companies this client may READ through /read/*. A normal client reads only its own companyCode. */
+  readCompanies: string[];
   actingFor: string | null;
   confirmedBy: string | null;
   requestId: string;
@@ -106,7 +110,7 @@ export async function integrationAuth(req: IntegrationRequest, res: Response, ne
   }
   try {
     const r = await query(
-      `SELECT client_id, display_name, secret_hash, scopes, company_code, is_active, revoked_at
+      `SELECT client_id, display_name, secret_hash, scopes, company_code, is_active, revoked_at, read_only, read_company_codes
          FROM integration_clients WHERE client_id = $1`,
       [presented]
     );
@@ -120,16 +124,25 @@ export async function integrationAuth(req: IntegrationRequest, res: Response, ne
       res.set('Retry-After', '60');
       return sendError(res, new IntegrationError(429, 'RATE_LIMITED', 'Too many requests. Please retry shortly.'));
     }
-    req.integration = {
+    const readOnly = row.read_only === true;
+    const extraCompanies: string[] = readOnly && Array.isArray(row.read_company_codes) ? (row.read_company_codes as unknown[]).map((c) => String(c)) : [];
+    const ctx: IntegrationContext = {
       clientId: row.client_id,
       displayName: row.display_name,
-      scopes: effectiveScopes(row.scopes),
+      // A read-only client never exercises a write scope, even if one were somehow stored.
+      scopes: effectiveScopes(row.scopes).filter((s) => !readOnly || !isWriteScope(s)),
       companyCode: String(row.company_code),
+      readOnly,
+      readCompanies: extraCompanies.length ? [...new Set(extraCompanies)] : [String(row.company_code)],
       actingFor: headerText(req, 'X-Acting-For'),
       confirmedBy: headerText(req, 'X-Confirmed-By'),
       requestId: headerText(req, 'X-Request-Id', 64) || crypto.randomUUID(),
     };
-    res.set('X-Request-Id', req.integration.requestId);
+    req.integration = ctx;
+    res.set('X-Request-Id', ctx.requestId);
+    if (readOnly && req.method !== 'GET' && req.method !== 'HEAD') {
+      return sendError(res, new IntegrationError(403, 'READ_ONLY_CLIENT', 'This integration client is read-only.'));
+    }
     query(
       `UPDATE integration_clients SET last_used_at = NOW()
         WHERE client_id = $1 AND (last_used_at IS NULL OR last_used_at < NOW() - INTERVAL '1 minute')`,

@@ -30,6 +30,7 @@ import { integrationAuth, requireScope, hasScope, IntegrationRequest } from './a
 import { IntegrationError, bad, sendError } from './errors';
 import { requestHash } from './keys';
 import * as data from './data';
+import { readRoutes } from './readRoutes';
 
 const router = Router();
 
@@ -222,7 +223,7 @@ router.get('/status', op('status', async (req, res) => {
   for (const s of ['customers', 'inventory', 'quickRates', 'quotes'] as const) sections[s] = await data.sectionAuthority(s);
   res.json({
     apiVersion: 'v1',
-    client: { id: ctx.clientId, name: ctx.displayName, companyCode: ctx.companyCode, scopes: ctx.scopes },
+    client: { id: ctx.clientId, name: ctx.displayName, companyCode: ctx.companyCode, scopes: ctx.scopes, readOnly: ctx.readOnly, readCompanies: ctx.readCompanies },
     sections,
     capabilities: {
       quoteDrafts: sections.quotes === 'relational' && ctx.scopes.includes('quote:create'),
@@ -609,6 +610,9 @@ router.patch('/quotes/:id', requireScope('quote:update'), op('quote.update_draft
     return { status: 200, body: bodyOut, committed: true };
   });
 }));
+
+// Owner read access (GET only) — readRoutes.ts.
+router.use('/read', readRoutes(op));
 
 // Anything else under /api/v1/integration: a clear, audited 404.
 router.use(op('unknown', async (_req, _res) => {
