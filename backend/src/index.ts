@@ -26,6 +26,9 @@ import freshnessRoutes from './routes/freshness';
 // secrets and scopes — see backend/src/integration/README.md. Fail-closed:
 // every route answers 503 until INTEGRATION_API_ENABLED=true is set.
 import integrationRoutes from './integration/router';
+// 2026-11-16: files attached to a quotation before it is emailed. Bytes live
+// in private file storage (backend/src/storage); see routes/quoteAttachments.ts.
+import quoteAttachmentsRoutes from './routes/quoteAttachments';
 import { errorHandler, notFound } from './middleware/errorHandler';
 import { ALL_SECTIONS, isSectionCutOver } from './relational/cutover';
 
@@ -106,6 +109,7 @@ app.use('/api/quote-conversions', quoteConversionsRoutes);
 app.use('/api/relational', relationalApiRoutes);
 app.use('/api/full-backup', fullBackupRoutes);
 app.use('/api/freshness', freshnessRoutes);
+app.use('/api/quote-attachments', quoteAttachmentsRoutes);
 app.use('/api/v1/integration', integrationRoutes);
 
 // ── Error handling ────────────────────────────────────────────

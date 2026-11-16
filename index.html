@@ -164,6 +164,10 @@ const API_RELATIONAL_SECTIONS_URL = (window.SIGNACORE_API_URL || 'https://signac
 // backend instead (see LoginPage), which returns a token stored here.
 const API_AUTH_LOGIN_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/auth/login';
 const API_AUTH_SYNC_URL  = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/auth/sync-user';
+// 2026-11-16: list accounts / add a user (main Administrator only — enforced by the server).
+const API_AUTH_USERS_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/auth/users';
+// 2026-11-16: files attached to a quotation before it is emailed (private storage, server-checked).
+const API_QUOTE_ATTACHMENTS_URL = (window.SIGNACORE_API_URL || 'https://signacore-backend-api.onrender.com/api') + '/quote-attachments';
 const SGR_TOKEN_KEY = 'sgr_token';
 function getAuthToken() { try { return localStorage.getItem(SGR_TOKEN_KEY) || null; } catch (e) { return null; } }
 function setAuthToken(t) { try { if (t) localStorage.setItem(SGR_TOKEN_KEY, t); else localStorage.removeItem(SGR_TOKEN_KEY); } catch (e) {} }
@@ -177,6 +181,40 @@ function authHeaders() { const t = getAuthToken(); return t ? { 'Authorization':
 function forceLogoutExpiredSession() {
   try { localStorage.removeItem('sgr_user'); localStorage.removeItem(SGR_TOKEN_KEY); } catch (e) {}
   if (window.__sgrOnAuthExpired) { window.__sgrOnAuthExpired(); }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   VIEW-ONLY LOGINS (2026-11-16)
+   Factory and Print Room (role `factory`) may open and print what they
+   could already see, and change nothing. The rule itself lives on the
+   server (backend/src/middleware/auth.ts): every write route refuses a
+   role that is not in the write list, whatever this page does. What is
+   here only keeps the screen honest — it mirrors the same fail-closed
+   list so write controls are not offered, and stops this browser from
+   even attempting a save the server would refuse.
+   Keep SGR_WRITE_ROLES identical to WRITE_ROLES in auth.ts.
+═══════════════════════════════════════════════════════════ */
+const SGR_WRITE_ROLES = ['admin','accounts','assistant'];
+const SGR_READ_ONLY_MESSAGE = 'This login is view-only. It can open and print records but cannot change, send or upload anything.';
+function sgrIsReadOnlyRole(role){
+  return SGR_WRITE_ROLES.indexOf(String(role==null?'':role).trim().toLowerCase()) === -1;
+}
+// The signed-in account as this browser stored it at login (the same record
+// App() restores on refresh). Read on demand so module-level helpers that have
+// no `user` prop — relationalFetch, the save functions — apply the same rule.
+function sgrSessionIsReadOnly(){
+  try{
+    const raw = localStorage.getItem('sgr_user');
+    if(!raw) return false;
+    const u = JSON.parse(raw);
+    return !!u && sgrIsReadOnlyRole(u.role);
+  }catch(e){ return false; }
+}
+function sgrReadOnlyError(){
+  const err = new Error(SGR_READ_ONLY_MESSAGE);
+  err.status = 403;
+  err.body = { type:'business_rule', code:'READ_ONLY_ROLE', error: SGR_READ_ONLY_MESSAGE };
+  return err;
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -733,6 +771,10 @@ function requestRelationalRefresh(reason) {
 async function relationalFetch(path, options) {
   options = options || {};
   const method = (options.method || 'GET').toUpperCase();
+  // VIEW-ONLY LOGINS: a view-only session never sends a write. The server
+  // refuses it regardless; refusing here means no request, no partial
+  // optimistic state and one clear message.
+  if (method !== 'GET' && method !== 'HEAD' && sgrSessionIsReadOnly()) throw sgrReadOnlyError();
   const res = await fetch(API_RELATIONAL_URL + path, Object.assign({
     headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders())
   }, options));
@@ -2096,15 +2138,15 @@ function sgrClassifyLegacyRoundingSettlement(rec, payableC, oldTotalCandidatesC)
    save/merge machinery as every other section.
 ═══════════════════════════════════════════ */
 const INITIAL_USERS = [
-  { id:'admin@signacore.co.za',    email:'admin@signacore.co.za',    pw:'Eunice2026!',    role:'admin',     name:'Ockert Smit',    initials:'OS', title:'Administrator'   },
-  { id:'accounts@signacore.co.za', email:'accounts@signacore.co.za', pw:'Accounts2024!',  role:'accounts',  name:'Accountant',     initials:'AC', title:'Accounts'        },
-  { id:'assist@signacore.co.za',   email:'assist@signacore.co.za',   pw:'Assist2024!',    role:'assistant', name:'Sales Assistant', initials:'SA', title:'Sales / Quoting' },
+  { id:'admin@signacore.co.za',    email:'admin@signacore.co.za',    pw:'',    role:'admin',     name:'Ockert Smit',    initials:'OS', title:'Administrator'   },
+  { id:'accounts@signacore.co.za', email:'accounts@signacore.co.za', pw:'',  role:'accounts',  name:'Accountant',     initials:'AC', title:'Accounts'        },
+  { id:'assist@signacore.co.za',   email:'assist@signacore.co.za',   pw:'',    role:'assistant', name:'Sales Assistant', initials:'SA', title:'Sales / Quoting' },
   // Signacore Holdings (co:1) logins — placeholder credentials, change the
   // email/pw values below to whatever you'd like. These logins are now
   // walled to the Holdings company context — see HOLDINGS_CO_ID /
   // isHoldingsUser() / belongsToUserCompany() below.
-  { id:'admin@signacoreholdings.co.za',  email:'admin@signacoreholdings.co.za',  pw:'Holdings2026!', role:'admin',     name:'Holdings Admin',      initials:'HA', title:'Administrator',   co:1 },
-  { id:'assist@signacoreholdings.co.za', email:'assist@signacoreholdings.co.za', pw:'HoldAssist2026!', role:'assistant', name:'Holdings Assistant', initials:'HS', title:'Sales / Quoting', co:1 },
+  { id:'admin@signacoreholdings.co.za',  email:'admin@signacoreholdings.co.za',  pw:'', role:'admin',     name:'Holdings Admin',      initials:'HA', title:'Administrator',   co:1 },
+  { id:'assist@signacoreholdings.co.za', email:'assist@signacoreholdings.co.za', pw:'', role:'assistant', name:'Holdings Assistant', initials:'HS', title:'Sales / Quoting', co:1 },
   // Manufacturing logins — Jobs menu only, no Rand values, view/print the
   // Job Card. No password required: these sign in via the one-tap buttons
   // on the login screen (see LoginPage) rather than the email/password form.
@@ -7173,6 +7215,18 @@ function downloadFile(content, filename, mimeType) {
    BUILD MIME .EML FILE WITH PDF ATTACHMENTS
    attachments: [{ filename, base64 }]
 ═══════════════════════════════════════════ */
+/* 2026-11-16: an attachment may now carry its own `contentType` (JPEG / PNG /
+   PDF files attached to a quotation). It defaults to application/pdf, so the
+   two generated PDFs — and every existing caller — produce byte-for-byte the
+   same MIME part as before. A customer-supplied filename is written as an
+   ASCII-safe `filename=` plus, when it differs, the exact name as an RFC 2231
+   `filename*=`, so an odd character can never break the message's headers. */
+function sgrEmlFilenameParams(name){
+  const raw = String(name==null?'':name).replace(/[\r\n]/g,' ').trim() || 'attachment';
+  const ascii = raw.replace(/[^\x20-\x7E]/g,'_').replace(/[\x22\x5C]/g,'_'); // \x22 = double quote, \x5C = backslash
+  const star = ascii===raw ? '' : "; filename*=UTF-8''" + encodeURIComponent(raw).replace(/[\x27()*]/g, c=>'%'+c.charCodeAt(0).toString(16).toUpperCase()); // \x27 = apostrophe
+  return { ascii, star };
+}
 function buildEmlFile(to, subject, bodyText, attachments) {
   const boundary = 'SGR_BOUND_' + Date.now().toString(36).toUpperCase();
   const lines = [];
@@ -7191,10 +7245,11 @@ function buildEmlFile(to, subject, bodyText, attachments) {
   attachments.forEach(att => {
     const b64     = att.base64.replace(/\s/g, '');
     const wrapped = b64.match(/.{1,76}/g).join('\r\n');
+    const fn = sgrEmlFilenameParams(att.filename);
     lines.push('--' + boundary);
-    lines.push('Content-Type: application/pdf; name="' + att.filename + '"');
+    lines.push('Content-Type: ' + (att.contentType || 'application/pdf') + '; name="' + fn.ascii + '"');
     lines.push('Content-Transfer-Encoding: base64');
-    lines.push('Content-Disposition: attachment; filename="' + att.filename + '"');
+    lines.push('Content-Disposition: attachment; filename="' + fn.ascii + '"' + fn.star);
     lines.push('');
     lines.push(wrapped);
     lines.push('');
@@ -7731,7 +7786,110 @@ async function generateDocumentPdfFromHtml(type, data, companies, logoDataUrl) {
 /* ═══════════════════════════════════════════
    GENERATE BOTH PDFS + BUILD + DOWNLOAD .EML
 ═══════════════════════════════════════════ */
-async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMarkSent, customers) {
+/* ═══════════════════════════════════════════
+   QUOTATION EMAIL ATTACHMENTS (2026-11-16)
+   Files a user attaches to a quotation before emailing it. The bytes live in
+   private file storage behind the backend (/api/quote-attachments — see
+   backend/src/routes/quoteAttachments.ts); this page holds no storage
+   address, key or credential, and every file is fetched back through the
+   server, which checks the session, the company and the quotation each time.
+
+   THE EMAIL ITSELF is unchanged: the platform has no mail server. It builds
+   an Outlook .eml (cover letter + document PDF) that the user opens and
+   sends. The extra files are simply further parts of that same .eml.
+
+   SIZE LIMIT. Because the message is sent by the user's own mailbox, the
+   limit that matters is that mailbox's (and the recipient's), measured on the
+   ENCODED message — base64 makes a file about 37% larger in transit. 25 MB is
+   the limit Gmail and Outlook.com publish and sits below Microsoft 365's
+   35 MB default, so a message under it is accepted by the common services.
+   Change SGR_EMAIL_MAX_MESSAGE_BYTES if your mailbox is configured otherwise.
+═══════════════════════════════════════════ */
+const SGR_EMAIL_MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
+const SGR_ATTACH_MAX_FILE_BYTES   = 5 * 1024 * 1024;   // per file — the server enforces the same figure
+const SGR_ATTACH_TYPES = {
+  jpg:  { family:'jpeg', mime:'image/jpeg',      declared:['image/jpeg','image/jpg','image/pjpeg'] },
+  jpeg: { family:'jpeg', mime:'image/jpeg',      declared:['image/jpeg','image/jpg','image/pjpeg'] },
+  png:  { family:'png',  mime:'image/png',       declared:['image/png'] },
+  pdf:  { family:'pdf',  mime:'application/pdf', declared:['application/pdf'] },
+};
+function sgrFmtBytes(n){
+  n = Number(n)||0;
+  if(n >= 1024*1024) return (n/1024/1024).toFixed(n >= 10*1024*1024 ? 0 : 1) + ' MB';
+  if(n >= 1024) return Math.round(n/1024) + ' KB';
+  return n + ' B';
+}
+// The size a file takes inside the email once base64-encoded and line-wrapped.
+function sgrEncodedBytes(rawBytes){ const b64 = Math.ceil((Number(rawBytes)||0)/3)*4; return b64 + Math.ceil(b64/76)*2 + 300; }
+function sgrSniffFamily(u8){
+  if(!u8 || u8.length < 4) return 'empty';
+  if(u8[0]===0x25 && u8[1]===0x50 && u8[2]===0x44 && u8[3]===0x46 && u8[4]===0x2D) return 'pdf';
+  if(u8[0]===0x89 && u8[1]===0x50 && u8[2]===0x4E && u8[3]===0x47 && u8[4]===0x0D && u8[5]===0x0A && u8[6]===0x1A && u8[7]===0x0A) return 'png';
+  if(u8[0]===0xFF && u8[1]===0xD8 && u8[2]===0xFF) return 'jpeg';
+  return 'other';
+}
+// Checks one picked file BEFORE it is uploaded: allowed extension, 5 MB, a
+// declared type that matches, and the file's real content signature. Resolves
+// { ok:true, mime } or { ok:false, error }. The server repeats every check.
+async function sgrCheckAttachmentFile(file){
+  const name = String(file && file.name || '');
+  const ext = (name.lastIndexOf('.') > 0 ? name.slice(name.lastIndexOf('.')+1) : '').toLowerCase();
+  const type = SGR_ATTACH_TYPES[ext];
+  if(!type) return { ok:false, error:'Not an allowed file type. Attach JPEG (.jpg, .jpeg), PNG or PDF files only.' };
+  if(!file.size) return { ok:false, error:'This file is empty.' };
+  if(file.size > SGR_ATTACH_MAX_FILE_BYTES) return { ok:false, error:'Larger than the 5 MB limit per file ('+sgrFmtBytes(file.size)+').' };
+  const declared = String(file.type||'').toLowerCase();
+  if(declared && declared!=='application/octet-stream' && type.declared.indexOf(declared) === -1) return { ok:false, error:'This file is reported as '+declared+', which does not match its .'+ext+' extension.' };
+  let head;
+  try{ head = new Uint8Array(await file.slice(0, 16).arrayBuffer()); }catch(e){ return { ok:false, error:'This file could not be read from your computer.' }; }
+  if(sgrSniffFamily(head) !== type.family) return { ok:false, error:'Not a real '+ext.toUpperCase()+' file — its content does not match its .'+ext+' extension.' };
+  return { ok:true, mime:type.mime };
+}
+function sgrArrayBufferToBase64(buf){
+  const u8 = new Uint8Array(buf); let bin = '';
+  for(let i=0;i<u8.length;i+=0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i+0x8000));
+  return btoa(bin);
+}
+// Thin client for /api/quote-attachments. Every failure throws an Error whose
+// message is the server's own plain-English reason (err.status / err.code set).
+async function sgrAttachmentFetch(path, options){
+  let res;
+  try{ res = await fetch(API_QUOTE_ATTACHMENTS_URL + path, Object.assign({}, options, { headers: Object.assign({}, (options&&options.headers)||{}, authHeaders()) })); }
+  catch(e){ const err = new Error('Could not reach the server. Check your connection and try again.'); err.network = true; throw err; }
+  if(res.status === 401){ forceLogoutExpiredSession(); throw new Error('Session expired — please log in again.'); }
+  return res;
+}
+async function sgrAttachmentError(res, fallback){
+  let body = null; try{ body = await res.json(); }catch(e){}
+  const err = new Error((body && body.error) || fallback || ('The server answered HTTP '+res.status+'.'));
+  err.status = res.status; err.code = body && body.code;
+  return err;
+}
+const sgrQuoteAttachmentsApi = {
+  async list(quoteId){
+    const res = await sgrAttachmentFetch('?quoteId='+encodeURIComponent(String(quoteId)));
+    if(!res.ok) throw await sgrAttachmentError(res);
+    return res.json();
+  },
+  async upload(quoteId, file, mime){
+    const res = await sgrAttachmentFetch('?quoteId='+encodeURIComponent(String(quoteId)), {
+      method:'POST', body:file, headers:{ 'Content-Type': mime, 'X-File-Name': encodeURIComponent(file.name) } });
+    if(!res.ok) throw await sgrAttachmentError(res, 'The upload failed.');
+    return (await res.json()).attachment;
+  },
+  async content(id){
+    const res = await sgrAttachmentFetch('/'+encodeURIComponent(String(id))+'/content');
+    if(!res.ok) throw await sgrAttachmentError(res, 'The file could not be retrieved from storage.');
+    return res.arrayBuffer();
+  },
+  async remove(id){
+    const res = await sgrAttachmentFetch('/'+encodeURIComponent(String(id)), { method:'DELETE' });
+    if(!res.ok && res.status !== 404) throw await sgrAttachmentError(res, 'The file could not be removed.');
+    return true;
+  },
+};
+
+async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMarkSent, customers, extraAttachments) {
   // 2026-10-15: an emailed Tax Invoice (cover letter, PDF and To: address)
   // uses the same current-Customer rule as Print / Preview. Quote and
   // Proforma are passed through exactly as before.
@@ -7771,10 +7929,34 @@ async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMa
       +'We look forward to working with you again in the future.\r\n\r\n'
       +'Kind regards,\r\n'+co.name+'\r\norders@snsg.co.za  |  040-940-5555';
 
+  // 2026-11-16: files the user attached to this quotation travel in the same
+  // message, after the two generated PDFs. With none, this is exactly the
+  // original two-attachment message.
+  const extras = Array.isArray(extraAttachments) ? extraAttachments : [];
+  const generatedNames = ['Cover_Letter_'+refNum+'.pdf', (isQuote?'Quotation_':isProforma?'Proforma_':'Invoice_')+refNum+'.pdf'];
+  const usedNames = new Set(generatedNames.map(n=>n.toLowerCase()));
+  const extraParts = extras.map(x=>{
+    // Two files with the same name would be indistinguishable to the recipient.
+    let name = String(x.filename||'attachment'); const dot = name.lastIndexOf('.');
+    const stem = dot>0?name.slice(0,dot):name, ext = dot>0?name.slice(dot):'';
+    for(let i=2; usedNames.has(name.toLowerCase()); i++) name = stem+' ('+i+')'+ext;
+    usedNames.add(name.toLowerCase());
+    return { filename:name, base64:x.base64, contentType:x.contentType };
+  });
   const emlContent = buildEmlFile(to, subject, body, [
-    { filename:'Cover_Letter_'+refNum+'.pdf',                base64: coverB64 },
-    { filename:(isQuote?'Quotation_':isProforma?'Proforma_':'Invoice_')+refNum+'.pdf', base64: docB64  }
-  ]);
+    { filename:generatedNames[0], base64: coverB64 },
+    { filename:generatedNames[1], base64: docB64  }
+  ].concat(extraParts));
+
+  // The whole encoded message must fit the mailbox's limit. Checked on the
+  // finished message, so the generated PDFs are counted at their real size.
+  // Nothing is downloaded and nothing is marked sent when it does not fit.
+  const emlBytes = new Blob([emlContent]).size;
+  if (emlBytes > SGR_EMAIL_MAX_MESSAGE_BYTES) {
+    const err = new Error('This email would be '+sgrFmtBytes(emlBytes)+' once encoded, which is over the '+sgrFmtBytes(SGR_EMAIL_MAX_MESSAGE_BYTES)+' limit most mail services accept. Untick or remove some attached files and try again.');
+    err.code = 'EMAIL_TOO_LARGE';
+    throw err;
+  }
 
   downloadFile(emlContent, (isQuote?'Quote_':isProforma?'Proforma_':'Invoice_')+refNum+'.eml', 'message/rfc822');
   if (onMarkSent) onMarkSent();
@@ -7791,21 +7973,198 @@ function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSen
   const [status, setStatus] = useState('idle'); // idle | generating | done | error
   const [errMsg, setErrMsg] = useState('');
 
+  /* ── ADDITIONAL ATTACHMENTS (2026-11-16) — quotations only ───────────────
+     Each row is one file: { key, id, name, size, mime, status, error, file,
+     include }. `id` is set once the server has stored it; `file` is kept
+     until then so a failed upload can be retried without picking it again.
+       uploading   being sent to the server
+       uploaded    stored — can be previewed, downloaded, removed, sent
+       failed      the upload did not succeed (Retry)
+       invalid     refused before upload (wrong type, over 5 MB, mislabelled)
+       unavailable stored, but could not be retrieved just now (Retry)
+     The email is built only when every TICKED file is `uploaded` and has just
+     been read back from storage. Anything else stops it with a reason and
+     leaves the list exactly as it was, so nothing has to be re-selected.
+     Proforma and Tax Invoice emails do not use any of this. */
+  const quoteKey = isQuote ? String(sgrRelRecordId(data.id)) : null;
+  const [atts, setAtts] = useState([]);
+  const [attState, setAttState] = useState(isQuote ? 'loading' : 'off'); // loading | ready | unavailable | error | off
+  const [attNote, setAttNote] = useState('');
+  const [attLimits, setAttLimits] = useState({ maxFilesPerQuote: 20 });
+  const [genErr, setGenErr] = useState('');
+  const [sentExtras, setSentExtras] = useState(0);
+  const attSeq = useRef(0);
+  const patchAtt = (key, patch) => setAtts(prev=>prev.map(a=>a.key===key?{...a,...patch}:a));
+
+  async function loadAttachments(){
+    if(!isQuote) return;
+    setAttState('loading'); setAttNote('');
+    let lastErr = null;
+    for(let attempt=0; attempt<3; attempt++){
+      try{
+        const body = await sgrQuoteAttachmentsApi.list(quoteKey);
+        if(body.limits) setAttLimits(body.limits);
+        setAtts(prev=>{
+          const pending = prev.filter(a=>a.status!=='uploaded' && a.id==null); // not stored yet — keep as picked
+          const stored = (body.attachments||[]).map(a=>{
+            const was = prev.find(x=>x.id===a.id);
+            return { key:'s'+a.id, id:a.id, name:a.filename, size:a.size, mime:a.mimeType, status:'uploaded', error:'', file:null, include: was ? was.include : true };
+          });
+          return stored.concat(pending);
+        });
+        if(body.storage && body.storage.configured===false){
+          setAttState('unavailable');
+          setAttNote('Extra files cannot be attached yet: file storage has not been set up on the server. The quotation can still be emailed without them.');
+        } else setAttState('ready');
+        return;
+      }catch(e){
+        lastErr = e;
+        // A quotation created a moment ago may still be on its way to the server.
+        if(e && e.status===404 && attempt<2){ await new Promise(r=>setTimeout(r,1200)); continue; }
+        break;
+      }
+    }
+    setAttState('error');
+    setAttNote(lastErr && lastErr.status===404
+      ? 'This quotation has not reached the server yet, so files cannot be attached to it. It saves automatically — try again in a moment. You can still email it without extra files.'
+      : ((lastErr && lastErr.message) || 'The attached files could not be loaded.') + ' You can still email the quotation without extra files.');
+  }
+  useEffect(()=>{ loadAttachments(); }, []);
+
+  async function uploadOne(item){
+    patchAtt(item.key, { status:'uploading', error:'' });
+    try{
+      const saved = await sgrQuoteAttachmentsApi.upload(quoteKey, item.file, item.mime);
+      setAtts(prev=>{
+        // The server treats the same file attached twice as ONE attachment.
+        if(prev.some(a=>a.key!==item.key && a.id===saved.id)) return prev.filter(a=>a.key!==item.key);
+        return prev.map(a=>a.key===item.key ? { ...a, id:saved.id, name:saved.filename, size:saved.size, mime:saved.mimeType, status:'uploaded', error:'' } : a);
+      });
+    }catch(e){
+      patchAtt(item.key, { status:'failed', error:(e && e.message) || 'The upload failed.' });
+    }
+  }
+  async function handlePickFiles(e){
+    const files = Array.from(e.target.files||[]);
+    e.target.value = '';
+    setGenErr('');
+    for(const file of files){
+      const key = 'n'+(++attSeq.current)+'-'+Date.now();
+      const check = await sgrCheckAttachmentFile(file);
+      const item = { key, id:null, name:file.name, size:file.size, mime: check.ok ? check.mime : (file.type||''),
+        status: check.ok ? 'uploading' : 'invalid', error: check.ok ? '' : check.error, file, include:true };
+      setAtts(prev=>prev.concat([item]));
+      if(check.ok) uploadOne(item); // uploads run side by side; each row shows its own status
+    }
+  }
+  async function retryAtt(item){
+    setGenErr('');
+    if(item.status==='failed' && item.file) return uploadOne(item);
+    if(item.status==='unavailable' && item.id!=null){
+      patchAtt(item.key, { status:'uploading', error:'' });
+      try{ await sgrQuoteAttachmentsApi.content(item.id); patchAtt(item.key, { status:'uploaded', error:'' }); }
+      catch(e){ patchAtt(item.key, { status:'unavailable', error:(e && e.message) || 'The file could not be retrieved from storage.' }); }
+    }
+  }
+  async function removeAtt(item){
+    setGenErr('');
+    if(item.status==='uploading' || item.status==='removing') return;
+    if(item.id!=null){
+      const before = item.status;
+      patchAtt(item.key, { status:'removing', error:'' });
+      try{ await sgrQuoteAttachmentsApi.remove(item.id); }
+      catch(e){ patchAtt(item.key, { status:before, error:'Not removed — '+((e && e.message) || 'please try again.') }); return; }
+    }
+    setAtts(prev=>prev.filter(a=>a.key!==item.key));
+  }
+  async function openAtt(item, download){
+    // Opened synchronously inside the click, so the browser does not treat
+    // the preview as a pop-up; it is pointed at the file once it arrives.
+    const win = download ? null : window.open('', '_blank');
+    if(!download && !win){ alert('Pop-up blocked! Please allow pop-ups for this page to preview the file.'); return; }
+    try{
+      let blob;
+      if(item.id!=null) blob = new Blob([await sgrQuoteAttachmentsApi.content(item.id)], { type:item.mime });
+      else if(item.file) blob = item.file;
+      else throw new Error('The file is not available.');
+      const url = URL.createObjectURL(blob);
+      if(download){
+        const a = document.createElement('a'); a.href = url; a.download = item.name;
+        document.body.appendChild(a); a.click(); setTimeout(()=>{ document.body.removeChild(a); }, 500);
+      } else win.location.href = url;
+      setTimeout(()=>URL.revokeObjectURL(url), 120000);
+      if(item.status==='unavailable') patchAtt(item.key, { status:'uploaded', error:'' });
+    }catch(e){
+      if(win) win.close();
+      patchAtt(item.key, { status: item.id!=null ? 'unavailable' : item.status, error:(e && e.message) || 'The file could not be opened.' });
+    }
+  }
+
+  const includedAtts   = atts.filter(a=>a.include);
+  const readyAtts      = includedAtts.filter(a=>a.status==='uploaded');
+  const extraEncoded   = readyAtts.reduce((sum,a)=>sum+sgrEncodedBytes(a.size), 0);
+  const extrasOverLimit = extraEncoded > SGR_EMAIL_MAX_MESSAGE_BYTES;
+  // Why the email cannot be built right now, in plain words — or '' when it can.
+  function attachmentBlockReason(){
+    const n = st => includedAtts.filter(a=>a.status===st);
+    const names = list => list.map(a=>'"'+a.name+'"').join(', ');
+    if(n('uploading').length) return names(n('uploading'))+' '+(n('uploading').length>1?'are':'is')+' still uploading. Wait for the upload to finish, then send.';
+    if(n('removing').length)  return names(n('removing'))+' '+(n('removing').length>1?'are':'is')+' still being removed. Try again in a moment.';
+    if(n('invalid').length)   return names(n('invalid'))+' cannot be attached ('+n('invalid')[0].error+'). Remove '+(n('invalid').length>1?'them':'it')+', or untick '+(n('invalid').length>1?'them':'it')+', to send.';
+    if(n('failed').length)    return names(n('failed'))+' did not upload. Retry '+(n('failed').length>1?'them':'it')+', or untick '+(n('failed').length>1?'them':'it')+' to send without '+(n('failed').length>1?'them':'it')+'.';
+    if(n('unavailable').length) return names(n('unavailable'))+' could not be retrieved from storage. Retry '+(n('unavailable').length>1?'them':'it')+', or untick '+(n('unavailable').length>1?'them':'it')+' to send without '+(n('unavailable').length>1?'them':'it')+'.';
+    if(extrasOverLimit) return 'The ticked files come to about '+sgrFmtBytes(extraEncoded)+' once encoded for email, which is over the '+sgrFmtBytes(SGR_EMAIL_MAX_MESSAGE_BYTES)+' limit most mail services accept. Untick or remove some files.';
+    return '';
+  }
+
   async function handleGenerate() {
+    setGenErr('');
+    const extras = [];
+    if(isQuote){
+      const reason = attachmentBlockReason();
+      if(reason){ setGenErr(reason); setStatus('idle'); return; }
+    }
     setStatus('generating');
     try {
-      await generateAndEmailDocument(type, data, companies, logoDataUrl, onMarkSent, customers);
+      if(isQuote){
+        // Every ticked file is read back from storage now (the server verifies
+        // it before sending a byte). One that cannot be retrieved stops the
+        // email — it is never silently left out.
+        for(const a of readyAtts){
+          try{
+            const buf = await sgrQuoteAttachmentsApi.content(a.id);
+            extras.push({ filename:a.name, base64:sgrArrayBufferToBase64(buf), contentType:a.mime });
+          }catch(e){
+            const why = (e && e.message) || 'The file could not be retrieved from storage.';
+            patchAtt(a.key, { status:'unavailable', error:why });
+            setGenErr('"'+a.name+'" could not be retrieved, so the email was NOT built. '+why+' Retry it, or untick it to send without it.');
+            setStatus('idle');
+            return;
+          }
+        }
+      }
+      await generateAndEmailDocument(type, data, companies, logoDataUrl, onMarkSent, customers, extras);
+      setSentExtras(extras.length);
       setStatus('done');
     } catch(e) {
+      if(e && e.code==='EMAIL_TOO_LARGE'){ setGenErr(e.message); setStatus('idle'); return; }
       console.error('Email generation error:', e);
       setErrMsg(e.message||'Unexpected error — check browser console.');
       setStatus('error');
     }
   }
+  const ATT_STATUS = {
+    uploading:   { text:'Uploading…',           cls:'text-blue-600' },
+    uploaded:    { text:'Uploaded',             cls:'text-emerald-600' },
+    failed:      { text:'Upload failed',        cls:'text-red-600' },
+    invalid:     { text:'Not attached',         cls:'text-red-600' },
+    unavailable: { text:'Could not be retrieved', cls:'text-red-600' },
+    removing:    { text:'Removing…',            cls:'text-gray-500' },
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center modal-backdrop bg-black/40">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-y-auto" style={{maxHeight:'94vh'}}>
 
         {/* Header */}
         <div className="bg-brand-600 px-6 py-4 flex items-center justify-between">
@@ -7834,7 +8193,70 @@ function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSen
                 <span>📬</span><span>To: <strong className="text-gray-700">{data.email}</strong></span>
               </div>
             )}
-            <button onClick={handleGenerate}
+            {isQuote&&(
+              <div data-sgr="quote-attachments" data-state={attState} className="border border-gray-200 rounded-xl p-3">
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <p className="text-xs font-black text-gray-500 uppercase tracking-widest">📎 Additional attachments</p>
+                  {attState==='ready'&&(
+                    <label className="cursor-pointer text-xs font-bold text-indigo-600 hover:text-indigo-800 px-3 py-1.5 border border-indigo-200 rounded-lg bg-indigo-50 hover:bg-indigo-100 transition-colors">
+                      ＋ Attach files
+                      <input data-sgr="quote-attach-input" type="file" multiple accept=".jpg,.jpeg,.png,.pdf,image/jpeg,image/png,application/pdf" className="hidden" onChange={handlePickFiles}/>
+                    </label>
+                  )}
+                </div>
+                <p className="text-[11px] text-gray-400 mb-2">JPEG (.jpg, .jpeg), PNG or PDF — up to 5 MB each. Files stay with this quotation and are sent as real attachments.</p>
+                {attState==='loading'&&<p className="text-xs text-gray-400">Loading attached files…</p>}
+                {(attState==='unavailable'||attState==='error')&&(
+                  <p data-sgr="quote-attach-note" className="text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg px-3 py-2 mb-2">
+                    {attNote} {attState==='error'&&<button type="button" onClick={loadAttachments} className="underline font-semibold">Try again</button>}
+                  </p>
+                )}
+                {atts.length===0 && attState==='ready' && <p className="text-xs text-gray-400">No extra files attached.</p>}
+                {atts.length>0&&(
+                  <div className="space-y-1.5">
+                    {atts.map(a=>{
+                      const st = ATT_STATUS[a.status] || ATT_STATUS.failed;
+                      // A refused file was never attached, so there is nothing to preview or download.
+                      const canOpen = (a.status==='uploaded' || a.status==='unavailable' || (a.status==='failed' && a.file));
+                      return (
+                        <div key={a.key} data-sgr-att={a.name} data-status={a.status} className={`rounded-lg border px-2.5 py-2 ${a.error?'border-red-200 bg-red-50':'border-gray-200 bg-gray-50'}`}>
+                          <div className="flex items-center gap-2">
+                            <input type="checkbox" checked={!!a.include} onChange={e=>{ setGenErr(''); patchAtt(a.key,{include:e.target.checked}); }} title="Include this file in the email"/>
+                            <span className="text-base">{a.mime==='application/pdf'?'📄':'🖼️'}</span>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs font-semibold text-gray-700 truncate" title={a.name}>{a.name}</p>
+                              <p className="text-[11px] text-gray-400">{sgrFmtBytes(a.size)} · <span data-sgr-att-status className={`font-semibold ${st.cls}`}>{st.text}</span></p>
+                            </div>
+                            {canOpen&&<button type="button" onClick={()=>openAtt(a,false)} className="text-[11px] font-bold text-blue-600 hover:underline">Preview</button>}
+                            {canOpen&&<button type="button" onClick={()=>openAtt(a,true)} className="text-[11px] font-bold text-blue-600 hover:underline">Download</button>}
+                            {(a.status==='failed'||a.status==='unavailable')&&<button type="button" data-sgr-att-retry onClick={()=>retryAtt(a)} className="text-[11px] font-bold text-amber-700 hover:underline">Retry</button>}
+                            <button type="button" data-sgr-att-remove onClick={()=>removeAtt(a)} disabled={a.status==='uploading'||a.status==='removing'} title="Remove this file" className="text-gray-400 hover:text-red-500 text-sm disabled:opacity-30">✕</button>
+                          </div>
+                          {a.error&&<p data-sgr-att-error className="text-[11px] text-red-600 mt-1 ml-6">{a.error}</p>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+            {isQuote&&(
+              <div data-sgr="quote-email-contents" className="bg-gray-50 border border-gray-200 rounded-xl px-3 py-2">
+                <p className="text-xs font-bold text-gray-600 mb-1">This email will include:</p>
+                <ul className="text-xs text-gray-600 space-y-0.5">
+                  <li>📄 Cover_Letter_{refNum}.pdf</li>
+                  <li>📄 Quotation_{refNum}.pdf</li>
+                  {includedAtts.map(a=>(
+                    <li key={a.key} data-sgr-included={a.name} className={a.status==='uploaded'?'':'text-red-600'}>
+                      {a.mime==='application/pdf'?'📄':'🖼️'} {a.name} <span className="text-gray-400">({sgrFmtBytes(a.size)})</span>{a.status!=='uploaded'&&<strong> — not ready</strong>}
+                    </li>
+                  ))}
+                </ul>
+                {readyAtts.length>0&&<p className={`text-[11px] mt-1 ${extrasOverLimit?'text-red-600 font-semibold':'text-gray-400'}`}>Extra files: about {sgrFmtBytes(extraEncoded)} once encoded for email, of a {sgrFmtBytes(SGR_EMAIL_MAX_MESSAGE_BYTES)} message limit.</p>}
+              </div>
+            )}
+            {genErr&&<p data-sgr="quote-email-error" className="text-xs bg-red-50 border border-red-200 text-red-700 rounded-xl px-3 py-2">{genErr}</p>}
+            <button onClick={handleGenerate} data-sgr="email-generate"
               className="w-full bg-brand-500 hover:bg-brand-600 text-white font-black text-sm rounded-xl py-3 transition-colors shadow">
               📧 Generate &amp; Download Email Package
             </button>
@@ -7855,6 +8277,7 @@ function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSen
                 <div className="text-4xl mb-2">✅</div>
                 <p className="text-sm font-black text-emerald-700">Email package downloaded!</p>
                 <p className="text-xs text-emerald-600 mt-1">Find the <strong>.eml file</strong> in your Downloads folder</p>
+                {isQuote&&sentExtras>0&&<p data-sgr="email-done-extras" className="text-xs text-emerald-700 mt-1">Includes both PDFs and {sentExtras} additional attached file{sentExtras>1?'s':''}.</p>}
               </div>
               <div className="bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 text-xs text-amber-800">
                 <p className="font-bold mb-0.5">📁 Recommended: Save packages to a dedicated folder</p>
@@ -7875,6 +8298,7 @@ function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSen
                 className="w-full text-xs border border-gray-200 text-gray-500 rounded-xl py-2 font-semibold hover:bg-gray-50">
                 ↻ Regenerate
               </button>
+              {isQuote&&<button onClick={()=>setStatus('idle')} className="w-full text-xs border border-gray-200 text-gray-500 rounded-xl py-2 font-semibold hover:bg-gray-50">← Change attachments</button>}
             </div>
           )}
 
@@ -7889,6 +8313,7 @@ function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSen
                 className="w-full bg-brand-500 hover:bg-brand-600 text-white font-black text-sm rounded-xl py-3">
                 ↻ Try Again
               </button>
+              {isQuote&&<button onClick={()=>setStatus('idle')} className="w-full text-xs border border-gray-200 text-gray-500 rounded-xl py-2 font-semibold hover:bg-gray-50">← Back to attachments</button>}
             </div>
           )}
 
@@ -17933,7 +18358,7 @@ function LoginPage({ onLogin, userAccounts }) {
             <p className="text-center font-bold tracking-widest uppercase" style={{color:'rgba(255,255,255,0.5)',fontSize:'0.65rem'}}>Manufacturing — Tap to Sign In</p>
           </div>
           <div className="p-3 flex gap-2">
-            {userAccounts.filter(u=>u.role==='factory').map(u=>(
+            {userAccounts.filter(u=>u.role==='factory' && !u.requiresPassword).map(u=>(
               <button key={u.email} type="button" disabled={busy} onClick={()=>oneTapLogin(u)}
                 className="flex-1 text-white font-bold rounded-xl py-2.5 text-xs transition-all hover:opacity-90 disabled:opacity-60"
                 style={{background:'rgba(255,255,255,0.12)',border:'1px solid rgba(255,255,255,0.25)'}}>
@@ -18043,19 +18468,202 @@ function UserRolesPage({ userAccounts, setUserAccounts }) {
       setTimeout(() => setSyncMsg(m => { const n = { ...m }; delete n[id]; return n; }), 3000);
     }, 800);
   }
+  /* ── ADD USER (2026-11-16) ────────────────────────────────────────────────
+     The server owns this end to end (backend/src/routes/auth.ts): who may add
+     a user, which roles and companies they may grant, the password rules and
+     the duplicate-login check. This form only collects the details.
+       - Role and Company are built from what GET /api/auth/users says THIS
+         admin may grant, so the form cannot offer what the server refuses.
+       - The password is typed into masked fields held in this component's
+         state only. It goes to the server once, is cleared the moment the
+         request returns, and is never put into userAccounts / platform_state,
+         the list, a message or the console.
+       - The new account is added to userAccounts (the visible record, saved
+         by the normal autosave) WITHOUT a password, flagged requiresPassword
+         so it is never offered as a one-tap sign-in. */
+  const [grantable, setGrantable] = useState(null);       // [{co,label,roles:[{role,label}]}] from the server
+  const [pwRules, setPwRules] = useState({ minLength: 8, maxLength: 72, needsLetterAndNumber: true });
+  const [adminLoadErr, setAdminLoadErr] = useState('');
+  const [showAdd, setShowAdd] = useState(false);
+  const BLANK_USER = { name:'', email:'', coKey:'', role:'', password:'', confirm:'' };
+  const [draft, setDraft] = useState(BLANK_USER);
+  const [addErr, setAddErr] = useState(null);             // { field?, message }
+  const [addBusy, setAddBusy] = useState(false);
+  const [addOk, setAddOk] = useState('');
+  const coKeyOf = co => (co===null || co===undefined) ? 'main' : String(co);
+  function accountFromServer(su){
+    const nm = su.name || su.email;
+    const initials = String(nm).split(/\s+/).filter(Boolean).slice(0,2).map(w=>w[0]).join('').toUpperCase() || 'U';
+    const title = su.role==='admin' ? 'Administrator' : su.role==='accounts' ? 'Accounts' : su.role==='assistant' ? 'Sales / Quoting' : 'Manufacturing';
+    const rec = { id: su.id, email: su.email, pw:'', role: su.role, name: nm, initials, title };
+    if (su.co===HOLDINGS_CO_ID) rec.co = HOLDINGS_CO_ID;
+    if (su.requiresPassword) rec.requiresPassword = true;
+    return rec;
+  }
+  // Accounts that can sign in (app_users) but are missing from the visible
+  // record — e.g. added from another browser — are shown here too. Additive
+  // only: an existing entry is never changed or removed by this.
+  function mergeServerAccounts(serverUsers){
+    if(!Array.isArray(serverUsers) || !serverUsers.length) return;
+    setUserAccounts(prev=>{
+      const have = new Set((prev||[]).flatMap(u=>[String(u.id||'').toLowerCase(), String(u.email||'').toLowerCase()]));
+      const missing = serverUsers.filter(su=>su && su.isActive!==false && !have.has(String(su.id||'').toLowerCase()) && !have.has(String(su.email||'').toLowerCase()));
+      return missing.length ? [...(prev||[]), ...missing.map(accountFromServer)] : prev;
+    });
+  }
+  async function loadAdminInfo(){
+    try{
+      const res = await fetch(API_AUTH_USERS_URL, { headers: { ...authHeaders() } });
+      if (res.status === 401) { forceLogoutExpiredSession(); return; }
+      const body = await res.json().catch(()=>null);
+      if (!res.ok) throw new Error((body && body.error) || ('HTTP ' + res.status));
+      setGrantable(Array.isArray(body.grantable) ? body.grantable : []);
+      if (body.passwordRules) setPwRules(body.passwordRules);
+      mergeServerAccounts(body.users);
+      setAdminLoadErr('');
+    }catch(e){
+      setGrantable([]);
+      setAdminLoadErr((e && e.message) || 'Could not load the user list from the server.');
+    }
+  }
+  useEffect(()=>{ loadAdminInfo(); }, []);
+  const draftCompany = (grantable||[]).find(g=>coKeyOf(g.co)===draft.coKey) || null;
+  const draftRoles = draftCompany ? draftCompany.roles : [];
+  function setDraftField(field, value){
+    setAddErr(null); setAddOk('');
+    setDraft(d=>{
+      const next = { ...d, [field]: value };
+      // Changing the company can make the chosen role unavailable — clear it rather than send it.
+      if(field==='coKey'){
+        const co = (grantable||[]).find(g=>coKeyOf(g.co)===value);
+        if(!co || !co.roles.some(r=>r.role===d.role)) next.role = '';
+      }
+      return next;
+    });
+  }
+  function openAdd(){ setDraft(BLANK_USER); setAddErr(null); setAddOk(''); setShowAdd(true); }
+  function closeAdd(){ setDraft(BLANK_USER); setAddErr(null); setShowAdd(false); }
+  // The same checks the server makes, so a slip is caught before the request.
+  // The server's answer is still the one that counts.
+  function draftProblem(){
+    const name = draft.name.replace(/\s+/g,' ').trim();
+    const email = draft.email.trim().toLowerCase();
+    if(!name) return { field:'name', message:'Enter a display name.' };
+    if(!email) return { field:'email', message:'Enter the login email.' };
+    if(!/^[^\s@<>\x22\x27]+@[^\s@<>\x22\x27]+\.[^\s@<>\x22\x27]{2,}$/.test(email)) return { field:'email', message:'Enter a valid email address for the login.' };
+    if((userAccounts||[]).some(u=>String(u.email||'').toLowerCase()===email || String(u.id||'').toLowerCase()===email)) return { field:'email', message:'That login email is already in use by another account.' };
+    if(!draftCompany) return { field:'co', message:'Choose a company.' };
+    if(!draftRoles.some(r=>r.role===draft.role)) return { field:'role', message:'Choose a role.' };
+    const pw = draft.password;
+    if(!pw) return { field:'password', message:'Enter an initial password.' };
+    if(pw.length < pwRules.minLength) return { field:'password', message:'The password must be at least '+pwRules.minLength+' characters.' };
+    if(new Blob([pw]).size > pwRules.maxLength) return { field:'password', message:'The password must be '+pwRules.maxLength+' characters or fewer.' };
+    if(pwRules.needsLetterAndNumber && (!/[A-Za-z]/.test(pw) || !/[0-9]/.test(pw))) return { field:'password', message:'The password must contain at least one letter and one number.' };
+    if(pw.trim()!==pw) return { field:'password', message:'The password cannot start or end with a space.' };
+    if(pw.toLowerCase()===email) return { field:'password', message:'The password cannot be the same as the login email.' };
+    if(pw!==draft.confirm) return { field:'confirm', message:'The two passwords do not match.' };
+    return null;
+  }
+  async function submitAdd(e){
+    if(e && e.preventDefault) e.preventDefault();
+    if(addBusy) return;
+    const problem = draftProblem();
+    if(problem){ setAddErr(problem); return; }
+    setAddBusy(true); setAddErr(null); setAddOk('');
+    try{
+      const res = await fetch(API_AUTH_USERS_URL, {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json', ...authHeaders() },
+        body: JSON.stringify({ name: draft.name, email: draft.email, role: draft.role, co: draftCompany.co, password: draft.password }),
+      });
+      if (res.status === 401) { forceLogoutExpiredSession(); return; }
+      const body = await res.json().catch(()=>null);
+      if(!res.ok){
+        // Keep what was typed (except nothing is logged) so it can be corrected and retried.
+        setAddErr({ field: body && body.field, message: (body && body.error) || ('The user could not be created (HTTP '+res.status+').') });
+        return;
+      }
+      const created = body && body.user;
+      setUserAccounts(prev=>{
+        const rec = accountFromServer(created);
+        return (prev||[]).some(u=>String(u.id||'').toLowerCase()===String(rec.id).toLowerCase()) ? prev : [...(prev||[]), rec];
+      });
+      setDraft(BLANK_USER);          // the password leaves memory with the form
+      setShowAdd(false);
+      setAddOk('User added: '+created.name+' ('+created.email+'). They can sign in now.');
+    }catch(ex){
+      setAddErr({ message:'Could not reach the server, so the user was NOT created. Check your connection and try again.' });
+    }finally{
+      setAddBusy(false);
+    }
+  }
+  const addFieldCls = f => 'w-full border rounded-lg px-3 py-2 text-sm '+(addErr&&addErr.field===f?'border-red-400 bg-red-50':'border-gray-200');
   function roleLabel(u) {
     if (u.role==='admin')     return isHoldingsUser(u) ? 'Holdings Admin' : 'Admin';
     if (u.role==='assistant') return isHoldingsUser(u) ? 'Holdings Assistant' : 'Assistant';
     if (u.role==='accounts')  return 'Accounts';
-    if (u.role==='factory')   return 'Manufacturing';
+    if (u.role==='factory')   return 'Manufacturing (view only)';
     return u.role;
   }
   return (
     <div className="p-6 max-w-4xl mx-auto">
-      <div className="mb-6">
-        <h2 className="text-lg font-bold" style={{color:'#06065c'}}>User Roles</h2>
-        <p className="text-sm text-gray-500 mt-1">Admin-only. Edit the login name and email for each account below — changes save automatically. Existing passwords are never shown here; type a new one only if you want to change it.</p>
+      <div className="mb-6 flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-lg font-bold" style={{color:'#06065c'}}>User Roles</h2>
+          <p className="text-sm text-gray-500 mt-1">Admin-only. Edit the login name and email for each account below — changes save automatically. Existing passwords are never shown here; type a new one only if you want to change it.</p>
+        </div>
+        {!showAdd&&<button type="button" data-sgr="add-user-open" onClick={openAdd} disabled={!grantable||!grantable.length}
+          title={(!grantable||!grantable.length)?'The server has not confirmed which roles this login may grant.':undefined}
+          className="shrink-0 text-sm font-bold text-white rounded-xl px-4 py-2 disabled:opacity-50" style={{background:'#06065c'}}>＋ Add User</button>}
       </div>
+      {adminLoadErr&&<p data-sgr="add-user-load-error" className="text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-xl px-3 py-2 mb-4">Adding users is unavailable right now — {adminLoadErr} <button type="button" onClick={loadAdminInfo} className="underline font-semibold">Try again</button></p>}
+      {addOk&&<p data-sgr="add-user-ok" className="text-xs bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-xl px-3 py-2 mb-4">✓ {addOk}</p>}
+      {showAdd&&(
+        <form data-sgr="add-user-form" onSubmit={submitAdd} autoComplete="off" className="bg-white border-2 rounded-2xl p-4 mb-6" style={{borderColor:'#c7d2fe'}}>
+          <div className="flex items-center justify-between mb-3">
+            <span className="font-bold text-sm" style={{color:'#06065c'}}>Add a new user</span>
+            <button type="button" onClick={closeAdd} className="text-xs text-gray-500 hover:text-gray-700">Cancel</button>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-widest text-gray-500 mb-1">Display Name</label>
+              <input name="sgr-new-name" className={addFieldCls('name')} value={draft.name} onChange={e=>setDraftField('name',e.target.value)} maxLength={80} autoComplete="off"/>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-widest text-gray-500 mb-1">Username / Email</label>
+              <input name="sgr-new-email" type="email" className={addFieldCls('email')} value={draft.email} onChange={e=>setDraftField('email',e.target.value.toLowerCase())} autoComplete="off"/>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-widest text-gray-500 mb-1">Company</label>
+              <select name="sgr-new-company" className={addFieldCls('co')} value={draft.coKey} onChange={e=>setDraftField('coKey',e.target.value)}>
+                <option value="">Choose a company…</option>
+                {(grantable||[]).map(g=><option key={coKeyOf(g.co)} value={coKeyOf(g.co)}>{g.label}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-widest text-gray-500 mb-1">Role</label>
+              <select name="sgr-new-role" className={addFieldCls('role')} value={draft.role} onChange={e=>setDraftField('role',e.target.value)} disabled={!draftCompany}>
+                <option value="">{draftCompany?'Choose a role…':'Choose a company first'}</option>
+                {draftRoles.map(r=><option key={r.role} value={r.role}>{r.label}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-widest text-gray-500 mb-1">Initial Password</label>
+              <input name="sgr-new-password" type="password" className={addFieldCls('password')+' font-mono'} value={draft.password} onChange={e=>setDraftField('password',e.target.value)} autoComplete="new-password"/>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-widest text-gray-500 mb-1">Confirm Password</label>
+              <input name="sgr-new-confirm" type="password" className={addFieldCls('confirm')+' font-mono'} value={draft.confirm} onChange={e=>setDraftField('confirm',e.target.value)} autoComplete="new-password"/>
+            </div>
+          </div>
+          <p className="text-xs text-gray-400 mt-2">At least {pwRules.minLength} characters, with a letter and a number. The password is never shown again — give it to the user directly and ask them to have it changed.</p>
+          {addErr&&<p data-sgr="add-user-error" className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2 mt-3">{addErr.message}</p>}
+          <div className="mt-3 flex justify-end gap-2">
+            <button type="button" onClick={closeAdd} className="text-sm border border-gray-200 text-gray-600 rounded-xl px-4 py-2 font-semibold hover:bg-gray-50">Cancel</button>
+            <button type="submit" data-sgr="add-user-submit" disabled={addBusy} className="text-sm text-white rounded-xl px-4 py-2 font-bold disabled:opacity-60" style={{background:'#06065c'}}>{addBusy?'Creating…':'Create User'}</button>
+          </div>
+        </form>
+      )}
       <div className="space-y-4">
         {(userAccounts||[]).map(u=>(
           <div key={u.id} className="bg-white border border-gray-200 rounded-2xl p-4">
@@ -18074,7 +18682,7 @@ function UserRolesPage({ userAccounts, setUserAccounts }) {
               </div>
               <div>
                 <label className="block text-xs font-semibold uppercase tracking-widest text-gray-500 mb-1">Password</label>
-                {u.role==='factory'
+                {(u.role==='factory' && !u.requiresPassword)
                   ? <input className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm bg-gray-50 text-gray-400" value="No password — one-tap sign in" disabled/>
                   : <div className="flex gap-2">
                       <input type={showNewPw[u.id]?'text':'password'} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono" value={newPw[u.id]||''} onChange={e=>setNewPassword(u,e.target.value)} placeholder="Enter a new password to change it" autoComplete="new-password"/>
@@ -18590,6 +19198,10 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 
   const isAdmin = user.role === 'admin';
   const isFactory = user.role === 'factory'; // Manufacturing — Job Card view only, no Rand values, no invoicing
+  // VIEW-ONLY LOGINS (2026-11-16): Factory / Print Room see the job exactly as
+  // before — lifecycle, scope of work, notes, purchase orders, job card — but
+  // every control that changes it is withheld. Enforced on the server too.
+  const readOnly = sgrIsReadOnlyRole(user.role);
   const co=companies.find(c=>c.id===job.co)||companies[0];
   // ── Linked-record lookup (read-only; never mutates the job) ──
   const _links = findLinkedRecords({ job }, { quotes, jobs, accInvoices, customers });
@@ -19083,10 +19695,10 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
         <div className="bg-white rounded-2xl border border-gray-200 p-5">
           <div className="flex items-center justify-between mb-3">
             <p className="text-xs font-black text-gray-400 uppercase tracking-widest">🛒 Purchase Orders for this Job</p>
-            <button onClick={()=>setShowCreatePO(true)}
+            {!readOnly&&<button onClick={()=>setShowCreatePO(true)}
               className="text-xs font-bold bg-blue-800 hover:bg-blue-900 text-white rounded-xl px-3 py-1.5">
               + Create Purchase Order
-            </button>
+            </button>}
           </div>
           {(() => {
             const jobPOs = (purchaseOrders||[]).filter(p => p.jobNum && job.num && String(p.jobNum).toUpperCase()===String(job.num).toUpperCase());
@@ -19176,7 +19788,9 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
           {/* BUG 5 — the override, once taken, is stated plainly and permanently
               on the job, and says in as many words that nothing is paid. */}
           {isDepositWaived&&!isZeroValueJob&&<div className="bg-slate-50 border border-slate-300 rounded-xl px-4 py-2 mb-3 flex items-start gap-2"><span className="text-base">⤳</span><p className="text-xs text-slate-600"><strong>Progressed without payment.</strong> A user chose to continue this job before a deposit was received{job.depositWaivedBy?' ('+job.depositWaivedBy+')':''}{job.depositWaivedAt?' on '+String(job.depositWaivedAt).slice(0,10):''}. {jobHasAnyPayment?'Payments have since been recorded — see Payments for the current position.':'No payment has been recorded and nothing is marked as paid; this job still shows as unpaid on every invoice, statement and report.'}</p></div>}
-          {isLast
+          {readOnly&&!isLast
+            ? <div data-sgr-view-only="job-stage" className="bg-gray-50 border border-dashed border-gray-300 rounded-xl px-4 py-3 flex items-start gap-2"><span className="text-lg">👁</span><div><p className="text-sm font-bold text-gray-600">View only</p><p className="text-xs text-gray-400 mt-0.5">This login can view and print the job. Stages are advanced by the office.</p></div></div>
+            : isLast
             ? <div className="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 flex items-center gap-2"><span className="text-emerald-500 text-lg">✅</span><p className="text-sm font-bold text-emerald-700">Job Complete — Invoiced</p></div>
             : nextLocked
               ? <div className="bg-gray-50 border border-dashed border-gray-300 rounded-xl px-4 py-3 flex items-start gap-2">
@@ -19231,7 +19845,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
             <h3 className="text-sm font-bold text-gray-700">📋 Scope of Work</h3>
             <p className="text-xs text-gray-400 mt-0.5">Work items and specifications — used on the printed job card</p>
           </div>
-          {!editingLines
+          {readOnly ? null : !editingLines
             ? <button onClick={startEditLines} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
                 {(job.lines&&job.lines.length>0) ? '✏️ Edit' : '+ Add Items'}
               </button>
@@ -19286,7 +19900,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
             <div className="text-center py-4">
               <p className="text-gray-400 text-sm">No work items specified yet.</p>
               <p className="text-xs text-gray-300 mt-1">Jobs converted from a quote inherit the quote's line items automatically.</p>
-              <button onClick={startEditLines} className="mt-2 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Add items manually</button>
+              {!readOnly&&<button onClick={startEditLines} className="mt-2 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Add items manually</button>}
             </div>
           )}
         </div>
@@ -19369,7 +19983,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
             <h3 className="text-sm font-bold text-gray-700">📝 Special Notes</h3>
             <p className="text-xs text-gray-400 mt-0.5">Internal notes, special instructions, reminders</p>
           </div>
-          {!editingNotes
+          {readOnly ? null : !editingNotes
             ? <button onClick={startEditNotes} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
                 {job.notes ? '✏️ Edit' : '+ Add Note'}
               </button>
@@ -19393,7 +20007,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
           ) : (
             <div className="text-center py-4">
               <p className="text-gray-400 text-sm">No notes yet.</p>
-              <button onClick={startEditNotes} className="mt-2 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Add a note</button>
+              {!readOnly&&<button onClick={startEditNotes} className="mt-2 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Add a note</button>}
             </div>
           )}
         </div>
@@ -19861,6 +20475,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
   },[highlightJobId]);
 
   const isFactory = user.role === 'factory'; // Manufacturing (Factory / Print Room) — Jobs list + Job Card only, no Rand values
+  const readOnly = sgrIsReadOnlyRole(user.role); // VIEW-ONLY LOGINS — see JobDetail
   const isAdmin = user.role !== 'assistant' && !isFactory;
   // UNIONTECH_ID is now a no-op sentinel — Signacore Holdings shows normally.
   // Company-context filter: Holdings users see/create only Holdings (co:1)
@@ -20106,8 +20721,9 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
                   <div onClick={e=>e.stopPropagation()} className="mt-1.5 flex justify-end">
                     <input type="date" value={job.dueDate||''}
                       onClick={e=>e.stopPropagation()}
-                      onChange={e=>updateJobDueDate(e.target.value)}
-                      title="Due date"
+                      onChange={e=>{ if(!readOnly) updateJobDueDate(e.target.value); }}
+                      disabled={readOnly}
+                      title={readOnly?'Due date (view only)':'Due date'}
                       className={`text-[11px] font-semibold rounded-full px-2.5 py-1 border cursor-pointer focus:ring-2 focus:ring-emerald-400 focus:outline-none
                         ${job.dueDate
                           ? (jobTab==='active' && new Date(job.dueDate) < new Date(new Date().toDateString())
@@ -29664,6 +30280,10 @@ function App() {
     if (!apiReadyRef.current) {
       throw new Error('Not yet connected to the server — please wait a moment and try again.');
     }
+    // VIEW-ONLY LOGINS: the debounced autosave is a no-op for a view-only
+    // session — "nothing of ours to push", the same answer as an unchanged
+    // snapshot. Nothing is sent, so nothing can be refused or half-saved.
+    if (sgrSessionIsReadOnly()) return false;
     const ownBaseline = capturedBaseline !== undefined ? capturedBaseline : serverBaselineRef.current;
     // Sections THIS user edited, measured against the state they last synced from.
     const changed = ownBaseline ? locallyChangedSections(snapshot, ownBaseline) : null;
@@ -30043,6 +30663,7 @@ function App() {
     if(!apiReadyRef.current){
       return Promise.reject(new Error('Not yet connected to the server — please wait a moment and try again.'));
     }
+    if(sgrSessionIsReadOnly()) return Promise.reject(sgrReadOnlyError()); // VIEW-ONLY LOGINS
     // Systemic safety guard (Stage 2 Phase 4) — see
     // assertNoUnwiredRelationalSections's definition near the top of this
     // file. `overrides`' keys are, by construction, exactly the sections
@@ -30103,6 +30724,7 @@ function App() {
   // try/catch is always trustworthy.
   async function savePartialSectionsNow(overrides, recordBase, deletedIds){
     if(!apiReadyRef.current) throw new Error('Not yet connected to the server — please wait a moment and try again.');
+    if(sgrSessionIsReadOnly()) throw sgrReadOnlyError(); // VIEW-ONLY LOGINS — an explicit save says why it did not happen
     // 2026-08-18 (production stabilisation, second layer of protection for
     // the stale-save race described on mergeAndSave/capturedBaseline above):
     // a confirmed save is about to advance serverBaselineRef.current. Cancel

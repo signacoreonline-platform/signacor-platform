@@ -116,6 +116,11 @@ function freshEnv(extra) {
     relationalAuthoritativeSectionsRef: { current: [] },
     relationalCutOverSeenRef: { current: [] },
     serverBaselineRef: { current: null },
+    // 2026-11-16: the save functions ask whether the session is view-only
+    // (Factory / Print Room). Every case in this suite models a login that may
+    // write, which is the default answer here.
+    sgrSessionIsReadOnly: () => false,
+    sgrReadOnlyError: () => new Error('view-only'),
   };
   return Object.assign(env, extra || {});
 }

@@ -58,6 +58,8 @@
     "repair:audio-access-payment-dedup": "ts-node --transpile-only src/scripts/repair-audio-access-payment-dedup.ts",
     "repair:sq-00150-inv-00111": "ts-node --transpile-only src/scripts/repair-sq-00150-inv-00111.ts",
     "test:admin-quote-revision": "node test/admin-quote-revision.test.js",
+    "test:users-readonly-attachments": "ts-node --transpile-only test/users-readonly-attachments.stress.ts",
+    "test:quote-email-attachments": "node test/quote-email-attachments.test.js",
     "record:cancelled-invoice": "ts-node --transpile-only src/scripts/record-cancelled-invoice.ts",
     "restore:deleted-job-invoice": "ts-node --transpile-only src/scripts/restore-deleted-job-invoice.ts",
     "diagnose:job-invoice-links": "node scripts/diagnose-job-invoice-links.js",

@@ -2090,15 +2090,15 @@ function sgrClassifyLegacyRoundingSettlement(rec, payableC, oldTotalCandidatesC)
    save/merge machinery as every other section.
 ═══════════════════════════════════════════ */
 const INITIAL_USERS = [
-  { id:'admin@signacore.co.za',    email:'admin@signacore.co.za',    pw:'Eunice2026!',    role:'admin',     name:'Ockert Smit',    initials:'OS', title:'Administrator'   },
-  { id:'accounts@signacore.co.za', email:'accounts@signacore.co.za', pw:'Accounts2024!',  role:'accounts',  name:'Accountant',     initials:'AC', title:'Accounts'        },
-  { id:'assist@signacore.co.za',   email:'assist@signacore.co.za',   pw:'Assist2024!',    role:'assistant', name:'Sales Assistant', initials:'SA', title:'Sales / Quoting' },
+  { id:'admin@signacore.co.za',    email:'admin@signacore.co.za',    pw:'',    role:'admin',     name:'Ockert Smit',    initials:'OS', title:'Administrator'   },
+  { id:'accounts@signacore.co.za', email:'accounts@signacore.co.za', pw:'',  role:'accounts',  name:'Accountant',     initials:'AC', title:'Accounts'        },
+  { id:'assist@signacore.co.za',   email:'assist@signacore.co.za',   pw:'',    role:'assistant', name:'Sales Assistant', initials:'SA', title:'Sales / Quoting' },
   // Signacore Holdings (co:1) logins — placeholder credentials, change the
   // email/pw values below to whatever you'd like. These logins are now
   // walled to the Holdings company context — see HOLDINGS_CO_ID /
   // isHoldingsUser() / belongsToUserCompany() below.
-  { id:'admin@signacoreholdings.co.za',  email:'admin@signacoreholdings.co.za',  pw:'Holdings2026!', role:'admin',     name:'Holdings Admin',      initials:'HA', title:'Administrator',   co:1 },
-  { id:'assist@signacoreholdings.co.za', email:'assist@signacoreholdings.co.za', pw:'HoldAssist2026!', role:'assistant', name:'Holdings Assistant', initials:'HS', title:'Sales / Quoting', co:1 },
+  { id:'admin@signacoreholdings.co.za',  email:'admin@signacoreholdings.co.za',  pw:'', role:'admin',     name:'Holdings Admin',      initials:'HA', title:'Administrator',   co:1 },
+  { id:'assist@signacoreholdings.co.za', email:'assist@signacoreholdings.co.za', pw:'', role:'assistant', name:'Holdings Assistant', initials:'HS', title:'Sales / Quoting', co:1 },
   // Manufacturing logins — Jobs menu only, no Rand values, view/print the
   // Job Card. No password required: these sign in via the one-tap buttons
   // on the login screen (see LoginPage) rather than the email/password form.

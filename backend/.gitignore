@@ -2,3 +2,5 @@ node_modules/
 dist/
 .env
 *.log
+# local file storage used in development only (FILE_STORAGE_PROVIDER=local)
+/storage/

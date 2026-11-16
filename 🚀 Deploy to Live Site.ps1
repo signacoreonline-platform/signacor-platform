@@ -4,7 +4,15 @@
 #  GitHub. Render will automatically redeploy within ~60 sec.
 # ============================================================
 
-$TOKEN  = "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"
+# 2026-11-16: the GitHub token is no longer stored in this file (it was
+# committed and published). Set it for this PowerShell session only:
+#   $env:SIGNACORE_GITHUB_TOKEN = "<a new fine-grained token>"
+$TOKEN  = $env:SIGNACORE_GITHUB_TOKEN
+if (-not $TOKEN) {
+    Write-Host "  ERROR: set SIGNACORE_GITHUB_TOKEN first (see the comment above)." -ForegroundColor Red
+    Read-Host "  Press Enter to close"
+    exit 1
+}
 $OWNER  = "ockertsmit64-hash"
 $REPO   = "signacore-platform"
 $BRANCH = "main"

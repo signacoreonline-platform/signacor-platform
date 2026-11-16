@@ -158,6 +158,8 @@ const CONSTS = [
   'HOLDINGS_CO_ID', 'HOLDINGS_CO_KEY', 'QUOTE_DEFAULT_DEPOSIT_PCT',
   'SGR_INV_SETUP_FEE_DESC', 'SGR_INV_DISCOUNT_RE', 'SGR_INV_ADJ_EPSILON', 'SGR_INV_MONEY_TOLERANCE',
   'SGR_LEGAL_SUFFIX_RE',
+  // 2026-11-16: generateAndEmailDocument checks the finished message against the mailbox limit
+  'SGR_EMAIL_MAX_MESSAGE_BYTES',
 ];
 const FNS = [
   // document plumbing
@@ -176,6 +178,7 @@ const FNS = [
   // the builders and every entry point that reaches them
   'buildQuoteHtml', 'buildInvoiceHtml', 'printInvoice', 'printManualInvoice', 'printQuoteWindow',
   'generateDocumentPdfFromHtml', 'generateAndEmailDocument',
+  'sgrFmtBytes',
 ];
 // Browser-only side effects are replaced by recorders. Everything that
 // decides WHAT is printed is the shipped code.
@@ -417,7 +420,9 @@ ok(/Voortrekker/.test(printBt), '[18] printInvoice (Print + Preview window + Dow
   const emailInv = SRC.match(/<EmailFlowModal\s+type="invoice"[^>]*>/g) || [];
   ok(emailInv.length > 0 && emailInv.every(s => /customers=\{customers\}/.test(s)),
      '[18] every invoice EmailFlowModal passes customers (' + emailInv.length + ' sites)');
-  ok(/generateAndEmailDocument\(type, data, companies, logoDataUrl, onMarkSent, customers\)/.test(extractFunction(SRC, 'EmailFlowModal')),
+  // 2026-11-16: the call gained a trailing argument (the quotation's extra
+  // attachments). `customers` is still forwarded in the same position.
+  ok(/generateAndEmailDocument\(type, data, companies, logoDataUrl, onMarkSent, customers(?:, extras)?\)/.test(extractFunction(SRC, 'EmailFlowModal')),
      '[18] EmailFlowModal forwards customers to generateAndEmailDocument');
 
   /* ══════════════════════════════════════════════════════════════════════
