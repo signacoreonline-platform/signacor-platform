@@ -7889,6 +7889,75 @@ const sgrQuoteAttachmentsApi = {
   },
 };
 
+/* ═══════════════════════════════════════════
+   QUOTATION ATTACHMENT UPLOAD QUEUE (2026-11-17)
+   Files chosen in the quote editor are held there until the save has
+   finished and the quotation has its canonical saved id. They are then
+   handed to this queue, keyed by that id, which uploads them through the
+   same /api/quote-attachments route the Email to Customer panel uses.
+
+   It lives at module level, not in a component, so an upload carries on
+   after the editor closes and its outcome is still known when the user opens
+   Email to Customer: that panel shows these files (uploading, uploaded or
+   failed) already ticked, so they go into the first .eml without being
+   picked again.
+
+   A retry posts the same file to the SAME saved quotation id. Nothing here
+   ever creates, saves or edits a quotation.
+═══════════════════════════════════════════ */
+const sgrQuoteUploadQueue = (function(){
+  const byQuote = new Map();   // quote id (string) -> [{ key, file, name, size, mime, status, error, id }]
+  const subscribers = new Set();
+  let seq = 0;
+  const keyOf = quoteId => String(sgrRelRecordId(quoteId));
+  function emit(){ subscribers.forEach(fn=>{ try{ fn(); }catch(e){} }); }
+  function list(quoteId){ return (byQuote.get(keyOf(quoteId)) || []).slice(); }
+  function patch(qk, itemKey, changes){
+    const items = byQuote.get(qk) || [];
+    byQuote.set(qk, items.map(it => it.key===itemKey ? Object.assign({}, it, changes) : it));
+    emit();
+  }
+  async function run(qk, itemKey){
+    const item = (byQuote.get(qk) || []).find(it=>it.key===itemKey);
+    if(!item || item.status==='uploading') return;
+    patch(qk, itemKey, { status:'uploading', error:'' });
+    let lastErr = null;
+    for(let attempt=0; attempt<3; attempt++){
+      try{
+        const saved = await sgrQuoteAttachmentsApi.upload(qk, item.file, item.mime);
+        patch(qk, itemKey, { status:'uploaded', error:'', id:saved.id, name:saved.filename, size:saved.size, mime:saved.mimeType });
+        return;
+      }catch(e){
+        lastErr = e;
+        // A quotation saved a moment ago may not be readable by the server for
+        // a second or two (legacy JSON mode). Only that case is retried here.
+        if(e && e.status===404 && attempt<2){ await new Promise(r=>setTimeout(r, 1500)); continue; }
+        break;
+      }
+    }
+    patch(qk, itemKey, { status:'failed', error:(lastErr && lastErr.message) || 'The upload failed.' });
+  }
+  return {
+    list,
+    // files: [{ file, mime }] already checked with sgrCheckAttachmentFile.
+    enqueue(quoteId, files){
+      const qk = keyOf(quoteId);
+      const added = (files||[]).map(f=>({ key:'u'+(++seq)+'-'+Date.now(), file:f.file, name:f.file.name, size:f.file.size, mime:f.mime, status:'queued', error:'', id:null }));
+      if(!added.length) return;
+      byQuote.set(qk, (byQuote.get(qk) || []).concat(added));
+      emit();
+      added.forEach(it=>{ run(qk, it.key); });
+    },
+    retry(quoteId, itemKey){ return run(keyOf(quoteId), itemKey); },
+    forget(quoteId, itemKey){
+      const qk = keyOf(quoteId);
+      byQuote.set(qk, (byQuote.get(qk) || []).filter(it=>it.key!==itemKey));
+      emit();
+    },
+    subscribe(fn){ subscribers.add(fn); return ()=>subscribers.delete(fn); },
+  };
+})();
+
 async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMarkSent, customers, extraAttachments) {
   // 2026-10-15: an emailed Tax Invoice (cover letter, PDF and To: address)
   // uses the same current-Customer rule as Print / Preview. Quote and
@@ -7962,6 +8031,29 @@ async function generateAndEmailDocument(type, data, companies, logoDataUrl, onMa
   if (onMarkSent) onMarkSent();
 }
 
+/* Upload status for files queued from the quote editor (2026-11-17), shown on
+   the quotation view. Names any file that failed and retries it against the
+   same saved quotation. Renders nothing when the queue has nothing for it. */
+function QuoteUploadStatus({ quoteId }) {
+  const [, setTick] = useState(0);
+  useEffect(()=> sgrQuoteUploadQueue.subscribe(()=>setTick(t=>t+1)), []);
+  const items = sgrQuoteUploadQueue.list(quoteId);
+  const busy = items.filter(it=>it.status==='queued'||it.status==='uploading');
+  const failed = items.filter(it=>it.status==='failed');
+  if(!busy.length && !failed.length) return null;
+  return (
+    <div data-sgr="quote-upload-status" className={`rounded-xl border px-3 py-2 text-xs ${failed.length?'bg-red-50 border-red-200 text-red-700':'bg-blue-50 border-blue-100 text-blue-700'}`}>
+      {busy.length>0&&<p>📎 Uploading {busy.length} attached file{busy.length>1?'s':''}…</p>}
+      {failed.map(it=>(
+        <p key={it.key} data-sgr-upload-failed={it.name} className="flex items-center gap-2 flex-wrap">
+          <span>⚠ <strong>{it.name}</strong> did not upload — {it.error}</span>
+          <button type="button" onClick={()=>sgrQuoteUploadQueue.retry(quoteId, it.key)} className="font-bold underline">Retry</button>
+        </p>
+      ))}
+    </div>
+  );
+}
+
 /* ═══════════════════════════════════════════
    EMAIL FLOW MODAL  (single-click .eml)
 ═══════════════════════════════════════════ */
@@ -8031,6 +8123,30 @@ function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSen
   }
   useEffect(()=>{ loadAttachments(); }, []);
 
+  // Files queued from the quote editor (sgrQuoteUploadQueue) appear here with
+  // their live status, ticked, so they go into this email without being picked
+  // again. Once uploaded they are ordinary stored attachments (same id as the
+  // server list, so never shown twice).
+  const [queueTick, setQueueTick] = useState(0);
+  useEffect(()=> isQuote ? sgrQuoteUploadQueue.subscribe(()=>setQueueTick(t=>t+1)) : undefined, []);
+  useEffect(()=>{
+    if(!isQuote) return;
+    const queued = sgrQuoteUploadQueue.list(quoteKey);
+    setAtts(prev=>{
+      let next = prev.slice();
+      for(const it of queued){
+        const rowKey = 'q:'+it.key;
+        const at = next.findIndex(a=>a.key===rowKey);
+        if(it.id!=null && next.some(a=>a.key!==rowKey && a.id===it.id)){ if(at>=0) next.splice(at,1); continue; }
+        const row = { key:rowKey, queueKey:it.key, id:it.id, name:it.name, size:it.size, mime:it.mime,
+          status: it.status==='queued' ? 'uploading' : it.status, error:it.error, file:it.file,
+          include: at>=0 ? next[at].include : true };
+        if(at>=0) next[at] = row; else next.push(row);
+      }
+      return next.filter(a=>!a.queueKey || queued.some(it=>it.key===a.queueKey));
+    });
+  }, [queueTick]);
+
   async function uploadOne(item){
     patchAtt(item.key, { status:'uploading', error:'' });
     try{
@@ -8059,6 +8175,9 @@ function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSen
   }
   async function retryAtt(item){
     setGenErr('');
+    // A file queued from the quote editor is retried by the queue, against the
+    // same saved quotation id — never by saving the quotation again.
+    if(item.queueKey && item.status==='failed'){ sgrQuoteUploadQueue.retry(quoteKey, item.queueKey); return; }
     if(item.status==='failed' && item.file) return uploadOne(item);
     if(item.status==='unavailable' && item.id!=null){
       patchAtt(item.key, { status:'uploading', error:'' });
@@ -8075,6 +8194,7 @@ function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSen
       try{ await sgrQuoteAttachmentsApi.remove(item.id); }
       catch(e){ patchAtt(item.key, { status:before, error:'Not removed — '+((e && e.message) || 'please try again.') }); return; }
     }
+    if(item.queueKey) sgrQuoteUploadQueue.forget(quoteKey, item.queueKey);
     setAtts(prev=>prev.filter(a=>a.key!==item.key));
   }
   async function openAtt(item, download){
@@ -9634,45 +9754,35 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   // the one shared resolver the documents/PDFs use. Display only.
   const _formDep = quoteDepositInfo({depositPct: depositPctValue}, total);
 
-  /* ── QUOTE ATTACHMENTS (2026-08-24) — TEMPORARILY READ-ONLY ────────────────
-     Quote attachments are whole files held as base64 data URLs
-     (reader.readAsDataURL below). rel_quotes has no column for them and the
-     relational quote services neither accept nor return them, so while
-     "quotes" is relational-authoritative an attachment change is silently
-     lossy in BOTH directions: a newly attached file is dropped on save, and —
-     because a backfilled quote's attachments hydrate from legacy_data — a file
-     the user removed comes back on the next authoritative read.
-
-     Persisting them properly means a real document-storage design (a blob
-     column or a file service), which is a much larger piece of work than the
-     Quote reliability repair this change is part of. Until that exists, the
-     honest behaviour is to REFUSE the mutation and say so, rather than accept
-     it and quietly not save it. Existing attachments stay fully viewable and
-     downloadable; only add/remove is blocked, and only while quotes are
-     relational-authoritative — the legacy JSON path is unchanged. */
-  const quoteAttachmentsReadOnly = isRelationalAuthoritative('quotes');
-  const QUOTE_ATTACHMENTS_BLOCKED_REASON =
-    'Quote attachments cannot be added or removed at the moment. Quotes are now stored in the accounting database, which does not yet hold attachment files, so a change here would not actually be saved. Existing attachments below still open and download normally. Everything else on this quote saves as usual.';
-  function handleAttach(e) {
-    if(quoteAttachmentsReadOnly){
-      e.target.value='';
-      window.alert(QUOTE_ATTACHMENTS_BLOCKED_REASON);
-      return;
+  /* ── QUOTE ATTACHMENTS (2026-11-17) ───────────────────────────────────────
+     JPEG, PNG and PDF files (5 MB each) can be chosen while drafting, before
+     the quotation has ever been saved. They stay here, in this form, until
+     the save below has succeeded and the quotation has its canonical saved
+     id; only then are they handed to sgrQuoteUploadQueue, which uploads them
+     to private storage against that id. If the save fails the form stays open
+     with the files still listed. Upload progress, failures and retries are
+     shown in Email to Customer, where these files arrive already ticked.
+     The older "Designs & Mockups" files (base64 inside the quote record) are
+     no longer edited here; `attachments` above is carried through every save
+     unchanged, and Quote view still lists and opens them. */
+  const [pendingFiles, setPendingFiles] = useState([]); // [{ key, file, mime, error }]
+  const pendingSeq = useRef(0);
+  async function handlePickAttachments(e){
+    const files = Array.from(e.target.files||[]);
+    e.target.value = '';
+    for(const file of files){
+      const check = await sgrCheckAttachmentFile(file);
+      setPendingFiles(prev=>prev.concat([{ key:'p'+(++pendingSeq.current), file, mime: check.ok ? check.mime : '', error: check.ok ? '' : check.error }]));
     }
-    const files = Array.from(e.target.files);
-    files.forEach(file=>{
-      const reader = new FileReader();
-      reader.onload = ev => {
-        setAttachments(prev=>[...prev,{id:Date.now()+Math.random(),name:file.name,type:file.type,data:ev.target.result,size:file.size}]);
-      };
-      reader.readAsDataURL(file);
-    });
-    e.target.value='';
   }
-  function removeAttachment(id){
-    if(quoteAttachmentsReadOnly){ window.alert(QUOTE_ATTACHMENTS_BLOCKED_REASON); return; }
-    setAttachments(prev=>prev.filter(a=>a.id!==id));
+  function removePendingFile(key){ setPendingFiles(prev=>prev.filter(p=>p.key!==key)); }
+  function previewPendingFile(p){
+    const url = URL.createObjectURL(p.file);
+    const w = window.open(url, '_blank');
+    if(!w) alert('Pop-up blocked! Please allow pop-ups for this page to preview the file.');
+    setTimeout(()=>URL.revokeObjectURL(url), 120000);
   }
+  const pendingValid = pendingFiles.filter(p=>!p.error);
 
   async function submit(e){
     e.preventDefault();
@@ -9877,6 +9987,11 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       return; // nothing local changed — form stays open, draft preserved
     }
     setSaving(false);
+    // The quotation now exists with its canonical saved id (payload.id: the
+    // relational id the create call returned, the confirmed JSON id, or the
+    // edited quote's own id). Only now are the chosen files uploaded, against
+    // that id. A failure is shown, and retried, in Email to Customer.
+    if(pendingValid.length) sgrQuoteUploadQueue.enqueue(payload.id, pendingValid.map(p=>({ file:p.file, mime:p.mime })));
     // ── Sync VAT number back to the matching saved customer (2026-08-07) ──
     // If this quote's client already exists under Customers and the VAT
     // number entered here is new or different from what's on file, update
@@ -10371,43 +10486,33 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
             className={iCls+' resize-none'} placeholder="Exclusions, special conditions, lead time estimates..."/>
         </div>
 
-        {/* ── Attachments: Designs & Mockups ── */}
-        <div>
+        {/* ── Attachments (2026-11-17) — uploaded once the quotation is saved ── */}
+        <div data-sgr="quote-editor-attachments">
           <div className="flex items-center justify-between mb-2">
-            <p className="text-xs font-black text-gray-400 uppercase tracking-widest">Designs & Mockups</p>
-            {quoteAttachmentsReadOnly ? (
-              <span className="flex items-center gap-1 text-xs font-bold text-gray-400 px-3 py-1.5 border border-gray-200 rounded-lg bg-gray-50">
-                📎 Attach PDF / Image <PaymentLockedBadge reason={QUOTE_ATTACHMENTS_BLOCKED_REASON}/>
-              </span>
-            ) : (
-              <label className="cursor-pointer text-xs font-bold text-indigo-600 hover:text-indigo-800 px-3 py-1.5 border border-indigo-200 rounded-lg bg-indigo-50 hover:bg-indigo-100 transition-colors">
-                📎 Attach PDF / Image
-                <input type="file" accept=".pdf,image/*" multiple className="hidden" onChange={handleAttach}/>
-              </label>
-            )}
+            <p className="text-xs font-black text-gray-400 uppercase tracking-widest">📎 Attachments</p>
+            <label className="cursor-pointer text-xs font-bold text-indigo-600 hover:text-indigo-800 px-3 py-1.5 border border-indigo-200 rounded-lg bg-indigo-50 hover:bg-indigo-100 transition-colors">
+              ＋ Attach files
+              <input data-sgr="quote-editor-attach-input" type="file" multiple accept=".jpg,.jpeg,.png,.pdf,image/jpeg,image/png,application/pdf" className="hidden" onChange={handlePickAttachments}/>
+            </label>
           </div>
-          {quoteAttachmentsReadOnly && (
-            <div className="bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 mb-2 text-xs text-amber-800">
-              📎 <strong>Attachments are read-only for now.</strong> {QUOTE_ATTACHMENTS_BLOCKED_REASON}
-            </div>
-          )}
-          {attachments.length===0 ? (
-            <div className="border-2 border-dashed border-gray-200 rounded-xl p-4 text-center">
-              <p className="text-xs text-gray-400">No attachments yet — attach design files, mockups, or client briefs.</p>
+          <p className="text-[11px] text-gray-400 mb-2">JPEG (.jpg, .jpeg), PNG or PDF — up to 5 MB each. Files are uploaded when you save, and are ready to include under Email to Customer.</p>
+          {pendingFiles.length===0 ? (
+            <div className="border-2 border-dashed border-gray-200 rounded-xl p-3 text-center">
+              <p className="text-xs text-gray-400">No files chosen.</p>
             </div>
           ) : (
-            <div className="space-y-2">
-              {attachments.map(a=>(
-                <div key={a.id} className="flex items-center gap-3 bg-gray-50 border border-gray-200 rounded-xl px-3 py-2">
-                  <span className="text-lg">{a.type&&a.type.includes('pdf')?'📄':'🖼️'}</span>
+            <div className="space-y-1.5">
+              {pendingFiles.map(p=>(
+                <div key={p.key} data-sgr-pending={p.file.name} className={`flex items-center gap-2 rounded-lg border px-2.5 py-2 ${p.error?'border-red-200 bg-red-50':'border-gray-200 bg-gray-50'}`}>
+                  <span className="text-base">{p.mime==='application/pdf'?'📄':'🖼️'}</span>
                   <div className="flex-1 min-w-0">
-                    <p className="text-xs font-semibold text-gray-700 truncate">{a.name}</p>
-                    <p className="text-xs text-gray-400">{(a.size/1024).toFixed(0)} KB</p>
+                    <p className="text-xs font-semibold text-gray-700 truncate" title={p.file.name}>{p.file.name}</p>
+                    <p className="text-[11px] text-gray-400">{sgrFmtBytes(p.file.size)} · {p.error
+                      ? <span className="font-semibold text-red-600">Not attached — {p.error}</span>
+                      : <span className="font-semibold text-gray-500">Uploads on save</span>}</p>
                   </div>
-                  <a href={a.data} download={a.name} className="text-xs font-bold text-blue-600 hover:underline px-2 py-1 rounded-lg hover:bg-blue-50">Download</a>
-                  {quoteAttachmentsReadOnly
-                    ? <PaymentLockedBadge reason={QUOTE_ATTACHMENTS_BLOCKED_REASON}/>
-                    : <button type="button" onClick={()=>removeAttachment(a.id)} className="text-gray-300 hover:text-red-400 text-sm">✕</button>}
+                  {!p.error&&<button type="button" onClick={()=>previewPendingFile(p)} className="text-[11px] font-bold text-blue-600 hover:underline">Preview</button>}
+                  <button type="button" data-sgr-pending-remove onClick={()=>removePendingFile(p.key)} title="Remove this file" className="text-gray-400 hover:text-red-500 text-sm">✕</button>
                 </div>
               ))}
             </div>
@@ -11239,6 +11344,8 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
             </div>
           </div>
         )}
+
+        <QuoteUploadStatus quoteId={quote.id}/>
 
         {/* Action buttons */}
         <div className="flex flex-wrap gap-3 pt-1">
