@@ -38,6 +38,7 @@
 import { Router, Response } from 'express';
 import { authenticate, AuthRequest } from '../middleware/auth';
 import { isSectionCutOver, CutoverSection } from './cutover';
+import pool from '../db/pool';
 import {
   ConcurrencyConflictError, BusinessRuleError, LegacyInvoiceConflictError,
   createCustomer, updateCustomer,
@@ -48,7 +49,7 @@ import {
   createPurchaseOrder, updatePurchaseOrder,
   createSupplier, updateSupplier, deleteSupplier,
   createInventoryItem, updateInventoryItem, adjustInventoryStock, deleteInventoryItem,
-  createManualInvoice, updateInvoice, deleteInvoice,
+  createManualInvoice, updateInvoice, cancelInvoice,
 } from './services';
 
 const router = Router();
@@ -526,41 +527,79 @@ router.put('/invoices/:id', async (req: AuthRequest, res: Response): Promise<voi
   } catch (err) { handleServiceError(err, res); }
 });
 
-// Gated on BOTH sections, exactly like POST /jobs/:id/create-invoice above —
-// the operation this one reverses. Deleting an invoice now also reverses the
-// invoice linkage the create stamped onto rel_jobs (see services.ts
-// deleteInvoice), so it is a two-section write. With "jobs" still on JSON
-// authority that write would land in a table nothing reads, leaving the
-// reported leftover unfixed while silently diverging rel_jobs from the JSON
-// the reconciliation gate compares against before cutover. Refusing with the
-// standard not_cut_over conflict is the honest answer; the frontend surfaces
-// it through the existing catch as "The invoice was NOT deleted."
-router.delete('/invoices/:id', async (req: AuthRequest, res: Response): Promise<void> => {
+// ── CANCEL INVOICE (2026-11-19) ─────────────────────────────────────────────
+// An invoice is never deleted any more. Both routes below run the SAME
+// server-side operation (services.ts cancelInvoice): the invoice row, its
+// number and its original lines are kept, status becomes 'void', who/when/why
+// is recorded, and the job's invoice linkage is released so a replacement can
+// be raised — all in one transaction.
+//
+//   POST   /invoices/:id/cancel   the route the dashboard uses.
+//   DELETE /invoices/:id          kept ONLY so a browser tab still running an
+//                                 older index.html cannot hard-delete: it now
+//                                 cancels too, and answers `deleted: false`.
+//
+// Gated on BOTH sections, exactly like POST /jobs/:id/create-invoice — the
+// operation this one reverses on the job side. With "jobs" still on JSON
+// authority the linkage write would land in a table nothing reads.
+//
+// ADMIN ONLY, from the signed session — the record says "Cancelled by Admin",
+// so the server has to know that it was. A Holdings admin can only cancel a
+// Holdings invoice. Safe to repeat: a second request finds the invoice already
+// cancelled, writes nothing and returns the same record.
+async function handleCancelInvoice(req: AuthRequest, res: Response, legacyDeleteRoute: boolean): Promise<void> {
   if (!(await requireCutOver('jobs', res)) || !(await requireCutOver('accInvoices', res))) return;
+  const actor = req.user;
+  if (!actor || actor.role !== 'admin') {
+    res.status(403).json({ conflict: false, type: 'forbidden', error: 'Only an admin can cancel an invoice. The invoice was not changed.' });
+    return;
+  }
   try {
     const id = Number(req.params.id);
-    const expectedVersion = Number(req.body?.expectedVersion);
-    if (!Number.isFinite(id) || !Number.isFinite(expectedVersion)) {
-      res.status(400).json({ error: '"id" (path) and "expectedVersion" (body) must be numbers' }); return;
+    const rawVersion = req.body?.expectedVersion;
+    const expectedVersion = (rawVersion === undefined || rawVersion === null || rawVersion === '') ? null : Number(rawVersion);
+    if (!Number.isFinite(id) || (expectedVersion !== null && !Number.isFinite(expectedVersion))) {
+      res.status(400).json({ error: '"id" (path) must be a number and "expectedVersion" (body), when sent, must be a number' }); return;
     }
-    const result = await deleteInvoice(id, expectedVersion);
-    // `clearedJobs` reports the jobs whose own invoice linkage this delete
-    // reversed (see services.ts deleteInvoice) — id + rowVersion so the client
-    // can drop the job-derived invoice row it synthesises from job.invoiceNum
-    // immediately, and keep its optimistic-concurrency baseline for that job
-    // honest, instead of waiting on the coalesced authoritative re-read.
-    // `ambiguousJobs` names the jobs a historical numbering collision left
-    // sharing this invoice number when the invoice carried no job_id to
-    // disambiguate them. Nothing was cleared for them on purpose — that is a
-    // human decision (see LegacyInvoiceConflictError) — so the client must
-    // say so rather than let the leftover look like a bug.
+    // A reason is REQUIRED on the real route. The legacy DELETE route cannot
+    // carry one (an older page sends only expectedVersion), so the service
+    // records its default wording there.
+    const reasonText = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+    if (!legacyDeleteRoute && !reasonText) {
+      res.status(400).json({ error: 'A cancellation reason is required. The invoice was not changed.' }); return;
+    }
+    // COMPANY ISOLATION: a company-bound admin never reaches another company's invoice.
+    if (actor.co !== undefined && actor.co !== null) {
+      const co = await pool.query('SELECT company_code FROM rel_invoices WHERE id = $1', [id]);
+      if ((co.rowCount ?? 0) > 0 && String(co.rows[0].company_code) !== String(actor.co)) {
+        res.status(403).json({ conflict: false, type: 'forbidden', error: 'This invoice belongs to another company. The invoice was not changed.' });
+        return;
+      }
+    }
+    const result = await cancelInvoice(id, expectedVersion, {
+      reason: reasonText || null,
+      replacedBy: typeof req.body?.replacedBy === 'string' ? req.body.replacedBy : null,
+      actor: { id: actor.id, email: actor.email, role: actor.role },
+      via: legacyDeleteRoute ? 'api:DELETE /invoices/:id (cancelled, not deleted)' : 'api:POST /invoices/:id/cancel',
+    });
+    if (!result.alreadyCancelled) {
+      console.log(`[cancel-invoice] ${result.invoiceNumber} (id ${result.invoiceId}) cancelled by ${actor.email || actor.id}; jobs released: ${result.clearedJobs.map((j) => j.jobNumber).join(', ') || '-'}`);
+    }
+    // `clearedJobs` / `ambiguousJobs` keep the meaning they had on the delete
+    // route (see services.ts): jobs whose own invoice linkage was released, and
+    // jobs left untouched because a historical numbering collision makes the
+    // owner a human decision. `creditReleased` is always 0 — cancelling never
+    // removes a payment, so no credit is ever released by it.
     res.json({
-      success: true, deleted: result.deleted,
-      clearedJobs: result.clearedJobs, ambiguousJobs: result.ambiguousJobs,
-      creditReleased: result.creditReleased,
+      success: true, cancelled: true, deleted: false, alreadyCancelled: result.alreadyCancelled,
+      invoiceId: result.invoiceId, invoiceNumber: result.invoiceNumber, status: result.status,
+      rowVersion: result.rowVersion, marker: result.marker,
+      clearedJobs: result.clearedJobs, ambiguousJobs: result.ambiguousJobs, creditReleased: 0,
     });
   } catch (err) { handleServiceError(err, res); }
-});
+}
+router.post('/invoices/:id/cancel', (req: AuthRequest, res: Response): Promise<void> => handleCancelInvoice(req, res, false));
+router.delete('/invoices/:id', (req: AuthRequest, res: Response): Promise<void> => handleCancelInvoice(req, res, true));
 
 // ── PAYMENTS ────────────────────────────────────────────────────────────────
 // owner.type in {job, invoice, quote} — gated on that OWNER's section being

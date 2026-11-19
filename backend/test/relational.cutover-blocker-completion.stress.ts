@@ -101,16 +101,21 @@ function checkFrontendWiring(src: string) {
   // follows it there and is STRENGTHENED — it now also pins that BOTH pages
   // delegate to that single implementation, which the page-local form could
   // not express at all.
-  ok(/async function deleteCanonicalInvoice\(id, ctx\)\{[\s\S]{0,2500}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,300}relationalApi\.deleteInvoice\(inv\._relId, inv\._relRowVersion\)/.test(src),
-    'AccountingPage.deleteInvoice() checks isRelationalAuthoritative(\'accInvoices\') and calls relationalApi.deleteInvoice(inv._relId, inv._relRowVersion)');
-  ok(src.includes('return deleteCanonicalInvoice(id, { accInvoices, setAccInvoices, setJobs });'),
-    'AccountingPage delegates its delete to that ONE shared implementation');
-  ok(src.includes('deleteCanonicalInvoice(manualRec.id, { accInvoices: myAccInvoices, setAccInvoices, setJobs })'),
+  // 2026-11-19 (cancel, never delete): the shared action is now
+  // cancelCanonicalInvoice and it calls relationalApi.cancelInvoice — the
+  // invoice is retained as void instead of being removed. The same five facts
+  // are pinned against the new shape; the DB behaviour is pinned by
+  // relational.invoice-cancel.stress.ts and invoice-cancel-frontend.test.js.
+  ok(/async function cancelCanonicalInvoice\(id, ctx\)\{[\s\S]{0,4000}isRelationalAuthoritative\('accInvoices'\)[\s\S]{0,4000}relationalApi\.cancelInvoice\(inv\._relId, inv\._relRowVersion, reason\)/.test(src),
+    'the shared cancel action checks isRelationalAuthoritative(\'accInvoices\') and calls relationalApi.cancelInvoice(inv._relId, inv._relRowVersion, reason)');
+  ok(src.includes('return cancelCanonicalInvoice(id, { accInvoices, setAccInvoices, setJobs, user });'),
+    'AccountingPage delegates its cancel to that ONE shared implementation');
+  ok(src.includes('cancelCanonicalInvoice(manualRec.id, { accInvoices: myAccInvoices, setAccInvoices, setJobs, user })'),
     'Sales -> Invoices delegates to the SAME implementation, against its company-filtered list');
-  ok(/relationalApi\.deleteInvoice\(inv\._relId, inv\._relRowVersion\)[\s\S]{0,2500}delResult\.clearedJobs[\s\S]{0,1500}syncRelationalBaseline\('jobs',/.test(src),
-    'AccountingPage.deleteInvoice() also reverses the JOB-side half locally (clearedJobs -> setJobs + jobs baseline), so the job-derived invoice twin cannot survive the delete');
-  ok(/delResult\.ambiguousJobs/.test(src),
-    'AccountingPage.deleteInvoice() surfaces a quarantined invoice-number collision instead of leaving it looking like a failed delete');
+  ok(/relationalApi\.cancelInvoice\(inv\._relId, inv\._relRowVersion, reason\)[\s\S]{0,2500}result\.clearedJobs[\s\S]{0,1500}syncRelationalBaseline\('jobs',/.test(src),
+    'the cancel also releases the JOB-side half locally (clearedJobs -> setJobs + jobs baseline), so the job can be invoiced again');
+  ok(/result\.ambiguousJobs/.test(src) && !/relationalApi\.deleteInvoice/.test(src),
+    'a quarantined invoice-number collision is surfaced, and no relational delete call remains in the page');
 
   console.log('\n  -- Accounting-view payments (PaymentHistoryModal) --');
   // 2026-09-07: addPayment is now wrapped in guardAction (synchronous

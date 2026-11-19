@@ -3,6 +3,17 @@
  * Created 2026-11-10. MANUAL ONLY — never run by Render (not referenced by
  * `npm start`, `npm run migrate` or `npm run build`).
  *
+ * ── STATUS (reviewed 2026-11-19) — HISTORICAL RECOVERY ONLY ─────────────────
+ * The platform no longer deletes invoices: "Cancel invoice" (services.ts
+ * cancelInvoice) keeps the row and marks it void, so nothing new can reach the
+ * state this script repairs. It is retained because it does something the
+ * cancel workflow deliberately does not: re-issue, as an ACTIVE invoice, a
+ * number that was hard-deleted BEFORE 2026-11-19 and never re-invoiced. It
+ * cannot re-activate a cancelled invoice — it refuses whenever the number is
+ * held by any row, active or void. For SNS-00236 it is superseded (the job was
+ * re-invoiced; INV-00219 and INV-00223 are recorded as cancelled instead, via
+ * record-cancelled-invoice.ts).
+ *
  * ── THE CASE ────────────────────────────────────────────────────────────────
  * Quote SQ-00304 became Job SNS-00236, which was invoiced as INV-00219. The
  * invoice was then deleted (services.ts deleteInvoice — a HARD delete: the

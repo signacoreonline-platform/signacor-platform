@@ -4,3 +4,5 @@ dist/
 *.log
 # local file storage used in development only (FILE_STORAGE_PROVIDER=local)
 /storage/
+# reports written by src/scripts/record-cancelled-invoice.ts (live database output; kept locally, never committed)
+/record-cancelled-*-report.txt

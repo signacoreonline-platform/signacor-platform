@@ -1,0 +1,3 @@
+# Output of `npm run diagnose:dashboard-metrics` redirected to a file: live figures.
+# Kept locally only. This folder is the published static site, so it must not be committed.
+/dashboard-metrics.txt

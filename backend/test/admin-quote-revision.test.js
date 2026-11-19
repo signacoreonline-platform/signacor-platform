@@ -94,7 +94,14 @@ ok(/const APPLY = argv\.includes\('--apply'\)/.test(rc) && /confirm !== required
 ok(rc.indexOf('INSERT INTO platform_state_backups') > 0 && rc.indexOf('INSERT INTO platform_state_backups') < rc.indexOf('INSERT INTO rel_invoices'), 'backs up before inserting');
 ok(!/UPDATE rel_|DELETE FROM|TRUNCATE|DROP /i.test(rc), 'never updates or deletes anything');
 ok(!/INSERT INTO rel_payments/.test(rc) && !/reserveDocumentNumber/.test(rc), 'no payment, no new document number');
-ok(/'void', \$10::date/.test(rc) && /\$7, NULL, \$8, NULL, \$9/.test(rc), "inserts status 'void' with job_id/quote_id NULL");
+ok(/\$7, NULL, \$8, NULL, \$9, 'void', \$10::date/.test(rc), "inserts status 'void' with job_id/quote_id NULL");
+// 2026-11-19: the script is now only for invoices hard-deleted BEFORE cancellation kept them.
+ok(/BEGIN TRANSACTION READ ONLY/.test(rc) && /const DIAGNOSE = argv\.includes\('--diagnose'\)/.test(rc), 'diagnostic and dry run execute inside a READ ONLY transaction');
+ok(/buildInvoiceCancellationMarker\(/.test(rc), 'writes the same cancellation record as the live Cancel invoice action');
+// 2026-11-19 (connection timeout fix): one dedicated connection with its own limit, never the shared 2 s pool.
+ok(!/from '\.\.\/db\/pool'/.test(rc) && !/pool\.connect\(/.test(rc) && /new Client\(\{/.test(rc) && /connectWithRetry\(connectTimeoutMs, 3\)/.test(rc) && (rc.match(/connectWithRetry\(/g) || []).length === 2, 'opens exactly one dedicated connection (30 s limit, 3 attempts) instead of the shared pool');
+ok(/await client\.end\(\)\.catch/.test(rc) && /if \(client\) await client\.end\(\)/.test(rc), 'a failed attempt and the finished run both close their connection');
+ok(/originalDetailRetained: !!chosen/.test(rc) && /NO EVIDENCE FOUND — FALLBACK/.test(rc), 'original detail is taken from evidence only; a fallback is disclosed and flagged on the record');
 
 console.log('\n============================================================');
 console.log(`PASSED: ${pass}   FAILED: ${fail}`);

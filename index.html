@@ -1009,7 +1009,9 @@ const relationalApi = {
   // editing/deleting any accInvoices row regardless of how it was created.
   createInvoice(data) { return relationalFetch('/invoices', { method: 'POST', body: JSON.stringify(data) }); },
   updateInvoice(id, expectedVersion, patch) { return relationalFetch('/invoices/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
-  deleteInvoice(id, expectedVersion) { return relationalFetch('/invoices/' + id, { method: 'DELETE', body: JSON.stringify({ expectedVersion: expectedVersion }) }); },
+  // 2026-11-19: an invoice is never deleted — it is CANCELLED and kept on
+  // record (services.ts cancelInvoice). There is deliberately no delete adapter.
+  cancelInvoice(id, expectedVersion, reason) { return relationalFetch('/invoices/' + id + '/cancel', { method: 'POST', body: JSON.stringify({ expectedVersion: expectedVersion, reason: reason }) }); },
   recordPayment(ownerType, ownerId, amount, extra) { return relationalFetch('/payments', { method: 'POST', body: JSON.stringify(Object.assign({ ownerType: ownerType, ownerId: ownerId, amount: amount }, extra || {})) }); },
   // ownerSection ('jobs'/'accInvoices'/'quotes') is required by the server —
   // a payment has no independent JSON section of its own (read.ts's
@@ -4655,7 +4657,7 @@ function paymentDeleteBlockReason(payment, user, fallbackSection) {
 // both the row badge and every locked action, so the explanation can never
 // differ between the two places a person meets it.
 const INVOICE_NO_ACCOUNTING_RECORD_REASON =
-  'This is a historical job invoice. It was raised on the job itself, before invoices were kept as separate accounting records, so there is no accounting record for Accounting to edit, mark paid or delete. It is a real invoice: view and print it here, and record or review its payments against the job. To change its details, open the job in Jobs or Sales.';
+  'This is a historical job invoice. It was raised on the job itself, before invoices were kept as separate accounting records, so there is no accounting record for Accounting to edit, mark paid or cancel. It is a real invoice: view and print it here, and record or review its payments against the job. To change its details, open the job in Jobs or Sales.';
 
 // Hoisted to module scope 2026-08-24: the shared ViewInvoiceModal needs it,
 // and a second copy would let the two screens colour the same status
@@ -4668,6 +4670,33 @@ const STATUS_COLORS = { draft:'#6b7280', sent:'#2563eb', paid:'#059669', partial
 // the record's legacy_data (spread onto the hydrated record by read.ts).
 function invoiceCancelledLabel(inv){
   return (inv && inv.cancelledByAdmin) ? 'Cancelled by Admin' : 'Cancelled';
+}
+// 2026-11-19 — WHICH INVOICE REPLACED A CANCELLED ONE.
+// The recorded `replacedBy` always wins: the server stamps it in the same
+// transaction that raises the replacement, and a link once recorded is never
+// re-derived (that is what keeps INV-A -> INV-B -> INV-C a chain rather than
+// everything pointing at the newest invoice). Only where nothing is recorded
+// yet — a legacy JSON record, or the moment before the next re-read — is it
+// derived, and then only from an unambiguous match: exactly ONE active invoice
+// of the SAME company for the same job (or, failing a job, the same quote).
+function invoiceReplacementNumber(inv, accInvoices){
+  if(!inv || inv.status!=='void') return '';
+  if(inv.replacedBy) return String(inv.replacedBy);
+  if(!inv.cancelledByAdmin) return '';
+  const norm = v => (v==null ? '' : String(v).trim().toUpperCase());
+  const jobNum = norm(inv.originalJobNum), quoteNum = norm(inv.originalQuoteNum);
+  if(!jobNum && !quoteNum) return '';
+  const live = (accInvoices||[]).filter(i => i && i.status!=='void' && i.id!==inv.id && sameCompany(i, inv));
+  let hits = jobNum ? live.filter(i => norm(i.jobNum)===jobNum || norm(i.reference)===jobNum) : [];
+  if(!hits.length && quoteNum) hits = live.filter(i => norm(i.quoteNum)===quoteNum);
+  return hits.length===1 ? String(hits[0].number||'') : '';
+}
+// The payments that belong to THE INVOICE ITSELF (not its job's or quote's,
+// which the relational read merges into the same array for display).
+function invoiceOwnMoneyPayments(inv, relational){
+  return ((inv && inv.payments) || []).filter(p => p
+    && (!relational || !p._relOwnerType || p._relOwnerType==='invoice')
+    && sgrToCents(p.amount)!==0);
 }
 
 /* ═══════════════════════════════════════════
@@ -4722,6 +4751,18 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
         </div>
         <div className="p-5 space-y-4">
           {isJob&&<div className="bg-purple-50 border border-purple-200 rounded-xl px-4 py-2 text-xs text-purple-700 font-semibold">📋 This invoice is linked to Job {inv.jobNum} — edit it in the Jobs section.</div>}
+          {inv.status==='void'&&(
+            <div className="bg-gray-100 border border-gray-300 rounded-xl px-4 py-3 text-xs text-gray-700 space-y-1" data-testid="invoice-cancelled-banner">
+              <p className="font-black text-sm text-gray-800">🚫 {invoiceCancelledLabel(inv).toUpperCase()} — kept for the record only. No amount is due on this invoice.</p>
+              {invoiceReplacementNumber(inv,accInvoices)&&<p>Replaced by <span className="font-mono font-bold">{invoiceReplacementNumber(inv,accInvoices)}</span>.</p>}
+              {(inv.cancelledAt||inv.cancelledBy)&&<p>Cancelled{inv.cancelledAt?(' on '+fmtDate(String(inv.cancelledAt).slice(0,10))):''}{inv.cancelledBy?(' by '+inv.cancelledBy):''}.</p>}
+              {inv.cancelledReason&&<p>Reason: {inv.cancelledReason}</p>}
+              {(inv.originalJobNum||inv.originalQuoteNum)&&<p>Originally raised for {inv.originalJobNum?('Job '+inv.originalJobNum):''}{inv.originalJobNum&&inv.originalQuoteNum?' / ':''}{inv.originalQuoteNum?('Quote '+inv.originalQuoteNum):''}.</p>}
+              {inv.originalDetailRetained
+                ? <p className="text-gray-500">The lines and amounts below are the invoice exactly as it was issued. They are not counted in any total, balance, statement or report.</p>
+                : (inv.note?<p className="text-gray-500">{inv.note}</p>:null)}
+            </div>
+          )}
           <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
           <div className="grid grid-cols-2 gap-3 text-sm">
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">CONTACT</span><span className="font-semibold">{inv.contactName||'—'}</span></div>
@@ -4729,7 +4770,7 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">INVOICE DATE</span><span>{fmtDate(inv.date)}</span></div>
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">DUE DATE</span><span>{fmtDate(inv.dueDate)}</span></div>
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">REFERENCE</span><span>{inv.reference||'—'}</span></div>
-            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">STATUS</span><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status==='void'?invoiceCancelledLabel(inv):inv.status}</span>{inv.status==='void'&&inv.replacedBy&&<span className="block text-xs text-gray-500 mt-1">Replaced by {inv.replacedBy}</span>}</div>
+            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">STATUS</span><span className="px-2 py-0.5 rounded-full text-white text-xs font-bold" style={{background:STATUS_COLORS[inv.status]||'#6b7280'}}>{inv.status==='void'?invoiceCancelledLabel(inv):inv.status}</span>{inv.status==='void'&&invoiceReplacementNumber(inv,accInvoices)&&<span className="block text-xs text-gray-500 mt-1">Replaced by {invoiceReplacementNumber(inv,accInvoices)}</span>}</div>
             {/* 2026-09-07: derived through invoiceDiscountView so an invoice
                 whose discount lives in its LINES (every invoice raised from a
                 quote or job) shows it here too, not only the legacy records
@@ -4769,7 +4810,8 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
             <div className="bg-gray-50 border-t border-gray-200 px-4 py-2 flex justify-end gap-6 text-xs">
               <span className="text-gray-500">Excl. VAT: <strong className="text-gray-800">{fmtAmt(sub)}</strong></span>
               <span className="text-gray-500">VAT (15%): <strong className="text-blue-700">{fmtAmt(vat)}</strong></span>
-              <span className="text-gray-600 font-black text-sm">Total (incl. VAT): <span style={{color:'#06065c'}}>{fmtAmt(sub+vat)}</span></span>
+              <span className="text-gray-600 font-black text-sm">Total (incl. VAT): <span style={inv.status==='void'?{color:'#9ca3af',textDecoration:'line-through'}:{color:'#06065c'}}>{fmtAmt(sub+vat)}</span></span>
+              {inv.status==='void'&&<span className="font-black text-sm text-gray-700">Cancelled — nothing due</span>}
             </div>
           </div>
           <div className="flex gap-3 pt-1">
@@ -4780,15 +4822,18 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
                 Accounting's Invoices table and Sales → Invoices, so a
                 manual invoice prints/emails identically everywhere it's
                 opened from. */}
-            {isJob&&_links.job&&(
+            {isJob&&_links.job&&inv.status!=='void'&&(
               <button onClick={()=>printInvoice(_links.job,companies,logoDataUrl,customers)}
                 className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
             )}
-            {!isJob&&(
+            {/* 2026-11-19: a cancelled invoice is viewable, never re-issued —
+                printing or emailing it would put a dead tax invoice back in
+                circulation looking live. */}
+            {!isJob&&inv.status!=='void'&&(
               <button onClick={()=>printManualInvoice(inv,companies,logoDataUrl,{quotes,jobs,accInvoices,customers})}
                 className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
             )}
-            {!isJob&&(
+            {!isJob&&inv.status!=='void'&&(
               <button onClick={()=>emailManualInvoiceViaOutlook(inv,companies)}
                 className="px-5 py-2.5 text-white font-bold rounded-xl text-sm" style={{background:'#1e40af'}}>📧 Email Invoice</button>
             )}
@@ -4820,56 +4865,73 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
    on and inventing one would be exactly the fake action this repair exists
    to prevent.
 ═══════════════════════════════════════════ */
-async function deleteCanonicalInvoice(id, ctx){
-  const { accInvoices, setAccInvoices, setJobs } = ctx || {};
-  // Warn clearly if this invoice has payment history attached — deleting
-  // it discards that history too. Delete logic itself is unchanged.
-  const inv = accInvoices.find(i=>i.id===id);
-  const payCount = inv ? (inv.payments||[]).length : 0;
-  // An invoice raised against a job is ALSO represented as invoice linkage
-  // on that job (invoiceNum/invoiceDate/invoiceDue/invoiceCreated/
-  // invoiceStatus) — that is the second representation this delete now
-  // reverses server-side. The person confirming has to be told, because
-  // after this the job goes back to "ready to invoice, not yet invoiced"
-  // and re-invoicing it will mint a NEW number, not this one.
-  const linkedJobNum = inv ? (inv.reference || inv.jobNum || '') : '';
-  const warnParts = [];
-  if(payCount>0){
-    warnParts.push(`This invoice has ${payCount} recorded payment${payCount>1?'s':''} against it. Deleting the invoice will permanently remove that payment history too, and may affect statements and accounting totals.`);
+// 2026-11-19 — CANCEL, NEVER DELETE. This used to be deleteCanonicalInvoice,
+// which removed the record (and, relationally, hard-deleted the row, its lines
+// and its own payments). That is why a cancelled invoice vanished from both
+// lists. An invoice is now only ever CANCELLED:
+//   * the record stays, with its number, customer, dates, lines and amounts;
+//   * status becomes 'void' — already excluded from every money path — and the
+//     record carries who cancelled it, when and why;
+//   * the job's invoice link is released so a replacement can be raised, and
+//     that replacement is shown against the cancelled record;
+//   * Admin only, with a required reason. Safe to repeat.
+// Relational mode runs ONE server transaction (services.ts cancelInvoice) and
+// mirrors its answer locally; legacy JSON mode applies the same retention to
+// the JSON record. There is one implementation, used by Sales and Accounting.
+async function cancelCanonicalInvoice(id, ctx){
+  const { accInvoices, setAccInvoices, setJobs, user } = ctx || {};
+  const inv = (accInvoices||[]).find(i=>i.id===id);
+  if(!inv) return;
+  if(inv.status==='void'){ alert('Invoice '+(inv.number||'')+' is already cancelled. Nothing was changed.'); return; }
+  if(!user || user.role!=='admin'){ alert('Only an admin can cancel an invoice. The invoice was NOT cancelled.'); return; }
+  const relational = isRelationalAuthoritative('accInvoices') && inv._relId!=null;
+  // Money recorded directly ON the invoice stops the cancellation: voiding the
+  // invoice would take received money out of every total. (The server decides
+  // this authoritatively from rel_payments inside its transaction; this is the
+  // same rule, stated early.) Payments held against the job or quote are not
+  // the invoice's and carry to the replacement untouched.
+  const ownMoney = invoiceOwnMoneyPayments(inv, relational);
+  if(ownMoney.length){
+    const ownC = sgrPaidCents(ownMoney);
+    const credits = ownMoney.filter(p=>p.method==='Credit').length;
+    alert('Invoice '+(inv.number||'')+' was NOT cancelled.\n\nIt has '+ownMoney.length+' payment'+(ownMoney.length>1?'s':'')
+      +' totalling '+sgrZarC(ownC)+' recorded directly on it'+(credits?(' ('+credits+' of them applied customer credit)'):'')
+      +'. Cancelling it would take that money out of every total.\n\nOpen the invoice\'s Payments, remove '
+      +(ownMoney.length>1?'those payments':'that payment')+' and record the money against the job instead (or credit the customer), then cancel the invoice.');
+    return;
   }
-  if(linkedJobNum){
-    warnParts.push(`This invoice belongs to Job ${linkedJobNum}. Deleting it also removes the invoice number from that job, which will go back to "ready to invoice but not yet invoiced". Re-invoicing it later will use a NEW invoice number — ${inv&&inv.number?inv.number:'this number'} is not reused. The job itself, its stage and any payments recorded against the JOB are not affected.`);
-  }
-  const warn = warnParts.length
-    ? warnParts.join('\n\n')+'\n\nDelete anyway?'
-    : 'Delete this invoice? This cannot be undone.';
-  if(!window.confirm(warn)) return;
-  if(isRelationalAuthoritative('accInvoices') && inv && inv._relId!=null){
-    let delResult = null;
+  const linkedJobNum = inv.reference || inv.jobNum || '';
+  const reasonRaw = window.prompt(
+    'CANCEL INVOICE '+(inv.number||'')+'\n\n'
+    +'The invoice is NOT deleted. It stays on record, greyed out as "Cancelled by Admin", with its number, lines and amounts, and is no longer counted in any total.'
+    +(linkedJobNum ? '\n\nJob '+linkedJobNum+' goes back to "ready to invoice". Invoicing it again uses a NEW number, which is shown as the replacement.' : '')
+    +'\n\nReason for cancelling (required):', '');
+  if(reasonRaw===null) return;
+  const reason = String(reasonRaw).trim();
+  if(!reason){ alert('A cancellation reason is required. The invoice was NOT cancelled.'); return; }
+
+  if(relational){
+    let result = null;
     try {
-      delResult = await relationalApi.deleteInvoice(inv._relId, inv._relRowVersion);
+      result = await relationalApi.cancelInvoice(inv._relId, inv._relRowVersion, reason);
     } catch(e){
-      alert(describeSaveConflictError(e, 'invoice')+'\n\nThe invoice was NOT deleted.');
+      alert(describeSaveConflictError(e, 'invoice')+'\n\nThe invoice was NOT cancelled.');
       return;
     }
-    const accInvoicesUpdater = prev=>prev.filter(i=>i.id!==id);
+    // Mirror of a server fact: the record is KEPT and re-labelled, never
+    // filtered out. Its payments array drops the job's/quote's rows the read
+    // had merged in — the server has released that link.
+    const marker = (result && result.marker) || {};
+    const accInvoicesUpdater = prev=>(prev||[]).map(i=>i.id===id
+      ? {...i, ...marker, status:'void',
+         payments:(i.payments||[]).filter(p=>p && (!p._relOwnerType || p._relOwnerType==='invoice')),
+         _relRowVersion:(result && result.rowVersion!=null) ? result.rowVersion : i._relRowVersion}
+      : i);
     setAccInvoices(accInvoicesUpdater);
     syncRelationalBaseline('accInvoices', accInvoicesUpdater);
-    // INVOICE-DELETE REPAIR (2026-08-24). An invoice that belongs to a job
-    // is represented twice: as this accInvoices record AND as the invoice
-    // linkage stamped on the job itself (invoiceNum/invoiceDate/invoiceDue/
-    // invoiceCreated/invoiceStatus), out of which Sales, Accounting,
-    // getAllInvoicesUnified, the Payments tab and the dashboard revenue
-    // tile all synthesise a job-derived invoice row. The backend now
-    // reverses BOTH halves in one transaction (services.ts deleteInvoice)
-    // and reports the jobs it cleared; this mirrors that locally — the
-    // exact inverse of what createInvoiceNow already does after
-    // createInvoiceForJob — so the job-side twin goes at the same instant
-    // the record does, instead of surfacing for as long as it takes the
-    // coalesced authoritative re-read to land (or indefinitely, if that
-    // re-read fails). Purely a local mirror of a server fact: it filters
-    // nothing and hides nothing that the server still holds.
-    const clearedJobs = (delResult && delResult.clearedJobs) || [];
+    // The job-side half, exactly as the server reversed it (and exactly as the
+    // old delete mirrored it): the job is "not yet invoiced" again.
+    const clearedJobs = (result && result.clearedJobs) || [];
     if(clearedJobs.length && setJobs){
       const clearedByRelId = {};
       clearedJobs.forEach(c=>{ if(c && c.id!=null) clearedByRelId[c.id] = c; });
@@ -4882,31 +4944,47 @@ async function deleteCanonicalInvoice(id, ctx){
       setJobs(jobsUpdater);
       syncRelationalBaseline('jobs', jobsUpdater);
     }
-    // A historical numbering collision (more than one job carrying this
-    // invoice number, on an invoice with no job link to disambiguate them)
-    // is deliberately NOT auto-resolved server-side — see
-    // LegacyInvoiceConflictError. Say so plainly instead of leaving what
-    // remains looking like this delete having failed.
-    // A Credit payment against this invoice had consumed part of a customer
-    // credit note; deleting it gives that amount back (services.ts's shared
-    // releaseCreditForPaymentTx). Say so — the credit note's Remaining has
-    // just changed and the person needs to know it was not lost.
-    const creditReleased = (delResult && delResult.creditReleased) || 0;
-    if(creditReleased > 0){
-      alert('The invoice was deleted.\n\n'+zar(creditReleased)+' of customer credit that had been applied to it has been released back to the customer\'s credit note(s).');
-    }
-    const ambiguousJobs = (delResult && delResult.ambiguousJobs) || [];
+    const ambiguousJobs = (result && result.ambiguousJobs) || [];
     if(ambiguousJobs.length){
-      alert('The invoice was deleted.\n\nHowever '+ambiguousJobs.length+' jobs ('
+      alert('The invoice was cancelled and kept on record.\n\nHowever '+ambiguousJobs.length+' jobs ('
         +ambiguousJobs.map(a=>a.jobNumber).join(', ')
         +') all carry this same invoice number, which is a historical numbering'
         +' collision. Their invoice numbers were deliberately left untouched —'
-        +' clearing them automatically could remove the wrong job\'s invoice.'
+        +' clearing them automatically could release the wrong job.'
         +' Please review those jobs and decide which is correct.');
     }
     return;
   }
-  setAccInvoices(prev=>prev.filter(i=>i.id!==id));
+
+  // ── LEGACY JSON RECORD — the same retention, on the JSON record ──────────
+  const normNum = v => (v==null ? '' : String(v).trim().toUpperCase());
+  const jobsAreJson = !isRelationalAuthoritative('jobs');
+  const marker = {
+    cancelledByAdmin:true, cancelledAt:new Date().toISOString(),
+    cancelledBy:(user.name||user.email||''), cancelledReason:reason, cancelledVia:'dashboard (JSON record)',
+    statusBeforeCancel:inv.status||null, originalJobNum:linkedJobNum||null, originalQuoteNum:inv.quoteNum||null,
+    originalDetailRetained:true, replacedBy:null,
+  };
+  setAccInvoices(prev=>(prev||[]).map(i=>{
+    if(!i) return i;
+    if(i.id===id) return {...i, ...marker, status:'void'};
+    // CHAIN: an earlier cancelled invoice of the same job that named no
+    // replacement was replaced by THIS one — record that now, before this one
+    // is cancelled too, so INV-A -> INV-B -> INV-C stays a chain.
+    if(i.status==='void' && i.cancelledByAdmin && !i.replacedBy && sameCompany(i, inv)
+       && normNum(i.originalJobNum) && normNum(i.originalJobNum)===normNum(linkedJobNum)){
+      return {...i, replacedBy:inv.number};
+    }
+    return i;
+  }));
+  // The job's own copy of the invoice link is released too — otherwise the
+  // job would re-appear as an active "job invoice" under the cancelled number
+  // and could never be invoiced again. Same company, same number, JSON jobs only.
+  if(setJobs && jobsAreJson && normNum(inv.number)){
+    setJobs(prev=>(prev||[]).map(j=>(j && sameCompany(j, inv) && normNum(j.invoiceNum)===normNum(inv.number))
+      ? {...j, invoiceNum:null, invoiceDate:null, invoiceDue:null, invoiceCreated:false, invoiceStatus:null}
+      : j));
+  }
 }
 
 // 2026-09-07 — "Mark Paid" RECORDS A REAL PAYMENT, so it needs the same two
@@ -12326,7 +12404,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
   // 2026-11-10: cancelled (void) invoices are LISTED, never counted as money.
   const cancelledInvItems = myAccInvoices.filter(i=>i && i.status==='void').map(i=>({
     id:i.id, invoiceNum:i.number, invoiceStatus:'cancelled', _isCancelled:true,
-    _cancelLabel:invoiceCancelledLabel(i), _replacedBy:i.replacedBy||'', _cancelReason:i.cancelledReason||'',
+    _cancelLabel:invoiceCancelledLabel(i), _replacedBy:invoiceReplacementNumber(i, myAccInvoices), _cancelReason:i.cancelledReason||'',
+    // What the invoice was issued for — shown struck through, never counted.
+    _origCents:sgrInvoiceCents(i.lineItems).totalC,
     client:i.contactName||'', value:0, _totalCents:0,
     invoiceDate:i.date||i.issueDate||'', invoiceDue:i.dueDate||'', reference:i.reference,
     payments:[], num:i.jobNum||'', co:i.co??null, _isManual:true, _discountView:{pct:0,amt:0},
@@ -14629,12 +14709,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       </div>
                       <p className="text-sm font-bold text-gray-500 truncate">{j.client}</p>
                       <p className="text-xs text-gray-400 mt-0.5">
-                        {j.num?('Job: '+j.num+' · '):''}Invoice date: {j.invoiceDate||'—'}{j._cancelReason?(' · '+j._cancelReason):''}
+                        {(j.num&&j.num!=='manual')?('Job: '+j.num+' · '):''}Invoice date: {j.invoiceDate||'—'}{j._cancelReason?(' · '+j._cancelReason):''}
                       </p>
                     </div>
                     <div className="text-right flex-shrink-0">
                       <p className="text-base font-black text-gray-400">{zar(0)}</p>
                       <p className="text-xs text-gray-400">nothing due</p>
+                      {j._origCents>0&&<p className="text-xs text-gray-400 line-through" title="The amount this invoice was issued for. Not counted in any total.">{sgrZarC(j._origCents)}</p>}
                     </div>
                     <div className="flex flex-col gap-1">
                       {manualRec&&(
@@ -14744,9 +14825,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                             </button>
                           )}
                           {isAdmin&&(
-                            <button onClick={()=>guardAction('deleteInvoice:'+manualRec.id, ()=>deleteCanonicalInvoice(manualRec.id, { accInvoices: myAccInvoices, setAccInvoices, setJobs }))}
+                            <button onClick={()=>guardAction('cancelInvoice:'+manualRec.id, ()=>cancelCanonicalInvoice(manualRec.id, { accInvoices: myAccInvoices, setAccInvoices, setJobs, user }))}
+                              title="Admin only. The invoice is kept on record, greyed out as Cancelled by Admin — it is not deleted."
                               className="text-xs font-bold px-3 py-1.5 rounded-xl border border-gray-200 text-gray-400 hover:text-red-500 hover:border-red-200">
-                              ✕ Delete
+                              🚫 Cancel invoice
                             </button>
                           )}
                         </>
@@ -25875,7 +25957,7 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
               <div><label className="text-xs font-bold text-gray-500 block mb-1">Reference</label><input value={form.reference} onChange={e=>upd('reference')(e.target.value)} className={iCls} placeholder="PO# or job ref"/></div>
               <div><label className="text-xs font-bold text-gray-500 block mb-1">Status</label>
                 <select value={form.status} onChange={e=>upd('status')(e.target.value)} className={iCls}>
-                  {['draft','sent','paid','overdue','void'].map(s=><option key={s} value={s}>{s.charAt(0).toUpperCase()+s.slice(1)}</option>)}
+                  {['draft','sent','paid','overdue'].map(s=><option key={s} value={s}>{s.charAt(0).toUpperCase()+s.slice(1)}</option>)}
                 </select>
               </div>
               <div className="col-span-2"><label className="text-xs font-bold text-gray-500 block mb-1">Address</label><textarea value={form.contactAddress} onChange={e=>upd('contactAddress')(e.target.value)} rows={2} className={iCls}/></div>
@@ -26756,8 +26838,9 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   // CUTOVER BLOCKER COMPLETION — "invoice deletion" named blocker. Previously
   // unconditionally JSON with no relational gate at all — a confirmed audit
   // gap (create/read relational, delete silently JSON-only). Now routes
-  // through relationalApi.deleteInvoice (services.ts's deleteInvoice) when
-  // "accInvoices" is relational-authoritative.
+  // through the relational API when "accInvoices" is relational-authoritative.
+  // 2026-11-19: the action is now CANCEL (relationalApi.cancelInvoice ->
+  // services.ts cancelInvoice). The invoice is kept on record; nothing deletes.
   // POST-MIGRATION STABILIZATION (2026-08-24) — CONCURRENCY / DUPLICATE
   // SUBMISSION. This action's button had no in-flight protection, so a
   // double-click fired the request twice. Wrapped in the shared keyed
@@ -26765,11 +26848,11 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   // dropped before it leaves the browser, while the server keeps its own
   // transactional/row-version protection as the authoritative backstop.
   // Thin wrappers over the shared, hoisted implementations above — this page
-  // supplies only its own state setters. See deleteCanonicalInvoice /
+  // supplies only its own state setters. See cancelCanonicalInvoice /
   // markCanonicalInvoicePaid for the behaviour, which is byte-for-byte the
   // logic this page has always run.
-  async function deleteInvoice(id){
-    return deleteCanonicalInvoice(id, { accInvoices, setAccInvoices, setJobs });
+  async function cancelInvoice(id){
+    return cancelCanonicalInvoice(id, { accInvoices, setAccInvoices, setJobs, user });
   }
   async function markInvPaid(inv){
     return markCanonicalInvoicePaid(inv, { jobs, setAccInvoices, onJsonFallback: saveInvoice });
@@ -27988,12 +28071,12 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                                </span>)
                             : <span className="bg-blue-100 text-blue-700 rounded-full px-2 py-0.5 font-bold text-xs">Manual</span>}
                         </td>
-                        <td className="px-4 py-2.5 text-xs text-right text-gray-700">{fmtAmt(sub)}</td>
-                        <td className="px-4 py-2.5 text-xs text-right text-blue-600">{fmtAmt(vat)}</td>
-                        <td className="px-4 py-2.5 text-xs text-right font-black text-gray-800">{fmtAmt(sub+vat)}</td>
+                        <td className={`px-4 py-2.5 text-xs text-right text-gray-700 ${inv._isCancelled?'line-through text-gray-400':''}`}>{fmtAmt(sub)}</td>
+                        <td className={`px-4 py-2.5 text-xs text-right text-blue-600 ${inv._isCancelled?'line-through text-gray-400':''}`}>{fmtAmt(vat)}</td>
+                        <td className={`px-4 py-2.5 text-xs text-right font-black text-gray-800 ${inv._isCancelled?'line-through text-gray-400':''}`}>{fmtAmt(sub+vat)}</td>
                         <td className="px-4 py-2.5 text-center">
                           <span className="px-2 py-0.5 rounded-full text-white text-xs font-bold whitespace-nowrap" style={{background:STATUS_COLORS[isEffectivelyPaid?'paid':inv.status]||'#6b7280'}}>
-                            {inv._isCancelled ? ('🚫 '+invoiceCancelledLabel(inv)+(inv.replacedBy?' → '+inv.replacedBy:'')) : isEffectivelyPaid ? 'Paid' : (inv.status==='partial' ? `Outstanding: ${fmtAmt(outstanding)}` : inv.status)}
+                            {inv._isCancelled ? ('🚫 '+invoiceCancelledLabel(inv)+(invoiceReplacementNumber(inv,accInvoices)?' → '+invoiceReplacementNumber(inv,accInvoices):'')) : isEffectivelyPaid ? 'Paid' : (inv.status==='partial' ? `Outstanding: ${fmtAmt(outstanding)}` : inv.status)}
                           </span>
                         </td>
                         <td className="px-4 py-2.5 text-center">
@@ -28023,12 +28106,12 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                               <span className="flex items-center gap-1 text-xs font-semibold text-gray-400">Edit <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/></span>
                               <span className="flex items-center gap-1 text-xs font-semibold text-gray-400">Email <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/></span>
                               <span className="flex items-center gap-1 text-xs font-semibold text-gray-400">✓ Paid <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/></span>
-                              <span className="flex items-center gap-1 text-xs font-semibold text-gray-400">✕ Delete <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/></span>
+                              <span className="flex items-center gap-1 text-xs font-semibold text-gray-400">🚫 Cancel <PaymentLockedBadge reason={INVOICE_NO_ACCOUNTING_RECORD_REASON}/></span>
                             </div>
                           ):inv._isCancelled?(
                             <div className="flex items-center justify-center gap-1 flex-wrap">
                               <button onClick={()=>setViewInv(inv)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f3f4f6',color:'#374151'}}>👁 View</button>
-                              <span className="text-xs font-semibold text-gray-400" title="Cancelled invoices are kept for the record only — no payments, edits or deletion.">🔒 Record only</span>
+                              <span className="text-xs font-semibold text-gray-400" title="Cancelled invoices are kept for the record only — no payments, edits or re-activation.">🔒 Record only</span>
                             </div>
                           ):(
                             <div className="flex items-center justify-center gap-1 flex-wrap">
@@ -28038,7 +28121,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                               <button onClick={()=>printManualInvoice(inv,companies,logoDataUrl,{quotes,jobs,accInvoices,customers})} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f3f4f6',color:'#1f2937'}}>🧾 Print</button>
                               <button onClick={()=>emailManualInvoiceViaOutlook(inv,companies)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dbeafe',color:'#1e40af'}}>📧 Email</button>
                               {inv.status!=='paid'&&<button onClick={()=>guardAction('markInvPaid:'+relKey(inv), ()=>markInvPaid(inv))} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dcfce7',color:'#059669'}}>✓ Paid</button>}
-                              {isAdmin&&<button onClick={()=>guardAction('deleteInvoice:'+inv.id, ()=>deleteInvoice(inv.id))} className="text-xs text-gray-300 hover:text-red-400">✕</button>}
+                              {user?.role==='admin'&&<button onClick={()=>guardAction('cancelInvoice:'+inv.id, ()=>cancelInvoice(inv.id))} title="Admin only. The invoice is kept on record, greyed out as Cancelled by Admin — it is not deleted." className="text-xs font-bold px-2 py-1 rounded-lg border border-gray-200 text-gray-400 hover:text-red-500 hover:border-red-200 whitespace-nowrap">🚫 Cancel invoice</button>}
                             </div>
                           )}
                         </td>
