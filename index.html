@@ -1495,6 +1495,16 @@ function sgrAutoMaterialList(lines, ctx){
     qty:Math.round(e.total*100)/100, amount:sgrMatNum(e.total)+(e.unit?' '+e.unit:'') }));
   return sgrMaterialList({ [SGR_MATERIAL_LIST_KEY]: { rollW, qty, other:others } });
 }
+// A job's effective Material List: its own edited list when one is saved,
+// otherwise the automatic one drawn from its lines (else its source quote's).
+// The same rule JobDetail shows and the Job Card prints.
+function sgrJobMaterialList(job, ctx){
+  ctx=ctx||{};
+  if(job && job.breakdown && typeof job.breakdown==='object' && job.breakdown[SGR_MATERIAL_LIST_KEY]) return sgrMaterialList(job.breakdown);
+  const q = job && job.quoteNum ? resolveQuoteForJob(job, ctx.quotes||[]) : null;
+  const lines = job && (job.lines||[]).length ? job.lines : ((q && q.lines) || []);
+  return sgrAutoMaterialList(lines, { inventory:ctx.inventory, completeProducts:ctx.completeProducts, rollW:SGR_MATERIAL_ROLL_W });
+}
 // Same list? (ids ignored) — used to tell an edited list from the automatic one.
 function sgrMaterialListSig(ml){ return JSON.stringify([ml.rollW, ml.qty, ml.other.map(o=>[o.material,o.size,o.qty,o.amount])]); }
 
@@ -23662,10 +23672,274 @@ function CreateCustomPOModal({ onClose, onSave, suppliers, job=null, quote=null 
   );
 }
 
+/* ═══════════════════════════════════════
+   MATERIALS TO ORDER (2026-11-22) — top of the Purchase Orders page
+   The set Material List table with every job's quantities added together,
+   plus a Supplier column and an Ordered tick.
+
+   WHAT IS STORED (platform_state section `materialOrders`, one record per
+   material and company scope — nothing about the totals themselves, which are
+   always recomputed from the jobs):
+     { id:'<s|h>:<material id>', supplier, adjust, ordered:{ <job id>: qty },
+       adjOrdered, orderedAt, orderedBy }
+     manual lines add { manual:true, material, size, unit } and may be `removed`.
+   `ordered` is kept PER JOB so that the tick means "these quantities, for
+   these jobs, were ordered". Anything a job needs beyond that — a quantity
+   that grew, or a new job — is not covered, shows as "added after order" and
+   gets its own tick box. A job that completes drops out with its own ordered
+   quantity, so it can never hide a newer job's requirement.
+════════════════════════════════════════ */
+function MaterialOrderTable({ jobs, quotes, inventory, completeProducts, suppliers, user, materialOrders, setMaterialOrders }) {
+  const [open, setOpen] = useState(true);
+  const [allJobs, setAllJobs] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(null);
+  const readOnly = sgrIsReadOnlyRole(user && user.role);
+  const scope = isHoldingsUser(user) ? 'h' : 's';
+  const r2 = n=>Math.round((parseFloat(n)||0)*100)/100;
+
+  const model = useMemo(()=>{
+    const myJobs = (jobs||[]).filter(j=>j && j.co!==UNIONTECH_ID && belongsToUserCompany(j,user) && (allJobs || (parseInt(j.stage)||0)<8));
+    const jobNum = {};
+    const map = new Map();
+    SGR_MATERIAL_ROWS.forEach(r=>map.set(r.key,{ matId:r.key, row:r, material:r.material, need:{} }));
+    const ctx = { quotes, inventory, completeProducts };
+    myJobs.forEach(j=>{
+      const jk=String(j.id); jobNum[jk]=j.num||('#'+jk);
+      let ml; try { ml=sgrJobMaterialList(j, ctx); } catch(_){ return; }
+      SGR_MATERIAL_ROWS.forEach(r=>{ const q=ml.qty[r.key]; if(q>0) map.get(r.key).need[jk]=q; });
+      ml.other.forEach(o=>{
+        if(!(o.qty>0)) return;
+        const unit=String(o.amount||'').replace(/^[\d.,\s]+/,'').trim();
+        const id='o:'+o.material.toLowerCase();
+        let e=map.get(id);
+        if(!e){ e={ matId:id, row:null, material:o.material, size:o.size||'', unit, need:{} }; map.set(id,e); }
+        if(!e.size&&o.size) e.size=o.size;
+        if(!e.unit&&unit) e.unit=unit;
+        e.need[jk]=r2((e.need[jk]||0)+o.qty);
+      });
+    });
+    const recs = new Map();
+    (Array.isArray(materialOrders)?materialOrders:[]).forEach(r=>{ if(r && typeof r.id==='string' && r.id.indexOf(scope+':')===0) recs.set(r.id.slice(2), r); });
+    recs.forEach((r,id)=>{ if(r.manual && !r.removed && !map.has(id)) map.set(id,{ matId:id, row:null, manual:true, material:r.material||'', size:r.size||'', unit:r.unit||'', need:{} }); });
+    const rows=[];
+    map.forEach(e=>{
+      const rec=recs.get(e.matId)||{};
+      const jobsTotal=r2(Object.values(e.need).reduce((a,b)=>a+b,0));
+      const adjust=r2(rec.adjust);
+      const total=Math.max(0, r2(jobsTotal+adjust));
+      const ord=rec.ordered && typeof rec.ordered==='object' ? rec.ordered : {};
+      let ordered=0; const added=[];
+      Object.keys(e.need).forEach(jk=>{
+        const o=Math.min(e.need[jk], parseFloat(ord[jk])||0);
+        ordered+=o;
+        if(e.need[jk]-o>0.004) added.push(jobNum[jk]);
+      });
+      if(adjust>0) ordered+=Math.min(adjust, parseFloat(rec.adjOrdered)||0);
+      ordered=Math.min(total, r2(ordered));
+      const outstanding=r2(total-ordered);
+      if(!e.row && !e.manual && jobsTotal<=0 && total<=0) return; // an "Other" material no job needs any more
+      rows.push({ ...e, rec, jobsTotal, adjust, total, ordered, outstanding, added,
+        jobsTip: Object.keys(e.need).map(jk=>jobNum[jk]+': '+sgrMatNum(e.need[jk])).join('\n') });
+    });
+    return { rows, jobCount: myJobs.length, toOrder: rows.filter(r=>r.total>0 && r.outstanding>0).length };
+  },[jobs, quotes, inventory, completeProducts, materialOrders, allJobs, scope]);
+
+  const unitOf = e=>e.row ? sgrMaterialQtyUnit(e.row) : (e.unit||'');
+  const sizeOf = e=>e.row ? sgrMaterialStdSize(e.row, SGR_MATERIAL_ROLL_W) : (e.size||'—');
+  const amountOf = (e,q)=>!(q>0) ? '—' : e.row ? sgrMaterialAmount(e.row, q, SGR_MATERIAL_ROLL_W) : (sgrMatNum(q)+(e.unit?' '+e.unit:''));
+  const who = (user && (user.name || user.email)) || '';
+
+  function patchRecords(patches){ // { matId: patch | (base)=>patch }
+    setMaterialOrders(prev=>{
+      let list = Array.isArray(prev) ? prev.slice() : [];
+      Object.keys(patches).forEach(matId=>{
+        const id=scope+':'+matId;
+        const i=list.findIndex(r=>r && r.id===id);
+        const base=i>=0 ? list[i] : { id };
+        const p=typeof patches[matId]==='function' ? patches[matId](base) : patches[matId];
+        const next={ ...base, ...p, id };
+        if(i>=0) list[i]=next; else list.push(next);
+      });
+      return list;
+    });
+  }
+  function markOrdered(e){
+    const live=new Set((jobs||[]).map(j=>String(j.id)));
+    patchRecords({ [e.matId]: base=>{
+      const ordered={};
+      Object.keys(base.ordered||{}).forEach(k=>{ if(live.has(k)) ordered[k]=base.ordered[k]; }); // drop deleted jobs
+      Object.keys(e.need).forEach(k=>{ ordered[k]=e.need[k]; });
+      return { ordered, adjOrdered:Math.max(0, r2(base.adjust)), orderedAt:new Date().toISOString(), orderedBy:who };
+    }});
+  }
+  function unmarkOrdered(e){
+    if(!window.confirm('Remove the "ordered" tick from '+e.material+'?')) return;
+    patchRecords({ [e.matId]: base=>{
+      const ordered={...(base.ordered||{})};
+      Object.keys(e.need).forEach(k=>{ delete ordered[k]; });
+      return { ordered, adjOrdered:0, orderedAt:null, orderedBy:null };
+    }});
+  }
+  function startEdit(){
+    const d={ rows:{}, extra:[] };
+    model.rows.forEach(e=>{ d.rows[e.matId]={ qty:e.total>0?String(e.total):'', supplier:e.rec.supplier||'', material:e.material, size:e.size||'', unit:e.unit||'', removed:false }; });
+    setDraft(d); setOpen(true); setEditing(true);
+  }
+  function setRow(matId, field, val){ setDraft(d=>({ ...d, rows:{ ...d.rows, [matId]:{ ...d.rows[matId], [field]:val } } })); }
+  function setExtra(id, field, val){ setDraft(d=>({ ...d, extra:d.extra.map(x=>x.id===id?{ ...x, [field]:val }:x) })); }
+  function saveEdit(){
+    const patches={};
+    model.rows.forEach(e=>{
+      const dr=draft.rows[e.matId]; if(!dr) return;
+      if(e.manual && dr.removed){ patches[e.matId]={ removed:true }; return; }
+      const want=dr.qty===''||dr.qty==null ? e.jobsTotal : Math.max(0, r2(dr.qty));
+      const p={ supplier:String(dr.supplier||'').trim(), adjust:r2(want-e.jobsTotal) };
+      if(e.manual){ p.material=String(dr.material||'').trim()||e.material; p.size=String(dr.size||'').trim(); p.unit=String(dr.unit||'').trim(); }
+      const changed = p.supplier!==(e.rec.supplier||'') || p.adjust!==e.adjust || e.manual;
+      if(changed) patches[e.matId]=p;
+    });
+    draft.extra.forEach(x=>{
+      const name=String(x.material||'').trim(); if(!name) return;
+      patches['m:'+x.id]={ manual:true, removed:false, material:name, size:String(x.size||'').trim(), unit:String(x.unit||'').trim(),
+        supplier:String(x.supplier||'').trim(), adjust:Math.max(0, r2(x.qty)), ordered:{}, adjOrdered:0 };
+    });
+    if(Object.keys(patches).length) patchRecords(patches);
+    setEditing(false); setDraft(null);
+  }
+  const inCls='border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:ring-2 focus:ring-blue-400 focus:border-blue-400';
+  const fmtDay = iso=>{ try { return new Date(iso).toLocaleDateString('en-ZA',{day:'2-digit',month:'short'}); } catch(_){ return ''; } };
+
+  return (
+    <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden mb-5">
+      <div className={`flex flex-wrap items-center justify-between gap-3 px-5 py-4 ${open?'border-b border-gray-100':''}`}>
+        <button onClick={()=>setOpen(o=>!o)} className="flex-1 min-w-0 flex items-center gap-3 text-left">
+          <span className={`text-gray-400 text-xs font-bold transition-transform duration-200 ${open?'rotate-180':''}`} style={{display:'inline-block'}}>▼</span>
+          <div className="min-w-0">
+            <h3 className="text-sm font-bold text-gray-700">📦 Materials to Order — all jobs</h3>
+            <p className="text-xs text-gray-400 mt-0.5 truncate">{model.jobCount} {allJobs?'':'open '}job{model.jobCount===1?'':'s'} added together · {model.toOrder>0 ? model.toOrder+' material'+(model.toOrder===1?'':'s')+' still to order' : 'nothing waiting to be ordered'}</p>
+          </div>
+        </button>
+        <div className="flex flex-wrap items-center gap-2 flex-shrink-0">
+          {!editing&&(
+            <div className="flex rounded-xl border border-gray-200 overflow-hidden text-xs font-bold">
+              <button onClick={()=>setAllJobs(false)} className={'px-3 py-2 '+(!allJobs?'bg-blue-800 text-white':'bg-white text-gray-600 hover:bg-gray-50')}>Open jobs</button>
+              <button onClick={()=>setAllJobs(true)}  className={'px-3 py-2 '+(allJobs?'bg-blue-800 text-white':'bg-white text-gray-600 hover:bg-gray-50')}>All jobs</button>
+            </div>
+          )}
+          {readOnly ? null : !editing
+            ? <button onClick={startEdit} className="text-xs bg-blue-800 hover:bg-blue-900 text-white rounded-xl px-4 py-2 font-bold">✏️ Edit Table</button>
+            : <>
+                <button onClick={()=>{ setEditing(false); setDraft(null); }} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-3 py-2 font-semibold hover:bg-gray-50">Cancel</button>
+                <button onClick={saveEdit} className="text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl px-4 py-2 font-bold">✓ Save</button>
+              </>}
+        </div>
+      </div>
+      {open&&(
+      <div className="px-5 py-4">
+        {editing&&<p className="text-xs text-blue-700 bg-blue-50 border border-blue-100 rounded-xl p-3 mb-3">Quantities come from the jobs. Change a quantity to add to or take off the total, and set the supplier per material. A job's own list is changed on that job.</p>}
+        <datalist id="sgr-material-suppliers">{(suppliers||[]).map(sp=><option key={sp.id} value={sp.name||''}/>)}</datalist>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm" style={{minWidth:'720px'}}>
+            <thead>
+              <tr className="text-left text-xs font-black text-gray-400 uppercase tracking-wider border-b border-gray-200">
+                <th className="py-2 pr-3">Material</th>
+                <th className="py-2 pr-3">Std Size</th>
+                <th className="py-2 pr-3 text-right">Qty</th>
+                <th className="py-2 pr-3 text-right">Sq m / Unit</th>
+                <th className="py-2 pr-3">Supplier</th>
+                <th className="py-2 text-center">Ordered</th>
+              </tr>
+            </thead>
+            <tbody>
+              {model.rows.map(e=>{
+                const dr = editing && draft ? draft.rows[e.matId] : null;
+                if(dr && dr.removed) return null;
+                const on = e.total>0;
+                const partial = on && e.ordered>0 && e.outstanding>0;
+                return (
+                <React.Fragment key={e.matId}>
+                  <tr className="border-b border-gray-50 align-middle">
+                    <td className={`py-1.5 pr-3 ${on?'text-gray-800 font-semibold':'text-gray-400'}`}>
+                      {dr && e.manual
+                        ? <input value={dr.material} onChange={ev=>setRow(e.matId,'material',ev.target.value)} className={inCls+' w-full'}/>
+                        : e.material}
+                    </td>
+                    <td className={`py-1.5 pr-3 text-xs whitespace-nowrap ${on?'text-gray-500':'text-gray-300'}`}>
+                      {dr && e.manual
+                        ? <input value={dr.size} onChange={ev=>setRow(e.matId,'size',ev.target.value)} placeholder="Std size" className={inCls+' w-28'}/>
+                        : sizeOf(e)}
+                    </td>
+                    <td className={`py-1.5 pr-3 text-right whitespace-nowrap ${on?'text-gray-700':'text-gray-300'}`} title={e.jobsTip||undefined}>
+                      {dr
+                        ? <span className="inline-flex items-center gap-1.5 justify-end">
+                            <input type="number" min="0" step="any" value={dr.qty} onChange={ev=>setRow(e.matId,'qty',ev.target.value)} placeholder={sgrMatNum(e.jobsTotal)} className={inCls+' w-20 text-right'}/>
+                            {e.manual
+                              ? <input value={dr.unit} onChange={ev=>setRow(e.matId,'unit',ev.target.value)} placeholder="unit" className={inCls+' w-16'}/>
+                              : <span className="text-xs text-gray-400">{unitOf(e)}</span>}
+                          </span>
+                        : on ? <>{sgrMatNum(e.total)} {unitOf(e)}{e.adjust!==0&&<span className="block text-xs text-amber-600 font-normal">{e.adjust>0?'+':''}{sgrMatNum(e.adjust)} edited</span>}</> : '—'}
+                    </td>
+                    <td className={`py-1.5 pr-3 text-right whitespace-nowrap ${on?'text-gray-700 font-semibold':'text-gray-300'}`}>{amountOf(e, dr ? (dr.qty===''?e.jobsTotal:parseFloat(dr.qty)||0) : e.total)}</td>
+                    <td className="py-1.5 pr-3 text-gray-700">
+                      {dr
+                        ? <input list="sgr-material-suppliers" value={dr.supplier} onChange={ev=>setRow(e.matId,'supplier',ev.target.value)} placeholder="Supplier" className={inCls+' w-40'}/>
+                        : (e.rec.supplier || <span className="text-gray-300">—</span>)}
+                    </td>
+                    <td className="py-1.5 text-center whitespace-nowrap">
+                      {dr
+                        ? (e.manual ? <button onClick={()=>setRow(e.matId,'removed',true)} title="Remove this line" className="text-gray-300 hover:text-red-500 text-sm font-bold px-1">✕</button> : null)
+                        : !on ? <span className="text-gray-300">—</span>
+                        : <label className="inline-flex items-center gap-1.5 text-xs text-gray-500">
+                            <input type="checkbox" className="w-4 h-4" disabled={readOnly} checked={e.ordered>0}
+                              onChange={ev=>{ if(ev.target.checked) markOrdered(e); else unmarkOrdered(e); }}/>
+                            {e.ordered>0 ? <span className="text-emerald-600 font-semibold">{partial ? sgrMatNum(e.ordered)+' '+unitOf(e) : 'Ordered'}{e.rec.orderedAt?' · '+fmtDay(e.rec.orderedAt):''}</span> : null}
+                          </label>}
+                    </td>
+                  </tr>
+                  {!dr && partial && (
+                    <tr className="border-b border-amber-100 bg-amber-50 align-middle">
+                      <td className="py-1.5 pr-3 pl-4 text-amber-800 text-xs font-semibold" colSpan={2}>↳ Added after order{e.added.length ? ' — '+e.added.join(', ') : ' — edited quantity'}</td>
+                      <td className="py-1.5 pr-3 text-right text-amber-800 font-semibold whitespace-nowrap">+{sgrMatNum(e.outstanding)} {unitOf(e)}</td>
+                      <td className="py-1.5 pr-3 text-right text-amber-800 font-semibold whitespace-nowrap">{amountOf(e, e.outstanding)}</td>
+                      <td className="py-1.5 pr-3 text-xs text-amber-700">{e.rec.supplier||''}</td>
+                      <td className="py-1.5 text-center">
+                        <label className="inline-flex items-center gap-1.5 text-xs text-amber-800">
+                          <input type="checkbox" className="w-4 h-4" disabled={readOnly} checked={false} onChange={()=>markOrdered(e)}/>
+                          Order
+                        </label>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+                );
+              })}
+              {editing && draft && draft.extra.map(x=>(
+                <tr key={x.id} className="border-b border-gray-50 align-middle">
+                  <td className="py-1.5 pr-3"><input value={x.material} onChange={ev=>setExtra(x.id,'material',ev.target.value)} placeholder="Other material" className={inCls+' w-full'}/></td>
+                  <td className="py-1.5 pr-3"><input value={x.size} onChange={ev=>setExtra(x.id,'size',ev.target.value)} placeholder="Std size" className={inCls+' w-28'}/></td>
+                  <td className="py-1.5 pr-3 text-right"><span className="inline-flex items-center gap-1.5 justify-end">
+                    <input type="number" min="0" step="any" value={x.qty} onChange={ev=>setExtra(x.id,'qty',ev.target.value)} placeholder="0" className={inCls+' w-20 text-right'}/>
+                    <input value={x.unit} onChange={ev=>setExtra(x.id,'unit',ev.target.value)} placeholder="unit" className={inCls+' w-16'}/></span></td>
+                  <td className="py-1.5 pr-3 text-right text-gray-300">—</td>
+                  <td className="py-1.5 pr-3"><input list="sgr-material-suppliers" value={x.supplier} onChange={ev=>setExtra(x.id,'supplier',ev.target.value)} placeholder="Supplier" className={inCls+' w-40'}/></td>
+                  <td className="py-1.5 text-center"><button onClick={()=>setDraft(d=>({ ...d, extra:d.extra.filter(y=>y.id!==x.id) }))} title="Remove this line" className="text-gray-300 hover:text-red-500 text-sm font-bold px-1">✕</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {editing&&<button onClick={()=>setDraft(d=>({ ...d, extra:[...d.extra,{ id:Date.now()+'-'+Math.random().toString(36).slice(2,6), material:'', size:'', qty:'', unit:'', supplier:'' }] }))} className="mt-3 text-blue-700 hover:text-blue-900 text-xs font-semibold hover:underline">+ Add material line</button>}
+      </div>
+      )}
+    </div>
+  );
+}
+
 /* ═══════════════════════════════════════════
    PURCHASE ORDERS PAGE
 ═══════════════════════════════════════════ */
-function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user }) {
+function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user, jobs, quotes, inventory, completeProducts, materialOrders, setMaterialOrders }) {
   const [viewPO, setViewPO] = useState(null);
   const [filter, setFilter] = useState('all');
   const [search, setSearch] = useState('');
@@ -23759,6 +24033,9 @@ function PurchaseOrdersPage({ purchaseOrders, setPurchaseOrders, suppliers, user
           </button>
         </div>
       </div>
+
+      {/* 2026-11-22: all jobs' material totals, supplier and ordered ticks */}
+      {setMaterialOrders&&<MaterialOrderTable jobs={jobs} quotes={quotes} inventory={inventory} completeProducts={completeProducts} suppliers={suppliers||[]} user={user} materialOrders={materialOrders} setMaterialOrders={setMaterialOrders}/>}
 
       {/* Search */}
       <div className="relative mb-4">
@@ -30083,6 +30360,9 @@ function App() {
   const [payrollRecords,   setPayrollRecords]   = useState(_saved ? (_saved.payrollRecords||[])    : []);
   const [quickRates,       setQuickRates]       = useState(_saved ? withItemCat(_saved.quickRates||[]) : INITIAL_QUICK_RATES);
   const [proposedProjects, setProposedProjects] = useState(_saved ? (_saved.proposedProjects||[])  : []);
+  // 2026-11-22: Purchase Orders -> Materials to Order (supplier, edits, ordered
+  // ticks). A plain JSON section; see MaterialOrderTable.
+  const [materialOrders,   setMaterialOrders]   = useState(_saved && Array.isArray(_saved.materialOrders) ? _saved.materialOrders : undefined); // undefined until first used: an empty list must not look like a local change and trigger a save on every load
   const [creditNotes,      setCreditNotes]      = useState(_saved ? (_saved.creditNotes||[])         : []);
   // Login accounts — Admin-editable via the "User Roles" page (see
   // UserRolesPage/Sidebar). Seeded from INITIAL_USERS, merged the same way
@@ -30358,7 +30638,7 @@ function App() {
   // All array/object sections stored in platform_state
   const STATE_SECTIONS = ['jobs','inventory','quotes','customers','suppliers','assets',
     'employees','leaveRequests','disciplinary','savedCalcs','purchaseOrders','savedImports',
-    'bankTxns','chartOfAccounts','accInvoices','accBills','completeProducts','payrollRecords','quickRates','proposedProjects','creditNotes','userAccounts'];
+    'bankTxns','chartOfAccounts','accInvoices','accBills','completeProducts','payrollRecords','quickRates','proposedProjects','creditNotes','userAccounts','materialOrders'];
 
   // Fetch latest state from the backend.
   // 2026-08-20 hardening: the returned object now also carries
@@ -30513,6 +30793,7 @@ function App() {
     if (Array.isArray(dbData.payrollRecords))   setPayrollRecords(dbData.payrollRecords);
     if (Array.isArray(dbData.quickRates))       setQuickRates(dbData.quickRates);
     if (Array.isArray(dbData.proposedProjects)) setProposedProjects(dbData.proposedProjects);
+    if (Array.isArray(dbData.materialOrders))   setMaterialOrders(dbData.materialOrders);
     if (Array.isArray(dbData.creditNotes))      setCreditNotes(dbData.creditNotes);
     if (Array.isArray(dbData.userAccounts) && dbData.userAccounts.length) setUserAccounts(dbData.userAccounts);
     if (typeof dbData.logo === 'string')        setLogoDataUrl(dbData.logo);
@@ -31718,7 +31999,7 @@ function App() {
   //    Merges locally-changed sections onto the server baseline before writing,
   //    so two users editing different sections never overwrite each other.
   useEffect(()=>{
-    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, logo:logoDataUrl, utLogo:utLogoDataUrl, holdingsLogo:holdingsLogoDataUrl, sigOTSmit, savedAt:lastSaved};
+    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, materialOrders, logo:logoDataUrl, utLogo:utLogoDataUrl, holdingsLogo:holdingsLogoDataUrl, sigOTSmit, savedAt:lastSaved};
     // Always kept current (even pre-hydration) so it's immediately available
     // the instant hydration completes — purely in-memory, never written
     // anywhere, so this alone can't leak fallback data anywhere.
@@ -31792,7 +32073,7 @@ function App() {
       }
       setTimeout(() => setApiMsg(''), 2500);
     }, 800);
-  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, logoDataUrl, utLogoDataUrl, sigOTSmit, hydrationStatus]);
+  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, materialOrders, logoDataUrl, utLogoDataUrl, sigOTSmit, hydrationStatus]);
 
   // `token` is the backend-issued JWT from POST /api/auth/login (audit
   // finding B1) — stored the same way `user` already was, so a page refresh
@@ -31823,7 +32104,7 @@ function App() {
       });
       // Date-stamped filename so Drive folder shows version order clearly
       const dateTag = now.toISOString().slice(0,10); // e.g. 2026-04-10
-      const payload = JSON.stringify({v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, logo:logoDataUrl, utLogo:utLogoDataUrl, savedAt: stamp});
+      const payload = JSON.stringify({v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, materialOrders, logo:logoDataUrl, utLogo:utLogoDataUrl, savedAt: stamp});
       // outerHTML preserves the original <script type="text/babel"> source intact.
       // outerHTML omits the DOCTYPE; without it the saved file loads in quirks mode,
       // which broke startup. Prepend it so saved files stay in standards mode.
@@ -32038,7 +32319,7 @@ function App() {
     assets:      <AssetsPage      assets={assets} setAssets={setAssets} forceSaveSections={forceSaveSections} companies={companies} employees={employees} suppliers={suppliers}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} forceSaveSections={forceSaveSections} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} inventory={inventory} completeProducts={completeProducts}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
-    purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user}/>,
+    purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user} jobs={jobs} quotes={quotes} inventory={inventory} completeProducts={completeProducts} materialOrders={materialOrders} setMaterialOrders={setMaterialOrders}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quotes={quotes} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
