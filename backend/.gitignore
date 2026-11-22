@@ -6,3 +6,6 @@ dist/
 /storage/
 # reports written by src/scripts/record-cancelled-invoice.ts (live database output; kept locally, never committed)
 /record-cancelled-*-report.txt
+
+# 2026-11-22: local data for update-inventory-descriptions (item wording incl. customer names) — keep out of the public repo/site
+/src/scripts/data/inventory-descriptions-*.json
