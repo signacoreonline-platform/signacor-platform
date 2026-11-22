@@ -1288,6 +1288,85 @@ function emptyBreakdown(){ return { materials:0,labour:0,machine_time:0,design:0
 function breakdownTotal(bd){ return bd ? Object.values(bd).reduce((s,v)=>s+(parseFloat(v)||0),0) : 0; }
 
 /* ═══════════════════════════════════════════════════════════
+   JOB MATERIAL LIST (2026-11-22)
+   A per-job list of the physical material a job needs — sheets, vinyl and
+   lamination off the roll, LEDs, power supplies and free "other" lines.
+   It is stored INSIDE job.breakdown under one key, so it saves through the
+   existing cost-breakdown path (rel_jobs.breakdown JSONB / platform_state)
+   with no backend or database change. The value is an object, never a
+   number, so breakdownTotal() adds 0 for it and no cost total moves.
+═══════════════════════════════════════════════════════════ */
+const SGR_MATERIAL_LIST_KEY = 'material_list';
+const SGR_MATERIAL_ROLL_W   = 1.37; // default vinyl / laminate roll width, metres
+const SGR_MATERIAL_ROWS = [
+  { key:'acp',         material:'ACP',                kind:'sheet', l:3,   w:1.5 },
+  { key:'acrylic_3mm', material:'3mm Acrylic',        kind:'sheet', l:3,   w:1.5 },
+  { key:'pvc10_3015',  material:'10mm PVC Foam',      kind:'sheet', l:3,   w:1.5 },
+  { key:'pvc10_2412',  material:'10mm PVC Foam',      kind:'sheet', l:2.4, w:1.2 },
+  { key:'vinyl_white', material:'White Back Vinyl',   kind:'roll' },
+  { key:'vinyl_grey',  material:'Grey Back Vinyl',    kind:'roll' },
+  { key:'lam_matte',   material:'Lamination — Matte', kind:'roll', lam:true },
+  { key:'lam_gloss',   material:'Lamination — Gloss', kind:'roll', lam:true },
+  { key:'led_outdoor', material:"LED's — Outdoor",    kind:'unit' },
+  { key:'led_indoor',  material:"LED's — Indoor",     kind:'unit' },
+  { key:'psu_12v',     material:'Power Supply — 12V', kind:'unit' },
+  { key:'psu_24v',     material:'Power Supply — 24V', kind:'unit' },
+  { key:'psu_220v',    material:'Power Supply — 220V',kind:'unit' },
+];
+function sgrMatNum(n){ const x=Math.round((parseFloat(n)||0)*100)/100; return String(x); }
+// The saved list, always in one safe shape (missing / malformed -> empty).
+function sgrMaterialList(breakdown){
+  const ml = breakdown && typeof breakdown==='object' ? breakdown[SGR_MATERIAL_LIST_KEY] : null;
+  const ok = ml && typeof ml==='object' && !Array.isArray(ml);
+  const rollW = ok && parseFloat(ml.rollW)>0 ? parseFloat(ml.rollW) : SGR_MATERIAL_ROLL_W;
+  const qty = {};
+  if(ok && ml.qty && typeof ml.qty==='object'){
+    SGR_MATERIAL_ROWS.forEach(r=>{ const v=parseFloat(ml.qty[r.key]); if(v>0) qty[r.key]=v; });
+  }
+  const other = ok && Array.isArray(ml.other)
+    ? ml.other.filter(o=>o&&typeof o==='object'&&String(o.material||'').trim()).map((o,i)=>({
+        id:o.id||('o'+i), material:String(o.material||'').trim(), size:String(o.size||'').trim(),
+        qty:parseFloat(o.qty)>0?parseFloat(o.qty):0, amount:String(o.amount||'').trim() }))
+    : [];
+  return { v:1, rollW, qty, other };
+}
+function sgrMaterialListCount(ml){ return Object.keys(ml.qty).length + ml.other.length; }
+function sgrMaterialStdSize(row, rollW){
+  if(row.kind==='sheet') return sgrMatNum(row.l)+' m × '+sgrMatNum(row.w)+' m';
+  if(row.kind==='roll')  return 'Roll · '+sgrMatNum(rollW)+' m wide';
+  return 'Each';
+}
+function sgrMaterialQtyUnit(row){ return row.kind==='sheet'?'sheets':row.kind==='roll'?'m':'units'; }
+// Column 4: square metres for sheets and roll material, a unit count otherwise.
+function sgrMaterialAmount(row, qty, rollW){
+  const q=parseFloat(qty)||0;
+  if(q<=0) return '—';
+  if(row.kind==='sheet') return sgrMatNum(q*row.l*row.w)+' m²';
+  if(row.kind==='roll')  return sgrMatNum(q*rollW)+' m²';
+  return sgrMatNum(q)+' units';
+}
+// Roll length needed for the sized (Length × Width mm, pieces) m² lines of a
+// job / quote. Each line is nested across the roll width in whichever
+// orientation uses less roll; a piece wider than the roll both ways is cut
+// into panels. No waste allowance is added — the figure is a starting point
+// the user can overwrite. Rounded UP to the next 0.1 m.
+function sgrRollLengthForLines(lines, rollW){
+  const W=(parseFloat(rollW)>0?parseFloat(rollW):SGR_MATERIAL_ROLL_W)*1000;
+  let mm=0, area=0, count=0;
+  (Array.isArray(lines)?lines:[]).forEach(l=>{
+    if(!l || l.unit!=='m²') return;
+    const a=parseFloat(l.sqmL)||0, b=parseFloat(l.sqmW)||0;
+    if(a<=0||b<=0) return;
+    const pcs=Math.max(1, Math.ceil(parseFloat(l.pQty)||1));
+    const run=(across,along)=>across<=W ? Math.ceil(pcs/Math.floor(W/across))*along : Infinity;
+    let best=Math.min(run(a,b), run(b,a));
+    if(!isFinite(best)) best=Math.ceil(Math.min(a,b)/W)*Math.max(a,b)*pcs;
+    mm+=best; area+=a*b*pcs/1e6; count++;
+  });
+  return { lengthM: Math.ceil(mm/100-1e-9)/10, areaM2: Math.round(area*100)/100, count };
+}
+
+/* ═══════════════════════════════════════════════════════════
    EDITABLE DATA — change in Notepad if needed
 ═══════════════════════════════════════════════════════════ */
 const INITIAL_COMPANIES = [
@@ -6088,6 +6167,16 @@ function printJobCard(job, companies) {
     var unitCell = l.unit||'';
     return '<tr><td>'+(i+1)+'</td><td>'+descCell+'</td><td class="c">'+qtyCell+'</td><td class="c">'+unitCell+'</td></tr>';
   }).join('');
+  // 2026-11-22: the job's Material List (see sgrMaterialList) prints under
+  // the line items — only the materials that have a quantity, no Rand values.
+  const _ml = sgrMaterialList(job.breakdown);
+  const matRows = SGR_MATERIAL_ROWS.filter(function(r){ return _ml.qty[r.key]>0; }).map(function(r){
+    return '<tr><td>'+escapeHtml(r.material)+'</td><td class="c">'+escapeHtml(sgrMaterialStdSize(r,_ml.rollW))+'</td>'+
+      '<td class="c">'+sgrMatNum(_ml.qty[r.key])+' '+sgrMaterialQtyUnit(r)+'</td><td class="c">'+escapeHtml(sgrMaterialAmount(r,_ml.qty[r.key],_ml.rollW))+'</td></tr>';
+  }).concat(_ml.other.map(function(o){
+    return '<tr><td>'+escapeHtml(o.material)+'</td><td class="c">'+escapeHtml(o.size||'\u2014')+'</td>'+
+      '<td class="c">'+(o.qty>0?sgrMatNum(o.qty):'\u2014')+'</td><td class="c">'+escapeHtml(o.amount||'\u2014')+'</td></tr>';
+  })).join('');
   const stageNames=['Lead','Brief','Design','Artwork Approval','Quote Approved','Deposit Received','In Production','Installation','Complete','Invoiced'];
   const currentStage = stageNames[job.stage]||'In Progress';
   const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Job Card '+job.num+'</title>'+
@@ -6161,6 +6250,14 @@ stageNames.map(function(s,i){
 '<th class="c" style="width:60px">Material</th><th class="c" style="width:70px">Unit</th>'+
 '</tr></thead><tbody>'+rows+'</tbody></table>'
 :'<div style="border:1px solid #e5e7eb;border-radius:8px;padding:16px;text-align:center;color:#333;font-size:11px;margin-bottom:14px;">No line items recorded.</div>')+
+
+(matRows?
+'<div class="stage-bar" style="margin-bottom:6px"><div class="lbl" style="margin-bottom:0">Material List</div></div>'+
+'<table class="ln"><thead><tr>'+
+'<th>Material</th><th class="c" style="width:130px">Std Size</th>'+
+'<th class="c" style="width:90px">Qty</th><th class="c" style="width:100px">Sq m / Unit</th>'+
+'</tr></thead><tbody>'+matRows+'</tbody></table>'
+:'')+
 
 (job.notes?'<div class="notes-box"><div class="lbl">Notes</div><p>'+escapeHtml(job.notes)+'</p></div>':'')+
 
@@ -19346,6 +19443,12 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   const [editingNotes, setEditingNotes]=useState(false);
   const [noteDraft, setNoteDraft]=useState('');
   const [costBreakdownOpen, setCostBreakdownOpen]=useState(false);
+  // 2026-11-22: Material List (inside Cost Breakdown) and Special Notes are
+  // both collapsible and start collapsed.
+  const [materialsOpen, setMaterialsOpen]=useState(false);
+  const [editingMaterials, setEditingMaterials]=useState(false);
+  const [matDraft, setMatDraft]=useState(null);
+  const [notesOpen, setNotesOpen]=useState(false);
   const [editingLines, setEditingLines]=useState(false);
   const [linesDraft, setLinesDraft]=useState([]);
 
@@ -19379,7 +19482,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 
      Read-only viewing is deliberately NOT pinned — a job nobody is editing
      should show the freshest data. */
-  const _jobEditorDirty = editingCosts || editingNotes || editingLines;
+  const _jobEditorDirty = editingCosts || editingNotes || editingLines || editingMaterials;
   usePinnedRecord('jobs', jobId, _jobEditorDirty);
   const _jobPinnedStale = _jobEditorDirty && pinnedRecordIsStale('jobs', jobId);
 
@@ -19750,11 +19853,56 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     setJobs(prev=>prev.map(j=>j.id===job.id?{...j,breakdown:{...bd}}:j));
     setEditingCosts(false);
   }
+  // 2026-11-22: `bd` was only seeded when the job was opened. The Material
+  // List lives in the same job.breakdown object and is saved on its own, so
+  // the cost editor now starts from the job's CURRENT breakdown — an older
+  // copy must never overwrite a material list saved since. (saveMaterials
+  // also folds a newly saved list into an open cost editor's copy.)
+  function startEditCosts(){
+    setBd(job.breakdown ? {...job.breakdown} : emptyBreakdown());
+    setEditingCosts(true);
+  }
   function cancelCosts(){
     setBd(job.breakdown?{...job.breakdown}:emptyBreakdown());
     setEditingCosts(false);
   }
-  function startEditNotes(){ setNoteDraft(job.notes||''); setEditingNotes(true); }
+  // ── Material List (2026-11-22) — saved inside job.breakdown ──
+  function startEditMaterials(){
+    const ml = sgrMaterialList(job.breakdown);
+    const qty = {};
+    SGR_MATERIAL_ROWS.forEach(r=>{ qty[r.key] = ml.qty[r.key] ? String(ml.qty[r.key]) : ''; });
+    const other = ml.other.map(o=>({...o, qty:o.qty?String(o.qty):''}));
+    if(!other.length) other.push({id:'o'+Date.now(), material:'', size:'', qty:'', amount:''});
+    setMatDraft({ rollW:String(ml.rollW), qty, other });
+    setMaterialsOpen(true);
+    setEditingMaterials(true);
+  }
+  function cancelMaterials(){ setEditingMaterials(false); setMatDraft(null); }
+  function setMatQty(key,val){ setMatDraft(d=>({...d, qty:{...d.qty,[key]:val}})); }
+  function setMatOther(id,field,val){ setMatDraft(d=>({...d, other:d.other.map(o=>o.id===id?{...o,[field]:val}:o)})); }
+  function addMatOther(){ setMatDraft(d=>({...d, other:[...d.other,{id:'o'+Date.now()+Math.random().toString(36).slice(2,6), material:'', size:'', qty:'', amount:''}]})); }
+  function removeMatOther(id){ setMatDraft(d=>({...d, other:d.other.filter(o=>o.id!==id)})); }
+  async function saveMaterials(){
+    const clean = sgrMaterialList({ [SGR_MATERIAL_LIST_KEY]: matDraft });
+    const nextBd = {...(job.breakdown && typeof job.breakdown==='object' ? job.breakdown : {}), [SGR_MATERIAL_LIST_KEY]: clean};
+    if(isRelationalAuthoritative('jobs')){
+      try {
+        const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { breakdown: nextBd });
+        const jobsUpdater = prev=>prev.map(j=>j.id===job.id?{...j,breakdown:nextBd,_relRowVersion:result.rowVersion}:j);
+        setJobs(jobsUpdater);
+        syncRelationalBaseline('jobs', jobsUpdater);
+      } catch(e){
+        alert(describeSaveConflictError(e, 'job')+'\n\nYour material list was NOT saved.');
+        return;
+      }
+    } else {
+      setJobs(prev=>prev.map(j=>j.id===job.id?{...j,breakdown:nextBd}:j));
+    }
+    setBd(prev=>prev ? {...prev, [SGR_MATERIAL_LIST_KEY]: clean} : prev);
+    setEditingMaterials(false);
+    setMatDraft(null);
+  }
+  function startEditNotes(){ setNoteDraft(job.notes||''); setNotesOpen(true); setEditingNotes(true); }
   async function saveNotes(){
     const nextNotes = noteDraft.trim();
     if(isRelationalAuthoritative('jobs')){
@@ -19850,6 +19998,15 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   function updateSowLine(id,key,val){ setLinesDraft(prev=>prev.map(l=>l.id===id?{...l,[key]:val}:l)); }
 
   const editTotal = bd ? breakdownTotal(bd) : 0;
+  // Material List (2026-11-22)
+  const _matSaved  = sgrMaterialList(job.breakdown);
+  const _matCount  = sgrMaterialListCount(_matSaved);
+  const _matRollW  = editingMaterials && matDraft ? (parseFloat(matDraft.rollW)>0 ? parseFloat(matDraft.rollW) : SGR_MATERIAL_ROLL_W) : _matSaved.rollW;
+  const _matSized  = l=>l && l.unit==='m²' && parseFloat(l.sqmL)>0 && parseFloat(l.sqmW)>0;
+  const _matSrcQ   = job.quoteNum ? resolveQuoteForJob(job, quotes) : null;
+  const _matLines  = (job.lines||[]).some(_matSized) ? job.lines : ((_matSrcQ && _matSrcQ.lines) || []);
+  const _matCalc   = sgrRollLengthForLines(_matLines, _matRollW);
+  const _matVinylM = editingMaterials && matDraft ? (parseFloat(matDraft.qty.vinyl_white)||0)+(parseFloat(matDraft.qty.vinyl_grey)||0) : 0;
 
   return (
     <div className="p-4 space-y-4">
@@ -20165,23 +20322,27 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
         );
       })()}
 
-      {/* ─── SPECIAL NOTES ─── */}
+      {/* ─── SPECIAL NOTES — collapsible (2026-11-22) ─── */}
       <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
-        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
-          <div>
-            <h3 className="text-sm font-bold text-gray-700">📝 Special Notes</h3>
-            <p className="text-xs text-gray-400 mt-0.5">Internal notes, special instructions, reminders</p>
-          </div>
+        <div className={`flex items-center justify-between gap-3 px-5 py-4 ${(notesOpen||editingNotes)?'border-b border-gray-100':''}`}>
+          <button onClick={()=>setNotesOpen(o=>!o)} className="flex-1 min-w-0 flex items-center gap-3 text-left">
+            <span className={`text-gray-400 text-xs font-bold transition-transform duration-200 ${(notesOpen||editingNotes)?'rotate-180':''}`} style={{display:'inline-block'}}>▼</span>
+            <div className="min-w-0">
+              <h3 className="text-sm font-bold text-gray-700">📝 Special Notes{job.notes&&!(notesOpen||editingNotes)?<span className="ml-2 text-xs font-semibold text-amber-600">● note added</span>:null}</h3>
+              <p className="text-xs text-gray-400 mt-0.5 truncate">{job.notes&&!(notesOpen||editingNotes) ? job.notes : 'Internal notes, special instructions, reminders'}</p>
+            </div>
+          </button>
           {readOnly ? null : !editingNotes
-            ? <button onClick={startEditNotes} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
+            ? <button onClick={startEditNotes} className="flex-shrink-0 text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
                 {job.notes ? '✏️ Edit' : '+ Add Note'}
               </button>
-            : <div className="flex gap-2">
+            : <div className="flex gap-2 flex-shrink-0">
                 <button onClick={cancelNotes} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-3 py-2 font-semibold hover:bg-gray-50">Cancel</button>
                 <button onClick={saveNotes}   className="text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">✓ Save</button>
               </div>
           }
         </div>
+        {(notesOpen||editingNotes)&&(
         <div className="p-5">
           {editingNotes ? (
             <textarea
@@ -20200,6 +20361,139 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
             </div>
           )}
         </div>
+        )}
+      </div>
+
+      {/* ─── MATERIAL LIST — collapsible (2026-11-22) ───
+          Its own card, OUTSIDE the admin-only Cost Breakdown, so Factory and
+          Print Room can see it. It carries no Rand values. View-only logins
+          get no edit control (and the server refuses their writes anyway). */}
+      <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+        <div className={`flex items-center justify-between gap-3 px-5 py-4 ${(materialsOpen||editingMaterials)?'border-b border-gray-100':''}`}>
+          <button onClick={()=>setMaterialsOpen(o=>!o)} className="flex-1 min-w-0 flex items-center gap-3 text-left">
+            <span className={`text-gray-400 text-xs font-bold transition-transform duration-200 ${(materialsOpen||editingMaterials)?'rotate-180':''}`} style={{display:'inline-block'}}>▼</span>
+            <div className="min-w-0">
+              <h3 className="text-sm font-bold text-gray-700">📦 Material List</h3>
+              <p className="text-xs text-gray-400 mt-0.5 truncate">{_matCount>0 ? _matCount+' material'+(_matCount===1?'':'s')+' listed' : 'Sheets, vinyl, lamination, LEDs, power supplies — nothing listed yet'}</p>
+            </div>
+          </button>
+          {readOnly ? null : !editingMaterials
+            ? <button onClick={startEditMaterials} className="flex-shrink-0 text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
+                {_matCount>0 ? '✏️ Edit Materials' : '+ Add Materials'}
+              </button>
+            : <div className="flex gap-2 flex-shrink-0">
+                <button onClick={cancelMaterials} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-3 py-2 font-semibold hover:bg-gray-50">Cancel</button>
+                <button onClick={saveMaterials}   className="text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">✓ Save</button>
+              </div>
+          }
+        </div>
+        {(materialsOpen||editingMaterials)&&(
+        <div className="px-5 py-4">
+          {editingMaterials && matDraft ? (
+            <div className="space-y-3">
+              <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-blue-700">
+                  {_matCalc.count>0
+                    ? <>From the quote: {_matCalc.count} sized line{_matCalc.count===1?'':'s'}, {sgrMatNum(_matCalc.areaM2)} m² of print = <strong>{sgrMatNum(_matCalc.lengthM)} m</strong> off a {sgrMatNum(_matRollW)} m roll (no waste allowance).</>
+                    : <>No lines with a Length × Width size on this job's quote — enter the vinyl length by hand.</>}
+                </p>
+                <label className="flex items-center gap-1.5 text-xs text-blue-700 font-semibold">Roll width (m)
+                  <input type="number" min="0" step="0.01" value={matDraft.rollW} onChange={e=>setMatDraft(d=>({...d,rollW:e.target.value}))}
+                    className="w-20 border border-blue-200 rounded-lg px-2 py-1 text-xs text-right bg-white"/>
+                </label>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm" style={{minWidth:'560px'}}>
+                  <thead>
+                    <tr className="text-left text-xs font-black text-gray-400 uppercase tracking-wider border-b border-gray-200">
+                      <th className="py-2 pr-3">Material</th>
+                      <th className="py-2 pr-3">Std Size</th>
+                      <th className="py-2 pr-3">Qty</th>
+                      <th className="py-2 text-right">Sq m / Unit</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {SGR_MATERIAL_ROWS.map(row=>(
+                      <tr key={row.key} className="border-b border-gray-50 align-middle">
+                        <td className="py-1.5 pr-3 text-gray-800 font-semibold">{row.material}</td>
+                        <td className="py-1.5 pr-3 text-gray-500 text-xs whitespace-nowrap">{sgrMaterialStdSize(row,_matRollW)}</td>
+                        <td className="py-1.5 pr-3">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <input type="number" min="0" step={row.kind==='roll'?'0.1':'1'} value={matDraft.qty[row.key]} onChange={e=>setMatQty(row.key,e.target.value)} placeholder="0"
+                              className="w-20 border border-gray-300 rounded-lg px-2 py-1.5 text-sm text-right focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/>
+                            <span className="text-xs text-gray-400">{sgrMaterialQtyUnit(row)}</span>
+                            {row.kind==='roll'&&!row.lam&&_matCalc.lengthM>0&&(
+                              <button onClick={()=>setMatQty(row.key,String(_matCalc.lengthM))} className="text-xs text-blue-600 font-bold hover:underline whitespace-nowrap">← quote {sgrMatNum(_matCalc.lengthM)} m</button>
+                            )}
+                            {row.lam&&_matVinylM>0&&(
+                              <button onClick={()=>setMatQty(row.key,sgrMatNum(_matVinylM))} className="text-xs text-blue-600 font-bold hover:underline whitespace-nowrap">← same as vinyl {sgrMatNum(_matVinylM)} m</button>
+                            )}
+                          </div>
+                        </td>
+                        <td className="py-1.5 text-right text-gray-700 font-semibold whitespace-nowrap">{sgrMaterialAmount(row,matDraft.qty[row.key],_matRollW)}</td>
+                      </tr>
+                    ))}
+                    {matDraft.other.map(o=>(
+                      <tr key={o.id} className="border-b border-gray-50 align-middle">
+                        <td className="py-1.5 pr-3"><input value={o.material} onChange={e=>setMatOther(o.id,'material',e.target.value)} placeholder="Other — ABS, Magnetic, PVC Banner…"
+                          className="w-full border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/></td>
+                        <td className="py-1.5 pr-3"><input value={o.size} onChange={e=>setMatOther(o.id,'size',e.target.value)} placeholder="Std size"
+                          className="w-full border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/></td>
+                        <td className="py-1.5 pr-3"><input type="number" min="0" step="any" value={o.qty} onChange={e=>setMatOther(o.id,'qty',e.target.value)} placeholder="0"
+                          className="w-20 border border-gray-300 rounded-lg px-2 py-1.5 text-sm text-right focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/></td>
+                        <td className="py-1.5">
+                          <div className="flex items-center justify-end gap-1.5">
+                            <input value={o.amount} onChange={e=>setMatOther(o.id,'amount',e.target.value)} placeholder="m² or units"
+                              className="w-28 border border-gray-300 rounded-lg px-2 py-1.5 text-sm text-right focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/>
+                            <button onClick={()=>removeMatOther(o.id)} title="Remove this line" className="text-gray-300 hover:text-red-500 text-sm font-bold px-1">✕</button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <button onClick={addMatOther} className="text-brand-500 hover:text-brand-600 text-xs font-semibold hover:underline">+ Add other material</button>
+            </div>
+          ) : _matCount>0 ? (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm" style={{minWidth:'480px'}}>
+                <thead>
+                  <tr className="text-left text-xs font-black text-gray-400 uppercase tracking-wider border-b border-gray-200">
+                    <th className="py-2 pr-3">Material</th>
+                    <th className="py-2 pr-3">Std Size</th>
+                    <th className="py-2 pr-3 text-right">Qty</th>
+                    <th className="py-2 text-right">Sq m / Unit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {SGR_MATERIAL_ROWS.filter(row=>_matSaved.qty[row.key]>0).map(row=>(
+                    <tr key={row.key} className="border-b border-gray-50">
+                      <td className="py-1.5 pr-3 text-gray-800 font-semibold">{row.material}</td>
+                      <td className="py-1.5 pr-3 text-gray-500 text-xs whitespace-nowrap">{sgrMaterialStdSize(row,_matSaved.rollW)}</td>
+                      <td className="py-1.5 pr-3 text-right text-gray-700 whitespace-nowrap">{sgrMatNum(_matSaved.qty[row.key])} {sgrMaterialQtyUnit(row)}</td>
+                      <td className="py-1.5 text-right text-gray-700 font-semibold whitespace-nowrap">{sgrMaterialAmount(row,_matSaved.qty[row.key],_matSaved.rollW)}</td>
+                    </tr>
+                  ))}
+                  {_matSaved.other.map(o=>(
+                    <tr key={o.id} className="border-b border-gray-50">
+                      <td className="py-1.5 pr-3 text-gray-800 font-semibold">{o.material}</td>
+                      <td className="py-1.5 pr-3 text-gray-500 text-xs">{o.size||'—'}</td>
+                      <td className="py-1.5 pr-3 text-right text-gray-700 whitespace-nowrap">{o.qty>0?sgrMatNum(o.qty):'—'}</td>
+                      <td className="py-1.5 text-right text-gray-700 font-semibold whitespace-nowrap">{o.amount||'—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="text-center py-4">
+              <p className="text-gray-400 text-sm">No materials listed yet.</p>
+              {!readOnly&&<button onClick={startEditMaterials} className="mt-2 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Add materials</button>}
+            </div>
+          )}
+        </div>
+        )}
       </div>
 
       {/* ─── COST BREAKDOWN SECTION — admin only, collapsible ─── */}
@@ -20217,7 +20511,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
         <div>
           <div className="flex items-center justify-end px-5 py-3 border-b border-gray-50">
             {!editingCosts
-              ? <button onClick={()=>setEditingCosts(true)} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
+              ? <button onClick={startEditCosts} className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
                   ✏️ Edit Costs
                 </button>
               : <div className="flex gap-2">
@@ -20280,7 +20574,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
               ) : (
                 <div className="text-center py-6">
                   <p className="text-gray-400 text-sm">No cost breakdown entered yet.</p>
-                  <button onClick={()=>setEditingCosts(true)} className="mt-3 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Enter cost breakdown</button>
+                  <button onClick={startEditCosts} className="mt-3 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Enter cost breakdown</button>
                 </div>
               )
             )}
