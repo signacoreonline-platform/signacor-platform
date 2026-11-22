@@ -1345,11 +1345,15 @@ function sgrMaterialAmount(row, qty, rollW){
   if(row.kind==='roll')  return sgrMatNum(q*rollW)+' m²';
   return sgrMatNum(q)+' units';
 }
-// Roll length needed for the sized (Length × Width mm, pieces) m² lines of a
-// job / quote. Each line is nested across the roll width in whichever
-// orientation uses less roll; a piece wider than the roll both ways is cut
-// into panels. No waste allowance is added — the figure is a starting point
-// the user can overwrite. Rounded UP to the next 0.1 m.
+// Roll length (mm) for `pcs` pieces of a × b mm off a roll W mm wide: nested
+// across the roll in whichever orientation uses less roll; a piece wider than
+// the roll both ways is cut into panels. No waste allowance.
+function sgrRollMmForPieces(a, b, pcs, W){
+  const run=(across,along)=>across<=W ? Math.ceil(pcs/Math.floor(W/across))*along : Infinity;
+  let best=Math.min(run(a,b), run(b,a));
+  if(!isFinite(best)) best=Math.ceil(Math.min(a,b)/W)*Math.max(a,b)*pcs;
+  return best;
+}
 function sgrRollLengthForLines(lines, rollW){
   const W=(parseFloat(rollW)>0?parseFloat(rollW):SGR_MATERIAL_ROLL_W)*1000;
   let mm=0, area=0, count=0;
@@ -1358,13 +1362,141 @@ function sgrRollLengthForLines(lines, rollW){
     const a=parseFloat(l.sqmL)||0, b=parseFloat(l.sqmW)||0;
     if(a<=0||b<=0) return;
     const pcs=Math.max(1, Math.ceil(parseFloat(l.pQty)||1));
-    const run=(across,along)=>across<=W ? Math.ceil(pcs/Math.floor(W/across))*along : Infinity;
-    let best=Math.min(run(a,b), run(b,a));
-    if(!isFinite(best)) best=Math.ceil(Math.min(a,b)/W)*Math.max(a,b)*pcs;
-    mm+=best; area+=a*b*pcs/1e6; count++;
+    mm+=sgrRollMmForPieces(a,b,pcs,W); area+=a*b*pcs/1e6; count++;
   });
   return { lengthM: Math.ceil(mm/100-1e-9)/10, areaM2: Math.round(area*100)/100, count };
 }
+
+/* ── AUTOMATIC MATERIAL LIST (2026-11-22) ─────────────────────────────────
+   Draws the list up from a job's / quote's lines. Each line is read through
+   (1) the Complete Product it is linked to, if any — that product's own
+       component list is used, multiplied by the line quantity;
+   (2) otherwise the Inventory item it is linked to (name + category) together
+       with the line description.
+   The text is matched to the set table's materials by keyword. A linked stock
+   item that matches none of them is listed under "Other" in its own unit.
+   Labour / CNC / installation-type lines are left out. This is a best reading
+   of free text — the whole table stays editable, and a saved edit wins. */
+const SGR_MATERIAL_SERVICE_RE = /labou?r|install|design|artwork|deliver|travel|call.?out|set.?up|rigging|scaffold|\bcnc\b|routing|application|\bhire\b|permit|site visit|survey|removal|maintenance|repair|royalt/i;
+function sgrMaterialKinds(text){
+  const t=' '+String(text||'').toLowerCase()+' ';
+  const kinds=[];
+  const add=k=>{ if(!kinds.includes(k)) kinds.push(k); };
+  // a material thickness, not a panel dimension: the first "…mm" of 50 or less
+  let thick=null;
+  (t.match(/(\d+(?:[.,]\d+)?)\s*mm\b/g)||[]).some(m=>{ const v=parseFloat(m.replace(',','.')); if(v>0&&v<=50){ thick=v; return true; } return false; });
+  if(/laminat|overlam/.test(t)) add(/matt/.test(t)?'lam_matte':'lam_gloss');
+  if(/power suppl|\bpsu\b|transformer|led driver/.test(t)) add(/24 ?v/.test(t)?'psu_24v':/12 ?v/.test(t)?'psu_12v':/220|230|240/.test(t)?'psu_220v':'psu_12v');
+  else if(/\bleds?\b|\bled's\b|led module|led strip/.test(t)) add(/indoor|internal|ip20/.test(t)?'led_indoor':'led_outdoor');
+  if(/\bacp\b|alumini?um composite|alucobond|dibond|composite panel/.test(t)) add('acp');
+  if(/acrylic|perspex/.test(t)) add(thick===null||thick===3?'acrylic_3mm':'other');
+  if(/pvc foam|foam pvc|foamed pvc|forex|foamex|sintra|pvc board|foam board/.test(t)) add(thick===null||thick===10?'pvc10':'other');
+  if(/vinyl|sticker|decal|\bwrap\b/.test(t)){
+    if(/reflective|perforated|one.?way|chrome|metallic|frost|sandblast|cutting vinyl|cut vinyl|solid colou?r/.test(t)) add('other');
+    else add(/gr[ae]y.?back|block.?out/.test(t)?'vinyl_grey':'vinyl_white');
+  }
+  if(/\babs\b|magnetic|banner|correx|chromade(c|k)|polycarbonate|\bmesh\b|canvas|\bflag|fabric/.test(t)) add('other');
+  if(!kinds.length && /\bprint(ed|ing|s)?\b/.test(t)) add('vinyl_white');
+  return { kinds, labour: /labou?r|\bcnc\b|application/.test(t), matte: /matt/.test(t) };
+}
+function sgrAutoMaterialList(lines, ctx){
+  ctx=ctx||{};
+  const rollW=parseFloat(ctx.rollW)>0?parseFloat(ctx.rollW):SGR_MATERIAL_ROLL_W;
+  const W=rollW*1000;
+  const inv=Array.isArray(ctx.inventory)?ctx.inventory:[];
+  const cps=Array.isArray(ctx.completeProducts)?ctx.completeProducts:[];
+  const sheets={acp:0,acrylic_3mm:0,pvc_s:0,pvc_l:0};
+  const roll={vinyl_white:0,vinyl_grey:0,lam_matte:0,lam_gloss:0};
+  const units={led_outdoor:0,led_indoor:0,psu_12v:0,psu_24v:0,psu_220v:0};
+  const other=new Map();
+  let pvcFitsSmall=true, matteHint=false;
+  function measure(l){
+    const pcs=Math.max(1, Math.ceil(parseFloat(l.pQty)||1));
+    const unit=String(l.unit||'').trim(), u=unit.toLowerCase();
+    const isArea=u==='m²'||u==='m2'||u==='sqm';
+    const isLinear=u==='m'||u==='lm'||u.indexOf('m (')===0;
+    const a=isArea?(parseFloat(l.sqmL)||0):0, b=isArea?(parseFloat(l.sqmW)||0):0;
+    const total=(parseFloat(l.qty)||0)*pcs;
+    return { pcs, unit, isArea, isLinear, a, b, total, area:(a>0&&b>0)?a*b*pcs/1e6:(isArea?total:0) };
+  }
+  function sheetFrac(m, L, Wd){
+    if(m.a>0&&m.b>0){
+      const per=Math.max(Math.floor(L/m.a)*Math.floor(Wd/m.b), Math.floor(L/m.b)*Math.floor(Wd/m.a));
+      return per>0 ? m.pcs/per : m.area/(L*Wd/1e6);
+    }
+    if(m.isArea) return m.area/(L*Wd/1e6);
+    if(m.isLinear) return 0;
+    return m.total; // counted in sheets / pieces
+  }
+  function rollMm(m){
+    if(m.a>0&&m.b>0) return sgrRollMmForPieces(m.a,m.b,m.pcs,W);
+    if(m.isArea) return m.area/rollW*1000;
+    if(m.isLinear) return m.total*1000;
+    return 0;
+  }
+  function addOther(name, m){
+    name=String(name||'').trim().slice(0,80);
+    if(!name || !(m.total>0)) return;
+    const k=name.toLowerCase()+'|'+m.unit;
+    const e=other.get(k)||{material:name, unit:m.unit, total:0};
+    e.total+=m.total; other.set(k,e);
+  }
+  function apply(text, name, m, linked){
+    const k=sgrMaterialKinds(text);
+    if(k.labour) return;
+    if(!k.kinds.length){ if(linked && !SGR_MATERIAL_SERVICE_RE.test(text)) addOther(name,m); return; }
+    if(k.matte && k.kinds.some(x=>x.indexOf('vinyl_')===0||x.indexOf('lam_')===0)) matteHint=true;
+    k.kinds.forEach(kind=>{
+      if(kind==='acp'||kind==='acrylic_3mm') sheets[kind]+=sheetFrac(m,3000,1500);
+      else if(kind==='pvc10'){
+        sheets.pvc_l+=sheetFrac(m,3000,1500); sheets.pvc_s+=sheetFrac(m,2400,1200);
+        if(m.a>0&&m.b>0&&!(Math.max(m.a,m.b)<=2400&&Math.min(m.a,m.b)<=1200)) pvcFitsSmall=false;
+      }
+      else if(kind in roll)  roll[kind]+=rollMm(m);
+      else if(kind in units) units[kind]+=m.total;
+      else addOther(name,m);
+    });
+  }
+  (Array.isArray(lines)?lines:[]).forEach(l=>{
+    if(!l) return;
+    const m=measure(l);
+    const cp=(l.cpId!=null&&l.cpId!=='') ? cps.find(c=>c&&String(c.id)===String(l.cpId)) : null;
+    if(cp && Array.isArray(cp.items) && cp.items.length){
+      cp.items.forEach(it=>{
+        if(!it) return;
+        apply(String(it.desc||''), it.desc, measure({qty:(parseFloat(it.qty)||0)*m.total, pQty:1, unit:it.unit}), true);
+      });
+      return;
+    }
+    const item=(l.itemId!=null&&l.itemId!=='') ? inv.find(i=>i&&String(i.id)===String(l.itemId)) : null;
+    if(item && /tools|equipment/i.test(item.cat||'')) return;
+    apply([item&&item.name, item&&item.cat, l.desc].filter(Boolean).join(' '), item?item.name:l.desc, m, !!item);
+  });
+  const up=x=>Math.ceil(x-1e-9);
+  const qty={};
+  if(sheets.acp>0) qty.acp=up(sheets.acp);
+  if(sheets.acrylic_3mm>0) qty.acrylic_3mm=up(sheets.acrylic_3mm);
+  if(sheets.pvc_l>0||sheets.pvc_s>0){
+    const nS=up(sheets.pvc_s), nL=up(sheets.pvc_l);
+    if(pvcFitsSmall && nS*2.88<=nL*4.5) qty.pvc10_2412=nS; else qty.pvc10_3015=nL;
+  }
+  const toM=mm=>Math.ceil(mm/100-1e-9)/10;
+  const lenM={}; Object.keys(roll).forEach(k=>{ lenM[k]=toM(roll[k]); });
+  const vinylM=Math.round((lenM.vinyl_white+lenM.vinyl_grey)*10)/10;
+  // Lamination is always the same length as the vinyl. Matte only when the
+  // quote says so; otherwise Gloss.
+  if(vinylM>0 && !(lenM.lam_matte>0&&lenM.lam_gloss>0)){
+    const matte=lenM.lam_matte>0 || (matteHint && !(lenM.lam_gloss>0));
+    lenM.lam_matte=matte?vinylM:0; lenM.lam_gloss=matte?0:vinylM;
+  }
+  Object.keys(lenM).forEach(k=>{ if(lenM[k]>0) qty[k]=lenM[k]; });
+  Object.keys(units).forEach(k=>{ if(units[k]>0) qty[k]=up(units[k]); });
+  const others=[...other.values()].map((e,i)=>({ id:'a'+i, material:e.material, size:'',
+    qty:Math.round(e.total*100)/100, amount:sgrMatNum(e.total)+(e.unit?' '+e.unit:'') }));
+  return sgrMaterialList({ [SGR_MATERIAL_LIST_KEY]: { rollW, qty, other:others } });
+}
+// Same list? (ids ignored) — used to tell an edited list from the automatic one.
+function sgrMaterialListSig(ml){ return JSON.stringify([ml.rollW, ml.qty, ml.other.map(o=>[o.material,o.size,o.qty,o.amount])]); }
 
 /* ═══════════════════════════════════════════════════════════
    EDITABLE DATA — change in Notepad if needed
@@ -6152,7 +6284,7 @@ function escapeHtml(s){
   return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-function printJobCard(job, companies) {
+function printJobCard(job, companies, materialList) {
   const co = companies.find(c=>c.id===job.co)||{name:'Signacore',short:'SGR'};
   const lines = job.lines||[];
   const rows = lines.map(function(l,i){
@@ -6169,7 +6301,7 @@ function printJobCard(job, companies) {
   }).join('');
   // 2026-11-22: the job's Material List (see sgrMaterialList) prints under
   // the line items — only the materials that have a quantity, no Rand values.
-  const _ml = sgrMaterialList(job.breakdown);
+  const _ml = materialList || sgrMaterialList(job.breakdown);
   const matRows = SGR_MATERIAL_ROWS.filter(function(r){ return _ml.qty[r.key]>0; }).map(function(r){
     return '<tr><td>'+escapeHtml(r.material)+'</td><td class="c">'+escapeHtml(sgrMaterialStdSize(r,_ml.rollW))+'</td>'+
       '<td class="c">'+sgrMatNum(_ml.qty[r.key])+' '+sgrMaterialQtyUnit(r)+'</td><td class="c">'+escapeHtml(sgrMaterialAmount(r,_ml.qty[r.key],_ml.rollW))+'</td></tr>';
@@ -19419,7 +19551,7 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
 /* ═══════════════════════════════════════════
    JOB DETAIL  (with editable cost breakdown)
 ═══════════════════════════════════════════ */
-function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack, user, logoDataUrl, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer, purchaseOrders, setPurchaseOrders, suppliers }) {
+function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack, user, logoDataUrl, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer, purchaseOrders, setPurchaseOrders, suppliers, inventory, completeProducts }) {
   const [showInvoiceEmail, setShowInvoiceEmail] = useState(false);
   // 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: manual, OPTIONAL
   // "Create Purchase Order" action lives here — the preferred placement per
@@ -19867,16 +19999,19 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     setEditingCosts(false);
   }
   // ── Material List (2026-11-22) — saved inside job.breakdown ──
-  function startEditMaterials(){
-    const ml = sgrMaterialList(job.breakdown);
+  function matDraftFrom(ml){
     const qty = {};
     SGR_MATERIAL_ROWS.forEach(r=>{ qty[r.key] = ml.qty[r.key] ? String(ml.qty[r.key]) : ''; });
     const other = ml.other.map(o=>({...o, qty:o.qty?String(o.qty):''}));
     if(!other.length) other.push({id:'o'+Date.now(), material:'', size:'', qty:'', amount:''});
-    setMatDraft({ rollW:String(ml.rollW), qty, other });
+    return { rollW:String(ml.rollW), qty, other };
+  }
+  function startEditMaterials(){
+    setMatDraft(matDraftFrom(_matList)); // whatever is showing: the edited list, else the automatic one
     setMaterialsOpen(true);
     setEditingMaterials(true);
   }
+  function rebuildMaterials(){ setMatDraft(matDraftFrom(_matAuto)); }
   function cancelMaterials(){ setEditingMaterials(false); setMatDraft(null); }
   function setMatQty(key,val){ setMatDraft(d=>({...d, qty:{...d.qty,[key]:val}})); }
   function setMatOther(id,field,val){ setMatDraft(d=>({...d, other:d.other.map(o=>o.id===id?{...o,[field]:val}:o)})); }
@@ -19885,6 +20020,10 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
   async function saveMaterials(){
     const clean = sgrMaterialList({ [SGR_MATERIAL_LIST_KEY]: matDraft });
     const nextBd = {...(job.breakdown && typeof job.breakdown==='object' ? job.breakdown : {}), [SGR_MATERIAL_LIST_KEY]: clean};
+    // Saved exactly as the automatic list -> store nothing, so the table keeps
+    // following the quote. Only a real edit is kept as this job's own list.
+    const isAuto = sgrMaterialListSig(clean)===sgrMaterialListSig(_matAuto);
+    if(isAuto) delete nextBd[SGR_MATERIAL_LIST_KEY];
     if(isRelationalAuthoritative('jobs')){
       try {
         const result = await relationalApi.updateJob(job._relId, job._relRowVersion, { breakdown: nextBd });
@@ -19898,7 +20037,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
     } else {
       setJobs(prev=>prev.map(j=>j.id===job.id?{...j,breakdown:nextBd}:j));
     }
-    setBd(prev=>prev ? {...prev, [SGR_MATERIAL_LIST_KEY]: clean} : prev);
+    setBd(prev=>{ if(!prev) return prev; const n={...prev}; if(isAuto) delete n[SGR_MATERIAL_LIST_KEY]; else n[SGR_MATERIAL_LIST_KEY]=clean; return n; });
     setEditingMaterials(false);
     setMatDraft(null);
   }
@@ -19999,13 +20138,15 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 
   const editTotal = bd ? breakdownTotal(bd) : 0;
   // Material List (2026-11-22)
-  const _matSaved  = sgrMaterialList(job.breakdown);
-  const _matCount  = sgrMaterialListCount(_matSaved);
-  const _matRollW  = editingMaterials && matDraft ? (parseFloat(matDraft.rollW)>0 ? parseFloat(matDraft.rollW) : SGR_MATERIAL_ROLL_W) : _matSaved.rollW;
-  const _matSized  = l=>l && l.unit==='m²' && parseFloat(l.sqmL)>0 && parseFloat(l.sqmW)>0;
+  // Lines the automatic list is drawn from: the job's own (copied from the
+  // quote on conversion), else the source quote's.
   const _matSrcQ   = job.quoteNum ? resolveQuoteForJob(job, quotes) : null;
-  const _matLines  = (job.lines||[]).some(_matSized) ? job.lines : ((_matSrcQ && _matSrcQ.lines) || []);
-  const _matCalc   = sgrRollLengthForLines(_matLines, _matRollW);
+  const _matLines  = (job.lines||[]).length ? job.lines : ((_matSrcQ && _matSrcQ.lines) || []);
+  const _matAuto   = sgrAutoMaterialList(_matLines, { inventory, completeProducts, rollW: SGR_MATERIAL_ROLL_W });
+  const _matEdited = !!(job.breakdown && typeof job.breakdown==='object' && job.breakdown[SGR_MATERIAL_LIST_KEY]);
+  const _matList   = _matEdited ? sgrMaterialList(job.breakdown) : _matAuto; // what shows and prints
+  const _matCount  = sgrMaterialListCount(_matList);
+  const _matRollW  = editingMaterials && matDraft ? (parseFloat(matDraft.rollW)>0 ? parseFloat(matDraft.rollW) : SGR_MATERIAL_ROLL_W) : _matList.rollW;
   const _matVinylM = editingMaterials && matDraft ? (parseFloat(matDraft.qty.vinyl_white)||0)+(parseFloat(matDraft.qty.vinyl_grey)||0) : 0;
 
   return (
@@ -20374,12 +20515,12 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
             <span className={`text-gray-400 text-xs font-bold transition-transform duration-200 ${(materialsOpen||editingMaterials)?'rotate-180':''}`} style={{display:'inline-block'}}>▼</span>
             <div className="min-w-0">
               <h3 className="text-sm font-bold text-gray-700">📦 Material List</h3>
-              <p className="text-xs text-gray-400 mt-0.5 truncate">{_matCount>0 ? _matCount+' material'+(_matCount===1?'':'s')+' listed' : 'Sheets, vinyl, lamination, LEDs, power supplies — nothing listed yet'}</p>
+              <p className="text-xs text-gray-400 mt-0.5 truncate">{(_matCount>0 ? _matCount+' material'+(_matCount===1?'':'s')+' needed' : 'No materials picked up from the quote')+(_matEdited ? ' · edited by hand' : ' · automatic from the quote')}</p>
             </div>
           </button>
           {readOnly ? null : !editingMaterials
             ? <button onClick={startEditMaterials} className="flex-shrink-0 text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 font-bold transition-colors">
-                {_matCount>0 ? '✏️ Edit Materials' : '+ Add Materials'}
+                ✏️ Edit Table
               </button>
             : <div className="flex gap-2 flex-shrink-0">
                 <button onClick={cancelMaterials} className="text-xs border border-gray-200 text-gray-600 rounded-xl px-3 py-2 font-semibold hover:bg-gray-50">Cancel</button>
@@ -20392,10 +20533,9 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
           {editingMaterials && matDraft ? (
             <div className="space-y-3">
               <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2">
-                <p className="text-xs text-blue-700">
-                  {_matCalc.count>0
-                    ? <>From the quote: {_matCalc.count} sized line{_matCalc.count===1?'':'s'}, {sgrMatNum(_matCalc.areaM2)} m² of print = <strong>{sgrMatNum(_matCalc.lengthM)} m</strong> off a {sgrMatNum(_matRollW)} m roll (no waste allowance).</>
-                    : <>No lines with a Length × Width size on this job's quote — enter the vinyl length by hand.</>}
+                <p className="text-xs text-blue-700 flex-1 min-w-0">
+                  This table is drawn up from the quote's lines and their inventory items. Change anything and Save to keep your own version for this job.
+                  <button onClick={rebuildMaterials} className="ml-2 font-bold underline whitespace-nowrap">↻ Rebuild from quote</button>
                 </p>
                 <label className="flex items-center gap-1.5 text-xs text-blue-700 font-semibold">Roll width (m)
                   <input type="number" min="0" step="0.01" value={matDraft.rollW} onChange={e=>setMatDraft(d=>({...d,rollW:e.target.value}))}
@@ -20422,9 +20562,6 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                             <input type="number" min="0" step={row.kind==='roll'?'0.1':'1'} value={matDraft.qty[row.key]} onChange={e=>setMatQty(row.key,e.target.value)} placeholder="0"
                               className="w-20 border border-gray-300 rounded-lg px-2 py-1.5 text-sm text-right focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/>
                             <span className="text-xs text-gray-400">{sgrMaterialQtyUnit(row)}</span>
-                            {row.kind==='roll'&&!row.lam&&_matCalc.lengthM>0&&(
-                              <button onClick={()=>setMatQty(row.key,String(_matCalc.lengthM))} className="text-xs text-blue-600 font-bold hover:underline whitespace-nowrap">← quote {sgrMatNum(_matCalc.lengthM)} m</button>
-                            )}
                             {row.lam&&_matVinylM>0&&(
                               <button onClick={()=>setMatQty(row.key,sgrMatNum(_matVinylM))} className="text-xs text-blue-600 font-bold hover:underline whitespace-nowrap">← same as vinyl {sgrMatNum(_matVinylM)} m</button>
                             )}
@@ -20455,7 +20592,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
               </div>
               <button onClick={addMatOther} className="text-brand-500 hover:text-brand-600 text-xs font-semibold hover:underline">+ Add other material</button>
             </div>
-          ) : _matCount>0 ? (
+          ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm" style={{minWidth:'480px'}}>
                 <thead>
@@ -20467,29 +20604,34 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
                   </tr>
                 </thead>
                 <tbody>
-                  {SGR_MATERIAL_ROWS.filter(row=>_matSaved.qty[row.key]>0).map(row=>(
+                  {SGR_MATERIAL_ROWS.map(row=>{
+                    const q=_matList.qty[row.key]||0;
+                    return (
                     <tr key={row.key} className="border-b border-gray-50">
-                      <td className="py-1.5 pr-3 text-gray-800 font-semibold">{row.material}</td>
-                      <td className="py-1.5 pr-3 text-gray-500 text-xs whitespace-nowrap">{sgrMaterialStdSize(row,_matSaved.rollW)}</td>
-                      <td className="py-1.5 pr-3 text-right text-gray-700 whitespace-nowrap">{sgrMatNum(_matSaved.qty[row.key])} {sgrMaterialQtyUnit(row)}</td>
-                      <td className="py-1.5 text-right text-gray-700 font-semibold whitespace-nowrap">{sgrMaterialAmount(row,_matSaved.qty[row.key],_matSaved.rollW)}</td>
+                      <td className={`py-1.5 pr-3 ${q>0?'text-gray-800 font-semibold':'text-gray-400'}`}>{row.material}</td>
+                      <td className={`py-1.5 pr-3 text-xs whitespace-nowrap ${q>0?'text-gray-500':'text-gray-300'}`}>{sgrMaterialStdSize(row,_matList.rollW)}</td>
+                      <td className={`py-1.5 pr-3 text-right whitespace-nowrap ${q>0?'text-gray-700':'text-gray-300'}`}>{q>0 ? sgrMatNum(q)+' '+sgrMaterialQtyUnit(row) : '—'}</td>
+                      <td className={`py-1.5 text-right whitespace-nowrap ${q>0?'text-gray-700 font-semibold':'text-gray-300'}`}>{sgrMaterialAmount(row,q,_matList.rollW)}</td>
                     </tr>
-                  ))}
-                  {_matSaved.other.map(o=>(
+                    );
+                  })}
+                  {_matList.other.length ? _matList.other.map(o=>(
                     <tr key={o.id} className="border-b border-gray-50">
                       <td className="py-1.5 pr-3 text-gray-800 font-semibold">{o.material}</td>
                       <td className="py-1.5 pr-3 text-gray-500 text-xs">{o.size||'—'}</td>
                       <td className="py-1.5 pr-3 text-right text-gray-700 whitespace-nowrap">{o.qty>0?sgrMatNum(o.qty):'—'}</td>
                       <td className="py-1.5 text-right text-gray-700 font-semibold whitespace-nowrap">{o.amount||'—'}</td>
                     </tr>
-                  ))}
+                  )) : (
+                    <tr className="border-b border-gray-50">
+                      <td className="py-1.5 pr-3 text-gray-400">Other (ABS, Magnetic, PVC Banner…)</td>
+                      <td className="py-1.5 pr-3 text-gray-300 text-xs">—</td>
+                      <td className="py-1.5 pr-3 text-right text-gray-300">—</td>
+                      <td className="py-1.5 text-right text-gray-300">—</td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
-            </div>
-          ) : (
-            <div className="text-center py-4">
-              <p className="text-gray-400 text-sm">No materials listed yet.</p>
-              {!readOnly&&<button onClick={startEditMaterials} className="mt-2 text-brand-500 hover:text-brand-600 text-sm font-semibold hover:underline">+ Add materials</button>}
             </div>
           )}
         </div>
@@ -20588,7 +20730,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
       <div className="bg-white rounded-2xl border border-gray-200 p-5">
         <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-3">Documents</p>
         <div className="flex flex-wrap gap-3">
-          <button onClick={()=>printJobCard(job,companies)}
+          <button onClick={()=>printJobCard(job,companies,_matList)}
             className="flex items-center gap-1.5 text-xs bg-gray-800 hover:bg-gray-900 text-white rounded-xl px-4 py-2.5 font-bold">
             🖨️ Print Job Card
           </button>
@@ -20832,7 +20974,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 const DONE_STATUSES = ['completed','invoiced'];
 const WIP_STATUSES  = STAGE_STATUSES.filter(s=>!DONE_STATUSES.includes(s));
 
-function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared, proposedProjects=[], setProposedProjects, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer, purchaseOrders, setPurchaseOrders, suppliers, forceSaveSections }) {
+function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFilter, setEntityFilter, logoDataUrl, highlightJobId, onHighlightCleared, proposedProjects=[], setProposedProjects, accInvoices, customers, onOpenQuote, onOpenInvoice, onOpenJobPayments, onOpenCustomer, purchaseOrders, setPurchaseOrders, suppliers, forceSaveSections, inventory, completeProducts }) {
   // ── POST-MIGRATION STABILIZATION (2026-08-24) — FRONTEND AUDIT (BUG 8) ────
   // The job cards in this list render an inline due-date <input> whose onChange
   // called `updateJobDueDate` — a function defined ONLY inside JobDetail. It
@@ -21007,7 +21149,7 @@ function JobsPage({ jobs, setJobs, quotes, setQuotes, companies, user, entityFil
   const completedCount = visibleJobs.filter(j=> DONE_STATUSES.includes(j.status)).length;
   const statusOpts     = jobTab==='active' ? WIP_STATUSES : DONE_STATUSES;
 
-  if(detail!==null) return <JobDetail jobId={detail} jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} onBack={()=>setDetail(null)} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices} customers={customers} onOpenQuote={onOpenQuote} onOpenInvoice={onOpenInvoice} onOpenJobPayments={onOpenJobPayments} onOpenCustomer={onOpenCustomer} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>;
+  if(detail!==null) return <JobDetail jobId={detail} jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} onBack={()=>setDetail(null)} user={user} logoDataUrl={logoDataUrl} accInvoices={accInvoices} customers={customers} onOpenQuote={onOpenQuote} onOpenInvoice={onOpenInvoice} onOpenJobPayments={onOpenJobPayments} onOpenCustomer={onOpenCustomer} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} inventory={inventory} completeProducts={completeProducts}/>;
 
   return (
     <div className="p-4 space-y-4">
@@ -31894,7 +32036,7 @@ function App() {
     sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} onOpenJob={openJobRecord} forceSaveSections={forceSaveSections}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets} forceSaveSections={forceSaveSections} companies={companies} employees={employees} suppliers={suppliers}/>,
-    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} forceSaveSections={forceSaveSections} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers}/>,
+    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} forceSaveSections={forceSaveSections} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} inventory={inventory} completeProducts={completeProducts}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
