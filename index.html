@@ -1378,26 +1378,111 @@ function sgrRollLengthForLines(lines, rollW){
    Labour / CNC / installation-type lines are left out. This is a best reading
    of free text — the whole table stays editable, and a saved edit wins. */
 const SGR_MATERIAL_SERVICE_RE = /labou?r|install|design|artwork|deliver|travel|call.?out|set.?up|rigging|scaffold|\bcnc\b|routing|application|\bhire\b|permit|site visit|survey|removal|maintenance|repair|royalt/i;
+// A line priced per hour / day / trip / job is a service, never a material.
+const SGR_MATERIAL_SERVICE_UNITS = /^(hr|hrs|hour|hours|day|days|trip|trips|visit|visits|job|km)$/i;
+// Machine / labour rate items ("CNC Routing — Acrylic", "Laser Cutting") name a
+// material but are not one. Deliberately narrow: a sign described as "CNC
+// router cut" is still a material line.
+const SGR_MATERIAL_RATE_RE = /labou?r|cnc\s+(routing|vinyl|engraving|setup)|laser\s+cutting|sticker\s+cutting/i;
+
+/* ── MATERIAL WORD LIST (2026-11-22) — EDITABLE ───────────────────────────
+   Maps the wording used in quotations to a core material. To teach the
+   Material List a new word, add it to the `words` of the right line.
+     * a space in a word also matches a hyphen or no space
+       ('plexi glass' finds plexi glass, plexi-glass and plexiglass);
+     * a trailing * matches any ending ('laminat*' finds lamination, laminated).
+   `key` lines feed the set table. Lines without a key are listed under
+   "Other" by their `core` name. `media:true` marks something that is itself
+   printed on, so a "print" on that line is not counted as vinyl. */
+const SGR_MATERIAL_SYNONYMS = [
+  { core:'ACP',              key:'acp',     words:['acp','acm','aluminium composite','aluminum composite','alu composite','composite panel*','composite material*','composite board*','composite sheet*','alucobond','alupanel','alubond','dibond','reynobond'] },
+  { core:'Acrylic',          key:'acrylic', words:['acrylic*','plexi*','plexi glass','perspex','pmma','lucite'] },
+  { core:'PVC Foam',         key:'pvcfoam', words:['pvc foam','foam pvc','foamed pvc','rigid pvc','pvc board*','pvc back board*','pvc backing','pvc sheet*','foam board*','foam back board*','foam backing','foamex','forex','sintra','komatex','palight','celtec'] },
+  { core:'Grey Back Vinyl',  key:'vinyl_grey', vinyl:true, words:['grey back','gray back','block out','black out vinyl'] },
+  { core:'Frosted Vinyl',    vinyl:true, media:true, words:['frost*','sandblast*','etch*'] },
+  { core:'Contra Vision',    vinyl:true, media:true, words:['contra vision','one way vision','perforat*'] },
+  { core:'Reflective Vinyl', vinyl:true, media:true, words:['reflective'] },
+  { core:'Cut Vinyl',        vinyl:true, words:['cut vinyl','vinyl cut','cutting vinyl','vinyl lettering','cut polymeric vinyl'] },
+  { core:'Vinyl',            key:'vinyl',   words:['vinyl*','sticker*','decal*','wrap*','sav'] },
+  { core:'Print',            key:'print',   words:['print*'] },
+  { core:'Lamination',       key:'lam',     words:['laminat*','overlam*','uv protection'] },
+  { core:'Power Supply',     key:'psu',     words:['power supply','power supplies','psu','transformer*','led driver*','driver'] },
+  { core:'LED',              key:'led',     words:['led','leds',"led's",'led module*','led strip*'] },
+  { core:'Correx',           words:['correx','corex','coro','corflute','coroplast','fluted board*','corrugated plastic'] },
+  { core:'ABS',              words:['abs'] },
+  { core:'Magnetic Material',words:['magnetic','magnet*'] },
+  { core:'Mesh Banner',      media:true, words:['mesh banner*','mesh'] },
+  { core:'PVC Banner',       media:true, words:['pvc banner*','banner*','pvc print*'] },
+  { core:'Wallpaper',        media:true, words:['wallpaper','wall paper'] },
+  { core:'Canvas',           media:true, words:['canvas'] },
+  { core:'Fabric',           media:true, words:['fabric','fabrics','textile*','sock print*','flag','flags'] },
+  { core:'Polycarbonate',    words:['polycarbonate','polycarb','lexan'] },
+  { core:'Chromadek',        words:['chromadek','chromadeck'] },
+  { core:'MDF',              words:['mdf','supawood'] },
+  { core:'Neon Flex',        words:['neon flex','neon'] },
+];
+function sgrMaterialWordRe(words, flags){
+  return new RegExp('[^a-z0-9](?:'+words.map(w=>{
+    const star=w.slice(-1)==='*';
+    const base=(star?w.slice(0,-1):w).replace(/[.*+?^${}()|[\]\\]/g,'\\$&').replace(/[\s\-]+/g,'[\\s\\-]*');
+    return base+(star?'[a-z]*':'');
+  }).join('|')+')(?![a-z0-9])', flags||'i');
+}
+SGR_MATERIAL_SYNONYMS.forEach(e=>{ e.re=sgrMaterialWordRe(e.words); });
+// "10mm PVC back board", "10mm foam" — a thickness straight in front of pvc /
+// foam is board, unless it is a banner, print, connector, return or pipe.
+const SGR_MATERIAL_PVC_THICK_RE = /\d\s*mm\s+(?:white\s+|black\s+)?(?:pvc|foam)(?![a-z])(?!\s*(?:banner|print|connector|return|pipe))/i;
+// Printing that does not go onto vinyl.
+const SGR_MATERIAL_DIRECT_PRINT_RE = /flatbed|direct(?:ly)?\s+print|uv\s+print|sublimation|embroider|screen\s*print/i;
+// The material thickness written next to a material word: "3mm opal acrylic",
+// "Acrylic 5mm", "ACRYLIC-1,5x3m-OPAL-16mm". A "60mm return" is a dimension of
+// the sign, not a thickness, and anything over 50mm is not a sheet thickness.
+function sgrMaterialThicknessNear(t, entry){
+  const mmRe=/(\d+(?:[.,]\d+)?)\s*mm\b(?!\s*(?:[a-z]+\s+)?returns?)/g;
+  const sizes=[]; let m;
+  while((m=mmRe.exec(t))){ const v=parseFloat(m[1].replace(',','.')); if(v>0&&v<=50) sizes.push({ at:m.index, end:m.index+m[0].length, v }); }
+  if(!sizes.length) return null;
+  const clear=(from,to)=>!/[.;:]|\b(?:on|onto|with|and|to|from|over)\b/.test(t.slice(from,to)); // same phrase: no sentence break or joining word between
+  const re=sgrMaterialWordRe(entry.words,'gi');
+  while((m=re.exec(t))){
+    const s0=m.index+1, e0=m.index+m[0].length;
+    const before=sizes.filter(z=>z.end<=s0 && s0-z.at<=34 && clear(z.end,s0)).pop();
+    if(before) return before.v;
+    const after=sizes.find(z=>z.at>=e0 && z.at-e0<=30 && clear(e0,z.at));
+    if(after) return after.v;
+  }
+  return null;
+}
+// Which materials a piece of quote / inventory wording refers to.
+//   kinds: set-table keys ('acp','acrylic_3mm','pvc10','vinyl_white',…) and
+//          'other:<Material name>' for everything listed under "Other".
 function sgrMaterialKinds(text){
-  const t=' '+String(text||'').toLowerCase()+' ';
+  const t=' '+String(text||'').toLowerCase().replace(/\s+/g,' ')+' ';
   const kinds=[];
   const add=k=>{ if(!kinds.includes(k)) kinds.push(k); };
-  // a material thickness, not a panel dimension: the first "…mm" of 50 or less
-  let thick=null;
-  (t.match(/(\d+(?:[.,]\d+)?)\s*mm\b/g)||[]).some(m=>{ const v=parseFloat(m.replace(',','.')); if(v>0&&v<=50){ thick=v; return true; } return false; });
-  if(/laminat|overlam/.test(t)) add(/matt/.test(t)?'lam_matte':'lam_gloss');
-  if(/power suppl|\bpsu\b|transformer|led driver/.test(t)) add(/24 ?v/.test(t)?'psu_24v':/12 ?v/.test(t)?'psu_12v':/220|230|240/.test(t)?'psu_220v':'psu_12v');
-  else if(/\bleds?\b|\bled's\b|led module|led strip/.test(t)) add(/indoor|internal|ip20/.test(t)?'led_indoor':'led_outdoor');
-  if(/\bacp\b|alumini?um composite|alucobond|dibond|composite panel/.test(t)) add('acp');
-  if(/acrylic|perspex/.test(t)) add(thick===null||thick===3?'acrylic_3mm':'other');
-  if(/pvc foam|foam pvc|foamed pvc|forex|foamex|sintra|pvc board|foam board/.test(t)) add(thick===null||thick===10?'pvc10':'other');
-  if(/vinyl|sticker|decal|\bwrap\b/.test(t)){
-    if(/reflective|perforated|one.?way|chrome|metallic|frost|sandblast|cutting vinyl|cut vinyl|solid colou?r/.test(t)) add('other');
-    else add(/gr[ae]y.?back|block.?out/.test(t)?'vinyl_grey':'vinyl_white');
+  const hit={}; let media=false, specialVinyl=false;
+  SGR_MATERIAL_SYNONYMS.forEach(e=>{ if(e.re.test(t)){ hit[e.key||e.core]=e; if(e.media) media=true; if(e.vinyl) specialVinyl=true; } });
+  if(hit.acp) add('acp');
+  if(hit.acrylic){ const th=sgrMaterialThicknessNear(t, hit.acrylic); add(th===null||th===3 ? 'acrylic_3mm' : 'other:'+sgrMatNum(th)+'mm Acrylic'); }
+  const pvcEntry=SGR_MATERIAL_SYNONYMS.find(e=>e.key==='pvcfoam');
+  if(hit.pvcfoam || SGR_MATERIAL_PVC_THICK_RE.test(t)){
+    let th=sgrMaterialThicknessNear(t, pvcEntry);
+    if(th===null){ const m=t.match(/(\d+(?:[.,]\d+)?)\s*mm\s+(?:white\s+|black\s+)?(?:pvc|foam)(?![a-z])/); if(m) th=parseFloat(m[1].replace(',','.')); }
+    add(th===null||th===10 ? 'pvc10' : 'other:'+sgrMatNum(th)+'mm PVC Foam');
   }
-  if(/\babs\b|magnetic|banner|correx|chromade(c|k)|polycarbonate|\bmesh\b|canvas|\bflag|fabric/.test(t)) add('other');
-  if(!kinds.length && /\bprint(ed|ing|s)?\b/.test(t)) add('vinyl_white');
-  return { kinds, labour: /labou?r|\bcnc\b|application/.test(t), matte: /matt/.test(t) };
+  SGR_MATERIAL_SYNONYMS.forEach(e=>{
+    if(e.key && e.key!=='vinyl_grey') return;
+    if(!hit[e.key||e.core]) return;
+    if(e.key==='vinyl_grey'){ add('vinyl_grey'); return; }
+    if(e.core==='PVC Banner' && hit['Mesh Banner']) return;
+    add('other:'+e.core);
+  });
+  // Plain vinyl, or a print that is not on another printable material -> white back vinyl.
+  if(!specialVinyl && (hit.vinyl || (hit.print && !media && !SGR_MATERIAL_DIRECT_PRINT_RE.test(t)))) add('vinyl_white');
+  if(hit.lam) add(/matt/.test(t)?'lam_matte':'lam_gloss');
+  if(hit.psu) add(/24\s*v/.test(t)?'psu_24v':/12\s*v/.test(t)?'psu_12v':/220|230|240/.test(t)?'psu_220v':'psu_12v');
+  else if(hit.led && !/controller|dimmer|amplifier/.test(t)) add(/indoor|interior|internal(?!ly)|ip20|non[\s\-]*waterproof/.test(t)?'led_indoor':'led_outdoor');
+  return { kinds, labour: SGR_MATERIAL_RATE_RE.test(t), matte: /matt/.test(t) };
 }
 function sgrAutoMaterialList(lines, ctx){
   ctx=ctx||{};
@@ -1442,9 +1527,14 @@ function sgrAutoMaterialList(lines, ctx){
     e.total+=m.total; other.set(k,e);
   }
   function apply(text, name, m, linked){
+    if(SGR_MATERIAL_SERVICE_UNITS.test(m.unit)) return;
     const k=sgrMaterialKinds(text);
     if(k.labour) return;
     if(!k.kinds.length){ if(linked && !SGR_MATERIAL_SERVICE_RE.test(text)) addOther(name,m); return; }
+    // LEDs / power supplies are counted only on a line that is itself the LED
+    // or power-supply item. On a sign line ("… illuminated with LED strip") the
+    // line quantity is the sign's, not a number of LEDs.
+    const hasSubstrate=k.kinds.some(x=>!(x in units));
     if(k.matte && k.kinds.some(x=>x.indexOf('vinyl_')===0||x.indexOf('lam_')===0)) matteHint=true;
     k.kinds.forEach(kind=>{
       if(kind==='acp'||kind==='acrylic_3mm') sheets[kind]+=sheetFrac(m,3000,1500);
@@ -1453,8 +1543,8 @@ function sgrAutoMaterialList(lines, ctx){
         if(m.a>0&&m.b>0&&!(Math.max(m.a,m.b)<=2400&&Math.min(m.a,m.b)<=1200)) pvcFitsSmall=false;
       }
       else if(kind in roll)  roll[kind]+=rollMm(m);
-      else if(kind in units) units[kind]+=m.total;
-      else addOther(name,m);
+      else if(kind in units){ if(!hasSubstrate) units[kind]+=m.total; }
+      else addOther(kind.indexOf('other:')===0 ? kind.slice(6) : name, m);
     });
   }
   (Array.isArray(lines)?lines:[]).forEach(l=>{
@@ -1469,7 +1559,7 @@ function sgrAutoMaterialList(lines, ctx){
       return;
     }
     const item=(l.itemId!=null&&l.itemId!=='') ? inv.find(i=>i&&String(i.id)===String(l.itemId)) : null;
-    if(item && /tools|equipment/i.test(item.cat||'')) return;
+    if(item && /tools|equipment|labou?r|services?|machining|fabrication/i.test(item.cat||'')) return;
     apply([item&&item.name, item&&item.cat, l.desc].filter(Boolean).join(' '), item?item.name:l.desc, m, !!item);
   });
   const up=x=>Math.ceil(x-1e-9);
