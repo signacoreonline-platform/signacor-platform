@@ -207,6 +207,20 @@ async function main() {
   (readModule as any).getAuthoritativeJson = originalBuilder;
   ok(threwOnBuilderFailure, 'a failure while assembling a cut-over section\'s data aborts the WHOLE export rather than shipping a partial/incorrect zip');
 
+  console.log('\n[Full Backup V2] 2026-11-23: no login passwords from platform_state.userAccounts');
+  {
+    await pool.query(`UPDATE relational_cutover SET enabled = false`);
+    delete process.env.RELATIONAL_AUTHORITY_ENABLED;
+    await pool.query(`UPDATE platform_state SET data = $1::jsonb, updated_at = NOW() WHERE id = 1`, [JSON.stringify({
+      jobs: [], userAccounts: [{ id: 'u-bkp', email: 'bkp@example.test', pw: 'Plain-Secret-7781', role: 'admin', name: 'Backup User', requiresPassword: true }, { id: 'u-fac', email: 'factory@example.test', pw: '', role: 'factory' }],
+    })]);
+    const r = await buildFullBackupV2('admin');
+    const dj = extractDataJson(r);
+    const parsedAcc = (JSON.parse(dj).userAccounts || []) as any[];
+    ok(dj.length > 2 && !dj.includes('Plain-Secret-7781'), 'the plaintext password stored in userAccounts[].pw is not in data.json');
+    ok(parsedAcc.length === 2 && parsedAcc[0].email === 'bkp@example.test' && parsedAcc[0].role === 'admin' && parsedAcc[0].requiresPassword === true && !('pw' in parsedAcc[0]), 'accounts are kept (email, role, requiresPassword) with the pw field removed', JSON.stringify(parsedAcc[0]));
+  }
+
   await pool.query(`UPDATE relational_cutover SET enabled = false, enabled_at = NULL, enabled_by = NULL`);
   delete process.env.RELATIONAL_AUTHORITY_ENABLED;
   await pool.query(`TRUNCATE rel_customers, rel_quotes, rel_quote_line_items, rel_jobs, rel_job_line_items RESTART IDENTITY CASCADE`).catch(() => undefined);

@@ -384,51 +384,404 @@ async function deductInventoryRelational(consumption, api) {
   return { applied, failed };
 }
 
-// Bulk Import through the relational API. Mirrors the JSON importer's rules:
-//   "add"     — a row whose SKU (case-insensitive) matches an existing item
-//               updates that item's CSV fields; otherwise a new item is created.
-//               A CSV row carries no supplier, so an existing item's supplier
-//               link is never touched and new items have none. A SKU that only
-//               matches a removed (inactive) item updates AND restores it, so an
-//               imported row can never be saved yet invisible.
-//   "replace" — the same upserts; then every other ACTIVE item is removed
-//               (soft delete). Removals run ONLY if every row saved, so a
-//               failed import can never also strip the existing inventory.
+/* ═══════════════════════════════════════════════════════════════════════════
+   2026-11-23 INVENTORY CSV EXPORT / IMPORT (shared, top-level, testable)
+
+   Root cause this replaces: the old Bulk Import ignored the header row and
+   read columns BY POSITION (SKU,Name,Category,Stock,Reorder,Unit,Cost,Sell)
+   with a plain split(','). A file in any other column order (e.g. the
+   22 Nov inventory export: …,Unit,Stock on hand,Reorder level,…) put the
+   edited stock into the reorder level and wrote stock 0; a quoted comma or an
+   Excel "1,250.00" shifted every later column; blank cells overwrote real
+   values with defaults; every matched row was rewritten and reported as a
+   success whether or not anything changed.
+
+   Rules now:
+     · Columns are matched BY HEADER NAME (aliases below). Unknown columns are
+       listed as ignored. A header row is required.
+     · RFC 4180 parsing: quotes, "" escapes, commas/new lines inside quotes,
+       UTF-8 BOM, CRLF/LF/CR, and ',' ';' or TAB separators.
+     · A row is matched by ID (the export's "ID (do not edit)" column) when it
+       has one, otherwise by SKU (case-insensitive). Unknown ID, a SKU shared by
+       several items, or two rows for the same item → the row is REJECTED with
+       its row number and field. Nothing is ever matched by guesswork.
+     · For an existing item a blank cell, or a column that is not in the file,
+       leaves the current value unchanged. 0 is a real value and is kept.
+       Only fields that actually differ are sent; an identical row is
+       "unchanged" and is not written at all. Supplier is never touched.
+     · New items need SKU and Name; missing values take the Add Item defaults
+       (Category General, unit "unit", stock 0, reorder 5, prices 0).
+   ═══════════════════════════════════════════════════════════════════════════ */
+function sgrCsvParse(text) {
+  let s = String(text == null ? '' : text);
+  if (s.charCodeAt(0) === 0xFEFF) s = s.slice(1);
+  // Separator: the most frequent of , ; TAB in the first line (outside quotes).
+  let firstLine = '', inQ = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '"') inQ = !inQ;
+    else if (!inQ && (c === '\n' || c === '\r')) break;
+    firstLine += inQ ? '' : c;
+  }
+  const counts = { ',': 0, ';': 0, '\t': 0 };
+  for (const c of firstLine) if (counts[c] !== undefined) counts[c]++;
+  let delimiter = ',';
+  if (counts[';'] > counts[delimiter]) delimiter = ';';
+  if (counts['\t'] > counts[delimiter]) delimiter = '\t';
+  const rows = []; let row = []; let cell = ''; let quoted = false; let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (quoted) {
+      if (c === '"') {
+        if (s[i + 1] === '"') { cell += '"'; i += 2; continue; }
+        quoted = false; i++; continue;
+      }
+      cell += c; i++; continue;
+    }
+    if (c === '"' && cell === '') { quoted = true; i++; continue; }
+    if (c === delimiter) { row.push(cell); cell = ''; i++; continue; }
+    if (c === '\r' || c === '\n') {
+      row.push(cell); rows.push(row); row = []; cell = '';
+      if (c === '\r' && s[i + 1] === '\n') i++;
+      i++; continue;
+    }
+    cell += c; i++;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  return { rows: rows.filter(r => r.some(v => String(v).trim() !== '')), delimiter };
+}
+function sgrCsvCell(v) {
+  const t = v === null || v === undefined ? '' : String(v);
+  return /[",\r\n;\t]/.test(t) || /^\s|\s$/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+}
+function sgrCsvStringify(rows) {
+  return rows.map(r => r.map(sgrCsvCell).join(',')).join('\r\n') + '\r\n';
+}
+// Numbers as typed by people or written by Excel: "1250", "1250.5",
+// "1 250,50", "R 1,250.00", "1.250,50", "1,250." (Excel '#,##0.##').
+// A lone comma with exactly three digits after it ("1,250") is ambiguous in a
+// comma-separated file and is refused rather than guessed; in a ';' file
+// (regional Excel) a lone comma is the decimal mark.
+function sgrParseImportNumber(raw, delimiter) {
+  let t = String(raw == null ? '' : raw).replace(/[\s  ]/g, '').replace(/^R(?=[-\d.,])/i, '');
+  if (t === '') return { blank: true };
+  let dec = null;
+  if (/\d[.,]$/.test(t)) { dec = t.slice(-1); t = t.slice(0, -1); }
+  const neg = t[0] === '-'; if (neg || t[0] === '+') t = t.slice(1);
+  let norm = null;
+  const hasDot = t.indexOf('.') !== -1, hasComma = t.indexOf(',') !== -1;
+  if (/^\d+$/.test(t)) norm = t;
+  else if (hasDot && hasComma) {
+    const d = t.lastIndexOf('.') > t.lastIndexOf(',') ? '.' : ',';
+    const th = d === '.' ? ',' : '.';
+    const intPart = t.slice(0, t.lastIndexOf(d)), frac = t.slice(t.lastIndexOf(d) + 1);
+    const groupRe = new RegExp('^\\d{1,3}(\\' + th + '\\d{3})+$');
+    if (/^\d+$/.test(frac) && groupRe.test(intPart)) norm = intPart.split(th).join('') + '.' + frac;
+  } else {
+    const sep = hasComma ? ',' : '.';
+    const parts = t.split(sep);
+    const grouped = /^\d{1,3}$/.test(parts[0]) && parts.slice(1).every(p => /^\d{3}$/.test(p));
+    if (parts.every(p => /^\d+$/.test(p))) {
+      if (dec && dec !== sep) { if (grouped) norm = parts.join(''); }
+      else if (parts.length > 2) { if (grouped) norm = parts.join(''); }
+      else if (parts[1].length !== 3 || (sep === '.') === (delimiter !== ';')) norm = parts.join('.');
+      else return { error: 'is ambiguous ("' + String(raw).trim() + '" could be ' + parts.join('') + ' or ' + parts.join('.') + ') — write it without a thousands separator' };
+    }
+  }
+  if (norm === null || !isFinite(Number(norm))) return { error: 'is not a number ("' + String(raw).trim() + '")' };
+  const n = Math.round(Number(norm) * 10000) / 10000;
+  return { value: neg ? -n : n };
+}
+// Functions rather than module constants so every test harness can lift them by name.
+function sgrInventoryCsvFields() { return {
+  id:      { label: 'ID',       aliases: ['id', 'iddonotedit', 'itemid', 'inventoryid', 'recordid'] },
+  sku:     { label: 'SKU',      aliases: ['sku', 'code', 'itemcode', 'productcode', 'stockcode'] },
+  name:    { label: 'Name',     aliases: ['name', 'itemname', 'description', 'itemdescription', 'item', 'productname'] },
+  cat:     { label: 'Category', aliases: ['category', 'cat'] },
+  unit:    { label: 'Unit',     aliases: ['unit', 'units', 'unittype', 'uom'] },
+  stock:   { label: 'Stock',    aliases: ['stock', 'stockqty', 'stockonhand', 'onhand', 'qty', 'quantity', 'stockquantity'], number: true },
+  reorder: { label: 'Reorder',  aliases: ['reorder', 'reorderlevel', 'reorderqty', 'reorderpoint', 'minstock'], number: true },
+  cost:    { label: 'Cost',     aliases: ['cost', 'costprice', 'costr', 'costpricer', 'costexvat', 'costpriceexvat', 'unitcost'], number: true },
+  sell:    { label: 'Sell',     aliases: ['sell', 'sellprice', 'sellingprice', 'sellr', 'sellpricer', 'sellingpricer', 'sellexvat', 'sellpriceexvat', 'price'], number: true },
+  // Supplier: the item's link to a record in Suppliers (supplierId), read
+  // and written BY SUPPLIER NAME. A name must match exactly one supplier.
+  supplier:{ label: 'Supplier', aliases: ['supplier', 'suppliername', 'vendor'] },
+}; }
+// Columns people put in inventory sheets that the inventory model does NOT
+// store. They are listed in the preview as ignored, with the reason.
+function sgrInventoryUnsupportedColumns() { return {
+  notes: 'Inventory items have no Notes field, so notes are not imported',
+  note: 'Inventory items have no Notes field, so notes are not imported',
+  comments: 'Inventory items have no Notes field, so comments are not imported',
+  remarks: 'Inventory items have no Notes field, so remarks are not imported',
+  active: 'Active is not imported — a removed item listed in the file is restored automatically',
+}; }
+function sgrInventoryCsvHeader() { return ['SKU', 'Name', 'Category', 'Unit', 'Stock', 'Reorder', 'Cost', 'Sell', 'Supplier', 'ID (do not edit)']; }
+// Rows for both exports. IDs are TEXT: 76 of the 193 items in the 5 May
+// snapshot have 13-digit ids, which Excel turns into "1.77702E+12" when it
+// opens a CSV. The CSV therefore writes "#<id>" (Excel keeps that as text);
+// the Excel export stores the id as a text cell. The importer accepts both.
+function sgrInventoryExportRows(inventory, suppliers) {
+  const sup = new Map((suppliers || []).map(x => [String(x.id), x.name || '']));
+  const items = (inventory || []).filter(i => i && i.active !== false).slice().sort((a, b) =>
+    String(a.cat || '').localeCompare(String(b.cat || ''), undefined, { sensitivity: 'base' }) ||
+    String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' }));
+  const num = v => (v === null || v === undefined || v === '' || !isFinite(Number(v))) ? '' : Math.round(Number(v) * 10000) / 10000;
+  return items.map(i => [i.sku || '', i.name || '', i.cat || i.category || '', i.unit || '', num(i.stock), num(i.reorder), num(i.cost), num(i.sell),
+    (i.supplierId !== null && i.supplierId !== undefined && i.supplierId !== '' && sup.get(String(i.supplierId))) || '',
+    i.id === null || i.id === undefined ? '' : String(i.id)]);
+}
+function sgrInventoryCsvExport(inventory, suppliers) {
+  const rows = sgrInventoryExportRows(inventory, suppliers).map(r => r.map((v, k) => k === 9 && v !== '' ? '#' + v : String(v)));
+  return sgrCsvStringify([sgrInventoryCsvHeader(), ...rows]);
+}
+// Excel export: numbers stay numbers (no locale formatting), ids and SKUs are text cells.
+function sgrInventoryWorkbook(XLSX, inventory, suppliers) {
+  const rows = sgrInventoryExportRows(inventory, suppliers);
+  const ws = XLSX.utils.aoa_to_sheet([sgrInventoryCsvHeader(), ...rows]);
+  for (let r = 1; r <= rows.length; r++) for (const c of [0, 9]) {
+    const ref = XLSX.utils.encode_cell({ r, c });
+    if (ws[ref]) { ws[ref].t = 's'; ws[ref].v = String(ws[ref].v); ws[ref].z = '@'; }
+  }
+  ws['!cols'] = [{ wch: 22 }, { wch: 56 }, { wch: 22 }, { wch: 8 }, { wch: 10 }, { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 26 }, { wch: 18 }];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Inventory');
+  return wb;
+}
+// Excel import: the FIRST sheet, raw cell values (so 1250.75 is never read
+// back as the formatted "1,250.75"). Other sheets are reported, not read.
+function sgrWorkbookFirstSheetCsv(XLSX, data) {
+  const wb = XLSX.read(data, { type: 'array' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  return { csv: XLSX.utils.sheet_to_csv(ws, { rawNumbers: true, blankrows: false }), sheet: wb.SheetNames[0], otherSheets: wb.SheetNames.slice(1) };
+}
+// Text → records. A record only carries the fields that the file supplies
+// AND that are non-blank in that row; `errors` are per field.
+function sgrParseInventoryCsv(text) {
+  const SGR_INVENTORY_CSV_FIELDS = sgrInventoryCsvFields();
+  const out = { records: [], fileErrors: [], ignoredColumns: [], columns: [], delimiter: ',' };
+  const parsed = sgrCsvParse(text);
+  out.delimiter = parsed.delimiter;
+  if (parsed.rows.length === 0) { out.fileErrors.push('The file is empty.'); return out; }
+  const header = parsed.rows[0].map(h => String(h).trim());
+  const map = {};
+  header.forEach((h, idx) => {
+    const key = h.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const field = Object.keys(SGR_INVENTORY_CSV_FIELDS).find(f => SGR_INVENTORY_CSV_FIELDS[f].aliases.indexOf(key) !== -1);
+    if (!field) { if (h) out.ignoredColumns.push({ column: h, reason: sgrInventoryUnsupportedColumns()[key] || 'not an inventory field, so it is not imported' }); return; }
+    if (map[field] !== undefined) { out.fileErrors.push('Two columns are both read as ' + SGR_INVENTORY_CSV_FIELDS[field].label + ': "' + header[map[field]] + '" and "' + h + '". Remove one of them.'); return; }
+    map[field] = idx;
+  });
+  out.columns = Object.keys(map);
+  if (map.sku === undefined && map.id === undefined) {
+    out.fileErrors.push('No SKU column found. The first row must be a header row, e.g. ' + sgrInventoryCsvHeader().join(',') + '.');
+    return out;
+  }
+  if (out.fileErrors.length) return out;
+  for (let r = 1; r < parsed.rows.length; r++) {
+    const cells = parsed.rows[r];
+    const rec = { rowNum: r + 1, errors: [], warnings: [] };
+    for (const f of Object.keys(map)) {
+      const raw = cells[map[f]] === undefined ? '' : String(cells[map[f]]);
+      const v = raw.trim();
+      if (v === '') continue;
+      if (SGR_INVENTORY_CSV_FIELDS[f].number) {
+        const n = sgrParseImportNumber(v, parsed.delimiter);
+        if (n.error) rec.errors.push({ field: SGR_INVENTORY_CSV_FIELDS[f].label, message: SGR_INVENTORY_CSV_FIELDS[f].label + ' ' + n.error });
+        else if (n.value < 0) rec.errors.push({ field: SGR_INVENTORY_CSV_FIELDS[f].label, message: SGR_INVENTORY_CSV_FIELDS[f].label + ' cannot be negative (' + v + ')' });
+        else rec[f] = n.value;
+      } else if (f === 'id') {
+        if (/^\d+(\.\d+)?e\+?\d+$/i.test(v)) rec.warnings.push('ID "' + v + '" was shortened by Excel and is ignored; matched by SKU instead');
+        else rec.id = v.replace(/^#/, '');
+      } else rec[f] = v;
+    }
+    out.records.push(rec);
+  }
+  if (out.records.length === 0) out.fileErrors.push('The file has a header row but no data rows.');
+  return out;
+}
+// Records → plan. Pure: decides create / update / restore / unchanged /
+// rejected for each row against the CURRENT list, before anything is written.
+function sgrPlanInventoryImport(records, currentInventory, suppliers) {
+  const SGR_INV_IMPORT_DEFAULTS = { cat: 'General', unit: 'unit', stock: 0, reorder: 5, cost: 0, sell: 0 };
+  const SGR_INV_SERVER_FIELD = { sku: 'sku', name: 'name', cat: 'category', unit: 'unit', stock: 'stock', reorder: 'reorder', cost: 'cost', sell: 'sell' };
+  const FIELDS = sgrInventoryCsvFields();
+  const items = currentInventory || [];
+  const norm = v => String(v === null || v === undefined ? '' : v).trim().toLowerCase();
+  const fields = ['sku', 'name', 'cat', 'unit', 'stock', 'reorder', 'cost', 'sell'];
+  const numeric = { stock: 1, reorder: 1, cost: 1, sell: 1 };
+  const supList = suppliers || [];
+  const supName = id => { if (id === null || id === undefined || id === '') return null; const x = supList.find(z => String(z.id) === String(id)); return x ? (x.name || '') : null; };
+  // Supplier by NAME → { id } | { error }. A file naming the supplier the item
+  // is already linked to is "same", even if another supplier shares the name.
+  const resolveSupplier = (name, currentId) => {
+    const cur = supName(currentId);
+    if (cur !== null && norm(cur) === norm(name)) return { same: true, id: currentId };
+    const m = supList.filter(z => norm(z.name) === norm(name));
+    if (m.length === 1) return { id: m[0].id };
+    if (m.length > 1) return { error: m.length + ' suppliers are called "' + name + '" — rename one in Suppliers, or set this item\'s supplier with Edit' };
+    return { error: 'Supplier "' + name + '" is not in Suppliers — add it there first, or clear the cell to keep the current supplier' };
+  };
+  const claimed = new Map();   // "id:<id>" or "new:<sku>" -> rowNum
+  const plan = [];
+  (records || []).forEach((rec0, idx) => {
+    const rec = { ...rec0 };
+    if (rec.cat === undefined && rec.category !== undefined) rec.cat = rec.category;
+    for (const f of ['sku', 'name', 'cat', 'unit', 'supplier']) if (rec[f] !== undefined && rec[f] !== null) { rec[f] = String(rec[f]).trim(); if (rec[f] === '') delete rec[f]; } else delete rec[f];
+    for (const f of ['stock', 'reorder', 'cost', 'sell']) if (rec[f] === null || rec[f] === '' || rec[f] === undefined) delete rec[f];
+    const rowNum = rec.rowNum || idx + 2;
+    const e = { rowNum, sku: rec.sku !== undefined ? rec.sku : '', name: rec.name, action: null, target: null, patch: null, local: null, changes: [], errors: (rec.errors || []).slice(), warnings: (rec.warnings || []).slice() };
+    const reject = (field, message) => { e.errors.push({ field, message }); };
+    for (const f of ['stock', 'reorder', 'cost', 'sell']) if (rec[f] !== undefined && !(typeof rec[f] === 'number' && isFinite(rec[f]))) reject(FIELDS[f].label, FIELDS[f].label + ' is not a number');
+    if (!e.errors.length) {
+      let target = null;
+      const matchedById = rec.id !== undefined && rec.id !== null && String(rec.id).trim() !== '';
+      if (matchedById) {
+        target = items.find(i => String(i.id) === String(rec.id).trim()) || null;
+        if (!target) reject('ID', 'ID ' + rec.id + ' does not match any inventory item — clear the ID cell to create a new item');
+        else if (rec.sku !== undefined && norm(rec.sku) !== norm(target.sku)) {
+          const clash = items.filter(i => i !== target && i.active !== false && norm(i.sku) === norm(rec.sku));
+          if (clash.length) reject('SKU', 'SKU ' + rec.sku + ' is already used by another item (' + (clash[0].name || clash[0].id) + ')');
+        }
+      } else if (rec.sku === undefined) {
+        reject('SKU', 'SKU is required');
+      } else {
+        const all = items.filter(i => norm(i.sku) === norm(rec.sku));
+        const active = all.filter(i => i.active !== false);
+        if (active.length > 1) reject('SKU', active.length + ' active items share SKU ' + rec.sku + ' — import the export file (it has an ID column), or make the SKUs unique');
+        else if (active.length === 1) target = active[0];
+        else if (all.length > 1) reject('SKU', all.length + ' removed items share SKU ' + rec.sku + ' — cannot tell which one to restore');
+        else if (all.length === 1) target = all[0];
+      }
+      if (!e.errors.length) {
+        const key = target ? 'id:' + String(target.id) : 'new:' + norm(rec.sku);
+        if (claimed.has(key)) reject(target ? 'SKU' : 'SKU', 'the same item is also on row ' + claimed.get(key) + ' — keep one row per item');
+        else claimed.set(key, rowNum);
+      }
+      if (!e.errors.length && target) {
+        e.target = target;
+        const patch = {}; const local = {};
+        for (const f of fields) {
+          if (rec[f] === undefined) continue;
+          if (f === 'sku' && !matchedById) continue; // matched BY the SKU: it is the key, never rewritten (e.g. its letter case)
+          const cur = f === 'cat' ? (target.cat !== undefined && target.cat !== null ? target.cat : target.category) : target[f];
+          const same = numeric[f]
+            ? (cur !== null && cur !== undefined && cur !== '' && isFinite(Number(cur)) && Math.abs(Number(cur) - rec[f]) < 1e-9)
+            : String(cur === null || cur === undefined ? '' : cur).trim() === rec[f]; // whitespace-only differences are not a change
+          if (same) continue;
+          patch[SGR_INV_SERVER_FIELD[f]] = rec[f]; local[f] = rec[f];
+          e.changes.push({ field: FIELDS[f].label, from: cur, to: rec[f] });
+        }
+        if (rec.supplier !== undefined) {
+          const r = resolveSupplier(rec.supplier, target.supplierId);
+          if (r.error) reject('Supplier', r.error);
+          else if (!r.same) {
+            patch.supplierId = r.id; local.supplierId = r.id;
+            e.changes.push({ field: 'Supplier', from: supName(target.supplierId) || '—', to: rec.supplier });
+          }
+        }
+        if (local.cat !== undefined) local.category = local.cat;
+        const restore = target.active === false;
+        if (restore) patch.active = true;
+        e.patch = patch; e.local = local;
+        e.action = restore ? 'restore' : (e.changes.length ? 'update' : 'unchanged');
+        if (!e.sku) e.sku = String(target.sku || '');
+        if (e.name === undefined) e.name = target.name;
+      } else if (!e.errors.length) {
+        const sr = rec.supplier !== undefined ? resolveSupplier(rec.supplier, null) : { id: null };
+        if (rec.name === undefined) reject('Name', 'Name is required for a new item (SKU ' + rec.sku + ' is not in Inventory)');
+        else if (sr.error) reject('Supplier', sr.error);
+        else {
+          const v = {}; for (const f of fields) v[f] = rec[f] !== undefined ? rec[f] : SGR_INV_IMPORT_DEFAULTS[f];
+          e.action = 'create';
+          e.local = { ...v, category: v.cat, supplierId: sr.id };
+          e.patch = { sku: v.sku, name: v.name, category: v.cat, unit: v.unit, cost: v.cost, sell: v.sell, stock: v.stock, reorder: v.reorder, supplierId: sr.id };
+        }
+      }
+    }
+    if (e.errors.length) e.action = 'rejected';
+    plan.push(e);
+  });
+  return plan;
+}
+function sgrInventoryImportMessage(report, total, mode, where) {
+  const ok = report.created.length + report.updated.length + report.restored.length;
+  const lines = [];
+  lines.push(report.failed.length ? '⚠ Import finished WITH ERRORS.' : report.rejected.length ? '⚠ Import finished — some rows were REJECTED.' : (where === 'server' ? '✅ Import saved to the server.' : '✅ Import applied on this page.'));
+  lines.push(ok + ' of ' + total + ' row' + (total !== 1 ? 's' : '') + ' saved: ' + report.created.length + ' created, ' + report.updated.length + ' updated' + (report.restored.length ? ', ' + report.restored.length + ' restored' : '') + '.');
+  lines.push(report.unchanged.length + ' unchanged (nothing to save), ' + report.rejected.length + ' rejected, ' + report.failed.length + ' failed.');
+  if (mode === 'replace') {
+    lines.push(report.removalsSkipped
+      ? 'Replace mode: NO existing items were removed, because not every row was accepted and saved.'
+      : report.removed.length + ' other item' + (report.removed.length !== 1 ? 's' : '') + ' removed.');
+  }
+  if (report.rejected.length) {
+    lines.push('');
+    lines.push(report.rejected.length + ' rejected (not saved — fix and import again):');
+    for (const f of report.rejected.slice(0, 25)) lines.push('  • Row ' + f.row + (f.sku ? ' (' + f.sku + ')' : '') + ' — ' + f.field + ': ' + f.error);
+    if (report.rejected.length > 25) lines.push('  … and ' + (report.rejected.length - 25) + ' more.');
+  }
+  if (report.failed.length) {
+    lines.push('');
+    lines.push(report.failed.length + ' NOT saved:');
+    for (const f of report.failed.slice(0, 25)) lines.push('  • ' + (f.row ? 'Row ' + f.row + ' ' : '') + f.sku + ' (' + f.op + '): ' + f.error);
+    if (report.failed.length > 25) lines.push('  … and ' + (report.failed.length - 25) + ' more.');
+  }
+  return lines.join('\n');
+}
+function sgrNewInventoryReport(mode) {
+  return { created: [], updated: [], restored: [], unchanged: [], rejected: [], removed: [], failed: [], removalsSkipped: false, mode: mode };
+}
+function sgrCollectRejected(plan, report) {
+  for (const e of plan) if (e.action === 'rejected') report.rejected.push({ row: e.rowNum, sku: e.sku, field: e.errors[0].field, error: e.errors.map(x => x.message).join('; ') });
+}
+
+// Bulk Import through the relational API.
+//   "add"     — every row is planned by sgrPlanInventoryImport (above): a
+//               matched row sends ONLY its changed fields (version-checked);
+//               a new SKU is created; an identical row is not written. A CSV
+//               row carries no supplier, so an existing item's supplier link
+//               is never touched and new items have none. A SKU that only
+//               matches a removed (inactive) item updates AND restores it, so
+//               an imported row can never be saved yet invisible.
+//   "replace" — the same; then every other ACTIVE item is removed (soft
+//               delete). Removals run ONLY if every row was accepted and saved,
+//               so a rejected or failed row can never also strip the inventory.
 // Every write is acknowledged individually; failures are collected and
 // reported, never hidden, and nothing is retried.
-async function importInventoryRowsRelational(rows, mode, currentInventory, api) {
+async function importInventoryRowsRelational(rows, mode, currentInventory, api, suppliers) {
   const pool = (currentInventory || []).map(i => ({ ...i }));
-  const report = { created: [], updated: [], restored: [], removed: [], failed: [], removalsSkipped: false, mode: mode };
+  const report = sgrNewInventoryReport(mode);
   const changed = new Map();   // String(id) -> resulting local record
-  const touched = new Set();   // String(id) of every item this import wrote
-  const norm = v => String(v || '').trim().toLowerCase();
-  for (const row of (rows || [])) {
-    const cat = row.cat || 'General';
-    const fields = { sku: row.sku, name: row.name, category: cat, unit: row.unit, cost: row.cost, sell: row.sell, stock: row.stock, reorder: row.reorder };
-    const matches = pool.filter(i => norm(i.sku) === norm(row.sku));
-    const match = matches.find(i => i.active !== false) || matches[0] || null;
+  const touched = new Set();   // String(id) of every item the file names
+  const plan = sgrPlanInventoryImport(rows, pool, suppliers);
+  sgrCollectRejected(plan, report);
+  for (const e of plan) {
+    if (e.action === 'rejected') continue;
+    if (e.target) touched.add(String(e.target.id));
+    if (e.action === 'unchanged') { report.unchanged.push(e.sku); continue; }
     try {
-      if (match) {
-        if (match._relId === null || match._relId === undefined) throw new Error('existing item ' + (match.sku || match.id) + ' has no server record id — reload and try again');
-        const reactivate = match.active === false;
-        const res = await api.updateInventoryItem(match._relId, match._relRowVersion, reactivate ? { ...fields, active: true } : fields);
-        const next = { ...match, sku: row.sku, name: row.name, cat: cat, category: cat, unit: row.unit, cost: row.cost, sell: row.sell, stock: row.stock, reorder: row.reorder, active: true, _relRowVersion: res.rowVersion };
-        pool[pool.indexOf(match)] = next;
-        changed.set(String(next.id), next); touched.add(String(next.id));
-        (reactivate ? report.restored : report.updated).push(row.sku);
-      } else {
-        const res = await api.createInventoryItem({ ...fields, supplierId: null });
-        const next = { id: res.id, sku: row.sku, name: row.name, cat: cat, category: cat, unit: row.unit, cost: row.cost, sell: row.sell, stock: row.stock, reorder: row.reorder, supplierId: null, active: true, _relId: res.id, _relRowVersion: res.rowVersion };
+      if (e.action === 'create') {
+        const res = await api.createInventoryItem({ supplierId: null, ...e.patch });
+        const next = { supplierId: null, ...e.local, id: res.id, active: true, _relId: res.id, _relRowVersion: res.rowVersion };
         pool.push(next);
         changed.set(String(next.id), next); touched.add(String(next.id));
-        report.created.push(row.sku);
+        report.created.push(e.sku);
+      } else {
+        const match = pool.find(i => String(i.id) === String(e.target.id)) || e.target;
+        if (match._relId === null || match._relId === undefined) throw new Error('existing item ' + (match.sku || match.id) + ' has no server record id — reload and try again');
+        const res = await api.updateInventoryItem(match._relId, match._relRowVersion, e.patch);
+        const next = { ...match, ...e.local, active: true, _relRowVersion: res.rowVersion };
+        pool[pool.indexOf(match)] = next;
+        changed.set(String(next.id), next);
+        (e.action === 'restore' ? report.restored : report.updated).push(e.sku);
       }
-    } catch (e) {
-      report.failed.push({ sku: row.sku, op: match ? 'update' : 'create', error: (e && e.message) || 'unknown error' });
+    } catch (err) {
+      report.failed.push({ row: e.rowNum, sku: e.sku, op: e.action === 'create' ? 'create' : 'update', error: (err && err.message) || 'unknown error' });
     }
   }
   if (mode === 'replace') {
-    if (report.failed.length) {
+    if (report.failed.length || report.rejected.length) {
       report.removalsSkipped = true;
     } else {
       for (const it of pool.slice()) {
@@ -440,29 +793,115 @@ async function importInventoryRowsRelational(rows, mode, currentInventory, api) 
           pool[pool.indexOf(it)] = next;
           changed.set(String(next.id), next);
           report.removed.push(it.sku || String(it.id));
-        } catch (e) {
-          report.failed.push({ sku: it.sku || String(it.id), op: 'remove', error: (e && e.message) || 'unknown error' });
+        } catch (err) {
+          report.failed.push({ sku: it.sku || String(it.id), op: 'remove', error: (err && err.message) || 'unknown error' });
         }
       }
     }
   }
-  const ok = report.created.length + report.updated.length + report.restored.length;
-  const lines = [];
-  lines.push((report.failed.length ? '⚠ Import finished WITH ERRORS.' : '✅ Import saved to the server.'));
-  lines.push(ok + ' of ' + (rows || []).length + ' row' + ((rows || []).length !== 1 ? 's' : '') + ' saved: ' + report.created.length + ' created, ' + report.updated.length + ' updated' + (report.restored.length ? ', ' + report.restored.length + ' restored' : '') + '.');
-  if (mode === 'replace') {
-    lines.push(report.removalsSkipped
-      ? 'Replace mode: NO existing items were removed, because not every row saved.'
-      : report.removed.length + ' other item' + (report.removed.length !== 1 ? 's' : '') + ' removed.');
-  }
-  if (report.failed.length) {
-    lines.push('');
-    lines.push(report.failed.length + ' NOT saved:');
-    for (const f of report.failed.slice(0, 25)) lines.push('  • ' + f.sku + ' (' + f.op + '): ' + f.error);
-    if (report.failed.length > 25) lines.push('  … and ' + (report.failed.length - 25) + ' more.');
-  }
-  return { report, changed: Array.from(changed.values()), message: lines.join('\n') };
+  return { report, changed: Array.from(changed.values()), message: sgrInventoryImportMessage(report, (rows || []).length, mode, 'server') };
 }
+// JSON (pre-cutover) Bulk Import: the same plan applied to the local list.
+// Existing items keep their ids. Persisted by the normal autosave.
+function sgrApplyInventoryImportJson(rows, mode, currentInventory, suppliers) {
+  const list = (currentInventory || []).map(i => ({ ...i }));
+  const report = sgrNewInventoryReport(mode);
+  const plan = sgrPlanInventoryImport(rows, list, suppliers);
+  sgrCollectRejected(plan, report);
+  if (mode === 'replace' && report.rejected.length) {
+    report.removalsSkipped = true;
+    return { list: null, report, message: 'Nothing was imported.\n\nReplace mode needs every row to be valid.\n\n' + sgrInventoryImportMessage(report, (rows || []).length, mode, 'json') };
+  }
+  let nextId = Math.max(100, ...list.map(i => Number(i.id)).filter(n => isFinite(n))) + 1;
+  const touched = new Set();
+  for (const e of plan) {
+    if (e.action === 'rejected') continue;
+    if (e.action === 'unchanged') { touched.add(String(e.target.id)); report.unchanged.push(e.sku); continue; }
+    if (e.action === 'create') {
+      const it = { supplierId: null, ...e.local, id: nextId++ };
+      list.push(it); touched.add(String(it.id)); report.created.push(e.sku);
+    } else {
+      const idx = list.findIndex(i => String(i.id) === String(e.target.id));
+      list[idx] = { ...list[idx], ...e.local, ...(e.action === 'restore' ? { active: true } : {}) };
+      touched.add(String(e.target.id));
+      (e.action === 'restore' ? report.restored : report.updated).push(e.sku);
+    }
+  }
+  let out = list;
+  if (mode === 'replace') {
+    report.removed = list.filter(i => !touched.has(String(i.id)) && i.active !== false).map(i => i.sku || String(i.id));
+    out = list.filter(i => touched.has(String(i.id)) || i.active === false);
+  }
+  return { list: out, report, message: sgrInventoryImportMessage(report, (rows || []).length, mode, 'json') };
+}
+// 2026-11-23 IMPORT/EXPORT AUDIT — bank statement CSV (Accounting → Bank).
+// The old reader split every line on ',' (a quoted "PAYMENT, REF 123"
+// description shifted every later column) and read amounts with
+// replace(/[,\s]/g,'') (a decimal comma "1250,50" became 125050). Now:
+// the shared RFC 4180 reader, the shared number reader ("(100.00)" is a
+// debit), and rows that cannot be read are reported, never guessed.
+function sgrParseBankStatementCsv(text) {
+  const p = sgrCsvParse(text);
+  if (p.rows.length < 2) return null;
+  const headers = p.rows[0].map(h => String(h).replace(/^﻿/, '').trim().toLowerCase());
+  const find = (...names) => { for (const n of names) { const h = headers.find(x => x.includes(n)); if (h) return h; } return null; };
+  const dateCol = find('date', 'transaction date', 'trans date', 'posting date');
+  const descCol = find('description', 'narrative', 'reference', 'details', 'memo', 'particulars');
+  const debitCol = find('debit', 'withdrawals', 'payment');
+  const creditCol = find('credit', 'deposits', 'receipt');
+  const amtCol = find('amount');
+  const amount = (raw) => {
+    let t = String(raw === undefined || raw === null ? '' : raw).trim();
+    if (!t) return { value: 0 };
+    const paren = /^\(.*\)$/.test(t); if (paren) t = t.slice(1, -1);
+    const n = sgrParseImportNumber(t, p.delimiter);
+    if (n.blank) return { value: 0 };
+    if (n.error) return { error: n.error };
+    return { value: paren ? -n.value : n.value };
+  };
+  const txns = [], rejected = [];
+  for (let r = 1; r < p.rows.length; r++) {
+    const cells = p.rows[r]; const row = {};
+    headers.forEach((h, idx) => { row[h] = String(cells[idx] === undefined ? '' : cells[idx]).trim(); });
+    let debit = 0, credit = 0; const errs = [];
+    if (debitCol) { const a = amount(row[debitCol]); if (a.error) errs.push('Debit ' + a.error); else debit = Math.abs(a.value); }
+    if (creditCol) { const a = amount(row[creditCol]); if (a.error) errs.push('Credit ' + a.error); else credit = Math.abs(a.value); }
+    if (amtCol && !debitCol && !creditCol) { const a = amount(row[amtCol]); if (a.error) errs.push('Amount ' + a.error); else if (a.value < 0) debit = -a.value; else credit = a.value; }
+    if (errs.length) { rejected.push({ row: r + 1, error: errs.join('; ') }); continue; }
+    if (!(debit > 0 || credit > 0)) continue; // balance / blank lines, as before
+    txns.push({ row: r + 1, date: (dateCol && row[dateCol]) || '', description: (descCol && row[descCol]) || '—', debit: Math.round(debit * 100) / 100, credit: Math.round(credit * 100) / 100 });
+  }
+  return { headers, txns, rejected, columns: { dateCol, descCol, debitCol, creditCol, amtCol } };
+}
+// Re-importing a statement must not double the transactions. A row counts as
+// already imported when the same date, description, debit and credit are
+// already on file — counted as a multiset, so two genuinely identical
+// transactions on one statement are both kept the first time.
+function sgrSplitBankDuplicates(txns, existing) {
+  const key = t => [String(t.date || '').trim(), String(t.description || '').replace(/\s+/g, ' ').trim().toLowerCase(), Math.round((Number(t.debit) || 0) * 100), Math.round((Number(t.credit) || 0) * 100)].join('|');
+  const have = new Map();
+  for (const t of (existing || [])) { const k = key(t); have.set(k, (have.get(k) || 0) + 1); }
+  const fresh = [], duplicates = [];
+  for (const t of (txns || [])) {
+    const k = key(t); const n = have.get(k) || 0;
+    if (n > 0) { have.set(k, n - 1); duplicates.push(t); } else fresh.push(t);
+  }
+  return { fresh, duplicates };
+}
+// Unique INTEGER ids for records an import adds to a platform_state section.
+// The old `Date.now()+Math.random()` is a float with only ~4,096 distinct
+// values inside one millisecond, so a 60-row import collides about one time in
+// three; the 5 May snapshot already holds 27 duplicate Quick Rate ids and one
+// duplicate customer id. The server's stable-id merge refuses any save that
+// creates a NEW duplicate id (so one collision blocked the whole import) and
+// any edit to a record whose id is already duplicated.
+function sgrNewRecordIds(count, existing) {
+  let next = Date.now();
+  for (const r of (existing || [])) { const n = Number(r && r.id); if (isFinite(n) && n >= next) next = Math.floor(n) + 1; }
+  const out = []; for (let i = 0; i < count; i++) out.push(next + i);
+  return out;
+}
+// ── END 2026-11-23 INVENTORY CSV EXPORT / IMPORT block (tests lift everything from the banner above to here) ──
 
 /* ═══════════════════════════════════════════════════════════════════════════
    2026-09-28 MID-SESSION CUTOVER SAFETY — confirm Inventory's persistence mode
@@ -579,6 +1018,35 @@ function syncRelationalBaseline(sectionKey, updater) {
   if (serverBaselineRef.current && Array.isArray(serverBaselineRef.current[sectionKey])) {
     serverBaselineRef.current = { ...serverBaselineRef.current, [sectionKey]: updater(serverBaselineRef.current[sectionKey]) };
   }
+}
+
+// 2026-11-23 IMPORT/EXPORT AUDIT — "success only after the save".
+// Customers, Quick Rates, bank statements (and Inventory before its cutover)
+// are platform_state sections: an import changes React state and the normal
+// debounced autosave writes it. sgrAwaitAutosave() lets an importer wait for
+// the first autosave whose snapshot was taken AFTER the call (a save already
+// in flight with an older snapshot never counts) and report its real result:
+//   { ok:true } | { ok:false, error } | { ok:false, timeout:true }.
+const sgrAutosaveSeqRef = { current: 0 };
+const sgrAutosaveWaiters = [];
+function sgrAwaitAutosave(timeoutMs) {
+  return new Promise(resolve => {
+    const w = { minSeq: sgrAutosaveSeqRef.current + 1, resolve, timer: null };
+    w.timer = setTimeout(() => { const i = sgrAutosaveWaiters.indexOf(w); if (i !== -1) sgrAutosaveWaiters.splice(i, 1); resolve({ ok: false, timeout: true }); }, timeoutMs || 20000);
+    sgrAutosaveWaiters.push(w);
+  });
+}
+function sgrSettleAutosave(seq, result) {
+  for (const w of sgrAutosaveWaiters.slice()) {
+    if (seq < w.minSeq) continue;
+    sgrAutosaveWaiters.splice(sgrAutosaveWaiters.indexOf(w), 1);
+    clearTimeout(w.timer); w.resolve(result);
+  }
+}
+function sgrAutosaveResultText(r) {
+  if (r && r.ok) return 'Saved to the server ✓';
+  if (r && r.timeout) return '⚠ The server save has not been confirmed yet. Keep this page open and check the save status at the top; if it shows "Save failed", the import is only on this page.';
+  return '⚠ The server did NOT accept the save: ' + ((r && r.error) || 'unknown error') + '\nThe import is only on this page — do not close it; resolve the problem and save again.';
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -9023,30 +9491,69 @@ function AddJobModal({ companies, onClose, onAdd }) {
 /* ═══════════════════════════════════════════
    BULK INVENTORY IMPORT MODAL
 ═══════════════════════════════════════════ */
-const CSV_EXAMPLE = `SKU,Name,Category,Stock,Reorder,Unit,Cost,Sell
-VIN-3M-RD,3M Vinyl Red Gloss 1.37m,Vinyl,25,8,m,310,490
-INK-EP-YL,Epson Yellow Ink 700ml,Ink,6,4,unit,1250,1800
-SUB-COREX-4,Corex 4mm 1.22x2.44m,Substrate,20,5,sheet,95,180`;
+const CSV_EXAMPLE = `SKU,Name,Category,Unit,Stock,Reorder,Cost,Sell
+VIN-3M-RD,3M Vinyl Red Gloss 1.37m,Vinyl,m,25,8,310,490
+INK-EP-YL,Epson Yellow Ink 700ml,Ink,unit,6,4,1250,1800
+SUB-COREX-4,"Corex 4mm 1.22x2.44m, white",Substrate,sheet,20,5,95.5,180`;
 
-function BulkImportModal({ inventory, onClose, onImport, onImportRows, resolveImportMode }) {
+// 2026-11-23: header-driven import with a per-row preview (see
+// sgrParseInventoryCsv / sgrPlanInventoryImport near the top of this file).
+function BulkImportModal({ inventory, suppliers, onClose, onImport, onImportRows, resolveImportMode }) {
   const [csv,setCsv]=useState(''); const [preview,setPreview]=useState(null);
+  const [planInfo,setPlanInfo]=useState(null); // { plan, ignored, columns } for the preview table
   const [mode,setMode]=useState('add'); const [error,setError]=useState('');
   const [busy,setBusy]=useState(false); // in-flight lock for the relational import
+  const [fileName,setFileName]=useState('');
+  const [otherSheets,setOtherSheets]=useState([]); // workbook sheets after the first (not read)
+  function resetPreview(){ setPreview(null); setPlanInfo(null); setError(''); }
+  function loadFile(file) {
+    if (!file) return;
+    resetPreview();
+    if (/\.xlsx?$/i.test(file.name)) {
+      if (!window.XLSX) { setError('The spreadsheet reader has not loaded. Save the sheet as CSV and choose that file instead.'); return; }
+      const r = new FileReader();
+      r.onload = ev => {
+        try {
+          const x = sgrWorkbookFirstSheetCsv(window.XLSX, new Uint8Array(ev.target.result));
+          setCsv(x.csv); setOtherSheets(x.otherSheets);
+          setFileName(file.name + ' (first sheet: ' + x.sheet + ')');
+        } catch (e) { setError('Could not read ' + file.name + ': ' + ((e && e.message) || e)); }
+      };
+      r.onerror = () => setError('Could not read ' + file.name + '.');
+      r.readAsArrayBuffer(file);
+      return;
+    }
+    const r = new FileReader();
+    r.onload = ev => {
+      const text = String(ev.target.result || '');
+      // "CSV (Comma delimited)" from Excel is Windows-1252, not UTF-8: re-read it
+      // that way rather than import replacement characters into item names.
+      setOtherSheets([]);
+      if (text.indexOf('\uFFFD') !== -1) {
+        const r2 = new FileReader();
+        r2.onload = ev2 => { setCsv(String(ev2.target.result || '')); setFileName(file.name); };
+        r2.readAsText(file, 'windows-1252');
+        return;
+      }
+      setCsv(text); setFileName(file.name);
+    };
+    r.onerror = () => setError('Could not read ' + file.name + '.');
+    r.readAsText(file, 'UTF-8');
+  }
   function parse() {
     setError('');
-    const lines=csv.trim().split('\n').filter(l=>l.trim());
-    if (lines.length<2){setError('Paste at least one data row below the header.');return;}
-    const rows=[]; let nextId=Math.max(...inventory.map(i=>i.id),100)+1;
-    for (let i=1;i<lines.length;i++) {
-      const cols=lines[i].split(',').map(c=>c.trim());
-      if (cols.length<4) continue;
-      const [sku,name,cat,stock,reorder,unit,cost,sell]=cols;
-      if (!sku||!name) continue;
-      rows.push({ id:nextId++, sku, name, cat:cat||'General', stock:parseInt(stock)||0, reorder:parseInt(reorder)||5, unit:unit||'unit', cost:parseFloat(cost)||0, sell:parseFloat(sell)||0 });
-    }
-    if (rows.length===0){setError('No valid rows found. Check column order matches the example.');return;}
-    setPreview(rows);
+    const p = sgrParseInventoryCsv(csv);
+    if (p.fileErrors.length) { setError(p.fileErrors.join(' ')); return; }
+    const plan = sgrPlanInventoryImport(p.records, inventory, suppliers);
+    setPreview(p.records);
+    setPlanInfo({ plan, ignored: p.ignoredColumns, columns: p.columns });
   }
+  const counts = { create:0, update:0, restore:0, unchanged:0, rejected:0 };
+  ((planInfo && planInfo.plan) || []).forEach(e => { counts[e.action] = (counts[e.action] || 0) + 1; });
+  const toSave = counts.create + counts.update + counts.restore;
+  // Replace mode: every ACTIVE item the file does not name.
+  const namedIds = new Set(((planInfo && planInfo.plan) || []).filter(e => e.target).map(e => String(e.target.id)));
+  const toRemove = planInfo ? (inventory || []).filter(i => i.active !== false && !namedIds.has(String(i.id))) : [];
   async function confirmImport() {
     // 2026-09-28 FINAL INVENTORY HARDENING: when Inventory is relational the
     // page supplies onImportRows, which saves every row through the relational
@@ -9056,15 +9563,18 @@ function BulkImportModal({ inventory, onClose, onImport, onImportRows, resolveIm
     // confirm time, from the server's current answer — never from whatever
     // the page believed when the modal was rendered.
     if (busy) return;
+    if (!preview || preview.length === 0) { alert('Nothing to import — please preview first.'); return; }
+    if (mode==='replace' && counts.rejected) { alert('Nothing was imported.\n\nReplace mode needs every row to be valid, and ' + counts.rejected + ' row' + (counts.rejected!==1?'s are':' is') + ' rejected. Fix them (see the preview) or use Add / Update.'); return; }
+    if (mode!=='replace' && toSave === 0) { alert('Nothing to import — every row is either unchanged or rejected.\n\nNothing was changed.'); return; }
     let importMode = onImportRows ? 'relational' : 'json';
     if (resolveImportMode) {
       setBusy(true);
       try { importMode = await resolveImportMode(); } finally { setBusy(false); }
       if (!importMode) return; // nothing changed; the user has been told why
     }
+    const removeList = mode !== 'replace' ? '' : toRemove.slice(0, 10).map(i => '  • ' + (i.sku || '—') + ' — ' + (i.name || '')).join('\n') + (toRemove.length > 10 ? '\n  … and ' + (toRemove.length - 10) + ' more' : '');
     if (importMode === 'relational' && onImportRows) {
-      if (!preview || preview.length === 0) { alert('Nothing to import — please preview first.'); return; }
-      if (mode==='replace' && !window.confirm('Replace entire inventory?\n\nAfter ALL '+preview.length+' rows have been saved, every other current stock item will be removed. If any row fails, nothing is removed.\n\nContinue?')) return;
+      if (mode==='replace' && !window.confirm('REPLACE ENTIRE INVENTORY?\n\nThis saves the ' + toSave + ' new/changed row(s) in the file and then REMOVES the ' + toRemove.length + ' active stock item(s) that are NOT in the file' + (toRemove.length ? ':\n' + removeList : '.') + '\n\nRemoved items disappear from Inventory, quotes and price lists. They stay on the server and come back if a later import lists them again.\nIf any row fails, nothing is removed.\n\nPress OK to replace, or Cancel to keep everything.')) return;
       setBusy(true);
       let message;
       try { message = await onImportRows(preview, mode); }
@@ -9075,24 +9585,34 @@ function BulkImportModal({ inventory, onClose, onImport, onImportRows, resolveIm
       return;
     }
     try {
-      if (!preview || preview.length === 0) { alert('Nothing to import — please preview first.'); return; }
-      if (mode==='replace') { onImport(preview); }
-      else {
-        const ex=[...inventory];
-        preview.forEach(row=>{ const idx=ex.findIndex(i=>i.sku.toLowerCase()===row.sku.toLowerCase()); if(idx>=0){ex[idx]={...ex[idx],...row};}else{ex.push(row);} });
-        onImport(ex);
-      }
+      if (mode==='replace' && !window.confirm('REPLACE ENTIRE INVENTORY?\n\nThis saves the rows in the file and then PERMANENTLY DELETES the ' + toRemove.length + ' stock item(s) that are NOT in the file' + (toRemove.length ? ':\n' + removeList : '.') + '\n\nPress OK to replace, or Cancel to keep everything.')) return;
+      const r = sgrApplyInventoryImportJson(preview, mode, inventory, suppliers);
+      if (!r.list) { alert(r.message); return; }
+      setBusy(true);
+      const saved = await Promise.resolve(onImport(r.list));   // resolves with the autosave result
+      setBusy(false);
       onClose();
-      alert(`✅ ${preview.length} item${preview.length!==1?'s':''} imported successfully into Inventory.`);
-    } catch(e) { alert('Import failed: ' + e.message); }
+      alert(r.message + '\n\n' + sgrAutosaveResultText(saved || { ok: false, timeout: true }));
+    } catch(e) { alert('Import failed: ' + e.message + '\n\nNothing was changed.'); }
   }
+  const fmtV = v => (v === null || v === undefined || v === '') ? '—' : String(v);
+  const badge = { create:['New','bg-emerald-100 text-emerald-700'], update:['Update','bg-blue-100 text-blue-700'], restore:['Restore','bg-purple-100 text-purple-700'], unchanged:['Unchanged','bg-gray-100 text-gray-500'], rejected:['Rejected','bg-red-100 text-red-700'] };
+  const allCols = ['sku','name','cat','unit','stock','reorder','cost','sell'];
+  const missingCols = planInfo ? allCols.filter(c => planInfo.columns.indexOf(c) === -1).map(c => sgrInventoryCsvFields()[c].label) : [];
   return (
     <Modal onClose={onClose} wide>
       <ModalHeader title="📦 Bulk Inventory Import" onClose={onClose}/>
       <div className="px-6 py-5 space-y-4">
-        <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
-          <p className="text-xs font-bold text-gray-600 mb-2">Required CSV format:</p>
-          <pre className="text-xs text-gray-500 overflow-x-auto">{CSV_EXAMPLE}</pre>
+        <div className="bg-gray-50 border border-gray-200 rounded-xl p-4 space-y-2">
+          <p className="text-xs font-bold text-gray-600">How it works</p>
+          <ul className="text-xs text-gray-500 list-disc pl-4 space-y-0.5">
+            <li>Use <b>⬇ Export Excel</b> (or CSV) on the Inventory page, edit the file, then choose it here. Columns are read <b>by their header name</b>, in any order; only the first sheet of a workbook is read.</li>
+            <li>Rows are matched by the <b>ID</b> column, or by <b>SKU</b> when there is no ID. Matched items are <b>updated</b>; a new SKU <b>creates</b> an item; identical rows are left alone.</li>
+            <li>A <b>blank cell</b>, or a column that is not in the file, keeps the current value. 0 is saved as 0.</li>
+            <li><b>Supplier</b> is matched by name to a supplier in Suppliers; a blank Supplier cell keeps the current link. Inventory has no Notes field, so a Notes column is ignored.</li>
+            <li>Rows that cannot be matched safely (unknown ID, shared SKU, bad number) are <b>rejected</b> and listed — they are never guessed.</li>
+          </ul>
+          <details className="text-xs text-gray-500"><summary className="cursor-pointer font-semibold">Example</summary><pre className="overflow-x-auto mt-1">{CSV_EXAMPLE}</pre></details>
         </div>
         <div className="flex gap-3">
           {[['add','Add / Update items'],['replace','Replace entire inventory']].map(([v,l])=>(
@@ -9100,29 +9620,57 @@ function BulkImportModal({ inventory, onClose, onImport, onImportRows, resolveIm
               className={`flex-1 text-xs py-2 rounded-xl border font-semibold transition-all ${mode===v?'bg-brand-500 text-white border-brand-500':'bg-white border-gray-200 text-gray-600'}`}>{l}</button>
           ))}
         </div>
-        {mode==='replace'&&<p className="text-xs text-red-500 bg-red-50 rounded-lg p-2">⚠️ Replace mode removes all current stock items.</p>}
+        {mode==='add'
+          ? <p className="text-xs text-gray-600 bg-gray-50 rounded-lg p-2"><b>Add / Update</b> (default): updates the items in the file, adds new SKUs, and leaves every item that is not in the file exactly as it is.</p>
+          : <p className="text-xs text-red-600 bg-red-50 rounded-lg p-2">⚠️ <b>Replace</b>: updates and adds the rows in the file, then <b>removes every active stock item that is not in the file</b>. The preview shows how many, and you are asked to confirm. Nothing is removed if any row is rejected or fails.</p>}
+        <div className="flex items-center gap-3 flex-wrap">
+          <label className="inline-flex items-center gap-2 bg-gray-800 hover:bg-gray-900 text-white rounded-xl px-3.5 py-2 text-xs font-bold cursor-pointer">
+            📂 Choose file
+            <input type="file" accept=".csv,.txt,.xlsx,.xls,text/csv" className="hidden" onChange={e=>{ loadFile(e.target.files && e.target.files[0]); e.target.value=''; }}/>
+          </label>
+          <span className="text-xs text-gray-500">{fileName ? 'Loaded: ' + fileName : 'or paste the CSV below'}</span>
+        </div>
         <div>
-          <label className="block text-xs font-bold text-gray-500 mb-1.5">Paste CSV data here:</label>
-          <textarea value={csv} onChange={e=>{setCsv(e.target.value);setPreview(null);setError('');}} rows={6}
-            placeholder="SKU,Name,Category,Stock,Reorder,Unit,Cost,Sell"
+          <textarea value={csv} onChange={e=>{setCsv(e.target.value);setFileName('');resetPreview();}} rows={6}
+            placeholder={sgrInventoryCsvHeader().join(',')}
             className="w-full border border-gray-300 rounded-xl px-3 py-2.5 text-xs font-mono focus:ring-2 focus:ring-brand-400 resize-none"/>
         </div>
         {error&&<p className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-xl p-3">❌ {error}</p>}
         {!preview
           ? <button onClick={parse} className="w-full bg-gray-800 hover:bg-gray-900 text-white rounded-xl py-2.5 text-sm font-bold">Preview Import</button>
           : <div className="space-y-3">
-              <div className="border border-emerald-200 rounded-xl overflow-hidden">
-                <div className="bg-emerald-50 px-4 py-2 border-b border-emerald-200"><p className="text-xs font-bold text-emerald-700">✅ {preview.length} items ready</p></div>
-                <div className="overflow-x-auto max-h-40">
-                  <table className="w-full text-xs min-w-[500px]">
-                    <thead className="bg-gray-50"><tr>{['SKU','Name','Cat','Stock','Cost','Sell'].map(h=><th key={h} className="px-3 py-2 text-left font-semibold text-gray-400">{h}</th>)}</tr></thead>
-                    <tbody>{preview.map((r,i)=><tr key={i} className="border-t border-gray-50"><td className="px-3 py-1.5 font-mono text-gray-500">{r.sku}</td><td className="px-3 py-1.5">{r.name}</td><td className="px-3 py-1.5 text-gray-500">{r.cat}</td><td className="px-3 py-1.5 font-semibold">{r.stock}</td><td className="px-3 py-1.5">R {r.cost}</td><td className="px-3 py-1.5">R {r.sell}</td></tr>)}</tbody>
+              <div className="border border-gray-200 rounded-xl overflow-hidden">
+                <div className="bg-gray-50 px-4 py-2 border-b border-gray-200 space-y-1">
+                  <p className="text-xs font-bold text-gray-700">{preview.length} row{preview.length!==1?'s':''}: {counts.create} new · {counts.update} to update{counts.restore?' · '+counts.restore+' to restore':''} · {counts.unchanged} unchanged · <span className={counts.rejected?'text-red-600':''}>{counts.rejected} rejected</span></p>
+                  {planInfo.ignored.length>0&&<div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1"><b>Ignored columns (not imported):</b>{planInfo.ignored.map(c=><div key={c.column}>• <b>{c.column}</b> — {c.reason}</div>)}</div>}
+                  {otherSheets.length>0&&<p className="text-xs text-amber-700">Only the first sheet was read. Not imported: sheet{otherSheets.length!==1?'s':''} {otherSheets.map(n=>'"'+n+'"').join(', ')}.</p>}
+                  {mode==='replace'&&<p className="text-xs font-bold text-red-600">Replace mode will remove {toRemove.length} active stock item{toRemove.length!==1?'s':''} that {toRemove.length!==1?'are':'is'} not in this file{toRemove.length?': '+toRemove.slice(0,5).map(i=>i.sku||i.name).join(', ')+(toRemove.length>5?' …':''):'.'}</p>}
+                  {missingCols.length>0&&<p className="text-xs text-gray-500">Not in the file, so left unchanged on existing items: {missingCols.join(', ')}</p>}
+                </div>
+                <div className="overflow-auto max-h-64">
+                  <table className="w-full text-xs min-w-[600px]">
+                    <thead className="bg-gray-50 sticky top-0"><tr>{['Row','Action','SKU','Name','Details'].map(h=><th key={h} className="px-3 py-2 text-left font-semibold text-gray-400">{h}</th>)}</tr></thead>
+                    <tbody>{planInfo.plan.map((e,i)=>(
+                      <tr key={i} className={`border-t border-gray-50 align-top ${e.action==='rejected'?'bg-red-50':''}`}>
+                        <td className="px-3 py-1.5 text-gray-400">{e.rowNum}</td>
+                        <td className="px-3 py-1.5"><span className={`px-2 py-0.5 rounded-full font-bold ${badge[e.action][1]}`}>{badge[e.action][0]}</span></td>
+                        <td className="px-3 py-1.5 font-mono text-gray-500">{e.sku||'—'}</td>
+                        <td className="px-3 py-1.5">{e.name||'—'}</td>
+                        <td className="px-3 py-1.5 text-gray-600">
+                          {e.action==='rejected' && <span className="text-red-600">{e.errors.map(x=>x.message).join('; ')}</span>}
+                          {e.action==='create' && <span>Cat {fmtV(e.local.cat)} · {fmtV(e.local.unit)} · stock {fmtV(e.local.stock)} · reorder {fmtV(e.local.reorder)} · cost R {fmtV(e.local.cost)} · sell R {fmtV(e.local.sell)}</span>}
+                          {(e.action==='update'||e.action==='restore') && <span>{e.action==='restore'?'Restore removed item. ':''}{e.changes.map(c=>c.field+': '+fmtV(c.from)+' → '+fmtV(c.to)).join(' · ')}</span>}
+                          {e.action==='unchanged' && <span className="text-gray-400">No changes</span>}
+                          {e.warnings.length>0 && <div className="text-amber-600">{e.warnings.join('; ')}</div>}
+                        </td>
+                      </tr>
+                    ))}</tbody>
                   </table>
                 </div>
               </div>
               <div className="flex gap-3">
-                <button onClick={()=>setPreview(null)} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Back</button>
-                <button type="button" onClick={confirmImport} disabled={busy} className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed">{busy?'Importing…':'Confirm Import'}</button>
+                <button onClick={resetPreview} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Back</button>
+                <button type="button" onClick={confirmImport} disabled={busy} className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed">{busy?'Importing…':(mode==='replace'?'Confirm Replace':'Import '+toSave+' row'+(toSave!==1?'s':''))}</button>
               </div>
             </div>
         }
@@ -9224,6 +9772,8 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
   const [error,   setError]   = useState('');
   const [loading, setLoading] = useState(false);
   const [done,    setDone]    = useState(false);
+  const [saving,  setSaving]  = useState(false);   // 2026-11-23: wait for the server save
+  const [saveResult, setSaveResult] = useState(null);
 
   // Column header aliases (case-insensitive match)
   const COL_MAP = {
@@ -9269,6 +9819,7 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
         }
 
         const parsed = [];
+        const seenInFile = new Set(); // 2026-11-23: a name repeated inside the file is added once
         for (let i = headerRow+1; i < raw.length; i++) {
           const row = raw[i];
           // Skip rows with descriptive labels (like the "★ Required / Optional" row)
@@ -9281,10 +9832,13 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
           }
           if (!obj.companyName) continue; // skip blank rows
           // Check duplicate against existing
+          const _key = obj.companyName.toLowerCase();
           const isDup = existingCustomers.some(
-            c=>(c.companyName||'').toLowerCase()===obj.companyName.toLowerCase()
+            c=>(c.companyName||'').trim().toLowerCase()===_key
           );
-          parsed.push({ ...obj, _dup: isDup });
+          const dupInFile = !isDup && seenInFile.has(_key);
+          seenInFile.add(_key);
+          parsed.push({ ...obj, _dup: isDup || dupInFile, _dupReason: isDup ? 'Already on file — will be skipped' : (dupInFile ? 'Repeats an earlier row of this file — will be skipped' : '') });
         }
 
         if (parsed.length === 0) { setError('No valid customer rows found. Make sure at least one row has a Company Name.'); setLoading(false); return; }
@@ -9297,9 +9851,11 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
     reader.readAsArrayBuffer(file);
   }
 
-  function handleImport() {
-    const toAdd = rows.filter(r=>!r._dup).map(r=>({
-      id: Date.now()+Math.random(),
+  async function handleImport() {
+    if (saving) return;
+    const _ids = sgrNewRecordIds(rows.length, existingCustomers);
+    const toAdd = rows.filter(r=>!r._dup).map((r,k)=>({
+      id: _ids[k],
       companyName:   r.companyName,
       contactPerson: r.contactPerson||'',
       email:         r.email||'',
@@ -9308,8 +9864,11 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
       address:       r.address||'',
       notes:         r.notes||'',
     }));
-    if (toAdd.length > 0) onImport(toAdd);
-    setDone(true);
+    setSaving(true);
+    let result = { ok: true };
+    try { if (toAdd.length > 0) result = (await onImport(toAdd)) || { ok: false, timeout: true }; }
+    catch (e) { result = { ok: false, error: (e && e.message) || String(e) }; }
+    setSaveResult(result); setSaving(false); setDone(true);
   }
 
   const newCount = rows.filter(r=>!r._dup).length;
@@ -9324,8 +9883,9 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
 
         {done ? (
           <div className="text-center py-10 space-y-3">
-            <div className="text-5xl">✅</div>
-            <p className="text-lg font-black text-gray-800">{newCount} customer{newCount!==1?'s':''} imported successfully!</p>
+            <div className="text-5xl">{saveResult&&!saveResult.ok?'⚠️':'✅'}</div>
+            <p className="text-lg font-black text-gray-800">{newCount} customer{newCount!==1?'s':''} added</p>
+            <p className={`text-sm font-semibold whitespace-pre-line ${saveResult&&saveResult.ok?'text-emerald-600':'text-amber-700'}`}>{sgrAutosaveResultText(saveResult)}</p>
             {dupCount>0&&<p className="text-sm text-amber-600">{dupCount} duplicate{dupCount!==1?'s':''} skipped (already on file).</p>}
             <button onClick={onClose} className="mt-4 bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-6 py-2.5 text-sm font-bold">Close</button>
           </div>
@@ -9337,6 +9897,7 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
             <div className="flex-1">
               <p className="text-sm font-black text-brand-800 mb-0.5">Step 1 — Download the template (if you haven't yet)</p>
               <p className="text-xs text-brand-600">Fill in your customers in the Excel template, then upload it below. Do not rename the column headings.</p>
+              <p className="text-xs text-brand-600 mt-1"><b>Adds new customers only.</b> A Company Name that is already on file, or repeats in the file, is skipped — existing customers are never changed.</p>
             </div>
             <button type="button"
               onClick={()=>{
@@ -9428,7 +9989,7 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
                         <tr key={i} className={`border-b border-gray-100 ${r._dup?'bg-amber-50':'i%2===0?bg-white:bg-gray-50'}`}>
                           <td className="px-3 py-1.5 whitespace-nowrap">
                             {r._dup
-                              ? <span className="text-amber-600 font-bold" title="Already on file — will be skipped">⚠️ dup</span>
+                              ? <span className="text-amber-600 font-bold" title={r._dupReason||'Duplicate — will be skipped'}>⚠️ dup</span>
                               : <span className="text-emerald-600 font-bold">✅ new</span>}
                           </td>
                           <td className="px-3 py-1.5 font-semibold text-gray-800 whitespace-nowrap">{r.companyName}</td>
@@ -9446,9 +10007,9 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
               </div>
               <div className="flex gap-3 mt-4">
                 <button type="button" onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Cancel</button>
-                <button type="button" onClick={handleImport} disabled={newCount===0}
-                  className={`flex-1 rounded-xl py-2.5 text-sm font-bold text-white ${newCount>0?'bg-brand-500 hover:bg-brand-600':'bg-gray-300 cursor-not-allowed'}`}>
-                  ⬆ Import {newCount} Customer{newCount!==1?'s':''}
+                <button type="button" onClick={handleImport} disabled={newCount===0||saving}
+                  className={`flex-1 rounded-xl py-2.5 text-sm font-bold text-white ${newCount>0&&!saving?'bg-brand-500 hover:bg-brand-600':'bg-gray-300 cursor-not-allowed'}`}>
+                  {saving ? 'Saving…' : <>⬆ Import {newCount} Customer{newCount!==1?'s':''}</>}
                 </button>
               </div>
             </div>
@@ -9538,7 +10099,11 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
     setCustomers(prev => prev.find(x=>x.id===c.id) ? prev.map(x=>x.id===c.id?c:x) : [c,...prev]);
   }
   function handleBulkImport(newCustomers) {
+    // 2026-11-23: resolves with the result of the autosave that carries these
+    // customers, so the import dialog only says "saved" once the server has it.
+    const saved = sgrAwaitAutosave();
     setCustomers(prev => [...prev, ...newCustomers]);
+    return saved;
   }
 
   // ── Match a quote / job / manual-invoice to a customer by client name ──
@@ -24493,8 +25058,11 @@ function BulkImportQuickRatesModal({ onClose, onImport, existingRates }) {
   const [error,   setError]   = useState('');
   const [loading, setLoading] = useState(false);
   const [done,    setDone]    = useState(false);
-  const newCount = rows.filter(r=>!r._dup).length;
+  const [saving,  setSaving]  = useState(false);   // 2026-11-23: wait for the server save
+  const [saveResult, setSaveResult] = useState(null);
+  const newCount = rows.filter(r=>!r._dup&&!r._err).length;
   const dupCount = rows.filter(r=>r._dup).length;
+  const errCount = rows.filter(r=>r._err).length;
 
   // Exact same column map as inventory bulk import
   const COL_MAP = {
@@ -24532,21 +25100,39 @@ function BulkImportQuickRatesModal({ onClose, onImport, existingRates }) {
         const idxMap  = {};
         for(const [f,al] of Object.entries(COL_MAP)) idxMap[f]=findCol(headers,al);
         const parsed=[];
+        const seenInFile=new Set(); // 2026-11-23: a name repeated inside the file is added once
+        // 2026-11-23: shared number reader (sgrParseImportNumber). The
+        // old reader kept only digits and '.', so "12,50" became 1250 and "-5" became 5.
+        const qrNum=(v,label,errs)=>{
+          if(v===''||v===null||v===undefined) return 0;
+          if(typeof v==='number') return isFinite(v)&&v>=0?v:(errs.push(label+' cannot be negative'),0);
+          const n=sgrParseImportNumber(v, ',');
+          if(n.blank) return 0;
+          if(n.error){ errs.push(label+' '+n.error); return 0; }
+          if(n.value<0){ errs.push(label+' cannot be negative'); return 0; }
+          return n.value;
+        };
         for(let i=headerRow+1;i<raw.length;i++){
           const row=raw[i];
           const nm=String(row[idxMap.name>=0?idxMap.name:1]||'').trim();
           if(!nm) continue;
           const sku=String(row[idxMap.sku>=0?idxMap.sku:0]||'').trim()||('QR-'+Date.now()+'-'+i);
-          const isDup=(existingRates||[]).some(x=>(x.name||'').toLowerCase()===nm.toLowerCase());
+          const isDup=(existingRates||[]).some(x=>(x.name||'').trim().toLowerCase()===nm.toLowerCase());
+          const dupInFile=!isDup&&seenInFile.has(nm.toLowerCase());
+          seenInFile.add(nm.toLowerCase());
+          const errs=[];
+          const cell=k=>idxMap[k]>=0?row[idxMap[k]]:'';
           parsed.push({
             sku, name:nm,
-            cat:   String(row[idxMap.cat>=0?idxMap.cat:-1]||'').trim(),
-            stock: parseFloat(String(row[idxMap.stock>=0?idxMap.stock:-1]||'0').replace(/[^0-9.]/g,''))||0,
-            reorder:parseFloat(String(row[idxMap.reorder>=0?idxMap.reorder:-1]||'0').replace(/[^0-9.]/g,''))||0,
-            unit:  String(row[idxMap.unit>=0?idxMap.unit:-1]||'').trim(),
-            cost:  parseFloat(String(row[idxMap.cost>=0?idxMap.cost:-1]||'0').replace(/[^0-9.]/g,''))||0,
-            sell:  parseFloat(String(row[idxMap.sell>=0?idxMap.sell:-1]||'0').replace(/[^0-9.]/g,''))||0,
-            _dup:isDup
+            cat:   String(cell('cat')||'').trim(),
+            stock: qrNum(cell('stock'),'Stock',errs),
+            reorder:qrNum(cell('reorder'),'Reorder',errs),
+            unit:  String(cell('unit')||'').trim(),
+            cost:  qrNum(cell('cost'),'Cost',errs),
+            sell:  qrNum(cell('sell'),'Selling',errs),
+            _dup:isDup||dupInFile,
+            _dupReason:isDup?'Already in Quick Rates (same name) — will skip':(dupInFile?'Repeats an earlier row of this file — will skip':''),
+            _err:errs.length?('Row '+(i+1)+': '+errs.join('; ')):''
           });
         }
         if(parsed.length===0){setError('No valid rows found. Make sure at least one row has a Name.');setLoading(false);return;}
@@ -24557,10 +25143,15 @@ function BulkImportQuickRatesModal({ onClose, onImport, existingRates }) {
     reader.readAsArrayBuffer(file);
   }
 
-  function handleImport(){
-    const toAdd=rows.filter(r=>!r._dup).map(r=>({id:Date.now()+Math.random(), sku:r.sku, name:r.name, cat:r.cat, stock:r.stock, reorder:r.reorder, unit:r.unit, cost:r.cost, sell:r.sell, supplierId:null}));
-    if(toAdd.length>0) onImport(toAdd);
-    setDone(true);
+  async function handleImport(){
+    if(saving) return;
+    const _ids=sgrNewRecordIds(rows.length, existingRates);
+    const toAdd=rows.filter(r=>!r._dup&&!r._err).map((r,k)=>({id:_ids[k], sku:r.sku, name:r.name, cat:r.cat, stock:r.stock, reorder:r.reorder, unit:r.unit, cost:r.cost, sell:r.sell, supplierId:null}));
+    setSaving(true);
+    let result={ok:true};
+    try{ if(toAdd.length>0) result=(await onImport(toAdd))||{ok:false,timeout:true}; }
+    catch(e){ result={ok:false,error:(e&&e.message)||String(e)}; }
+    setSaveResult(result); setSaving(false); setDone(true);
   }
 
   function downloadTemplate(){
@@ -24597,9 +25188,11 @@ function BulkImportQuickRatesModal({ onClose, onImport, existingRates }) {
       <div className="px-6 py-5 space-y-5">
         {done ? (
           <div className="text-center py-10 space-y-3">
-            <div className="text-5xl">✅</div>
-            <p className="text-lg font-black text-gray-800">{newCount} item{newCount!==1?'s':''} imported successfully!</p>
+            <div className="text-5xl">{saveResult&&!saveResult.ok?'⚠️':'✅'}</div>
+            <p className="text-lg font-black text-gray-800">{newCount} item{newCount!==1?'s':''} added</p>
+            <p className={`text-sm font-semibold whitespace-pre-line ${saveResult&&saveResult.ok?'text-emerald-600':'text-amber-700'}`}>{sgrAutosaveResultText(saveResult)}</p>
             {dupCount>0&&<p className="text-sm text-amber-600">{dupCount} duplicate{dupCount!==1?'s':''} skipped.</p>}
+            {errCount>0&&<p className="text-sm text-red-600">{errCount} row{errCount!==1?'s':''} rejected (invalid numbers) — not imported.</p>}
             <button onClick={onClose} className="mt-4 bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-6 py-2.5 text-sm font-bold">Close</button>
           </div>
         ) : (<>
@@ -24608,6 +25201,7 @@ function BulkImportQuickRatesModal({ onClose, onImport, existingRates }) {
             <div className="flex-1">
               <p className="text-sm font-black text-blue-800 mb-0.5">Step 1 — Download the template</p>
               <p className="text-xs text-blue-600">Columns: <strong>SKU, NAME, CATEGORY, STOCK, REORDER, UNIT, COST, SELLING</strong></p>
+              <p className="text-xs text-blue-600 mt-1"><b>Adds new rates only.</b> A NAME already in Quick Rates, or repeated in the file, is skipped — existing rates are never changed.</p>
             </div>
             <button type="button" onClick={downloadTemplate}
               className="flex-shrink-0 bg-brand-500 hover:bg-brand-600 text-white rounded-xl px-4 py-2 text-xs font-bold whitespace-nowrap cursor-pointer">
@@ -24632,6 +25226,7 @@ function BulkImportQuickRatesModal({ onClose, onImport, existingRates }) {
                 <div className="flex gap-3 text-xs">
                   <span className="font-bold text-emerald-600">✅ {newCount} new</span>
                   {dupCount>0&&<span className="font-bold text-amber-500">⚠️ {dupCount} duplicate{dupCount!==1?'s':''} (will skip)</span>}
+                  {errCount>0&&<span className="font-bold text-red-600" title={rows.filter(r=>r._err).map(r=>r._err).join('\n')}>❌ {errCount} rejected</span>}
                 </div>
               </div>
               <div className="border border-gray-200 rounded-2xl overflow-hidden">
@@ -24642,8 +25237,8 @@ function BulkImportQuickRatesModal({ onClose, onImport, existingRates }) {
                     </thead>
                     <tbody>
                       {rows.map((r,i)=>(
-                        <tr key={i} className={`border-b border-gray-100 ${r._dup?'bg-amber-50':'bg-white'}`}>
-                          <td className="px-3 py-2 text-center">{r._dup?<span className="text-amber-500 font-bold" title="Duplicate — will skip">⚠️</span>:<span className="text-emerald-500">✅</span>}</td>
+                        <tr key={i} className={`border-b border-gray-100 ${r._err?'bg-red-50':r._dup?'bg-amber-50':'bg-white'}`}>
+                          <td className="px-3 py-2 text-center">{r._err?<span className="text-red-600 font-bold" title={r._err}>❌</span>:r._dup?<span className="text-amber-500 font-bold" title={r._dupReason||'Duplicate — will skip'}>⚠️</span>:<span className="text-emerald-500">✅</span>}</td>
                           <td className="px-3 py-2 text-gray-500 font-mono text-xs">{r.sku}</td>
                           <td className="px-3 py-2 font-semibold text-gray-800">{r.name}</td>
                           <td className="px-3 py-2 text-gray-500">{r.cat||'—'}</td>
@@ -24660,8 +25255,8 @@ function BulkImportQuickRatesModal({ onClose, onImport, existingRates }) {
               </div>
               <div className="flex gap-3 pt-4">
                 <button onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-semibold hover:bg-gray-50">Cancel</button>
-                <button onClick={handleImport} disabled={newCount===0} className="flex-1 bg-brand-500 hover:bg-brand-600 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-bold">
-                  ⚡ Import {newCount} Item{newCount!==1?'s':''}
+                <button onClick={handleImport} disabled={newCount===0||saving} className="flex-1 bg-brand-500 hover:bg-brand-600 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-bold">
+                  {saving ? 'Saving…' : <>⚡ Import {newCount} Item{newCount!==1?'s':''}</>}
                 </button>
               </div>
             </div>
@@ -24799,7 +25394,7 @@ function QuickRatesModal({ quickRates, setQuickRates, suppliers, inventory, setI
   }
 
   function handleDelete(id){ setQuickRates(prev=>prev.filter(x=>x.id!==id)); setDelId(null); }
-  function handleBulkImport(items){ setQuickRates(prev=>[...prev,...items]); }
+  function handleBulkImport(items){ const saved=sgrAwaitAutosave(); setQuickRates(prev=>[...prev,...items]); return saved; } // 2026-11-23: resolves with the server save result
 
   const zarFmt = n => 'R '+Number(n||0).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
   const stockBadge = item => {
@@ -25116,7 +25711,7 @@ function QuickRatesPanel({ quickRates, setQuickRates, suppliers, inventory, setI
     setPendingMove(null);
   }
   function handleDelete(id){ setQuickRates(prev=>prev.filter(x=>x.id!==id)); setDelId(null); }
-  function handleBulkImport(items){ setQuickRates(prev=>[...prev,...items]); }
+  function handleBulkImport(items){ const saved=sgrAwaitAutosave(); setQuickRates(prev=>[...prev,...items]); return saved; } // 2026-11-23: resolves with the server save result
 
   return (
     <div className="space-y-4">
@@ -25436,15 +26031,17 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
   function importInventory(list) {
     if(isRelationalAuthoritative('inventory')){
       alert('Bulk import could not use the server path.\n\nNothing was imported and nothing was changed. Please reload the page and try again.');
-      return;
+      return { ok: false, error: 'not saved' };
     }
+    const saved = sgrAwaitAutosave(); // 2026-11-23: report the real server save
     setInventory(list);
+    return saved;
   }
   // Relational import: every row is written through the relational API and
   // only server-acknowledged results are applied locally (then confirmed by
   // the post-mutation refresh). Returns the report shown to the user.
   async function importInventoryRelational(rows, mode) {
-    const result = await importInventoryRowsRelational(rows, mode, inventory, relationalApi);
+    const result = await importInventoryRowsRelational(rows, mode, inventory, relationalApi, suppliers||[]);
     if(result.changed.length){
       const byId = new Map(result.changed.map(i=>[String(i.id), i]));
       const inventoryUpdater = prev=>{
@@ -25456,7 +26053,28 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
       setInventory(inventoryUpdater);
       syncRelationalBaseline('inventory', inventoryUpdater);
     }
+    // 2026-11-23: re-read Inventory from the server straight after an import,
+    // so what stays on screen is the saved copy, not this tab's local merge.
+    if(result.changed.length) requestRelationalRefresh('inventory bulk import');
     return result.message;
+  }
+  // 2026-11-23: editable CSV export — the same columns Bulk Import reads
+  // (by header name), plus each item's ID so a re-import updates exactly the
+  // item it came from. Active items only (what the page lists). UTF-8 with a
+  // BOM so Excel shows names correctly; CRLF; plain numbers.
+  function exportInventoryCSV() {
+    const active = inventory.filter(i=>i.active!==false);
+    if(active.length===0){ alert('There are no stock items to export.'); return; }
+    downloadFile('\ufeff'+sgrInventoryCsvExport(active, suppliers||[]), 'signacore-inventory-'+new Date().toISOString().slice(0,10)+'.csv', 'text/csv;charset=utf-8');
+  }
+  // Same columns as an .xlsx workbook — the safer file to edit in Excel
+  // (numbers stay numbers whatever the PC's regional settings; ids are text).
+  function exportInventoryExcel() {
+    const active = inventory.filter(i=>i.active!==false);
+    if(active.length===0){ alert('There are no stock items to export.'); return; }
+    if(!window.XLSX){ alert('The spreadsheet library has not loaded. Use ⬇ Export CSV instead.'); return; }
+    try { window.XLSX.writeFile(sgrInventoryWorkbook(window.XLSX, active, suppliers||[]), 'signacore-inventory-'+new Date().toISOString().slice(0,10)+'.xlsx'); }
+    catch(e){ alert('Could not create the Excel file: '+((e&&e.message)||e)); }
   }
   function getSupplierName(supplierId) {
     if(!supplierId) return null;
@@ -25673,7 +26291,7 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
     const DISC = 0.30; // 30% agent discount — never shown in output
 
     // Only in-stock items; exclude Tools & Equipment category
-    const inStock = inventory.filter(i=>i.stock>0 && !/tool|equipment/i.test(i.cat||''));
+    const inStock = activeInventory.filter(i=>i.stock>0 && !/tool|equipment/i.test(i.cat||'')); // 2026-11-23: removed items never listed
     if (inStock.length===0){ alert('No in-stock items to list.'); return; }
 
     // Group by category
@@ -25812,7 +26430,7 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
 
   return (
     <div className="p-4 space-y-4">
-      {showImport&&<BulkImportModal inventory={inventory} onClose={()=>setShowImport(false)} onImport={importInventory} onImportRows={importInventoryRelational} resolveImportMode={()=>confirmInventoryWriteMode({ existing: true })}/>}
+      {showImport&&<BulkImportModal inventory={inventory} suppliers={suppliers||[]} onClose={()=>setShowImport(false)} onImport={importInventory} onImportRows={importInventoryRelational} resolveImportMode={()=>confirmInventoryWriteMode({ existing: true })}/>}
       {(showAddItem||editItem||copyItem)&&<AddEditInventoryItemModal item={copyItem||editItem} suppliers={suppliers||[]} allCats={cats} onClose={()=>{setShowAddItem(false);setEditItem(null);setCopyItem(null);}} onSave={async it=>{await saveItem(it);setCopyItem(null);}}/>}
       {editCP&&<EditCompleteProductModal cp={editCP} completeProducts={completeProducts||[]} setCompleteProducts={setCompleteProducts} quotes={quotes||[]} setQuotes={setQuotes} onSaved={syncCPInventory} onClose={()=>setEditCP(null)}/>}
       {showQuickRates&&<QuickRatesModal quickRates={quickRates||[]} setQuickRates={setQuickRates} suppliers={suppliers||[]} inventory={inventory} setInventory={setInventory} inventoryCats={cats} onClose={()=>setShowQuickRates(false)}/>}
@@ -25898,6 +26516,20 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
               <button onClick={()=>setShowImport(true)}
                 className="flex items-center gap-1.5 bg-gray-700 hover:bg-gray-800 text-white rounded-xl px-3.5 py-2 text-xs font-bold whitespace-nowrap">
                 ⬆ Bulk Import
+              </button>
+            )}
+            {isAdmin&&(
+              <button onClick={exportInventoryExcel}
+                className="flex items-center gap-1.5 bg-gray-600 hover:bg-gray-700 text-white rounded-xl px-3.5 py-2 text-xs font-bold whitespace-nowrap"
+                title="Download every stock item as an Excel workbook you can edit and import again with Bulk Import">
+                ⬇ Export Excel
+              </button>
+            )}
+            {isAdmin&&(
+              <button onClick={exportInventoryCSV}
+                className="flex items-center gap-1.5 bg-gray-600 hover:bg-gray-700 text-white rounded-xl px-3.5 py-2 text-xs font-bold whitespace-nowrap"
+                title="Download every stock item as a CSV you can edit and import again with Bulk Import">
+                ⬇ Export CSV
               </button>
             )}
             <button onClick={exportStockCountPDF}
@@ -27502,57 +28134,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   const fmtDate = d => d ? new Date(d).toLocaleDateString('en-ZA') : '';
 
   // ── CSV Parser for bank statements ──
-  function parseCSV(text) {
-    const lines = text.trim().split(/\r?\n/).filter(l=>l.trim());
-    if (lines.length < 2) return null;
-    // Detect delimiter
-    const delim = lines[0].includes('\t') ? '\t' : ',';
-    const headers = lines[0].split(delim).map(h=>h.replace(/['"]/g,'').trim().toLowerCase());
-    const rows = [];
-    for(let i=1;i<lines.length;i++){
-      const cols = lines[i].split(delim).map(c=>c.replace(/['"]/g,'').trim());
-      const obj = {};
-      headers.forEach((h,idx)=>{ obj[h]=cols[idx]||''; });
-      rows.push(obj);
-    }
-    return {headers, rows};
-  }
-
-  function mapCSVToTxns(rows, headers) {
-    // Try to find date, description, debit, credit, amount columns
-    const find = (...names) => {
-      for(const n of names){ const h=headers.find(h=>h.includes(n)); if(h) return h; }
-      return null;
-    };
-    const dateCol  = find('date','transaction date','trans date','posting date');
-    const descCol  = find('description','narrative','reference','details','memo','particulars');
-    const debitCol = find('debit','withdrawals','payment');
-    const creditCol= find('credit','deposits','receipt');
-    const amtCol   = find('amount');
-
-    return rows.map((r,i)=>{
-      let debit=0, credit=0;
-      if(debitCol&&r[debitCol]) debit=parseFloat(r[debitCol].replace(/[,\s]/g,''))||0;
-      if(creditCol&&r[creditCol]) credit=parseFloat(r[creditCol].replace(/[,\s]/g,''))||0;
-      if(amtCol&&!debitCol&&!creditCol){
-        const amt=parseFloat(r[amtCol].replace(/[,\s]/g,''))||0;
-        if(amt<0) debit=Math.abs(amt); else credit=amt;
-      }
-      return {
-        id: Date.now()+i,
-        date: r[dateCol||'']||'',
-        description: r[descCol||'']||'—',
-        debit, credit,
-        accountId: null,
-        accountName: '',
-        vatCode: '',
-        reconciled: false,
-        ref: '',
-        co: isHoldingsUser(user) ? HOLDINGS_CO_ID : null, // tag by the importing user's company context
-      };
-    }).filter(t=>t.debit>0||t.credit>0);
-  }
-
+  // 2026-11-23: shared reader + duplicate check — see sgrParseBankStatementCsv.
   function handleFileUpload(e) {
     const file = e.target.files[0];
     if(!file){ return; }
@@ -27560,22 +28142,41 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
     const reader = new FileReader();
     reader.onload = ev => {
       try {
-        const parsed = parseCSV(ev.target.result);
+        const parsed = sgrParseBankStatementCsv(String(ev.target.result||''));
         if(!parsed){ setCsvError('Could not parse file. Please use a CSV or TSV bank export.'); return; }
-        const txns = mapCSVToTxns(parsed.rows, parsed.headers);
-        if(!txns.length){ setCsvError('No valid transactions found. Check columns for Date, Description, Debit/Credit.'); return; }
-        setImportPreview({ txns, filename: file.name });
+        const _ids = sgrNewRecordIds(parsed.txns.length, bankTxnsAll);
+        const all = parsed.txns.map((t,i)=>({
+          id: _ids[i],
+          date: t.date,
+          description: t.description,
+          debit: t.debit, credit: t.credit,
+          accountId: null,
+          accountName: '',
+          vatCode: '',
+          reconciled: false,
+          ref: '',
+          co: isHoldingsUser(user) ? HOLDINGS_CO_ID : null, // tag by the importing user's company context
+        }));
+        const split = sgrSplitBankDuplicates(all, bankTxns); // bankTxns = this company's transactions
+        if(!all.length && !parsed.rejected.length){ setCsvError('No valid transactions found. Check columns for Date, Description, Debit/Credit.'); return; }
+        setImportPreview({ txns: split.fresh, duplicates: split.duplicates.length, rejected: parsed.rejected, filename: file.name });
       } catch(err){ setCsvError('Parse error: '+err.message); }
     };
     reader.readAsText(file);
     e.target.value='';
   }
 
-  function confirmImport() {
-    if(!importPreview) return;
+  async function confirmImport() {
+    if(!importPreview || importPreview.saving) return;
+    if(!importPreview.txns.length){ alert('Nothing to import — every transaction in this file is already on file or could not be read.\n\nNothing was changed.'); return; }
+    const n = importPreview.txns.length;
+    const saved = sgrAwaitAutosave(); // 2026-11-23: report the real server save
+    setImportPreview(p=>({ ...p, saving:true }));
     setBankTxns(prev=>[...importPreview.txns, ...prev]);
+    const res = await saved;
     setImportPreview(null);
     setShowImport(false);
+    alert(n + ' transaction' + (n!==1?'s':'') + ' imported' + (importPreview.duplicates ? ', ' + importPreview.duplicates + ' already on file skipped' : '') + (importPreview.rejected.length ? ', ' + importPreview.rejected.length + ' unreadable row(s) skipped' : '') + '.\n\n' + sgrAutosaveResultText(res));
   }
 
   // ── Filtered transactions ──
@@ -28198,7 +28799,10 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   // ── Multi-type Xero export ──
   function exportXeroInvoices() {
     const rows = [['*ContactName','*InvoiceDate','*DueDate','*InvoiceNumber','*Description','*Quantity','*UnitAmount','*AccountCode','*TaxType','Currency']];
-    accInvoices.filter(i=>i.status!=='void').forEach(inv=>{
+    // 2026-11-23 IMPORT/EXPORT AUDIT: allInvoices (job + manual, void excluded,
+    // this company only) — the same set as the Invoices tab and its CSV. This
+    // export used to read accInvoices only, so every JOB invoice was missing.
+    allInvoices.forEach(inv=>{
       (inv.lineItems||[{description:inv.description||'Service',qty:1,unitAmount:inv.total||0,accountCode:'4000',taxType:'Tax Exclusive'}]).forEach(line=>{
         rows.push([
           inv.contactName||'',
@@ -28250,7 +28854,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   function exportXeroContacts() {
     const rows = [['*Name','EmailAddress','PhoneNumber','AddressLine1','City','PostalCode','Country','TaxNumber','AccountNumber','ContactType']];
     const added = new Set();
-    accInvoices.forEach(i=>{ if(i.contactName&&!added.has(i.contactName)){ added.add(i.contactName); rows.push([i.contactName,i.contactEmail||'','',i.contactAddress||'','','','South Africa','','','Customer']); }});
+    allInvoices.forEach(i=>{ if(i.contactName&&i.contactName!=='—'&&!added.has(i.contactName)){ added.add(i.contactName); rows.push([i.contactName,i.contactEmail||'','',i.contactAddress||'','','','South Africa','','','Customer']); }}); // 2026-11-23: job-invoice customers included
     accBills.forEach(b=>{ if(b.supplierName&&!added.has(b.supplierName)){ added.add(b.supplierName); rows.push([b.supplierName,b.supplierEmail||'','',b.supplierAddress||'','','','South Africa','','','Supplier']); }});
     if(rows.length<2){ alert('No contacts to export.'); return; }
     downloadCSV(rows, 'xero-contacts.csv');
@@ -29246,7 +29850,9 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                   ):(
                     <>
                       <div className="bg-green-50 border border-green-200 rounded-xl p-3">
-                        <p className="text-sm font-bold text-green-800">✓ {importPreview.txns.length} transactions found in {importPreview.filename}</p>
+                        <p className="text-sm font-bold text-green-800">✓ {importPreview.txns.length} new transaction{importPreview.txns.length!==1?'s':''} in {importPreview.filename}</p>
+                        {importPreview.duplicates>0&&<p className="text-xs text-amber-700 mt-1">{importPreview.duplicates} already on file (same date, description and amount) — will be skipped.</p>}
+                        {importPreview.rejected.length>0&&<p className="text-xs text-red-600 mt-1">{importPreview.rejected.length} row{importPreview.rejected.length!==1?'s':''} could not be read and will be skipped: {importPreview.rejected.slice(0,5).map(r=>'row '+r.row+' — '+r.error).join('; ')}{importPreview.rejected.length>5?' …':''}</p>}
                       </div>
                       <div className="max-h-64 overflow-y-auto border border-gray-200 rounded-xl">
                         <table className="w-full text-xs">
@@ -29272,7 +29878,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                         </table>
                       </div>
                       <div className="flex gap-3">
-                        <button onClick={confirmImport} className="flex-1 text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#06065c'}}>Import {importPreview.txns.length} Transactions</button>
+                        <button onClick={confirmImport} disabled={!!importPreview.saving} className="flex-1 text-white font-bold py-2.5 rounded-xl text-sm disabled:opacity-50" style={{background:'#06065c'}}>{importPreview.saving?'Saving…':'Import '+importPreview.txns.length+' Transactions'}</button>
                         <button onClick={()=>setImportPreview(null)} className="px-4 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600">Back</button>
                       </div>
                     </>
@@ -32302,6 +32908,7 @@ function App() {
     // capturedBaseline note on mergeAndSave() for the full explanation of
     // the race this closes.
     const capturedBaseline = serverBaselineRef.current;
+    const _sgrSnapSeq = ++sgrAutosaveSeqRef.current; // 2026-11-23: see sgrAwaitAutosave
     // Backup to localStorage (safety net — DB is source of truth).
     //
     // 2026-08-04 FIX: this backup previously carried no _autoSavedAt, so on
@@ -32336,12 +32943,14 @@ function App() {
         // snapshot is diffed against what it actually knew at capture time.
         const saved = await enqueueMergeAndSave(snapshot, capturedBaseline);
         if (saved) setApiMsg('Saved ✓');
+        sgrSettleAutosave(_sgrSnapSeq, { ok: true });
       } catch (e) {
         // A blocked/failed save must never look like a successful one — the
         // local in-browser copy (localStorage snapshot above) is still safe,
         // but the backend did not accept this write, so make that visible
         // instead of silently retrying invisibly.
         setApiMsg(e && e.message ? ('Save failed — ' + e.message) : 'Save failed — kept locally');
+        sgrSettleAutosave(_sgrSnapSeq, { ok: false, error: (e && e.message) || 'save failed' });
       }
       setTimeout(() => setApiMsg(''), 2500);
     }, 800);

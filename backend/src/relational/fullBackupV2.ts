@@ -93,6 +93,13 @@ const RAW_REL_TABLES = [
 const RAW_SUPPORTING_TABLES = ['document_number_counters', 'quote_conversions'];
 
 function arr(v: unknown): any[] { return Array.isArray(v) ? v : []; }
+const CREDENTIAL_KEYS = new Set(['pw', 'password', 'passwordhash', 'password_hash', 'token', 'apikey', 'api_key', 'secret']);
+export function redactAccountCredentials(acc: unknown): unknown {
+  if (!acc || typeof acc !== 'object' || Array.isArray(acc)) return acc;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(acc as Record<string, unknown>)) if (!CREDENTIAL_KEYS.has(k.toLowerCase())) out[k] = v;
+  return out;
+}
 
 export interface FullBackupV2Result {
   buffer: Buffer;
@@ -197,6 +204,16 @@ export async function buildFullBackupV2(exportedByRole: string): Promise<FullBac
     // manifest's `purchaseOrdersDataset` field for the human-readable
     // distinction.
     effectiveData.purchaseOrdersLegacyArchive = legacyPurchaseOrdersArchive;
+
+    // 2026-11-23 IMPORT/EXPORT AUDIT — credentials. platform_state.userAccounts
+    // is the dashboard's account list; older rows carried each user's login
+    // password in `pw` (plain text — removePlaintextPasswordsFromPlatformState
+    // clears it only where that script has been applied). Sign-in uses
+    // app_users, so a backup never needs it: every credential-shaped field is
+    // dropped from each account, everything else is kept unchanged.
+    if (Array.isArray(effectiveData.userAccounts)) {
+      effectiveData.userAccounts = effectiveData.userAccounts.map(redactAccountCredentials);
+    }
 
     // CUTOVER BLOCKER COMPLETION — closes gap #3: relational_cutover's RAW
     // per-section state, captured unconditionally (regardless of the env

@@ -551,7 +551,7 @@ const NEW_ITEM_2 = { id: 502, sku: 'SB-ACM-4', name: 'ACM 4mm White', category: 
     {
       const page = fn('InventoryPage');
       ok(/onImportRows=\{importInventoryRelational\} resolveImportMode=\{\(\)=>confirmInventoryWriteMode\(\{ existing: true \}\)\}/.test(page), 'the modal gets the relational importer and decides the path at confirm time');
-      ok(/const result = await importInventoryRowsRelational\(rows, mode, inventory, relationalApi\);/.test(page) && /syncRelationalBaseline\('inventory', inventoryUpdater\);/.test(page), 'only server-acknowledged records are applied locally');
+      ok(/const result = await importInventoryRowsRelational\(rows, mode, inventory, relationalApi(, suppliers\|\|\[\])?\);/.test(page) && /syncRelationalBaseline\('inventory', inventoryUpdater\);/.test(page), 'only server-acknowledged records are applied locally');
       const modal = fn('BulkImportModal');
       ok(/if \(importMode === 'relational' && onImportRows\) \{[\s\S]{0,900}message = await onImportRows\(preview, mode\);[\s\S]{0,700}alert\(message\);[\s\S]{0,40}return;/.test(modal), 'the modal shows the server-built report and returns before the JSON branch');
     }

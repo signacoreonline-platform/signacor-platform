@@ -353,7 +353,10 @@ async function main() {
     }
 
     section('[16] Bulk Import through the relational API (the REAL frontend importer against this server)');
-    const importer = liftFrontend('importInventoryRowsRelational', { String, Array, Map, Set });
+    // 2026-11-23: the importer now plans every row with the shared CSV helpers.
+    const impEnv: Record<string, any> = { String, Array, Map, Set, Number, Object, Math, JSON, Error, isFinite };
+    for (const n of ['sgrInventoryCsvFields', 'sgrPlanInventoryImport', 'sgrInventoryImportMessage', 'sgrNewInventoryReport', 'sgrCollectRejected']) { const f = liftFrontend(n, impEnv); if (f) impEnv[n] = f; }
+    const importer = liftFrontend('importInventoryRowsRelational', impEnv);
     ok(!!importer, 'importInventoryRowsRelational exists in index.html');
     if (importer) {
       const deactivated = (await createItem(H, { sku: 'INVP-IMP-OLD', name: 'INVP old', category: 'INVP Old', stock: 1 })).body;
@@ -378,9 +381,11 @@ async function main() {
       // failure reporting + replace safety
       const before16b = mine(await readTargeted(H));
       const bad = await importer([{ sku: 'INVP-IMP-3', name: 'INVP imported 3', cat: 'X', stock: 1 }, { sku: 'INVP-IMP-BAD', name: '', cat: 'X', stock: 1 }], 'replace', before16b, api);
-      ok(bad.report.failed.length === 1 && bad.report.failed[0].sku === 'INVP-IMP-BAD', 'the failing row is reported by SKU', bad.report.failed);
-      ok(bad.report.removalsSkipped === true && bad.report.removed.length === 0, 'replace mode removed NOTHING because a row failed');
-      ok(!/✅/.test(bad.message) && /NOT saved/.test(bad.message), 'no success message on a partial failure', bad.message);
+      // 2026-11-23: a new item with no name is now REJECTED before any write
+      // (reported with its row and field) instead of failing at the server.
+      ok(bad.report.rejected.length === 1 && bad.report.rejected[0].sku === 'INVP-IMP-BAD' && bad.report.rejected[0].field === 'Name', 'the invalid row is rejected and reported by SKU and field (never sent)', bad.report.rejected);
+      ok(bad.report.removalsSkipped === true && bad.report.removed.length === 0, 'replace mode removed NOTHING because a row was rejected');
+      ok(!/✅/.test(bad.message) && /REJECTED/.test(bad.message), 'no success message on a partial import', bad.message);
       const after16b = mine(await readTargeted(H));
       ok(after16b.filter((i) => i.active !== false).length === before16b.filter((i) => i.active !== false).length + 1, 'only the one good row was added; every existing item is still active');
     }

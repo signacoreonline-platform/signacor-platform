@@ -9,3 +9,6 @@ dist/
 
 # 2026-11-22: local data for update-inventory-descriptions (item wording incl. customer names) — keep out of the public repo/site
 /src/scripts/data/inventory-descriptions-*.json
+
+# 2026-11-23: plan + full records written by src/scripts/repair-id-collisions.ts --apply (customer names) — keep local, never commit
+/id-collision-repair-*.json
