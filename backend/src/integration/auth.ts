@@ -29,6 +29,9 @@ export interface IntegrationContext {
   readOnly: boolean;
   /** Companies this client may READ through /read/*. A normal client reads only its own companyCode. */
   readCompanies: string[];
+  /** Owner-writer client (migration 020): may ONLY use /write/* (and /status), for writeCompanies, with owner write scopes. */
+  ownerWriter: boolean;
+  writeCompanies: string[];
   actingFor: string | null;
   confirmedBy: string | null;
   requestId: string;
@@ -110,7 +113,8 @@ export async function integrationAuth(req: IntegrationRequest, res: Response, ne
   }
   try {
     const r = await query(
-      `SELECT client_id, display_name, secret_hash, scopes, company_code, is_active, revoked_at, read_only, read_company_codes
+      `SELECT client_id, display_name, secret_hash, scopes, company_code, is_active, revoked_at, read_only, read_company_codes,
+              COALESCE(owner_writer, FALSE) AS owner_writer, COALESCE(write_company_codes, '{}') AS write_company_codes
          FROM integration_clients WHERE client_id = $1`,
       [presented]
     );
@@ -125,6 +129,7 @@ export async function integrationAuth(req: IntegrationRequest, res: Response, ne
       return sendError(res, new IntegrationError(429, 'RATE_LIMITED', 'Too many requests. Please retry shortly.'));
     }
     const readOnly = row.read_only === true;
+    const ownerWriter = !readOnly && row.owner_writer === true;
     const extraCompanies: string[] = readOnly && Array.isArray(row.read_company_codes) ? (row.read_company_codes as unknown[]).map((c) => String(c)) : [];
     const ctx: IntegrationContext = {
       clientId: row.client_id,
@@ -134,6 +139,8 @@ export async function integrationAuth(req: IntegrationRequest, res: Response, ne
       companyCode: String(row.company_code),
       readOnly,
       readCompanies: extraCompanies.length ? [...new Set(extraCompanies)] : [String(row.company_code)],
+      ownerWriter,
+      writeCompanies: ownerWriter && Array.isArray(row.write_company_codes) ? [...new Set((row.write_company_codes as unknown[]).map((c) => String(c)))] : [],
       actingFor: headerText(req, 'X-Acting-For'),
       confirmedBy: headerText(req, 'X-Confirmed-By'),
       requestId: headerText(req, 'X-Request-Id', 64) || crypto.randomUUID(),
@@ -142,6 +149,16 @@ export async function integrationAuth(req: IntegrationRequest, res: Response, ne
     res.set('X-Request-Id', ctx.requestId);
     if (readOnly && req.method !== 'GET' && req.method !== 'HEAD') {
       return sendError(res, new IntegrationError(403, 'READ_ONLY_CLIENT', 'This integration client is read-only.'));
+    }
+    // An owner-writer exists only for confirmed owner writes: it may not use Sally's routes or the read API, and no
+    // other client may use the owner write routes (writeRoutes.ts checks ownerWriter again on every route).
+    const sub = req.path || '';
+    const isWritePath = sub === '/write' || sub.startsWith('/write/');
+    if (ownerWriter && !isWritePath && sub !== '/status') {
+      return sendError(res, new IntegrationError(403, 'OWNER_WRITER_ONLY', 'This integration client may only use the owner write API.'));
+    }
+    if (!ownerWriter && isWritePath) {
+      return sendError(res, new IntegrationError(403, 'NOT_OWNER_WRITER', 'This integration client may not use the owner write API.'));
     }
     query(
       `UPDATE integration_clients SET last_used_at = NOW()

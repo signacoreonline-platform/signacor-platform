@@ -31,6 +31,7 @@ import { IntegrationError, bad, sendError } from './errors';
 import { requestHash } from './keys';
 import * as data from './data';
 import { readRoutes } from './readRoutes';
+import { writeRoutes } from './writeRoutes';
 
 const router = Router();
 
@@ -223,7 +224,7 @@ router.get('/status', op('status', async (req, res) => {
   for (const s of ['customers', 'inventory', 'quickRates', 'quotes'] as const) sections[s] = await data.sectionAuthority(s);
   res.json({
     apiVersion: 'v1',
-    client: { id: ctx.clientId, name: ctx.displayName, companyCode: ctx.companyCode, scopes: ctx.scopes, readOnly: ctx.readOnly, readCompanies: ctx.readCompanies },
+    client: { id: ctx.clientId, name: ctx.displayName, companyCode: ctx.companyCode, scopes: ctx.scopes, readOnly: ctx.readOnly, readCompanies: ctx.readCompanies, ownerWriter: ctx.ownerWriter, writeCompanies: ctx.writeCompanies },
     sections,
     capabilities: {
       quoteDrafts: sections.quotes === 'relational' && ctx.scopes.includes('quote:create'),
@@ -613,6 +614,9 @@ router.patch('/quotes/:id', requireScope('quote:update'), op('quote.update_draft
 
 // Owner read access (GET only) — readRoutes.ts.
 router.use('/read', readRoutes(op));
+
+// Owner write access (CORE-AGENTS confirmed actions, owner-writer clients only) — writeRoutes.ts.
+router.use('/write', writeRoutes(op, idempotent));
 
 // Anything else under /api/v1/integration: a clear, audited 404.
 router.use(op('unknown', async (_req, _res) => {

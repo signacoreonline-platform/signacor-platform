@@ -46,6 +46,12 @@ export const KNOWN_SCOPES = [
   'jobs:read',        // jobs, production stage, due dates, quote/invoice links, payment position
   'accounts:read',    // invoices, credit notes, payments, receivables, supplier bills
   'purchasing:read',  // suppliers, purchase orders, supplier unit-price history, inventory cost
+  // Owner WRITE access (CORE-AGENTS confirmed actions) — /write/* only, owner-writer clients only, see writeRoutes.ts.
+  // Each call carries the owner's confirmation (X-Confirmed-By) and goes through relational/services.ts unchanged.
+  'jobs:update',        // a job's due date, notes, reference and PO reference (never stage, values, discounts or lines)
+  'invoices:create',    // create the invoice for a completed job (ensureInvoiceForJob: idempotent, one invoice per job)
+  'purchasing:create',  // create a DRAFT purchase order from inventory items (cost and names from the inventory record)
+  'purchasing:update',  // a PO's notes; approve or decline a DRAFT purchase order
 ] as const;
 export type Scope = (typeof KNOWN_SCOPES)[number];
 
@@ -61,7 +67,10 @@ export const DEFAULT_SCOPES: readonly Scope[] = [
 ];
 
 /** Every scope that writes anything. A read-only client may never hold one (also a DB CHECK, migration 018). */
-export const WRITE_SCOPES: readonly Scope[] = ['customer:create', 'customer:update', 'quote:create', 'quote:update'];
+export const WRITE_SCOPES: readonly Scope[] = ['customer:create', 'customer:update', 'quote:create', 'quote:update', 'jobs:update', 'invoices:create', 'purchasing:create', 'purchasing:update'];
+
+/** What `clientCli create-writer` may grant, and the only scopes an owner-writer client can hold (also a DB CHECK, 020). */
+export const OWNER_WRITE_SCOPES: readonly Scope[] = ['jobs:update', 'invoices:create', 'purchasing:create', 'purchasing:update'];
 
 /** What `clientCli create-reader` grants when --scopes is omitted: read only, nothing that writes. */
 export const OWNER_READ_SCOPES: readonly Scope[] = [

@@ -14,6 +14,12 @@
  * A reader gets OWNER_READ_SCOPES unless --scopes names a subset; it can never hold a write scope (CLI, API and DB
  * all refuse) and every non-GET request it makes is refused.
  *
+ * Owner-writer client (CORE-AGENTS confirmed actions, migration 020) — separate from the reader:
+ *   node dist/integration/clientCli.js create-writer --client-id core-agents-writer --name "CORE-AGENTS (owner writes)" --companies 1,2,4
+ *   node dist/integration/clientCli.js set-write-companies --client-id core-agents-writer --companies 2
+ * A writer gets OWNER_WRITE_SCOPES unless --scopes names a subset of them. It may only use /write/* (auth.ts), every
+ * mutation needs X-Confirmed-By, and `revoke` / `rotate` work exactly as for every other client.
+ *
  * `create` and `rotate` print the secret ONCE. Only its SHA-256 hash is
  * stored; if it is lost, rotate. Default scopes (no --scopes) = DEFAULT_SCOPES
  * in scopes.ts: the read + draft-quote set. Customer writes (customer:create,
@@ -26,7 +32,7 @@
  */
 import type { Pool } from 'pg';
 import { createCliPool } from './cliDb';
-import { KNOWN_SCOPES, DEFAULT_SCOPES, MASTER_DATA_WRITE_SCOPES, OWNER_READ_SCOPES, isKnownScope, isWriteScope } from './scopes';
+import { KNOWN_SCOPES, DEFAULT_SCOPES, MASTER_DATA_WRITE_SCOPES, OWNER_READ_SCOPES, OWNER_WRITE_SCOPES, isKnownScope, isWriteScope } from './scopes';
 import { generateSecret, hashSecret } from './keys';
 
 function arg(name: string): string | undefined {
@@ -51,7 +57,7 @@ async function main(): Promise<void> {
   const clientId = arg('client-id');
   const by = process.env.USER || process.env.USERNAME || 'cli';
   if (cmd === 'list') {
-    const r = await pool.query(`SELECT client_id, display_name, company_code, read_only, read_company_codes, scopes, is_active, revoked_at, created_at, rotated_at, last_used_at FROM integration_clients ORDER BY client_id`);
+    const r = await pool.query(`SELECT client_id, display_name, company_code, read_only, read_company_codes, owner_writer, write_company_codes, scopes, is_active, revoked_at, created_at, rotated_at, last_used_at FROM integration_clients ORDER BY client_id`);
     console.table(r.rows);
     return;
   }
@@ -92,6 +98,34 @@ async function main(): Promise<void> {
       [clientId, name, hashSecret(secret), scopes, companies[0], companies, by]
     );
     printSecret(clientId, secret, scopes, companies);
+    return;
+  }
+  if (cmd === 'create-writer') {
+    const name = arg('name') || clientId;
+    const companies = await parseCompanies(arg('companies'));
+    const named = parseScopes(arg('scopes'));
+    const scopes = named.length ? named : [...OWNER_WRITE_SCOPES];
+    const outside = scopes.filter((s) => !(OWNER_WRITE_SCOPES as readonly string[]).includes(s));
+    if (outside.length) throw new Error(`An owner-writer may only hold ${OWNER_WRITE_SCOPES.join(', ')} (not ${outside.join(', ')}).`);
+    const secret = generateSecret();
+    await pool.query(
+      `INSERT INTO integration_clients (client_id, display_name, secret_hash, scopes, company_code, owner_writer, write_company_codes, created_by)
+       VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7)`,
+      [clientId, name, hashSecret(secret), scopes, companies[0], companies, by]
+    );
+    console.log('');
+    console.log('  Owner-writer client ready. Store these on the CORE-AGENTS web service (core-agents) only:');
+    console.log(`    SIGNACORE_WRITE_CLIENT_ID=${clientId}`);
+    console.log(`    SIGNACORE_WRITE_API_KEY=${secret}`);
+    console.log(`  Companies it may change: ${companies.join(', ')}. Scopes: ${scopes.join(', ')}`);
+    console.log('  This secret is shown ONCE and is not stored. If lost, run "rotate".');
+    console.log('');
+    return;
+  }
+  if (cmd === 'set-write-companies') {
+    const companies = await parseCompanies(arg('companies'));
+    const r = await pool.query(`UPDATE integration_clients SET write_company_codes = $2, company_code = $3 WHERE client_id = $1 AND owner_writer RETURNING client_id`, [clientId, companies, companies[0]]);
+    console.log(r.rowCount ? `${clientId} may now change companies: ${companies.join(', ')}` : 'No such owner-writer client (set-write-companies only applies to clients made with create-writer).');
     return;
   }
   if (cmd === 'set-companies') {
@@ -140,7 +174,7 @@ async function main(): Promise<void> {
     reportMasterDataScopes(add);
     return;
   }
-  throw new Error('Usage: create | create-reader | set-companies | rotate | revoke | set-scopes | add-scopes | list');
+  throw new Error('Usage: create | create-reader | create-writer | set-companies | set-write-companies | rotate | revoke | set-scopes | add-scopes | list');
 }
 
 /** Company codes the owner authorises, validated against rel_companies. */
@@ -158,6 +192,11 @@ async function refuseWritesForReader(clientId: string, scopes: string[]): Promis
   const r = await pool.query(`SELECT read_only FROM integration_clients WHERE client_id = $1`, [clientId]);
   const writes = scopes.filter(isWriteScope);
   if (r.rows[0]?.read_only && writes.length) throw new Error(`${clientId} is read-only and cannot be given write scopes (${writes.join(', ')}).`);
+  const w = await pool.query(`SELECT owner_writer FROM integration_clients WHERE client_id = $1`, [clientId]).catch(() => ({ rows: [] as any[] }));
+  const outside = scopes.filter((s) => !(OWNER_WRITE_SCOPES as readonly string[]).includes(s));
+  if (w.rows[0]?.owner_writer && outside.length) throw new Error(`${clientId} is an owner-writer and may only hold ${OWNER_WRITE_SCOPES.join(', ')}.`);
+  const ownerOnly = scopes.filter((s) => (OWNER_WRITE_SCOPES as readonly string[]).includes(s));
+  if (!w.rows[0]?.owner_writer && ownerOnly.length) throw new Error(`${ownerOnly.join(', ')} can only be held by an owner-writer client (create-writer).`);
 }
 
 function printSecret(clientId: string, secret: string, scopes: string[], companies?: string[]): void {

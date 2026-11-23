@@ -315,6 +315,40 @@ record from a stale tab is refused with `409 stale_revision` instead of overwrit
 
 Tests: `npm run test:integration-materials` (same `*_test` database rules).
 
+## Owner write access — `/api/v1/integration/write/*` (CORE-AGENTS confirmed changes)
+
+Added with `database/migrations/020_integration_owner_writers.sql`. Only an **owner-writer** client may call these
+routes; Sally and the read-only CORE-AGENTS reader get `403 NOT_OWNER_WRITER`, and an owner-writer is refused
+everywhere except `/write/*` and `/status` (`403 OWNER_WRITER_ONLY`). Each route calls `relational/services.ts` — the
+same services, validation, numbering, transactions and `row_version` concurrency as the dashboard.
+
+| Route | Scope | What it does |
+|---|---|---|
+| `GET /write/capabilities` | – | Scopes, write companies, and whether each section is relational |
+| `GET /write/jobs/:id` | any (owner-writer) | Writable fields and `rowVersion` |
+| `PATCH /write/jobs/:id` | `jobs:update` | `dueDate`, `notes`, `reference`, `poRef` only (no stage, prices or customer) |
+| `POST /write/jobs/:id/invoice` | `invoices:create` | `ensureInvoiceForJob` — completed jobs only; idempotent; never sends |
+| `GET /write/purchase-orders/:id` | any (owner-writer) | Writable fields and `rowVersion` |
+| `POST /write/purchase-orders` | `purchasing:create` | A **DRAFT** PO from inventory items; names and costs from the inventory records (a caller cost is refused); SignaCore's PO number |
+| `PATCH /write/purchase-orders/:id` | `purchasing:update` | `notes`; status `draft → approved \| declined` only |
+
+Every mutation needs `Idempotency-Key`, `X-Confirmed-By` (428 `CONFIRMATION_REQUIRED` without it) and, where a record
+changes, `expectedVersion` (409 `STALE_VERSION` when it moved). A company outside the client's `write_company_codes`
+answers 404. Nothing here deletes, sends, records payments, changes prices, discounts, customers or users, or runs
+caller SQL. All requests are audited like the rest of the integration API.
+
+Set-up (after deploying the backend and running migration 020):
+
+```
+node dist/integration/clientCli.js create-writer --client-id core-agents-writer --name "CORE-AGENTS (owner writes)" --companies 2
+node dist/integration/clientCli.js set-write-companies --client-id core-agents-writer --companies 2,4
+node dist/integration/clientCli.js revoke --client-id core-agents-writer        # switch it off at any time
+```
+
+The secret is printed once; put it only in Render on the core-agents web service, in
+`SIGNACORE_OWNER_WRITER_CLIENT_ID` and `SIGNACORE_OWNER_WRITER_API_KEY` (switch: `SIGNACORE_OWNER_WRITES_ENABLED`).
+Do not reuse `SIGNACORE_WRITE_*`: those hold the existing draft-quote client, which an owner-writer cannot replace. Tests: `npm run test:integration-write` (needs a migrated `*_test` database).
+
 ## Errors
 
 `{ "error": { "code": "…", "message": "…", "details": { … } } }`
