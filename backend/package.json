@@ -65,6 +65,8 @@
     "restore:deleted-job-invoice": "ts-node --transpile-only src/scripts/restore-deleted-job-invoice.ts",
     "update:inventory-descriptions": "ts-node --transpile-only src/scripts/update-inventory-descriptions.ts",
     "update:inventory-descriptions:compiled": "node dist/scripts/update-inventory-descriptions.js",
+    "recategorise:hennies": "ts-node --transpile-only src/scripts/recategorise-hennies-inventory.ts",
+    "recategorise:hennies:compiled": "node dist/scripts/recategorise-hennies-inventory.js",
     "test:invoice-cancel": "ts-node --transpile-only test/relational.invoice-cancel.stress.ts",
     "test:invoice-cancel:compiled": "node dist/test/relational.invoice-cancel.stress.js",
     "test:invoice-cancel-frontend": "node test/invoice-cancel-frontend.test.js",
