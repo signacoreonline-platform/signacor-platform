@@ -8857,7 +8857,7 @@ function EmailFlowModal({ type, data, companies, logoDataUrl, onClose, onMarkSen
 /* ═══════════════════════════════════════════
    SHARED UI COMPONENTS
 ═══════════════════════════════════════════ */
-function KpiCard({ label, value, sub, icon, accent }) {
+function KpiCard({ label, value, sub, icon, accent, children }) {
   return (
     <div className="bg-white rounded-2xl border border-gray-200 p-4 flex items-start gap-3">
       <span className="text-2xl mt-0.5">{icon}</span>
@@ -8865,6 +8865,7 @@ function KpiCard({ label, value, sub, icon, accent }) {
         <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">{label}</p>
         <p className={`text-xl font-black mt-0.5 ${accent||'text-gray-900'}`}>{value}</p>
         {sub && <p className="text-xs text-gray-400 mt-0.5">{sub}</p>}
+        {children}
       </div>
     </div>
   );
@@ -19490,6 +19491,11 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
     ? _sp.winner.count + ' job' + (_sp.winner.count!==1?'s':'') + ' · ' + _spMoney(_sp.winner.valueC)
       + ' · ' + _curMonthLabel + _spUnassigned
     : (_sp.unassigned.count ? 'No assigned jobs this month' + _spUnassigned : 'No jobs created this month');
+  // Percentage Covered — Salesman of the Month ONLY (2026-11-23): money
+  // received ÷ value of his jobs created this month (sgrSalesmanPaidCoverage).
+  const _spCov      = _sp.winner ? sgrSalesmanPaidCoverage(visibleJobs, visibleQuotes, visibleAccInvoices, _curMonthKey, _sp.winner.key) : null;
+  const _spCovPct   = _spCov && _spCov.pct!=null ? _spCov.pct : null;
+  const _spCovColor = _spCovPct==null ? '#9ca3af' : _spCovPct>=75 ? '#10b981' : _spCovPct>=50 ? '#0000ff' : _spCovPct>=25 ? '#f59e0b' : '#ED0101';
   // ── Revenue (incl. VAT) — ONE result for the card and the 6-month chart ──
   const _revByMonthC = _fin.revenue.byMonthC;
   const _revUndated  = _fin.revenue.undated;
@@ -19558,7 +19564,18 @@ function DashboardPage({ jobs, quotes, inventory, companies, user, logoDataUrl, 
             </div>
           </div>
         )}
-        {isAdmin&&<KpiCard icon="🏆" label="Salesman of the Month" value={topSalesman} sub={topSalesmanSub} accent="text-amber-500"/>}
+        {isAdmin&&<KpiCard icon="🏆" label="Salesman of the Month" value={topSalesman} sub={topSalesmanSub} accent="text-amber-500">
+          {_spCov&&(
+            <div className="mt-2 pt-2 border-t border-gray-100">
+              <div className="flex items-baseline justify-between gap-2">
+                <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Percentage Covered</p>
+                <p className="text-sm font-black" style={{color:_spCovColor}}>{_spCovPct==null?'—':_spCovPct+'%'}</p>
+              </div>
+              <div className="bg-gray-100 rounded-full h-1.5 overflow-hidden mt-1"><div className="h-1.5 rounded-full transition-all" style={{width:(_spCovPct||0)+'%',background:_spCovColor}}/></div>
+              <p className="text-[10px] text-gray-400 mt-1">{_spMoney(_spCov.paidC)} paid of {_spMoney(_spCov.valueC)}</p>
+            </div>
+          )}
+        </KpiCard>}
         {!isAdmin&&<KpiCard icon="📋" label="Total Jobs"   value={totalJobs}  sub="All companies"   accent="text-gray-800"/>}
         {!isAdmin&&<KpiCard icon="💬" label="In Quoting"   value={quoteJobs}  sub="Needs follow-up" accent="text-brand-500"/>}
       </div>
@@ -29969,6 +29986,46 @@ function sgrSalesmanOfMonth(jobs, monthKey){
     return { key:g.key, name, count:g.count, valueC:g.valueC };
   }).sort((a,b)=> (b.count-a.count) || (b.valueC-a.valueC) || a.name.localeCompare(b.name));
   return { monthKey, winner: ranked[0] || null, ranked, unassigned, undated };
+}
+/* SALESMAN OF THE MONTH — PERCENTAGE COVERED (2026-11-23). Money received
+   against the winner's jobs CREATED in this Johannesburg month (the exact job
+   set sgrSalesmanOfMonth ranked him on), divided by those jobs' value (the
+   same sgrToCents0(j.value) total the card already shows). Payments are each
+   job's chain — source quote ∪ job ∪ its issued invoice, the Reports rule
+   (sgrReportChainPayments) — de-duplicated ACROSS all his jobs, so a payment
+   visible from several stages counts once. Only positive amounts are money
+   received; applied credit notes are 'Credit' payments in the chain and count
+   as covered. Read-only: nothing here writes state. The percentage is capped
+   at 100 for display; paidC keeps the real figure. */
+function sgrSalesmanPaidCoverage(jobs, quotes, accInvoices, monthKey, salesKey){
+  if(!salesKey) return null;
+  const myJobs   = (jobs||[]).filter(j=>j && j.co!==UNIONTECH_ID);
+  const myQuotes = (quotes||[]).filter(Boolean);
+  const myInv    = (accInvoices||[]).filter(i=>i && i.status!=='void');
+  const seenKeys = new Set(), seenObjs = new Set();
+  let count = 0, valueC = 0, paidC = 0;
+  myJobs.forEach(j=>{
+    const ms = sgrJobCreatedMs(j);
+    if(ms===null || sgrJhbMonthKey(ms)!==monthKey) return;
+    if(sgrSalespersonKey(j.salesperson)!==salesKey) return;
+    count++; valueC += sgrToCents0(j.value);
+    const quote  = resolveQuoteForJob(j, myQuotes);
+    const found  = j.invoiceNum ? resolveJobInvoiceRecord(j, myInv, myJobs) : null;
+    const issued = (found && sameCompany(found, j)) ? found : null;
+    const chain  = sgrReportChainPayments([
+      { kind:'quote', list: quote && quote.payments }, { kind:'job', list: j.payments },
+      { kind:'invoice', list: issued && issued.payments }]);
+    chain.payments.forEach(p=>{
+      if(seenObjs.has(p)) return;
+      const k = sgrReportPaymentKey(p);
+      if(k!==null){ if(seenKeys.has(k)) return; seenKeys.add(k); }
+      seenObjs.add(p);
+      const c = sgrToCents0(p.amount);
+      if(c > 0) paidC += c;
+    });
+  });
+  const pct = valueC>0 ? Math.min(100, Math.round(paidC/valueC*100)) : null;
+  return { count, valueC, paidC, pct };
 }
 
 /* THE CANONICAL INVOICE ROWS — sgrPaymentsReportModelScoped's own rows, so the
