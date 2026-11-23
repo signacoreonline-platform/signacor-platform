@@ -2840,8 +2840,17 @@ function getNextPONum(purchaseOrders) {
   const nums = (purchaseOrders||[]).map(p=>p.num).filter(n=>n&&/^PO-\d+$/.test(n)).map(n=>parseInt(n.replace('PO-',''),10));
   return 'PO-'+String((nums.length>0?Math.max(...nums):0)+1).padStart(5,'0');
 }
-function getNextCPNum(completeProducts) {
-  const nums = (completeProducts||[]).map(p=>p.cpNum).filter(n=>n&&/^CP-\d+$/.test(n)).map(n=>parseInt(n.replace('CP-',''),10));
+// 2026-11-23: also scans saved calculations' reserved productNum and inventory
+// SKUs, so a number shown on an open / saved calculation, or already used by a
+// Complete Product's General inventory item, is never handed out twice.
+// Callers passing only completeProducts behave exactly as before.
+function getNextCPNum(completeProducts, savedCalcs, inventory) {
+  const all = [
+    ...(completeProducts||[]).map(p=>p&&p.cpNum),
+    ...(savedCalcs||[]).map(c=>c&&c.productNum),
+    ...(inventory||[]).map(i=>i&&i.sku),
+  ];
+  const nums = all.filter(n=>n&&/^CP-\d+$/.test(n)).map(n=>parseInt(n.replace('CP-',''),10));
   return 'CP-'+String((nums.length>0?Math.max(...nums):0)+1).padStart(5,'0');
 }
 function getNextImportNum(savedImports) {
@@ -22195,24 +22204,93 @@ const CALC_UNITS = ['m²','m','unit','hr','reel','roll','set','bag','box','tube'
    COMPLETE PRODUCTS — COMPONENTS
 ═══════════════════════════════════════════ */
 
+// ── COMPLETE PRODUCT ⇄ INVENTORY (2026-11-23) ──────────────────────────────
+// A Complete Product saved from Calculators → Signage Costing is ALSO an
+// Inventory item in category "General": SKU = its product number (CP-xxxxx),
+// name = the product / project name, cost = component cost total, sell = sell
+// price ex VAT, stock 0 (made to order). The component breakdown stays on the
+// Complete Product (platform_state completeProducts); the inventory item is
+// created through the same paths every other inventory create uses
+// (relationalApi.createInventoryItem when "inventory" is relational-
+// authoritative, the JSON list otherwise). The link is cp.invItemId, with the
+// SKU = cpNum as a fallback after a reload.
+function sgrRound2(n){ return Math.round((Number(n)||0)*100)/100; }
+function sgrCPInventoryItem(cp, inventory){
+  if(!cp) return null;
+  const list = (inventory||[]).filter(i=>i && i.active!==false);
+  if(cp.invItemId!==null && cp.invItemId!==undefined){
+    const byId = list.find(i=>String(i.id)===String(cp.invItemId) || (i._relId!=null && String(i._relId)===String(cp.invItemId)));
+    if(byId) return byId;
+  }
+  return cp.cpNum ? (list.find(i=>i.sku===cp.cpNum) || null) : null;
+}
+// Returns the created item, or null if the user cancelled the write-mode
+// check. Throws on a server refusal (caller reports it; nothing is saved).
+async function sgrCreateCPInventoryItem(cp, setInventory){
+  const base = {
+    sku: cp.cpNum, name: cp.name, cat: 'General', unit: 'unit',
+    cost: sgrRound2(cp.costTotal), sell: sgrRound2(cp.sellExVat),
+    stock: 0, reorder: 0, supplierId: null,
+    notes: 'Complete Product '+cp.cpNum+' — built in Calculators → Signage Costing',
+    active: true,
+  };
+  if(!(await confirmInventoryWriteMode({ existing: false }))) return null; // MID-SESSION CUTOVER SAFETY
+  if(isRelationalAuthoritative('inventory')){
+    const result = await relationalApi.createInventoryItem({
+      sku: base.sku, name: base.name, category: base.cat, unit: base.unit,
+      cost: base.cost, sell: base.sell, stock: base.stock, reorder: base.reorder,
+      supplierId: base.supplierId,
+    });
+    const created = { ...base, id: result.id, _relId: result.id, _relRowVersion: result.rowVersion };
+    const invUpdater = prev => [...prev, created];
+    setInventory(invUpdater);
+    syncRelationalBaseline('inventory', invUpdater);
+    return created;
+  }
+  const created = { id: Date.now(), ...base };
+  setInventory(prev => [...prev, created]);
+  return created;
+}
+
 // ── Modal: Save a calculator result as a named Complete Product ──
-function SaveAsProductModal({ calcData, completeProducts, setCompleteProducts, onClose }) {
-  const { items, markup, costTotal, sellExVat, vatAmt, sellIncVat, defaultName } = calcData;
+function SaveAsProductModal({ calcData, completeProducts, setCompleteProducts, savedCalcs, inventory, setInventory, onClose, onSaved }) {
+  const { items, markup, costTotal, sellExVat, vatAmt, sellIncVat, defaultName, productNum } = calcData;
   const [cpName, setCpName] = useState(defaultName||'');
   const [cpDesc, setCpDesc] = useState('');
   const [msg,    setMsg]    = useState('');
-  function doSave(){
+  const [saving, setSaving] = useState(false);
+  // The calculator's reserved product number, unless a Complete Product or an
+  // inventory SKU already uses it (e.g. the same project saved twice).
+  const _taken = n => (completeProducts||[]).some(p=>p&&p.cpNum===n) || (inventory||[]).some(i=>i&&i.sku===n);
+  const cpNum = (productNum && /^CP-\d+$/.test(productNum) && !_taken(productNum))
+    ? productNum
+    : getNextCPNum(completeProducts, (savedCalcs||[]).filter(c=>c&&c.productNum!==productNum), inventory);
+  const reference = cpNum + (cpName.trim() ? ' — ' + cpName.trim() : '');
+  async function doSave(){
+    if(saving) return;
     if(!cpName.trim()){alert('Please enter a product name.');return;}
     const now = new Date().toISOString();
     const cp = {
-      id: Date.now(), cpNum: getNextCPNum(completeProducts),
-      name: cpName.trim(), description: cpDesc.trim(),
+      id: Date.now(), cpNum,
+      name: cpName.trim(), description: cpDesc.trim(), reference,
       markup, items: items.map(it=>({...it})),
       costTotal, sellExVat, vatAmt, sellIncVat,
       createdAt: now, updatedAt: now,
     };
+    setSaving(true);
+    let invItem = null;
+    try {
+      invItem = await sgrCreateCPInventoryItem(cp, setInventory);
+    } catch(e){
+      alert(describeSaveConflictError(e, 'inventory item') + '\n\nThe Complete Product was NOT saved.');
+      setSaving(false);
+      return;
+    }
+    if(!invItem){ setSaving(false); return; }
+    cp.invItemId = invItem.id;
     setCompleteProducts(prev=>[cp,...prev]);
-    setMsg('✅ '+cp.cpNum+' saved to Complete Products!');
+    if(onSaved) onSaved(cp);
+    setMsg('✅ '+cp.cpNum+' saved to Inventory → General');
     setTimeout(()=>{setMsg('');onClose();},1800);
   }
   return (
@@ -22224,11 +22302,15 @@ function SaveAsProductModal({ calcData, completeProducts, setCompleteProducts, o
         </div>
         <div className="p-5 space-y-4">
           <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 text-xs text-blue-700">
-            A named assembly saved to Inventory → Complete Products. Pull it into any quotation as a live-linked item or clone it to customise for a similar job.
+            Saved to <strong>Inventory</strong> under category <strong>General</strong> (and Inventory → Complete Products). Edit it any time from the Inventory menu, pull it into any quotation as a live-linked item, or clone it for a similar job.
           </div>
           <div>
             <label className="text-xs font-bold text-gray-500 uppercase tracking-wide block mb-1">Product Name *</label>
             <input value={cpName} onChange={e=>setCpName(e.target.value)} className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm" placeholder="e.g. 3×2m Aluminium Composite Fascia Sign" autoFocus/>
+          </div>
+          <div>
+            <label className="text-xs font-bold text-gray-500 uppercase tracking-wide block mb-1">Reference</label>
+            <p className="w-full border border-gray-100 bg-gray-50 rounded-xl px-3 py-2 text-sm font-semibold text-gray-700">{reference}</p>
           </div>
           <div>
             <label className="text-xs font-bold text-gray-500 uppercase tracking-wide block mb-1">Description (optional)</label>
@@ -22242,7 +22324,7 @@ function SaveAsProductModal({ calcData, completeProducts, setCompleteProducts, o
           {msg&&<p className="text-center text-sm font-bold text-green-600">{msg}</p>}
           {!msg&&(
             <div className="flex gap-3 pt-1">
-              <button onClick={doSave} className="flex-1 text-white font-bold py-2.5 rounded-xl text-sm" style={{background:'#06065c'}}>📦 Save Complete Product</button>
+              <button onClick={doSave} disabled={saving} className="flex-1 text-white font-bold py-2.5 rounded-xl text-sm disabled:opacity-50" style={{background:'#06065c'}}>{saving?'Saving…':'📦 Save Complete Product'}</button>
               <button onClick={onClose} className="px-4 py-2.5 rounded-xl border border-gray-200 text-sm text-gray-600">Cancel</button>
             </div>
           )}
@@ -22253,7 +22335,7 @@ function SaveAsProductModal({ calcData, completeProducts, setCompleteProducts, o
 }
 
 // ── Modal: Edit a Complete Product (full calc embedded) ──
-function EditCompleteProductModal({ cp, completeProducts, setCompleteProducts, quotes, setQuotes, onClose }) {
+function EditCompleteProductModal({ cp, completeProducts, setCompleteProducts, quotes, setQuotes, onClose, onSaved }) {
   const [name,    setName]    = useState(cp.name);
   const [desc,    setDesc]    = useState(cp.description||'');
   const [markup,  setMarkup]  = useState(cp.markup||35);
@@ -22372,6 +22454,8 @@ function EditCompleteProductModal({ cp, completeProducts, setCompleteProducts, q
         })));
       }
     }
+    // 2026-11-23: keep the product's General inventory item in step.
+    if(onSaved) await onSaved(updated);
     onClose();
   }
 
@@ -22650,10 +22734,15 @@ const CAT_INV_MAP = {
   machining:    [],
 };
 
-function SignageCalc({ savedCalcs, setSavedCalcs, completeProducts, setCompleteProducts, inventory }) {
+function SignageCalc({ savedCalcs, setSavedCalcs, completeProducts, setCompleteProducts, inventory, setInventory }) {
   const [projectName,  setProjectName]  = useState('');
   const [showSaveAsProduct, setShowSaveAsProduct] = useState(false);
-  const [clientRef,    setClientRef]    = useState('');
+  // 2026-11-23: Client / Reference is automatic — "<product number> — <project
+  // name>". productNum stays null (= next free number) until this project is
+  // saved, then stays fixed so the open project keeps its own number.
+  const [productNum,   setProductNum]   = useState(null);
+  const refNum    = productNum || getNextCPNum(completeProducts, savedCalcs, inventory);
+  const clientRef = refNum + (projectName.trim() ? ' — ' + projectName.trim() : '');
   const [markup,       setMarkup]       = useState(35);
   const [items,        setItems]        = useState([]);
   const [expanded,     setExpanded]     = useState(new Set(['backboard']));
@@ -22743,11 +22832,13 @@ function SignageCalc({ savedCalcs, setSavedCalcs, completeProducts, setCompleteP
       id: Date.now(), num,
       name:      projectName || '(Unnamed)',
       clientRef: clientRef   || '',
+      productNum: refNum,
       date:      new Date().toISOString().slice(0,10),
       items:     items.map(it=>({...it})),
       markup, costTotal, sellExVat, vatAmt, sellIncVat,
     };
     setSavedCalcs(prev=>[calc,...prev]);
+    setProductNum(refNum);
     setSavedMsg(num+' saved!');
     setTimeout(()=>setSavedMsg(''),3000);
   }
@@ -22755,7 +22846,7 @@ function SignageCalc({ savedCalcs, setSavedCalcs, completeProducts, setCompleteP
   function loadCalculation(calc) {
     if(items.length>0&&!window.confirm('Replace current items with "'+calc.name+'" ('+calc.num+')?')) return;
     setProjectName(calc.name);
-    setClientRef(calc.clientRef||'');
+    setProductNum(calc.productNum||null);
     setMarkup(calc.markup||35);
     const loaded = calc.items.map(it=>({...it,id:nextId.current++}));
     setItems(loaded);
@@ -22786,7 +22877,7 @@ function SignageCalc({ savedCalcs, setSavedCalcs, completeProducts, setCompleteP
           </div>
           <div>
             <label className="block text-xs font-semibold text-gray-500 mb-1">Client / Reference</label>
-            <input className="w-full border border-gray-300 rounded-lg px-3 py-1.5 text-xs text-gray-800 focus:ring-2 focus:ring-brand-400" placeholder="e.g. Boer & Brit — Paarl" value={clientRef} onChange={e=>setClientRef(e.target.value)}/>
+            <input readOnly title="Automatic: product number + project name" className="w-full border border-gray-200 bg-gray-50 rounded-lg px-3 py-1.5 text-xs font-semibold text-gray-700 cursor-default" value={clientRef}/>
           </div>
         </div>
       </div>
@@ -23007,7 +23098,7 @@ function SignageCalc({ savedCalcs, setSavedCalcs, completeProducts, setCompleteP
           </button>
           <button
             disabled={items.length===0}
-            onClick={()=>{ if(window.confirm('Clear all items and reset the calculator?')){setItems([]);setProjectName('');setClientRef('');setMarkup(35);} }}
+            onClick={()=>{ if(window.confirm('Clear all items and reset the calculator?')){setItems([]);setProjectName('');setProductNum(null);setMarkup(35);} }}
             className="w-full border border-gray-200 text-gray-400 hover:text-red-600 hover:border-red-200 disabled:opacity-30 disabled:cursor-not-allowed text-xs rounded-xl py-2 transition-colors">
             🗑 Clear All
           </button>
@@ -23017,9 +23108,13 @@ function SignageCalc({ savedCalcs, setSavedCalcs, completeProducts, setCompleteP
 
       {/* ── Save as Complete Product Modal ── */}
       {showSaveAsProduct&&<SaveAsProductModal
-        calcData={{items, markup, costTotal, sellExVat, vatAmt, sellIncVat, defaultName: projectName}}
+        calcData={{items, markup, costTotal, sellExVat, vatAmt, sellIncVat, defaultName: projectName, productNum: refNum}}
         completeProducts={completeProducts||[]}
         setCompleteProducts={setCompleteProducts}
+        savedCalcs={savedCalcs||[]}
+        inventory={inventory||[]}
+        setInventory={setInventory}
+        onSaved={cp=>setProductNum(cp.cpNum)}
         onClose={()=>setShowSaveAsProduct(false)}
       />}
 
@@ -23041,7 +23136,7 @@ function SignageCalc({ savedCalcs, setSavedCalcs, completeProducts, setCompleteP
                         <span className="text-xs font-black text-blue-700 bg-blue-50 border border-blue-200 rounded-lg px-2 py-0.5">{c.num}</span>
                         <span className="text-sm font-bold text-gray-800 truncate">{c.name}</span>
                       </div>
-                      {c.clientRef&&<p className="text-xs text-gray-500">Client: {c.clientRef}</p>}
+                      {c.clientRef&&<p className="text-xs text-gray-500">{c.productNum?'Ref':'Client'}: {c.clientRef}</p>}
                       <p className="text-xs text-gray-400">{c.date} · {c.items.length} items · Markup {c.markup}%</p>
                       <div className="flex gap-3 mt-1 text-xs">
                         <span className="text-gray-600">Cost: <strong>R {Number(c.costTotal||0).toFixed(2)}</strong></span>
@@ -23071,7 +23166,7 @@ function SignageCalc({ savedCalcs, setSavedCalcs, completeProducts, setCompleteP
 /* ═══════════════════════════════════════════
    CALCULATORS PAGE
 ═══════════════════════════════════════════ */
-function CalculatorsPage({ savedCalcs, setSavedCalcs, completeProducts, setCompleteProducts, inventory }) {
+function CalculatorsPage({ savedCalcs, setSavedCalcs, completeProducts, setCompleteProducts, inventory, setInventory }) {
   const [tab,setTab]=useState('signage');
   const tabs=[['signage','🏷 Signage Costing'],['vinyl','🎞 Architectural Film'],['vehicle','🚗 Vehicle Wrap']];
   return (
@@ -23085,7 +23180,7 @@ function CalculatorsPage({ savedCalcs, setSavedCalcs, completeProducts, setCompl
         ))}
       </div>
       {tab==='signage'
-        ? <SignageCalc savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>
+        ? <SignageCalc savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory} setInventory={setInventory}/>
         : tab==='vinyl'?<VinylCalc/>:<VehicleCalc/>}
     </div>
   );
@@ -25367,6 +25462,23 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
     if(!supplierId) return null;
     return (suppliers||[]).find(s=>s.id===supplierId||s.id===Number(supplierId))?.name||null;
   }
+  // 2026-11-23 — Complete Product ⇄ General inventory item.
+  const cpForItem = item => (completeProducts||[]).find(cp=>sgrCPInventoryItem(cp,[item])) || null;
+  async function syncCPInventory(cp){
+    const inv = sgrCPInventoryItem(cp, inventory);
+    if(!inv) return;
+    const next = { ...inv, name: cp.name, cost: sgrRound2(cp.costTotal), sell: sgrRound2(cp.sellExVat) };
+    if(next.name===inv.name && next.cost===Number(inv.cost) && next.sell===Number(inv.sell)) return;
+    await saveItem(next);
+  }
+  async function addCPToInventory(cp){
+    try {
+      const created = await sgrCreateCPInventoryItem(cp, setInventory);
+      if(created) setCompleteProducts(prev=>prev.map(p=>p.id===cp.id?{...p, invItemId: created.id}:p));
+    } catch(e){
+      alert(describeSaveConflictError(e, 'inventory item') + '\n\nNothing was added to Inventory.');
+    }
+  }
   function removeCP(id) {
     if(window.confirm('Remove this Complete Product? Linked quote lines will keep their current price but will no longer auto-update.'))
       setCompleteProducts(prev=>prev.filter(p=>p.id!==id));
@@ -25702,7 +25814,7 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
     <div className="p-4 space-y-4">
       {showImport&&<BulkImportModal inventory={inventory} onClose={()=>setShowImport(false)} onImport={importInventory} onImportRows={importInventoryRelational} resolveImportMode={()=>confirmInventoryWriteMode({ existing: true })}/>}
       {(showAddItem||editItem||copyItem)&&<AddEditInventoryItemModal item={copyItem||editItem} suppliers={suppliers||[]} allCats={cats} onClose={()=>{setShowAddItem(false);setEditItem(null);setCopyItem(null);}} onSave={async it=>{await saveItem(it);setCopyItem(null);}}/>}
-      {editCP&&<EditCompleteProductModal cp={editCP} completeProducts={completeProducts||[]} setCompleteProducts={setCompleteProducts} quotes={quotes||[]} setQuotes={setQuotes} onClose={()=>setEditCP(null)}/>}
+      {editCP&&<EditCompleteProductModal cp={editCP} completeProducts={completeProducts||[]} setCompleteProducts={setCompleteProducts} quotes={quotes||[]} setQuotes={setQuotes} onSaved={syncCPInventory} onClose={()=>setEditCP(null)}/>}
       {showQuickRates&&<QuickRatesModal quickRates={quickRates||[]} setQuickRates={setQuickRates} suppliers={suppliers||[]} inventory={inventory} setInventory={setInventory} inventoryCats={cats} onClose={()=>setShowQuickRates(false)}/>}
 
       {/* Sub-tab toggle */}
@@ -25881,9 +25993,10 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
                   const pct  = Math.min(100, item.reorder>0 ? (item.stock/Math.max(item.stock*1.5,item.reorder*2))*100 : 100);
                   const mu   = item.cost>0?((item.sell-item.cost)/item.cost*100).toFixed(0):'—';
                   const supName = getSupplierName(item.supplierId);
+                  const _cp = cpForItem(item);
                   return(
-                    <tr key={item.id} className={`border-b border-gray-50 hover:bg-gray-50 ${out?'bg-red-50/60':low?'bg-red-50/30':''}`}>
-                      <td className="px-4 py-3 text-xs font-semibold text-gray-700">{item.name}</td>
+                    <tr key={item.id} className={`border-b border-gray-50 hover:bg-gray-50 ${_cp?'':out?'bg-red-50/60':low?'bg-red-50/30':''}`}>
+                      <td className="px-4 py-3 text-xs font-semibold text-gray-700">{item.name}{_cp&&<span className="ml-1.5 text-[10px] font-black px-1.5 py-0.5 rounded" style={{background:'#e6e6ff',color:'#06065c'}} title="Complete Product — built in Calculators → Signage Costing">📦 Complete Product</span>}</td>
                       <td className="px-4 py-3 text-xs font-mono text-gray-400">{item.sku}</td>
                       <td className="px-4 py-3"><span className="text-xs bg-gray-100 text-gray-600 rounded-full px-2 py-0.5">{item.cat}</span></td>
                       <td className="px-4 py-3 text-xs text-gray-500">{supName ? <span className="flex items-center gap-1">🏭 {supName}</span> : <span className="text-gray-300">—</span>}</td>
@@ -25897,16 +26010,19 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
                       </td>
                       <td className="px-4 py-3 text-xs text-gray-500">{item.reorder} {item.unit}</td>
                       <td className="px-4 py-3">
-                        <span className={`text-xs px-2 py-1 rounded-full font-semibold ${out?'bg-red-100 text-red-700':low?'bg-amber-100 text-amber-700':'bg-emerald-100 text-emerald-700'}`}>
+                        {_cp ? <span className="text-xs px-2 py-1 rounded-full font-semibold bg-blue-100 text-blue-700">Made to Order</span> : <span className={`text-xs px-2 py-1 rounded-full font-semibold ${out?'bg-red-100 text-red-700':low?'bg-amber-100 text-amber-700':'bg-emerald-100 text-emerald-700'}`}>
                           {out?'Out of Stock':low?'Reorder Now':'In Stock'}
-                        </span>
+                        </span>}
                       </td>
                       {isAdmin&&<td className="px-4 py-3 text-xs text-gray-600">{zar(item.cost)}</td>}
                       {isAdmin&&<td className="px-4 py-3"><p className="text-xs text-gray-700">{zar(item.sell)}</p><p className="text-xs text-emerald-600">+{mu}%</p></td>}
                       {isAdmin&&(
                         <td className="px-4 py-3">
                           <div className="flex gap-1.5">
-                            <button onClick={()=>{setEditItem(item);setShowAddItem(true);}} className="text-xs text-blue-400 hover:text-blue-600 font-semibold hover:bg-blue-50 rounded-lg px-2 py-1" title="Edit item">✏️</button>
+                            {_cp
+                              ? <button onClick={()=>setEditCP(_cp)} className="text-xs text-blue-400 hover:text-blue-600 font-semibold hover:bg-blue-50 rounded-lg px-2 py-1" title="Edit Complete Product (components, markup, price)">✏️</button>
+                              : <button onClick={()=>{setEditItem(item);setShowAddItem(true);}} className="text-xs text-blue-400 hover:text-blue-600 font-semibold hover:bg-blue-50 rounded-lg px-2 py-1" title="Edit item">✏️</button>}
+                            {_cp&&<button onClick={()=>{setEditItem(item);setShowAddItem(true);}} className="text-xs text-gray-400 hover:text-gray-600 font-semibold hover:bg-gray-50 rounded-lg px-2 py-1" title="Edit stock details (SKU, category, stock)">⚙️</button>}
                             <button onClick={()=>setCopyItem({...item,id:null,sku:'',name:'Copy of '+item.name})} className="text-xs text-green-500 hover:text-green-700 font-semibold hover:bg-green-50 rounded-lg px-2 py-1" title="Duplicate item">📋</button>
                             <button onClick={()=>removeItem(item.id)} className="text-xs text-red-400 hover:text-red-600 font-semibold hover:bg-red-50 rounded-lg px-2 py-1" title="Remove item">🗑</button>
                           </div>
@@ -25962,6 +26078,9 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
                     <div className="flex items-center gap-2 mb-1.5 flex-wrap">
                       <span className="text-xs font-black px-2 py-0.5 rounded-lg" style={{background:'#e6e6ff',color:'#06065c'}}>{cp.cpNum}</span>
                       <span className="text-sm font-black text-gray-800">{cp.name}</span>
+                      {sgrCPInventoryItem(cp, inventory)
+                        ? <span className="text-[10px] font-bold bg-emerald-50 text-emerald-700 rounded-full px-2 py-0.5">✓ In Inventory → General</span>
+                        : <span className="text-[10px] font-bold bg-gray-100 text-gray-500 rounded-full px-2 py-0.5">Not in Inventory</span>}
                     </div>
                     {cp.description&&<p className="text-xs text-gray-500 mb-2">{cp.description}</p>}
                     {/* Component summary */}
@@ -25990,6 +26109,12 @@ function InventoryPage({ inventory, setInventory, suppliers, user, completeProdu
                       style={{background:'#06065c'}}>
                       ✏️ Edit &amp; Update Linked Quotes
                     </button>
+                    {!sgrCPInventoryItem(cp, inventory)&&(
+                      <button onClick={()=>addCPToInventory(cp)}
+                        className="text-xs font-bold text-emerald-700 hover:bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-1.5">
+                        📦 Add to Inventory (General)
+                      </button>
+                    )}
                     <button onClick={()=>removeCP(cp.id)}
                       className="text-xs font-bold text-red-500 hover:text-red-700 hover:bg-red-50 border border-red-200 rounded-lg px-3 py-1.5">
                       🗑 Remove
@@ -32465,7 +32590,7 @@ function App() {
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets} forceSaveSections={forceSaveSections} companies={companies} employees={employees} suppliers={suppliers}/>,
     jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} forceSaveSections={forceSaveSections} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} inventory={inventory} completeProducts={completeProducts}/>,
-    calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory}/>,
+    calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory} setInventory={setInventory}/>,
     purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user} jobs={jobs} quotes={quotes} inventory={inventory} completeProducts={completeProducts} materialOrders={materialOrders} setMaterialOrders={setMaterialOrders}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quotes={quotes} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
