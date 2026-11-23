@@ -107,6 +107,9 @@ const STATE_ARRAY_KEYS = [
   'savedImports', 'bankTxns', 'chartOfAccounts', 'accInvoices', 'accBills',
   'completeProducts', 'payrollRecords', 'quickRates', 'proposedProjects', 'creditNotes',
   'userAccounts',
+  // 2026-11-23: Materials to Order (Purchase Orders page, added 2026-11-22). The frontend's STATE_SECTIONS already
+  // saves it; without it here it was missing from the record counts and the "no data sections at all" check.
+  'materialOrders',
 ];
 
 // Sections whose sudden loss is most consequential for the business — used
@@ -127,6 +130,12 @@ const PROTECTED_SECTIONS = [
   'jobs', 'quotes', 'customers', 'suppliers', 'inventory',
   'accInvoices', 'accBills', 'purchaseOrders', 'quickRates', 'employees',
   'leaveRequests', 'disciplinary', 'creditNotes', 'proposedProjects', 'userAccounts',
+  // 2026-11-23: Materials to Order gets the same stable-id merge as every other section: a save that carries
+  // materialOrders upserts the records it sends and KEEPS records it does not mention (before this it replaced the
+  // whole array, so a tab that had not loaded another user's new line or tick could drop it). Records are only ever
+  // updated in place by the dashboard (an "Ordered" tick, supplier, adjustment, a manual line's `removed` flag), never
+  // deleted, so no deletion path changes. Mirrored in index.html BACKEND_MERGE_SECTIONS.
+  'materialOrders',
 ];
 
 function arr(v: unknown): any[] {

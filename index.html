@@ -31435,7 +31435,7 @@ function App() {
       // from a ref at some later, possibly-advanced moment.
       const BACKEND_MERGE_SECTIONS = ['quotes','jobs','customers','suppliers','inventory',
         'accInvoices','accBills','purchaseOrders','quickRates','employees','leaveRequests',
-        'disciplinary','creditNotes','proposedProjects','userAccounts'];
+        'disciplinary','creditNotes','proposedProjects','userAccounts','materialOrders'];
       payload._deletedIds = {};
       BACKEND_MERGE_SECTIONS.forEach(k=>{
         const baseList = ownBaseline && Array.isArray(ownBaseline[k]) ? ownBaseline[k] : [];

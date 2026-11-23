@@ -16,6 +16,8 @@ import { IntegrationError, bad } from './errors';
 import { Scope } from './scopes';
 import * as d from './readData';
 import { rands, sgrToCents0 } from './money';
+import { READ_TYPES, READ_TYPE_BY_TYPE, API_VERSION, SCHEMA_VERSION } from './readCatalog';
+import { materialCalc, materialOrderView, HOLDINGS_CODE } from './materials';
 
 type Handler = (req: IntegrationRequest, res: Response) => Promise<void>;
 type Op = (name: string, fn: Handler) => (req: IntegrationRequest, res: Response, next: NextFunction) => Promise<void>;
@@ -102,7 +104,7 @@ export function readRoutes(op: Op): Router {
   r.get('/sections', anyReadScope, op('read.sections', async (_req, res) => {
     const snap = new d.Snapshot();
     const out: Record<string, unknown> = {};
-    for (const s of ['customers', 'suppliers', 'inventory', 'quotes', 'jobs', 'accInvoices', 'creditNotes', 'purchaseOrders', 'accBills', 'proposedProjects'] as const) {
+    for (const s of ['customers', 'suppliers', 'inventory', 'quotes', 'jobs', 'accInvoices', 'creditNotes', 'purchaseOrders', 'accBills', 'proposedProjects', 'materialOrders'] as const) {
       try {
         const l = await snap.load(s);
         out[s] = { source: l.source, records: l.items.length, sectionUpdatedAt: l.sectionUpdatedAt };
@@ -191,9 +193,11 @@ export function readRoutes(op: Op): Router {
     if (!REF_RE.test(ref)) throw bad('Invalid reference.');
     res.locals.targetType = 'job'; res.locals.targetId = ref;
     const companies = d.authorisedCompanies(req.integration!.readCompanies, req.query.company);
-    const { links, Q, J, I, rows } = await jobContext(companies);
+    const { snap, links, Q, J, I, rows } = await jobContext(companies);
     const hit = findOne(rows.map((j) => ({ id: String(j.id), number: j.num, companyCode: d.companyOf(j).code, j })), ref, 'number', companies);
-    res.json({ job: d.jobView(hit.j, J, { quotes: Q.items, invoices: I.items, links }, true), ...meta(['jobs', J], ['quotes', Q], ['accInvoices', I]), asOf: new Date().toISOString() });
+    // The Material List estimate reads stock items and complete products, exactly as the dashboard does.
+    const [INV, CP] = await Promise.all([snap.load('inventory'), snap.load('completeProducts')]);
+    res.json({ job: d.jobView(hit.j, J, { quotes: Q.items, invoices: I.items, links, materials: { inventory: INV.items, completeProducts: CP.items } }, true), ...meta(['jobs', J], ['quotes', Q], ['accInvoices', I], ['inventory', INV], ['completeProducts', CP]), asOf: new Date().toISOString() });
   }));
 
   // ── ACCOUNTS ─────────────────────────────────────────────────────────────
@@ -400,6 +404,66 @@ export function readRoutes(op: Op): Router {
     const rows = L.items.map((it) => d.inventoryView(it, L, opts))
       .filter((v) => (req.query.includeInactive === 'true' || v.active) && (req.query.lowStock !== 'true' || ['low', 'out_of_stock'].includes(v.stockStatus)) && matchQ(o.q, v.sku, v.name, v.category));
     page(res, sinceFilter(rows, o, notes), o, meta(['inventory', L]), notes);
+  }));
+
+  // ── MATERIALS TO ORDER ────────────────────────────────────────────────────
+  // platform_state `materialOrders` (dashboard: Purchase Orders → Materials to Order). See materials.ts for how company
+  // ownership is decided: scope-wide fields only when the client may read every company in the scope; per-job
+  // quantities only for jobs of authorised companies; nothing is ever attributed by a name.
+  const MO = READ_TYPE_BY_TYPE.materialOrders;
+  r.get(MO.list.path.replace(/^\/read/, ''), requireScope(MO.scope as Scope), op('read.material_orders', async (req, res) => {
+    const o = listOpts(req);
+    const companies = d.authorisedCompanies(req.integration!.readCompanies, req.query.company);
+    const snap = new d.Snapshot();
+    const [M, J] = await Promise.all([snap.load('materialOrders'), snap.load('jobs')]);
+    const jobsById = new Map(J.items.map((j) => [String(j.id), j]));
+    // Companies the 'signacore' scope covers: every named company except Holdings, plus any code actually on a job.
+    const known = new Set<string>(Object.entries(d.COMPANY_NAMES).filter(([, n]) => n).map(([c]) => c));
+    for (const j of J.items) known.add(d.companyOf(j).code);
+    const scopeCompanies = { h: [HOLDINGS_CODE], s: [...known].filter((c) => c !== HOLDINGS_CODE).sort() };
+    const job = req.query.job ? String(req.query.job).trim().toUpperCase() : null;
+    const supplier = req.query.supplier ? String(req.query.supplier).trim().toLowerCase() : null;
+    const scope = req.query.scope ? String(req.query.scope) : null;
+    if (scope && !['signacore', 'holdings'].includes(scope)) throw bad('"scope" must be signacore or holdings.');
+    const { calc } = materialCalc();
+    const rows: any[] = [];
+    let unreadable = 0;
+    for (const rec of M.items) {
+      const v = materialOrderView(rec, { calc, jobsById, companyOfJob: (j) => d.companyOf(j).code, allowed: companies, scopeCompanies });
+      if (!v.ok) { if (v.reason === 'no scope in id') unreadable++; continue; }
+      const x: any = v.view;
+      if (scope && x.scope !== scope) continue;
+      if (job) { x.orderedByJob = x.orderedByJob.filter((e: any) => String(e.jobNumber || '').toUpperCase() === job || e.jobId === job); if (!x.orderedByJob.length) continue; }
+      if (supplier && !String(x.supplier || '').toLowerCase().includes(supplier)) continue;
+      if (!matchQ(o.q, x.material, x.supplier, x.size)) continue;
+      rows.push(x);
+    }
+    const notes = ['Totals are not stored in SignaCore: the Materials to Order table adds up the jobs\' Material Lists each time. Required per job: jobs/:ref materialList; ordered: orderedByJob here.'];
+    if (unreadable) notes.push(`${unreadable} stored record(s) have no company scope in their id and were not returned.`);
+    page(res, rows, o, meta(['materialOrders', M], ['jobs', J]), notes);
+  }));
+
+  // ── CAPABILITIES ──────────────────────────────────────────────────────────
+  // What this credential may read, described from readCatalog.ts (the same definition the routes above use).
+  r.get('/capabilities', anyReadScope, op('read.capabilities', async (req, res) => {
+    const ctx = req.integration!;
+    const { version, error } = materialCalc();
+    const snap = new d.Snapshot();
+    const updated: Record<string, string | null> = {};
+    for (const s of ['customers', 'suppliers', 'inventory', 'quotes', 'jobs', 'accInvoices', 'creditNotes', 'purchaseOrders', 'accBills', 'proposedProjects', 'materialOrders'] as const) {
+      try { updated[s] = (await snap.load(s)).sectionUpdatedAt; } catch { updated[s] = null; }
+    }
+    const sectionOf: Record<string, string> = { invoices: 'accInvoices', bills: 'accBills', enquiries: 'proposedProjects' };
+    res.json({
+      apiVersion: API_VERSION, schemaVersion: SCHEMA_VERSION,
+      client: { scopes: ctx.scopes, readCompanies: ctx.readCompanies, readOnly: ctx.readOnly },
+      materialCalculation: { version, available: !error, ...(error ? { unavailableBecause: error } : {}) },
+      types: READ_TYPES.map((t) => ({
+        ...t, allowed: t.scope === 'any-read' ? READ_SCOPES.some((s) => ctx.scopes.includes(s)) : ctx.scopes.includes(t.scope),
+        scope: t.scope === 'any-read' ? null : t.scope, sectionUpdatedAt: updated[sectionOf[t.type] || t.type] ?? null,
+      })),
+      asOf: new Date().toISOString(),
+    });
   }));
 
   // ── SUMMARY (the daily briefing's numbers) ──────────────────────────────

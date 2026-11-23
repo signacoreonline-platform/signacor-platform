@@ -241,12 +241,12 @@ payroll, bank transactions and the chart of accounts.
 
 | Scope | Endpoints |
 |---|---|
-| any read scope | `GET /read/companies`, `/read/sections`, `/read/summary` (each part needs its own scope) |
+| any read scope | `GET /read/companies`, `/read/sections`, `/read/summary` (each part needs its own scope), `/read/capabilities` |
 | `customer:read` | `/read/customers` |
 | `sales:read` | `/read/quotes`, `/read/quotes/:ref`, `/read/enquiries` |
-| `jobs:read` | `/read/jobs`, `/read/jobs/:ref` |
+| `jobs:read` | `/read/jobs`, `/read/jobs/:ref` (both include the Job Material List; the detail adds job lines, the cost breakdown and the estimate) |
 | `accounts:read` | `/read/invoices`, `/read/invoices/:ref`, `/read/payments`, `/read/credit-notes`, `/read/receivables`, `/read/bills` |
-| `purchasing:read` | `/read/suppliers`, `/read/purchase-orders` (`items=true` adds lines), `/read/purchase-orders/:ref`, `/read/supplier-prices?item=`; adds cost to `/read/inventory` |
+| `purchasing:read` | `/read/suppliers`, `/read/purchase-orders` (`items=true` adds lines), `/read/purchase-orders/:ref`, `/read/supplier-prices?item=`, `/read/material-orders`; adds cost to `/read/inventory` |
 | `inventory:read` | `/read/inventory` (sell price with `pricing:read`) |
 
 **Lists and filters.**
@@ -264,6 +264,56 @@ each labelled `source: "legacy_json"`.
 
 Tests: `npm run test:integration-read`. It runs the same dataset under JSON and relational authority and checks that
 both give the same answers.
+
+### Job Material Lists (`/read/jobs`, `/read/jobs/:ref`)
+
+Each job carries `materialList`, read from `job.breakdown.material_list` — the same record the Job Material List tab saves.
+
+- `state`: `saved` (a list with lines), `saved_empty` (a list was saved with nothing in it), `none` (never saved), or
+  `unreadable` (something is stored but it is not a list; the dashboard shows that as empty).
+- `effective` says what the dashboard shows: `saved`, `saved_empty`, `estimate` (detail only), `estimate_on_detail`
+  (list view: nothing saved, the estimate is on the detail) or `none`.
+- `saved.lines`: each row with its key, material, `kind`, `qty` and `qtyUnit` (`sheets`, `m` or `units`), sheet or roll
+  dimensions in metres and `areaM2`, plus the free-text "other" lines with their description and size.
+  `saved.ignoredEntries` lists stored entries the dashboard does not show (unknown rows, zero quantities, blank lines).
+  `stored` is the stored value as saved.
+- `estimate` (detail only, and only when nothing is saved): the dashboard's automatic list, worked out by the
+  dashboard's own `sgrAutoMaterialList` (loaded from `index.html` at runtime, so the two cannot drift). It is labelled
+  ESTIMATED and its `basis` says which lines it used (the job's, or its quote's when the job has none), how many were
+  linked to stock items or complete products, and that service lines are left out. `calculation.version` identifies
+  the rules used; `calculation.available` is false when `index.html` cannot be found (set `SIGNACORE_INDEX_HTML`).
+- Material List lines are not linked to stock items in SignaCore (`stockItemRef` is always null), so any comparison
+  with stock is the caller's own matching.
+
+The job detail also returns `lines` (the job's own lines, with dimensions and units) and `costBreakdown` (the numeric
+cost categories on the job).
+
+### Materials to Order (`/read/material-orders`, `purchasing:read`)
+
+One record per material and scope, from the `materialOrders` section the Purchase Orders page keeps. The scope comes
+from the record id: `h:` is Holdings (company 1), `s:` is shared by every other company.
+
+- `orderedByJob` lists the quantity ticked as ordered for each job, with the job number and company. Only jobs of
+  companies the credential may read are shown; the rest are counted in `orderedEntriesWithheld`.
+- The supplier, adjustment, ordered date and manual-line details belong to the whole scope, so they are returned only
+  when the credential may read every company in that scope; otherwise `scopeFieldsWithheld` says why.
+- Who ticked it is never returned. Records with no scope in their id are not returned and are counted in `notes`.
+- Filters: `q`, `company`, `job`, `supplier`, `scope` (`signacore` or `holdings`), with `page` and `limit`.
+
+### Capabilities (`/read/capabilities`, any read scope)
+
+Describes every read type: list and detail paths, required scope (and whether this credential holds it), filters,
+pagination, company scoping, fields and types, relationships, plus `apiVersion`, `schemaVersion` and the Material
+List rules version. It is built from `readCatalog.ts`, and `npm run test:integration-materials` checks it against the
+real routes (every path answers, every returned field is described, every described field is returned, and the scope
+is enforced).
+
+**Saves.** `materialOrders` is a protected platform-state section, like quotes and jobs: a save that sends some of its
+records updates those records and keeps the others, and a record is removed only when the save lists it in
+`_deletedIds` (the dashboard never deletes these records). As with the other protected sections, changing an existing
+record from a stale tab is refused with `409 stale_revision` instead of overwriting the newer copy.
+
+Tests: `npm run test:integration-materials` (same `*_test` database rules).
 
 ## Errors
 

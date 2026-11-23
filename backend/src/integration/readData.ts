@@ -18,6 +18,7 @@
 import { query } from '../db/pool';
 import { CutoverSection } from '../relational/cutover';
 import { loadSection, sectionAuthority, SectionSource, customerSummary, productRef, stockStatus } from './data';
+import { materialListView, costBreakdownView, jobLinesView } from './materials';
 import { IntegrationError } from './errors';
 import * as m from './money';
 
@@ -28,7 +29,7 @@ const REL_TABLE: Partial<Record<string, string>> = {
   quotes: 'rel_quotes', jobs: 'rel_jobs', accInvoices: 'rel_invoices', creditNotes: 'rel_credit_notes', purchaseOrders: 'rel_purchase_orders',
   suppliers: 'rel_suppliers', inventory: 'rel_inventory_items', customers: 'rel_customers',
 };
-const JSON_ONLY = ['accBills', 'proposedProjects'] as const;
+const JSON_ONLY = ['accBills', 'proposedProjects', 'completeProducts', 'materialOrders'] as const;
 type JsonOnly = (typeof JSON_ONLY)[number];
 
 export const str = (v: unknown): string | null => (v === null || v === undefined || v === '' ? null : String(v));
@@ -189,7 +190,11 @@ export function quoteView(q: any, L: Loaded, ctx: { jobs: any[]; invoices: any[]
   };
 }
 
-export function jobView(j: any, L: Loaded, ctx: { quotes: any[]; invoices: any[]; links: Links }, detail: boolean) {
+/**
+ * `ctx.materials` (job DETAIL only) adds the automatic Material List estimate when nothing is saved; it needs stock
+ * items and complete products. Lists, and other views that build job views (payments), never pay for that.
+ */
+export function jobView(j: any, L: Loaded, ctx: { quotes: any[]; invoices: any[]; links: Links; materials?: { inventory: any[]; completeProducts: any[] } }, detail: boolean) {
   const c = companyOf(j);
   const quote = quoteForJob(j, ctx.quotes);
   const inv = invoiceForJob(j, ctx.invoices, ctx.links);
@@ -221,8 +226,16 @@ export function jobView(j: any, L: Loaded, ctx: { quotes: any[]; invoices: any[]
       lastPaymentDate: lastPaid(pay.map((x) => x.p)),
     },
     poRef: str(j.poRef), reference: str(j.reference), salesperson: str(j.salesperson),
+    materialList: materialListView(j, detail && ctx.materials ? {
+      lines: (j.lines || []).length ? j.lines : ((quote && quote.lines) || []), linesFrom: (j.lines || []).length ? 'job' : quote ? 'quote' : 'none',
+      quoteNumber: quote ? quote.num ?? null : null, inventory: ctx.materials.inventory, completeProducts: ctx.materials.completeProducts,
+    } : undefined),
     ...stamps(L, j),
-    ...(detail ? { payments: pay.map((x) => paymentView(x.p, x.kind, { id: String(j.id), number: j.num ?? null, company: c.code })), notes: str(j.notes) } : {}),
+    ...(detail ? {
+      payments: pay.map((x) => paymentView(x.p, x.kind, { id: String(j.id), number: j.num ?? null, company: c.code })), notes: str(j.notes),
+      lines: jobLinesView(j), linesNote: (j.lines || []).length ? null : quote ? `The job has no lines of its own; its quote ${quote.num} has ${(quote.lines || []).length}.` : 'The job has no lines.',
+      costBreakdown: costBreakdownView(j),
+    } : {}),
   };
 }
 
