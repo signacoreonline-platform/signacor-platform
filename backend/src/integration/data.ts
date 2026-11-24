@@ -65,6 +65,24 @@ export async function loadSection(section: CutoverSection): Promise<{ items: any
 
 const str = (v: unknown): string | null => (v === null || v === undefined || v === '' ? null : String(v));
 
+/* 021 CUSTOMER LINKS (2026-11-24): a document's customer is read from the
+   customer record it is linked to (customer_ref / customerId = the customer's
+   id). An unlinked document, or a link that no longer resolves to exactly one
+   customer, keeps its stored snapshot and says so. */
+export function linkedCustomer(ref: unknown, customers: any[]): any | null {
+  if (ref === undefined || ref === null || String(ref).trim() === '') return null;
+  const hits = (customers || []).filter((c: any) => c && String(c.id) === String(ref).trim());
+  return hits.length === 1 ? hits[0] : null;
+}
+export async function canonicalCustomerBlock(ref: unknown, snapshot: Record<string, any>): Promise<Record<string, any>> {
+  let c: any = null;
+  if (ref !== undefined && ref !== null && String(ref).trim() !== '') {
+    try { c = linkedCustomer(ref, (await loadSection('customers')).items); } catch { c = null; }
+  }
+  if (!c) return { id: ref ? String(ref) : null, linked: false, ...snapshot };
+  return { id: String(c.id), linked: true, name: str(c.companyName), contactPerson: str(c.contactPerson), email: str(c.email), phone: str(c.tel ?? c.phone), vatNumber: str(c.vatNumber) };
+}
+
 export function customerSummary(c: any) {
   return {
     id: String(c.id),
@@ -482,7 +500,7 @@ export async function quoteView(q: any, clientId: string) {
     // Same rule PATCH /quotes/:id enforces (router.ts): owned, draft, no job, no proforma.
     editableByClient: owned && status === 'draft' && !q.converted_job_id && !q.proforma_num,
     createdByThisClient: owned,
-    customer: { name: q.customer_name_raw, contactPerson: q.contact_person, email: q.email, phone: q.phone, vatNumber: q.vat_number },
+    customer: await canonicalCustomerBlock(q.customer_ref, { name: q.customer_name_raw, contactPerson: q.contact_person, email: q.email, phone: q.phone, vatNumber: q.vat_number }),
     reference: q.reference, poRef: q.po_ref, notes: q.notes,
     quoteDate: dateOnly(q.quote_date), validUntil: dateOnly(q.valid_until),
     lines: lines.rows.map((l: any) => ({

@@ -523,6 +523,8 @@ router.post('/quotes', requireScope('quote:create'), op('quote.create_draft', as
     const created = await createQuote({
       companyCode: ctx.companyCode,
       customerId: relCustomerId,
+      // 021: the stable link — the Signacore customer id Sally chose.
+      customerRef: String(cust.id),
       customerNameRaw: String(cust.companyName).trim(),
       contactPerson: cust.contactPerson || null,
       email: cust.email || null,

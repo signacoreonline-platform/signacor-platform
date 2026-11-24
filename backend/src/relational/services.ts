@@ -54,6 +54,31 @@ export class BusinessRuleError extends Error {
     this.name = 'BusinessRuleError';
   }
 }
+
+/* 021 CUSTOMER LINKS. A document's stable customer link is the platform_state
+   customer id, stored as text in customer_ref. Set right after the INSERT, in
+   the same transaction, so no existing INSERT parameter list changes. An empty
+   or missing ref leaves the column NULL (an unlinked document, exactly as
+   before this migration). */
+export function normalizeCustomerRef(raw: unknown): string | null {
+  if (raw === undefined || raw === null) return null;
+  const t = String(raw).trim();
+  if (!t) return null;
+  if (!/^[A-Za-z0-9._-]{1,40}$/.test(t)) throw new BusinessRuleError(`Customer reference "${t.slice(0, 40)}" is not valid.`);
+  return t;
+}
+async function setCustomerRefTx(client: PoolClient, table: 'rel_quotes' | 'rel_jobs' | 'rel_invoices' | 'rel_credit_notes', id: number, raw: unknown): Promise<void> {
+  const ref = normalizeCustomerRef(raw);
+  if (ref === null) return;
+  await client.query(`UPDATE ${table} SET customer_ref = $1 WHERE id = $2`, [ref, id]);
+}
+/** Conversion: the new document inherits its source document's link. */
+async function copyCustomerRefTx(client: PoolClient, toTable: 'rel_jobs' | 'rel_invoices', toId: number, fromTable: 'rel_quotes' | 'rel_jobs', fromId: number | null): Promise<void> {
+  if (fromId === null || fromId === undefined) return;
+  await client.query(
+    `UPDATE ${toTable} SET customer_ref = (SELECT customer_ref FROM ${fromTable} WHERE id = $2) WHERE id = $1 AND customer_ref IS NULL`,
+    [toId, fromId]);
+}
 // STAGE 3 Phase 6 — createInvoiceForJob's legacy branch (a job that already
 // carries an invoiceNum from historical/backfilled JSON data, or from an
 // earlier partial relational write, but was never actually invoiced
@@ -187,6 +212,8 @@ export interface QuoteLineInput {
 export interface CreateQuoteInput {
   companyCode: string;
   customerId?: number | null;
+  /** 021: stable link to the platform_state customer (its `id`, as text). */
+  customerRef?: string | null;
   customerNameRaw: string;
   lines: QuoteLineInput[];
   discountPct?: number;
@@ -272,6 +299,7 @@ export async function createQuote(input: CreateQuoteInput): Promise<{ id: number
     );
     const quoteId = insertRes.rows[0].id;
     const quoteRowVersion = insertRes.rows[0].row_version;
+    await setCustomerRefTx(client, 'rel_quotes', quoteId, input.customerRef);
 
     for (let i = 0; i < input.lines.length; i++) {
       const l = input.lines[i];
@@ -418,6 +446,7 @@ export async function convertQuoteToJob(quoteId: number): Promise<{
     );
     const jobId = jobRes.rows[0].id;
     const jobRowVersion = jobRes.rows[0].row_version;
+    await copyCustomerRefTx(client, 'rel_jobs', jobId, 'rel_quotes', quoteId);
 
     for (const l of lineItemsRes.rows) {
       await client.query(
@@ -572,6 +601,8 @@ export async function convertQuoteToJob(quoteId: number): Promise<{
 export interface CreateJobInput {
   companyCode: string;
   customerId?: number | null;
+  /** 021: stable link to the platform_state customer (its `id`, as text). */
+  customerRef?: string | null;
   customerNameRaw: string;
   description?: string | null;
   status?: string | null;
@@ -611,6 +642,7 @@ export async function createJob(input: CreateJobInput): Promise<{ id: number; jo
        Number.isFinite(Number(input.stage)) ? Number(input.stage) : null,
        Number(input.value) || 0, input.notes ?? null, input.dueDate || null]
     );
+    await setCustomerRefTx(client, 'rel_jobs', res.rows[0].id, input.customerRef);
     await client.query('COMMIT');
     return { id: res.rows[0].id, jobNumber, rowVersion: res.rows[0].row_version };
   } catch (err) {
@@ -2151,6 +2183,7 @@ async function jobInvoiceTx(jobId: number, mode: JobInvoiceMode): Promise<JobInv
          job.email, job.address]
       );
       const legacyInvoiceId = legacyInvRes.rows[0].id;
+      await copyCustomerRefTx(client, 'rel_invoices', legacyInvoiceId, 'rel_jobs', jobId);
       // Ordinary Job-line path first; the preserved commercial-line fallback
       // only where the Job's own lines no longer support its value. The final
       // assertion below is UNCHANGED either way — the Job stays the authority.
@@ -2270,6 +2303,7 @@ async function jobInvoiceTx(jobId: number, mode: JobInvoiceMode): Promise<JobInv
        job.email, job.address]
     );
     const invoiceId = invRes.rows[0].id;
+    await copyCustomerRefTx(client, 'rel_invoices', invoiceId, 'rel_jobs', jobId);
 
     // Ordinary Job-line path first; the preserved commercial-line fallback only
     // where the Job's own lines no longer support its value. The final
@@ -2326,7 +2360,7 @@ async function replaceInvoiceLinesTx(client: PoolClient, invoiceId: number, line
 
 export interface InvoiceLineItemPatch { description?: string | null; qty: number; unitAmount: number; accountCode?: string | null; taxType?: string | null }
 export interface CreateManualInvoiceInput {
-  companyCode: string; customerId?: number | null; contactName: string; contactEmail?: string | null;
+  companyCode: string; customerId?: number | null; customerRef?: string | null; contactName: string; contactEmail?: string | null;
   contactAddress?: string | null; reference?: string | null; status?: string | null;
   issueDate?: string | null; dueDate?: string | null; lines: InvoiceLineItemPatch[];
 }
@@ -2350,6 +2384,7 @@ export async function createManualInvoice(input: CreateManualInvoiceInput): Prom
        input.contactAddress ?? null, input.reference ?? null, input.status ?? 'sent', input.issueDate || null, input.dueDate || null]
     );
     const invoiceId = invRes.rows[0].id;
+    await setCustomerRefTx(client, 'rel_invoices', invoiceId, input.customerRef);
     await replaceInvoiceLinesTx(client, invoiceId, input.lines || []);
     await client.query('COMMIT');
     return { id: invoiceId, invoiceNumber, rowVersion: invRes.rows[0].row_version };
@@ -3057,6 +3092,7 @@ async function createInvoiceFromQuoteTx(
      quote.email, quote.address]
   );
   const invoiceId = Number(invRes.rows[0].id);
+  await copyCustomerRefTx(client, 'rel_invoices', invoiceId, 'rel_quotes', quoteId);
   // JOB/QUOTE -> INVOICE FINANCIAL CONSISTENCY REPAIR (2026-08-25): this
   // loop carried the SAME defect as writeInvoiceLinesFromJobTx — a plain
   // qty x unit_price copy that dropped `pieces`, the setup fee and the
@@ -5258,6 +5294,8 @@ export interface CreditNoteInput {
   companyCode: string;
   type: 'customer' | 'supplier';
   contactName: string;
+  /** 021: stable link to the platform_state customer. */
+  customerRef?: string | null;
   date?: string | null;
   amount: number;
   reason?: string | null;
@@ -5277,6 +5315,7 @@ export async function createCreditNote(input: CreditNoteInput): Promise<{ id: nu
        RETURNING id, row_version`,
       [creditNumber, input.type, input.contactName, input.date || null, input.amount, input.reason ?? null, input.appliedTo ?? null, input.notes ?? null, input.status ?? 'active', input.companyCode]
     );
+    await setCustomerRefTx(client, 'rel_credit_notes', res.rows[0].id, input.customerRef);
     await client.query('COMMIT');
     return { id: res.rows[0].id, creditNumber, rowVersion: res.rows[0].row_version };
   } catch (err) {
@@ -5288,6 +5327,7 @@ export async function createCreditNote(input: CreditNoteInput): Promise<{ id: nu
 }
 
 export interface CreditNotePatchInput {
+  customerRef?: string | null;
   contactName?: string; date?: string | null; amount?: number; reason?: string | null;
   appliedTo?: string | null; notes?: string | null; status?: string | null;
 }
@@ -5304,6 +5344,9 @@ export async function updateCreditNote(id: number, expectedVersion: number, patc
   // reassigned to Original (or vice versa) through an edit.
   const colMap: Record<string, string> = {
     contactName: 'contact_name_raw', date: 'note_date', amount: 'amount', reason: 'reason',
+    // 021: a credit note belongs to a customer, not to a transaction chain, so
+    // its link is set directly (it is never moved by a chain reassignment).
+    customerRef: 'customer_ref',
     appliedTo: 'applied_to', notes: 'notes', status: 'status',
   };
   const client = await pool.connect();

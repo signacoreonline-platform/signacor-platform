@@ -172,6 +172,8 @@ const FNS = [
   'sgrLegalNameBase', 'sgrMatchInvoiceCustomer', 'sgrResolveInvoiceCustomer', 'sgrInvoiceWithCurrentCustomer',
   // 2026-11-24: invoice RECORD -> current customer (View / PDF / Email button)
   'sgrInvoiceRecordCustomer', 'sgrInvoiceRecordContactView',
+  // 2026-11-24 (021): stable customer links
+  'sgrCustRefOf', 'sgrCustNorm', 'sgrResolveCustomerRef', 'sgrDocCustomerLink', 'sgrCustomerFieldsFor', 'sgrApplyCustomerOverlay',
   // linkage used by the accInvoices printable adapter
   'companyTagOf', 'sameCompany', 'jobHasId', 'findCustomerByName', 'invoiceBelongsToJob',
   'resolveJobsForQuote', 'resolveJobForQuote', 'resolveQuoteForJob', 'resolveQuoteForInvoice',
@@ -185,6 +187,7 @@ const FNS = [
 // Browser-only side effects are replaced by recorders. Everything that
 // decides WHAT is printed is the shipped code.
 const STUBS = `
+  const sgrOverlayCache = { key:null, value:null };
   const __rec = { previews: [], pdfHtml: [], cover: [], eml: [], downloads: [] };
   function sgrOpenPrintPreview(rawHtml, docLabel, docFileName){ __rec.previews.push({ html: rawHtml, docLabel, docFileName }); }
   function sgrLoadPrintMargins(){ return null; }
@@ -672,6 +675,43 @@ ok(/Voortrekker/.test(printBt), '[18] printInvoice (Print + Preview window + Dow
   // The old single-answer function is unchanged.
   eq(A.sgrResolveInvoiceCustomer('Acme Signs CC', [CUST_AFTER, DUP]), null, '[R14] sgrResolveInvoiceCustomer still returns null on duplicates');
   eq(A.sgrResolveInvoiceCustomer('Acme Signs CC', [CUST_AFTER]), CUST_AFTER, '[R14] sgrResolveInvoiceCustomer still returns the unique match');
+
+  /* ══════════════════════════════════════════════════════════════════════
+     K1–K12 (2026-11-24, 021): the STABLE CUSTOMER LINK decides — not the name.
+     ══════════════════════════════════════════════════════════════════ */
+  section('K1–K12. Linked documents follow the customer record, by id');
+  const KA = { id: 1800000000001, companyName: 'Alpha Signs', contactPerson: 'Ann Alpha', email: 'ann@alpha.test', tel: '011 111 1111', address: '1 Alpha Rd', vatNumber: '4111111111' };
+  const KB = { id: 1800000000002, companyName: 'Beta Boards', contactPerson: 'Ben Beta', email: 'ben@beta.test', tel: '022 222 2222', address: '2 Beta Rd', vatNumber: '' };
+  const KQ = { id: 91, num: 'SQ-00991', co: 2, client: 'Alpha Signs', customerId: String(KB.id), lines: [] };
+  const KJ = { id: 92, num: 'SNS-00992', co: 2, quoteNum: 'SQ-00991', client: 'Alpha Signs', customerId: null, lines: [] };
+  const KI = { id: 93, number: 'INV-00993', co: 2, contactName: 'Alpha Signs', contactEmail: 'ann@alpha.test', contactAddress: '1 Alpha Rd', jobNum: 'SNS-00992', reference: 'SNS-00992', status: 'sent',
+    lineItems: [{ description: 'Sign', qty: 1, unitAmount: 1000, accountCode: '4000', taxType: '15%' }], payments: [] };
+  const kctx = { quotes: [KQ], jobs: [KJ], accInvoices: [KI], customers: [KA, KB] };
+  // The reported bug: the chain moved to Beta, the invoice still NAMES Alpha.
+  const kr1 = A.sgrInvoiceRecordCustomer(KI, kctx);
+  ok(kr1.state === 'matched' && kr1.customer === KB && kr1.linked, '[K1] invoice named "Alpha Signs" but chained to a quote linked to Beta resolves to BETA (link beats name)', kr1);
+  const kv1 = A.sgrInvoiceRecordContactView(KI, kctx);
+  ok(kv1.name === "Beta Boards" && kv1.email === "ben@beta.test" && kv1.address === "2 Beta Rd", "[K2] View shows Beta details", kv1);
+  ok(/Beta Boards/.test(billedTo(printOf(KI, kctx))) && !/Alpha/.test(billedTo(printOf(KI, kctx))), '[K3] PDF Billed To is Beta, nothing of Alpha');
+  ok(mailtoFor(KI, kctx).to === 'ben@beta.test', '[K4] Email goes to Beta\'s address');
+  const KI2 = { ...KI, id: 94, number: 'INV-00994', customerId: String(KA.id), jobNum: '', reference: 'x' };
+  eq(A.sgrInvoiceRecordCustomer(KI2, kctx).customer, KA, '[K5] the invoice\'s OWN link wins');
+  const KAren = { ...KA, companyName: 'Alpha Signage (Pty) Ltd', email: '' };
+  const r6 = A.sgrInvoiceRecordContactView(KI2, { ...kctx, customers: [KAren, KB] });
+  ok(r6.name === 'Alpha Signage (Pty) Ltd' && r6.email === '', '[K6] renamed linked customer: new name; a field cleared on the record shows blank (record is the source of truth)', r6);
+  const KAdup = { ...KB, id: KA.id, companyName: 'Imposter' };
+  const r7 = A.sgrInvoiceRecordCustomer(KI2, { ...kctx, customers: [KA, KAdup, KB] });
+  ok(r7.state === 'unresolved-link' && r7.linkState === 'duplicate-id' && !r7.customer, '[K7] a link id shared by two customers is reported, never guessed', r7);
+  const r8 = A.sgrInvoiceRecordCustomer({ ...KI2, customerId: '999' }, kctx);
+  ok(r8.state === 'unresolved-link' && r8.linkState === 'missing', '[K8] a link to a deleted customer is reported, NOT replaced by the "Alpha Signs" name match', r8);
+  const ren = { ...KA, companyName: 'Alpha Renamed', formerNames: ['Alpha Signs'] };
+  const r9 = A.sgrMatchInvoiceCustomer('Alpha Signs', [ren, KB]);
+  ok(r9.state === 'matched' && r9.customer === ren, '[K9] unlinked legacy name resolves through formerNames after a rename', r9);
+  ok(A.sgrMatchInvoiceCustomer('Alpha Signs', [ren, { ...KB, formerNames: ['Alpha Signs'] }]).state === 'ambiguous', '[K10] a former name shared by two customers stays ambiguous');
+  const ov = A.sgrApplyCustomerOverlay({ quotes: [KQ], jobs: [KJ], accInvoices: [KI, { ...KI, id: 95, number: 'INV-00995', status: 'void' }], customers: [KA, KB] });
+  ok(ov.quotes[0].client === 'Beta Boards' && ov.jobs[0].client === 'Beta Boards' && ov.accInvoices[0].contactName === 'Beta Boards', '[K11] overlay: quote, job (inherited) and invoice (inherited) all show Beta');
+  ok(ov.accInvoices[1].contactName === 'Alpha Signs', '[K12] overlay: a cancelled invoice keeps the name it was issued with');
+  ok(KI.contactName === 'Alpha Signs' && KQ.client === 'Alpha Signs', '[K12] raw records are not mutated by the overlay');
 
   console.log('\n' + (failures ? ('PASSED: ' + passed + '   FAILED: ' + failures) : ('ALL ' + passed + ' CHECKS PASSED')));
   process.exit(failures ? 1 : 0);

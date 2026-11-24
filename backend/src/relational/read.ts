@@ -449,6 +449,8 @@ export async function buildQuotesJson(): Promise<any[]> {
       id: restoreId(r.source_id),
       num: r.quote_number,
       co: coNum(r.company_code),
+      // 021: the stable customer link (platform_state customer id, as text).
+      customerId: r.customer_ref ?? legacyBase(r).customerId ?? null,
       client: r.customer_name_raw ?? legacyBase(r).client ?? null,
       contact: r.contact_person ?? legacyBase(r).contact ?? null,
       email: r.email ?? legacyBase(r).email ?? null,
@@ -614,6 +616,8 @@ export async function buildJobsJson(): Promise<any[]> {
       id: restoreId(r.source_id),
       num: r.job_number,
       co: coNum(r.company_code),
+      // 021: the stable customer link (platform_state customer id, as text).
+      customerId: r.customer_ref ?? legacyBase(r).customerId ?? null,
       client: r.customer_name_raw ?? legacyBase(r).client ?? null,
       contact: r.contact_person ?? legacyBase(r).contact ?? null,
       email: r.email ?? legacyBase(r).email ?? null,
@@ -819,6 +823,7 @@ export async function buildInvoicesJson(): Promise<any[]> {
       id: restoreId(r.source_id),
       number: r.invoice_number,
       co: coNum(r.company_code),
+      customerId: r.customer_ref ?? legacyBase(r).customerId ?? null,
       contactName: r.contact_name ?? legacyBase(r).contactName ?? null,
       contactEmail: r.contact_email ?? legacyBase(r).contactEmail ?? null,
       contactAddress: r.contact_address ?? legacyBase(r).contactAddress ?? null,
@@ -882,6 +887,7 @@ export async function buildCreditNotesJson(): Promise<any[]> {
     // never reached for that row again.
     co: coNum(r.company_code) ?? legacyBase(r).co ?? null,
     type: r.note_type,
+    customerId: r.customer_ref ?? legacyBase(r).customerId ?? null,
     contactName: r.contact_name_raw,
     date: dateStr(r.note_date) ?? legacyBase(r).date ?? null,
     amount: num(r.amount),

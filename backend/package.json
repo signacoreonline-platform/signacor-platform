@@ -29,6 +29,8 @@
     "diagnose:inventory-import:compiled": "node dist/scripts/diagnose-inventory-import.js",
     "repair:id-collisions": "ts-node --transpile-only src/scripts/repair-id-collisions.ts",
     "repair:id-collisions:compiled": "node dist/scripts/repair-id-collisions.js",
+    "backfill:customer-links": "ts-node --transpile-only src/scripts/backfill-customer-links.ts",
+    "backfill:customer-links:compiled": "node dist/scripts/backfill-customer-links.js",
     "test:repair-id-collisions": "ts-node --transpile-only test/repair-id-collisions.stress.ts",
     "test:inventory-csv-roundtrip": "ts-node --transpile-only test/relational.inventory-csv-roundtrip.stress.ts",
     "test:relational": "ts-node --transpile-only test/relational.stress.ts",

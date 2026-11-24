@@ -17,7 +17,7 @@
  */
 import { query } from '../db/pool';
 import { CutoverSection } from '../relational/cutover';
-import { loadSection, sectionAuthority, SectionSource, customerSummary, productRef, stockStatus } from './data';
+import { loadSection, sectionAuthority, SectionSource, customerSummary, productRef, stockStatus, linkedCustomer } from './data';
 import { materialListView, costBreakdownView, jobLinesView } from './materials';
 import { IntegrationError } from './errors';
 import * as m from './money';
@@ -46,6 +46,31 @@ export function companyOf(rec: any): { code: string; tagged: boolean } {
   return { code: '2', tagged: false };
 }
 
+/* 021 CUSTOMER LINKS (2026-11-24). A linked document's customer details are
+   the CUSTOMER RECORD's, not the snapshot the document was created with, so a
+   customer corrected in Signacore reads correctly here too. Applied once, as
+   the section loads, so every view below (and every future one) gets it. A
+   cancelled invoice keeps the details it was issued with (audit evidence). */
+const LINKED_SECTIONS = ['quotes', 'jobs', 'accInvoices', 'creditNotes'] as const;
+async function withLinkedCustomers(section: string, items: any[]): Promise<any[]> {
+  if (!items.some((r) => r && r.customerId)) return items;
+  let customers: any[] = [];
+  try { customers = (await loadSection('customers')).items; } catch { return items; }
+  return items.map((r) => {
+    const c = r ? linkedCustomer(r.customerId, customers) : null;
+    if (!c) return r;
+    const name = str(c.companyName);
+    if (section === 'quotes' || section === 'jobs') {
+      return { ...r, client: name ?? r.client, contact: str(c.contactPerson), email: str(c.email), tel: str(c.tel ?? c.phone), address: str(c.address), vatNum: str(c.vatNumber) };
+    }
+    if (section === 'accInvoices') {
+      if (String(r.status || '') === 'void') return r;
+      return { ...r, contactName: name ?? r.contactName, contactEmail: str(c.email), contactAddress: str(c.address) };
+    }
+    return { ...r, contactName: name ?? r.contactName };
+  });
+}
+
 export interface Loaded { items: any[]; source: SectionSource; updatedAt: Map<string, { createdAt: string | null; updatedAt: string | null }>; sectionUpdatedAt: string | null }
 
 /** Request-scoped cache so one request reads each section once. */
@@ -63,7 +88,9 @@ async function loadWithMeta(section: CutoverSection | JsonOnly): Promise<Loaded>
     const v = r.rows[0]?.v;
     return { items: Array.isArray(v) ? v : [], source: 'platform_state', updatedAt: new Map(), sectionUpdatedAt: r.rows[0]?.updated_at ? new Date(r.rows[0].updated_at).toISOString() : null };
   }
-  const { items, source } = await loadSection(section as CutoverSection);
+  const loaded = await loadSection(section as CutoverSection);
+  const source = loaded.source;
+  const items = (LINKED_SECTIONS as readonly string[]).includes(section) ? await withLinkedCustomers(section, loaded.items) : loaded.items;
   const updatedAt = new Map<string, { createdAt: string | null; updatedAt: string | null }>();
   let sectionUpdatedAt: string | null = null;
   const table = REL_TABLE[section];
@@ -176,7 +203,7 @@ export function quoteView(q: any, L: Loaded, ctx: { jobs: any[]; invoices: any[]
   return {
     id: String(q.id), relId: q._relId ?? null, number: q.num ?? null, companyCode: c.code, companyTagged: c.tagged,
     status, statusLabel: QUOTE_STATUS_LABELS[status] || status,
-    customer: { name: str(q.client), contactPerson: str(q.contact), email: str(q.email), phone: str(q.tel) },
+    customer: { id: str(q.customerId), name: str(q.client), contactPerson: str(q.contact), email: str(q.email), phone: str(q.tel) },
     reference: str(q.reference), poRef: str(q.poRef), salesperson: str(q.salesperson), preparedBy: str(q.preparedBy),
     quoteDate: dateOnly(q.date), validUntil: dateOnly(q.validUntil),
     sentAt: null, // SignaCore records the status 'sent' but not when it was sent
@@ -209,7 +236,7 @@ export function jobView(j: any, L: Loaded, ctx: { quotes: any[]; invoices: any[]
   return {
     id: String(j.id), relId: j._relId ?? null, number: j.num ?? null, companyCode: c.code, companyTagged: c.tagged,
     status: str(j.status), stage, stageName: stage !== null ? STAGE_NAMES[stage] || null : null,
-    customer: { name: str(j.client), contactPerson: str(j.contact), email: str(j.email), phone: str(j.tel) },
+    customer: { id: str(j.customerId), name: str(j.client), contactPerson: str(j.contact), email: str(j.email), phone: str(j.tel) },
     description: str(j.desc), valueInclVat: m.rands(m.sgrToCents0(j.value)),
     dueDate: due, pastDueDate: Boolean(due && due < today && !closed), daysPastDue: due && due < today && !closed ? daysBetween(due, today) : 0,
     installationDate: null, deliveredAt: null, // not recorded by SignaCore (stages only)
@@ -299,7 +326,7 @@ export function invoiceView(row: { kind: 'record' | 'job'; rec: any }, L: { invo
   const open = !['paid', 'void', 'draft'].includes(status) && outstandingC > 0;
   return {
     id: String(i.id), relId: i._relId ?? null, number: i.number ?? null, companyCode: c.code, companyTagged: c.tagged, source: 'record',
-    status, isVoid: status === 'void', contact: { name: str(i.contactName), email: str(i.contactEmail) },
+    status, isVoid: status === 'void', contact: { id: str(i.customerId), name: str(i.contactName), email: str(i.contactEmail) },
     links: { jobId: jobOk ? String(jobOk.id) : null, jobNumber: str(i.jobNum) || (jobOk?.num ?? null), quoteId: quoteOk ? String(quoteOk.id) : null, quoteNumber: str(i.quoteNum) || (quoteOk?.num ?? null) },
     reference: str(i.reference), issueDate: dateOnly(i.date || i.issueDate), dueDate: due,
     totals: { subtotalExVat: m.rands(t.subC), vat: m.rands(t.vatC), totalInclVat: m.rands(t.totalC), from: 'invoice_lines' },

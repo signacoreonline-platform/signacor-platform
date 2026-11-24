@@ -12,3 +12,7 @@ dist/
 
 # 2026-11-23: plan + full records written by src/scripts/repair-id-collisions.ts --apply (customer names) — keep local, never commit
 /id-collision-repair-*.json
+
+# 2026-11-24: reports/plans written by src/scripts/backfill-customer-links.ts (customer names) — keep local, never commit
+/customer-link-dry-run-*.json
+/customer-link-backfill-*.json

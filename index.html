@@ -5555,6 +5555,12 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
             </div>
           )}
           <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
+          <CustomerLinkPanel type="invoice" doc={inv} ctx={{ quotes, jobs, accInvoices, customers }}/>
+          {_cv.state==='unresolved-link'&&(
+            <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-2 text-xs text-amber-800" data-testid="invoice-customer-broken-link">
+              ⚠ This invoice is linked to a customer record that {_cv.linkState==='duplicate-id'?'shares its id with another customer':_cv.linkState==='conflict'?'its linked documents disagree about':'no longer exists'}, so the details below are as stored on the invoice. Choose the customer in the Customer box above.
+            </div>
+          )}
           {_cv.state==='ambiguous'&&(
             <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-2 text-xs text-amber-800" data-testid="invoice-customer-ambiguous">
               ⚠ {_cv.count>1?_cv.count+' customer records':'More than one customer record'} match “{_cv.matchName}”, so the customer details below are shown as stored on this invoice. Merge or rename the duplicate under Customers to show the current details.
@@ -5566,7 +5572,7 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
             </div>
           )}
           {_cv.state==='retained'&&(
-            <p className="text-xs text-gray-500" data-testid="invoice-customer-retained">Customer details are shown as they were when this invoice was issued.</p>
+            <p className="text-xs text-gray-500" data-testid="invoice-customer-retained">Customer details are shown as they were when this invoice was issued.{_cv.linkedCustomer?<span data-testid="invoice-customer-retained-link"> Linked customer record: <strong>{_cv.linkedCustomer.companyName}</strong>.</span>:null}</p>
           )}
           <div className="grid grid-cols-2 gap-3 text-sm">
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">CONTACT</span><span className="font-semibold" data-testid="invoice-view-contact-name">{_cv.name||'—'}</span>{_cv.person&&<span className="block text-xs text-gray-500 mt-0.5" data-testid="invoice-view-contact-person">Attn: {_cv.person}{_cv.tel?' · '+_cv.tel:''}</span>}</div>
@@ -6492,7 +6498,9 @@ function findLinkedRecords({ quote, job, invoice }, { quotes=[], jobs=[], accInv
 
   const nameToMatch = (invoice && invoice.client) || (invoice && invoice.contactName)
     || (linkedJob && linkedJob.client) || (srcQuote && srcQuote.client) || '';
-  const linkedCustomer = findCustomerByName(nameToMatch, customers);
+  // 2026-11-24: the stable customer link decides; the name only for unlinked records.
+  const _linkRefs = [invoice, linkedJob, srcQuote].map(d=>d && sgrCustRefOf(d.customerId)).filter(Boolean);
+  const linkedCustomer = _linkRefs.length ? (sgrResolveCustomerRef(_linkRefs[0], customers).customer || null) : findCustomerByName(nameToMatch, customers);
 
   return { quote: srcQuote, job: linkedJob, jobs: matchingJobs, invoice: linkedInvoice, invoices: linkedInvoices, customer: linkedCustomer, warnings };
 }
@@ -7114,6 +7122,12 @@ function sgrMatchInvoiceCustomer(clientName, customers){
   const hits = customers.filter(c=>c && norm(c.companyName)===n);
   if(hits.length===1) return { state:'matched', customer:hits[0], count:1 };
   if(hits.length>1) return { state:'ambiguous', customer:null, count:hits.length }; // never guess
+  // 2026-11-24: a renamed customer keeps its previous names (formerNames), so an
+  // UNLINKED legacy document issued under an old name still resolves to it —
+  // exact name, exactly one customer, otherwise no guess.
+  const former = customers.filter(c=>c && Array.isArray(c.formerNames) && c.formerNames.some(f=>norm(f)===n));
+  if(former.length===1) return { state:'matched', customer:former[0], count:1, via:'former-name' };
+  if(former.length>1) return { state:'ambiguous', customer:null, count:former.length };
   // 2nd choice - ONLY when nothing matched exactly: the same name once a
   // trailing (Pty) Ltd-type suffix is set aside on either side. Still must
   // be exactly one customer.
@@ -7138,12 +7152,20 @@ function sgrInvoiceWithCurrentCustomer(doc, customers){
   // the details it was issued with, and a customer found through the invoice's
   // linked job/quote is handed down explicitly instead of re-matched by name.
   if(doc._sgrCustomerRetained) return doc;
-  const cust = (doc._sgrCustomer && typeof doc._sgrCustomer==='object')
-    ? doc._sgrCustomer
-    : sgrResolveInvoiceCustomer(doc.client, customers);
+  let cust = (doc._sgrCustomer && typeof doc._sgrCustomer==='object') ? doc._sgrCustomer : null;
+  let linked = !!cust && doc._sgrCustomerLinked===true;
+  // 2026-11-24: a document that carries a customer link prints that customer.
+  if(!cust && sgrCustRefOf(doc.customerId) && Array.isArray(customers) && customers.length){
+    const lr = sgrResolveCustomerRef(doc.customerId, customers);
+    if(lr.state!=='matched') return doc;   // a broken link is never replaced by a name guess
+    cust = lr.customer; linked = true;
+  }
+  if(!cust) cust = sgrResolveInvoiceCustomer(doc.client, customers);
   if(!cust) return doc;
   const has = v=>v!==undefined && v!==null && String(v).trim()!=='';
-  const pick = (current, stored)=>has(current) ? current : stored;
+  // Linked: the customer record is the source of truth, field for field.
+  // Name-matched legacy record: a blank customer field keeps the stored value.
+  const pick = (current, stored)=> has(current) ? current : (linked ? '' : stored);
   return { ...doc,
     contact: pick(cust.contactPerson, doc.contact),
     email:   pick(cust.email, doc.email),
@@ -7183,7 +7205,15 @@ function sgrInvoiceRecordCustomer(inv, ctx){
   ctx = ctx || {};
   const customers = Array.isArray(ctx.customers) ? ctx.customers : [];
   if(!inv) return { state:'none', customer:null, via:null, name:'' };
-  if(inv.status==='void') return { state:'retained', customer:null, via:null, name:inv.contactName||'' };
+  // 2026-11-24: the stable customer link (the invoice's own, else its chain's)
+  // decides first. A link that does not resolve to exactly one customer is
+  // reported, never replaced by a name guess.
+  const link = sgrDocCustomerLink('invoice', inv, ctx);
+  if(inv.status==='void') return { state:'retained', customer:null, via:null, name:inv.contactName||'', linkedCustomer: link.state==='matched' ? link.customer : null };
+  if(link.linked){
+    if(link.state==='matched') return { state:'matched', customer:link.customer, via: link.via==='self' ? 'link' : 'link-'+link.via, name:inv.contactName, linked:true };
+    return { state:'unresolved-link', customer:null, via:'link', name:inv.contactName||'', count:link.count||0, linkState:link.state, linked:true };
+  }
   const own = sgrMatchInvoiceCustomer(inv.contactName, customers);
   if(own.state==='matched') return { state:'matched', customer:own.customer, via:'invoice', name:inv.contactName };
   if(own.state==='ambiguous') return { state:'ambiguous', customer:null, via:'invoice', name:inv.contactName, count:own.count };
@@ -7214,17 +7244,561 @@ function sgrInvoiceRecordContactView(inv, ctx){
   const stored = { name:(inv && inv.contactName)||'', person:'', email:(inv && inv.contactEmail)||'',
                    address:(inv && inv.contactAddress)||'', tel:'', vatNum:'' };
   const c = r.customer;
-  if(!c) return { ...stored, state:r.state, via:r.via, matchName:r.name, count:r.count||0, customer:null };
+  const linkedPick = (current)=> has(current) ? current : '';
+  if(!c) return { ...stored, state:r.state, via:r.via, matchName:r.name, count:r.count||0, customer:null, linkedCustomer:r.linkedCustomer||null, linkState:r.linkState||null };
+  const _lk = !!r.linked;
   return {
     name: pick(has(c.companyName) ? String(c.companyName).trim() : '', stored.name),
     person: c.contactPerson || '',
-    email: pick(c.email, stored.email),
-    address: pick(c.address, stored.address),
+    email: _lk ? linkedPick(c.email) : pick(c.email, stored.email),
+    address: _lk ? linkedPick(c.address) : pick(c.address, stored.address),
     tel: has(c.tel) ? c.tel : (c.phone || ''),
     vatNum: c.vatNumber || '',
     state: 'matched', via: r.via, matchName: r.name, count: 1, customer: c,
   };
 }
+/* ═══════════════════════════════════════════════════════════════════════════
+   CUSTOMER IDENTITY (2026-11-24, migration 021_customer_links)
+
+   THE MODEL
+     The customer record is the source of truth. Customers are platform_state
+     authoritative, so a document's stable link is the customer's `id` (as
+     text) in `customerId` (relational: rel_*.customer_ref, exposed by read.ts
+     as customerId). Every quote, job and invoice screen, list, PDF, print,
+     statement and email recipient reads the customer's details from the
+     LINKED RECORD; the document's own name/contact fields are a historical
+     snapshot only.
+
+   RESOLUTION ORDER (sgrDocCustomerLink)
+     1. the document's own link;
+     2. else the link of its chain (invoice -> job/quote, job -> quote,
+        quote -> job), company-scoped through the existing linkage helpers;
+     3. else, for an UNLINKED legacy record only, the unique-name rule
+        (exact name, then a former name of a renamed customer, then the
+        "(Pty) Ltd" equivalence). A name never chooses between two customers.
+     A link that no longer resolves to exactly ONE customer (deleted record,
+     duplicated id) or a chain whose members disagree is reported, never
+     replaced by a name guess.
+
+   TWO OPERATIONS
+     - Edit the linked customer's details (Customers, quote, job, invoice):
+       sgrSaveCustomerRecord() changes the customer record itself and reports
+       success only once the server has confirmed the save.
+     - Change which customer owns a transaction: sgrRequestReassign() previews
+       the whole quote -> job -> invoices chain (cancelled and replacement
+       invoices included) and moves it in one server transaction
+       (POST /api/relational/customer-links/reassign), or, for sections still
+       on platform_state, in one confirmed autosave.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const sgrStoreRef = { current: null };        // App registers the live arrays + setters every render
+const sgrReassignHostRef = { current: null }; // App's reassignment modal host
+function sgrCustRefOf(v){ if(v===undefined||v===null) return null; const t=String(v).trim(); return t?t:null; }
+function sgrCustNorm(s){ return String(s==null?'':s).trim().toLowerCase(); }
+function sgrResolveCustomerRef(ref, customers){
+  const r = sgrCustRefOf(ref);
+  if(!r) return { state:'unlinked', customer:null, count:0 };
+  const hits = (customers||[]).filter(c=>c && String(c.id)===r);
+  if(hits.length===1) return { state:'matched', customer:hits[0], count:1 };
+  return { state: hits.length ? 'duplicate-id' : 'missing', customer:null, count:hits.length };
+}
+/* The link a document has, or inherits from its chain. `linked:false` means
+   neither the document nor its chain carries a link (a legacy record). */
+function sgrDocCustomerLink(type, doc, ctx){
+  ctx = ctx || {};
+  const customers = ctx.customers || [];
+  if(!doc) return { state:'unlinked', customer:null, linked:false };
+  const ownRef = sgrCustRefOf(doc.customerId);
+  if(ownRef){ const own = sgrResolveCustomerRef(ownRef, customers); return { ...own, linked:true, via:'self', ref:ownRef }; }
+  const members = [];
+  try {
+    if(type==='invoice'){
+      const L = findLinkedRecords({ invoice: { ...doc, jobNum: doc.jobNum || doc.reference || '' } },
+        { quotes: ctx.quotes||[], jobs: ctx.jobs||[], accInvoices: ctx.accInvoices||[], customers });
+      if(!(L.warnings && L.warnings.length)){ if(L.job) members.push(['job', L.job]); if(L.quote) members.push(['quote', L.quote]); }
+    } else if(type==='job'){
+      const q = resolveQuoteForJob(doc, ctx.quotes||[]); if(q) members.push(['quote', q]);
+    } else if(type==='quote'){
+      const j = resolveJobForQuote(doc, ctx.jobs||[]); if(j) members.push(['job', j]);
+    }
+  } catch(e){ /* a malformed chain never breaks display */ }
+  const refs = members.map(([via, m])=>({ via, ref: sgrCustRefOf(m && m.customerId) })).filter(x=>x.ref);
+  const distinct = Array.from(new Set(refs.map(x=>x.ref)));
+  if(distinct.length===1){ const r = sgrResolveCustomerRef(distinct[0], customers); return { ...r, linked:true, via:refs[0].via, ref:distinct[0], inherited:true }; }
+  if(distinct.length>1) return { state:'conflict', customer:null, linked:true, via:'chain', refs:distinct };
+  return { state:'unlinked', customer:null, linked:false };
+}
+/* What a document shows. Linked: the customer record, field for field (the
+   record is the source of truth). Unlinked legacy: the stored snapshot. */
+function sgrCustomerFieldsFor(type, customer){
+  const c = customer || {};
+  const name = String(c.companyName||'').trim();
+  if(type==='invoice') return { contactName:name, contactEmail:c.email||'', contactAddress:c.address||'' };
+  if(type==='credit') return { contactName:name };
+  return { client:name, contact:c.contactPerson||'', email:c.email||'', tel:(c.tel||c.phone||''), address:c.address||'', vatNum:c.vatNumber||'' };
+}
+/* App-level display overlay: every page receives quotes / jobs / invoices whose
+   customer fields are the linked customer's. Raw state is never changed by it;
+   a cancelled invoice keeps the details it was issued with. Memoised on the
+   identity of the four arrays, so it costs nothing on unrelated renders. */
+const sgrOverlayCache = { key:null, value:null };
+function sgrApplyCustomerOverlay(src){
+  const key = [src.quotes, src.jobs, src.accInvoices, src.customers];
+  if(sgrOverlayCache.key && sgrOverlayCache.key.every((v,i)=>v===key[i])) return sgrOverlayCache.value;
+  const customers = src.customers || [];
+  const ctx = { quotes: src.quotes||[], jobs: src.jobs||[], accInvoices: src.accInvoices||[], customers };
+  const ov = (type, list) => (list||[]).map(r=>{
+    if(!r) return r;
+    if(type==='invoice' && r.status==='void') return r;
+    const link = sgrDocCustomerLink(type, r, ctx);
+    if(!link.linked || link.state!=='matched') return r;
+    const f = sgrCustomerFieldsFor(type, link.customer);
+    if(Object.keys(f).every(k=>String(r[k]==null?'':r[k])===f[k])) return r;
+    return { ...r, ...f };
+  });
+  const value = { quotes: ov('quote', src.quotes), jobs: ov('job', src.jobs), accInvoices: ov('invoice', src.accInvoices) };
+  sgrOverlayCache.key = key; sgrOverlayCache.value = value;
+  return value;
+}
+function sgrNewCustomerId(customers){
+  let id = Date.now();
+  const taken = new Set((customers||[]).map(c=>c && String(c.id)));
+  while(taken.has(String(id))) id++;
+  return id;
+}
+/* Create or edit a customer record through the AUTHORITATIVE customer store
+   and resolve only when the server has confirmed it. A rename keeps the old
+   name in `formerNames`, so legacy unlinked documents issued under it still
+   resolve to this customer (and never to another one). */
+async function sgrSaveCustomerRecord(next, opts){
+  opts = opts || {};
+  const st = sgrStoreRef.current;
+  if(!st) return { ok:false, error:'The page is still loading — try again in a moment.' };
+  if(sgrSessionIsReadOnly()) return { ok:false, error:'This login is view-only.' };
+  const customers = st.customers || [];
+  const isNew = !!opts.isNew;
+  const id = isNew ? (next.id!=null && !customers.some(c=>c && String(c.id)===String(next.id)) ? next.id : sgrNewCustomerId(customers)) : next.id;
+  const sameId = customers.filter(c=>c && String(c.id)===String(id));
+  if(!isNew && sameId.length>1) return { ok:false, error:sameId.length+' customer records share the id '+id+'. Repair the duplicate customer id before editing it.' };
+  const before = isNew ? null : (sameId[0] || null);
+  if(!isNew && !before) return { ok:false, error:'That customer no longer exists — it may have been deleted elsewhere.' };
+  const rec = { ...(before||{}), ...next, id };
+  rec.companyName = String(rec.companyName||'').trim();
+  if(!rec.companyName) return { ok:false, error:'A customer needs a company / trading name.' };
+  if(before){
+    const oldName = String(before.companyName||'').trim();
+    if(oldName && sgrCustNorm(oldName)!==sgrCustNorm(rec.companyName)){
+      const fn = Array.isArray(before.formerNames) ? before.formerNames.slice() : [];
+      if(!fn.some(f=>sgrCustNorm(f)===sgrCustNorm(oldName))) fn.push(oldName);
+      rec.formerNames = fn.filter(f=>sgrCustNorm(f)!==sgrCustNorm(rec.companyName));
+    }
+  }
+  if(isRelationalAuthoritative('customers')){
+    try {
+      const patch = { companyName:rec.companyName, contactPerson:rec.contactPerson, email:rec.email, phone:rec.tel, address:rec.address, vatNumber:rec.vatNumber, notes:rec.notes };
+      if(isNew){
+        const r = await relationalApi.createCustomer(patch);
+        const saved = { ...rec, id:r.id, _relId:r.id, _relRowVersion:r.rowVersion };
+        st.setCustomers(prev=>[saved, ...prev]);
+        return { ok:true, customer:saved };
+      }
+      const r = await relationalApi.updateCustomer(before._relId, before._relRowVersion, patch);
+      const saved = { ...rec, _relRowVersion:r.rowVersion };
+      st.setCustomers(prev=>prev.map(c=>String(c.id)===String(id)?saved:c));
+      return { ok:true, customer:saved };
+    } catch(e){ return { ok:false, error:describeSaveConflictError(e, 'customer') }; }
+  }
+  const wait = sgrAwaitAutosave(25000);
+  st.setCustomers(prev=> isNew ? [rec, ...prev] : prev.map(c=>String(c.id)===String(id)?rec:c));
+  const r = await wait;
+  if(r && r.ok) return { ok:true, customer:rec };
+  // A definite refusal: take the change back out of this page, so a later
+  // automatic save can never quietly persist what we just reported as failed.
+  // (A timeout is unknown, not refused — it is left for the save status.)
+  if(!(r && r.timeout)){
+    st.setCustomers(prev=> isNew ? prev.filter(c=>c!==rec) : prev.map(c=>c===rec ? before : c));
+  }
+  return { ok:false, timeout:!!(r && r.timeout),
+    error: (r && r.timeout) ? 'The server has not confirmed the customer save yet. Check the save status at the top before relying on it.'
+                            : ('The server did not accept the customer save: '+((r && r.error)||'unknown error')+'. Nothing else was changed.') };
+}
+/* Document forms: make sure the form's customer EXISTS and is linked, and that
+   any customer detail typed into the form is saved to the customer record.
+   `fields` holds only the customer fields that form shows. */
+async function sgrFormCustomerStep({ customerId, fields, docLabel }){
+  const st = sgrStoreRef.current || {};
+  const customers = st.customers || [];
+  const map = { client:'companyName', contact:'contactPerson', email:'email', tel:'tel', address:'address', vatNum:'vatNumber' };
+  const typedName = String(fields.client||'').trim();
+  let res = sgrResolveCustomerRef(customerId, customers);
+  if(res.state==='duplicate-id') return { ok:false, message:res.count+' customer records share this customer\'s id. Repair the duplicate customer id first — nothing was saved.' };
+  let cust = res.customer;
+  if(!cust){
+    if(!typedName) return { ok:false, message:'Choose a customer first.' };
+    const same = customers.filter(c=>c && sgrCustNorm(c.companyName)===sgrCustNorm(typedName));
+    if(same.length>1) return { ok:false, message:same.length+' customers are named "'+typedName+'". Choose the right one from the saved customers list — nothing was saved.' };
+    if(same.length===1){
+      if(!window.confirm('Link this '+docLabel+' to the existing customer "'+same[0].companyName+'"?\n\nOK = use that customer record. Cancel = go back and choose or create a different customer.')) return { ok:false };
+      cust = same[0];
+    } else {
+      if(!window.confirm('"'+typedName+'" is not a saved customer yet. A '+docLabel+' must belong to a customer.\n\nOK = create this customer from the details on the form and link it. Cancel = go back.')) return { ok:false };
+      const created = { companyName:typedName, contactPerson:'', email:'', tel:'', address:'', vatNumber:'', notes:'' };
+      Object.keys(fields).forEach(k=>{ if(map[k]) created[map[k]] = String(fields[k]==null?'':fields[k]).trim(); });
+      const r = await sgrSaveCustomerRecord(created, { isNew:true });
+      if(!r.ok) return { ok:false, message:r.error };
+      return { ok:true, customer:r.customer, created:true };
+    }
+  }
+  const diffs = Object.keys(fields).filter(k=>map[k]).filter(k=>{
+    const cur = map[k]==='tel' ? (cust.tel||cust.phone||'') : (cust[map[k]]||'');
+    return String(fields[k]==null?'':fields[k]).trim() !== String(cur).trim();
+  });
+  if(!diffs.length) return { ok:true, customer:cust };
+  const labels = { client:'name', contact:'contact person', email:'email', tel:'phone', address:'address', vatNum:'VAT number' };
+  if(!window.confirm('Save these changes to the customer record "'+cust.companyName+'"?\n\nChanged: '+diffs.map(k=>labels[k]).join(', ')+'.\nThe customer record is the source of truth — every quote, job, invoice and statement linked to this customer will show the new details.\n\nOK = update the customer. Cancel = go back without saving.')) return { ok:false };
+  const patch = {}; diffs.forEach(k=>{ patch[map[k]] = String(fields[k]==null?'':fields[k]).trim(); });
+  const r = await sgrSaveCustomerRecord({ ...cust, ...patch });
+  if(!r.ok) return { ok:false, message:r.error };
+  return { ok:true, customer:r.customer, updated:true };
+}
+/* Chain of a document, from the loaded arrays (company-scoped helpers). */
+function sgrLocalChain(type, rec, ctx){
+  const quotes = ctx.quotes||[], jobs = ctx.jobs||[], invs = ctx.accInvoices||[];
+  let quote = null; let js = []; const iv = [];
+  if(type==='quote'){ quote = rec; }
+  else if(type==='job'){ js = [rec]; quote = resolveQuoteForJob(rec, quotes); }
+  else { iv.push(rec);
+    const L = findLinkedRecords({ invoice:{ ...rec, jobNum: rec.jobNum || rec.reference || '' } }, { quotes, jobs, accInvoices:invs });
+    if(L.job) js = [L.job]; if(L.quote) quote = L.quote; }
+  if(quote && !js.length) js = resolveJobsForQuote(quote, jobs);
+  if(!quote && js.length===1) quote = resolveQuoteForJob(js[0], quotes);
+  const add = i=>{ if(i && !iv.some(x=>x===i || (x.id===i.id && sameCompany(x,i)))) iv.push(i); };
+  invs.forEach(i=>{
+    if(!i) return;
+    if(js.some(j=>(invoiceBelongsToJob(i, j.num) || i.originalJobNum===j.num) && sameCompany(i, j))) add(i);
+    if(quote && sameCompany(i, quote) && ((i.quoteId!=null && i.quoteId===quote.id) || (i.quoteNum && i.quoteNum===quote.num) || i.originalQuoteNum===quote.num)) add(i);
+  });
+  return { quote, jobs: js, invoices: iv };
+}
+function sgrChainCreditConflicts(chain, customer){
+  const out = [];
+  const name = String(customer.companyName||'').trim();
+  const check = (label, rec, payments, currentName) => {
+    const moves = sgrCustRefOf(rec.customerId)!==String(customer.id) || sgrCustNorm(currentName)!==sgrCustNorm(name);
+    if(!moves) return;
+    const credit = (payments||[]).filter(p=>p && String(p.method||'').trim().toLowerCase().startsWith('credit') && Math.abs(parseFloat(p.amount)||0)>0.004);
+    if(credit.length){ const tot = credit.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
+      out.push(label+' has R'+tot.toFixed(2)+' paid from customer credit ("Credit" payment). Credit is returned to the credit note of the customer named on the document, so moving it would later return that credit to the wrong customer. Delete the Credit payment first (this gives the credit back to its own credit note), change the customer, then apply the new customer\'s credit if needed.'); }
+  };
+  if(chain.quote) check('Quote '+(chain.quote.num||''), chain.quote, chain.quote.payments, chain.quote.client);
+  chain.jobs.forEach(j=>check('Job '+(j.num||''), j, j.payments, j.client));
+  chain.invoices.forEach(i=>check('Invoice '+(i.number||''), i, i.payments, i.contactName));
+  return out;
+}
+/* An open view holds the record it was opened with. After a change made from
+   inside that view (a customer move) lands in state, show the current copy of
+   the same record (same id, same company) rather than the opened snapshot. */
+function sgrLiveDoc(list, rec){
+  if(!rec || rec.id==null || rec.source==='job') return rec;
+  const live = (list||[]).find(x=>x && String(x.id)===String(rec.id) && sameCompany(x, rec));
+  return (live && live!==rec) ? { ...rec, ...live } : rec;
+}
+/* Row versions produced by a customer move this session made: "job:<relId>" ->
+   version. Only ever RAISES an expected version to one the server reported
+   for this session's own move; a real edit by someone else still conflicts. */
+const sgrRelVersionHints = new Map();
+function sgrRelVersionHint(type, rec){
+  const v = rec ? rec._relRowVersion : undefined;
+  if(!rec || rec._relId==null) return v;
+  const h = sgrRelVersionHints.get(type+':'+rec._relId);
+  return (h!=null && (v==null || h>v)) ? h : v;
+}
+function sgrApplyReassignLocally(st, members, cust){
+  const versions = {}; const voids = new Set();
+  members.forEach(m=>{ if(m && m.id!=null && m.rowVersion!=null){ versions[m.type+':'+m.id] = Number(m.rowVersion); sgrRelVersionHints.set(m.type+':'+m.id, Number(m.rowVersion)); if(m.cancelled) voids.add(String(m.id)); } });
+  const ref = String(cust.id);
+  const fq = sgrCustomerFieldsFor('quote', cust), fi = sgrCustomerFieldsFor('invoice', cust);
+  const v = (type, x) => (x && x._relId!=null) ? versions[type+':'+x._relId] : undefined;
+  if(st.setQuotes) st.setQuotes(prev=>prev.map(x=>{ const n=v('quote',x); return n==null ? x : { ...x, ...fq, customerId:ref, _relRowVersion:n }; }));
+  if(st.setJobs) st.setJobs(prev=>prev.map(x=>{ const n=v('job',x); return n==null ? x : { ...x, ...fq, customerId:ref, _relRowVersion:n }; }));
+  if(st.setAccInvoices) st.setAccInvoices(prev=>prev.map(x=>{ const n=v('invoice',x); if(n==null) return x;
+    return voids.has(String(x._relId)) ? { ...x, customerId:ref, _relRowVersion:n } : { ...x, ...fi, customerId:ref, _relRowVersion:n }; }));
+  return versions;
+}
+function sgrRequestReassign(req){
+  return new Promise(resolve=>{
+    const host = sgrReassignHostRef.current;
+    if(!host){ resolve({ ok:false, error:'not ready' }); return; }
+    host({ ...req, resolve });
+  });
+}
+/* Statement / picker label: duplicate names are disambiguated, so a statement
+   can be opened for ONE of two customers that share a name. */
+function sgrCustomerLabel(c, customers){
+  const name = String(c && c.companyName || '').trim();
+  const twins = (customers||[]).filter(x=>x && sgrCustNorm(x.companyName)===sgrCustNorm(name));
+  if(twins.length<2) return name;
+  const extra = c.contactPerson || c.email || c.tel || ('#'+c.id);
+  return name+' ['+extra+']';
+}
+
+function CustomerPickerModal({ customers, currentRef, title, onPick, onClose }){
+  const [q, setQ] = useState('');
+  const [creating, setCreating] = useState(false);
+  const list = (customers||[]).filter(c=>c && (!q.trim() || [c.companyName, c.contactPerson, c.email, c.tel].some(v=>String(v||'').toLowerCase().includes(q.trim().toLowerCase()))))
+    .sort((a,b)=>String(a.companyName||'').localeCompare(String(b.companyName||'')));
+  return (
+    <Modal onClose={onClose}>
+      <ModalHeader title={title||'Choose customer'} onClose={onClose}/>
+      <div className="px-6 py-4 space-y-3" data-testid="customer-picker">
+        <div className="flex gap-2">
+          <input autoFocus value={q} onChange={e=>setQ(e.target.value)} placeholder="Search name, contact, email or phone…" className="flex-1 border border-gray-300 rounded-xl px-3 py-2 text-sm" data-testid="customer-picker-search"/>
+          <button type="button" onClick={()=>setCreating(true)} className="text-xs font-bold px-3 py-2 rounded-xl border border-emerald-300 bg-emerald-50 text-emerald-700" data-testid="customer-picker-new">＋ New customer</button>
+        </div>
+        <div className="max-h-80 overflow-y-auto border border-gray-100 rounded-xl divide-y divide-gray-100">
+          {list.map(c=>{
+            const twin = (customers||[]).filter(x=>x && sgrCustNorm(x.companyName)===sgrCustNorm(c.companyName)).length>1;
+            const cur = currentRef!=null && String(c.id)===String(currentRef);
+            return (
+              <button key={String(c.id)} type="button" disabled={cur} onClick={()=>onPick(c)} data-testid="customer-picker-row" data-customer-id={String(c.id)}
+                className={`w-full text-left px-3 py-2 text-sm ${cur?'bg-gray-50 text-gray-400 cursor-default':'hover:bg-brand-50'}`}>
+                <span className="font-semibold">{c.companyName}</span>
+                {twin&&<span className="ml-2 text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 rounded px-1">same name as another customer</span>}
+                {cur&&<span className="ml-2 text-[10px] font-bold text-gray-500">current</span>}
+                <span className="block text-xs text-gray-500">{[c.contactPerson, c.email, c.tel].filter(Boolean).join(' · ')||'—'}</span>
+              </button>
+            );
+          })}
+          {!list.length&&<p className="px-3 py-6 text-center text-xs text-gray-400">No customer matches. Use “New customer”.</p>}
+        </div>
+      </div>
+      {creating&&<AddEditCustomerModal customer={null} customers={customers} onClose={()=>setCreating(false)}
+        onSave={async c=>{ const r = await sgrSaveCustomerRecord(c, { isNew:true }); if(!r.ok){ alert(r.error); return false; } onPick(r.customer); return true; }}/>}
+    </Modal>
+  );
+}
+
+/* Preview + confirm for "change which customer owns this transaction". */
+function CustomerReassignModal({ req, onFinish }){
+  const st = sgrStoreRef.current || {};
+  const relSections = ['quotes','jobs','accInvoices'];
+  const relCount = relSections.filter(isRelationalAuthoritative).length;
+  const mode = relCount===3 ? 'relational' : relCount===0 ? 'json' : 'mixed';
+  const [preview, setPreview] = useState(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const cust = req.customer;
+  const anchorRel = (()=>{
+    if(mode!=='relational') return null;
+    const r = req.rec || {};
+    if(req.type==='invoice' && r.source==='job'){
+      const j = (st.jobs||[]).find(x=>x && ('job-'+x.id)===String(r.id));
+      return j && j._relId!=null ? { type:'job', id:j._relId } : null;
+    }
+    return r._relId!=null ? { type:req.type, id:r._relId } : null;
+  })();
+  // keepNotice: after a stale refusal the explanation stays on screen while the
+  // current documents are shown again.
+  async function load(keepNotice){
+    if(!keepNotice) setError(''); setPreview(null);
+    if(mode==='mixed'){ setError('Quotes, jobs and invoices are not all on the same storage right now, so the customer cannot be changed safely. Nothing was changed.'); return; }
+    if(mode==='relational'){
+      if(!anchorRel){ setError('This document has not finished saving to the server yet. Refresh and try again.'); return; }
+      try {
+        const r = await relationalFetch('/customer-links/preview?anchorType='+anchorRel.type+'&anchorId='+encodeURIComponent(anchorRel.id)+'&customerRef='+encodeURIComponent(String(cust.id)));
+        const p = r.preview;
+        setPreview({ members: p.members.map(m=>({ key:m.type+':'+m.id, label:(m.type==='quote'?'Quote':m.type==='job'?'Job':'Invoice')+' '+(m.number||m.id), cancelled:m.cancelled, from:m.customerName||'—' })),
+          conflicts: p.conflicts.map(c=>c.message), expected: Object.fromEntries(p.members.map(m=>[m.type+':'+m.id, m.rowVersion])), currentNames:p.currentNames });
+      } catch(e){ setError(describeSaveConflictError(e, 'customer change')); }
+      return;
+    }
+    const chain = sgrLocalChain(req.type, req.rec, { quotes:st.quotes, jobs:st.jobs, accInvoices:st.accInvoices });
+    const members = [];
+    if(chain.quote) members.push({ key:'q'+chain.quote.id, label:'Quote '+(chain.quote.num||''), from:chain.quote.client||'—' });
+    chain.jobs.forEach(j=>members.push({ key:'j'+j.id, label:'Job '+(j.num||''), from:j.client||'—' }));
+    chain.invoices.forEach(i=>members.push({ key:'i'+i.id, label:'Invoice '+(i.number||''), cancelled:i.status==='void', from:i.contactName||'—' }));
+    setPreview({ members, conflicts: sgrChainCreditConflicts(chain, cust), chain });
+  }
+  useEffect(()=>{ load(); /* eslint-disable-next-line */ },[]);
+  async function confirm(){
+    if(!preview || busy) return;
+    setBusy(true); setError('');
+    try {
+      if(mode==='relational'){
+        const resp = await relationalFetch('/customer-links/reassign', { method:'POST', body: JSON.stringify({ anchorType:anchorRel.type, anchorId:anchorRel.id, customerRef:String(cust.id), expectedVersions:preview.expected }) });
+        // Mirror the committed change locally (customer + new row versions), so
+        // an editor that is still open — e.g. the form that asked for this
+        // move — saves against the versions this move produced instead of
+        // reporting its own move as "changed elsewhere". The authoritative
+        // re-read still follows (relationalFetch schedules it).
+        const versions = sgrApplyReassignLocally(st, (resp && resp.result && resp.result.members) || [], cust);
+        onFinish({ ok:true, versions });
+        return;
+      }
+      // platform_state sections: one confirmed autosave.
+      const ch = preview.chain; const ref = String(cust.id);
+      const fq = sgrCustomerFieldsFor('quote', cust), fi = sgrCustomerFieldsFor('invoice', cust);
+      const qIds = new Set(ch.quote ? [ch.quote.id] : []); const jIds = new Set(ch.jobs.map(j=>j.id));
+      const iIds = new Map(ch.invoices.map(i=>[String(i.id), i.status==='void']));
+      const wait = sgrAwaitAutosave(25000);
+      if(qIds.size) st.setQuotes(prev=>prev.map(x=>x && qIds.has(x.id) && (!ch.quote || sameCompany(x, ch.quote)) ? { ...x, ...fq, customerId:ref } : x));
+      if(jIds.size) st.setJobs(prev=>prev.map(x=>x && jIds.has(x.id) ? { ...x, ...fq, customerId:ref } : x));
+      if(iIds.size) st.setAccInvoices(prev=>prev.map(x=>{ if(!x || !iIds.has(String(x.id))) return x; return iIds.get(String(x.id)) ? { ...x, customerId:ref } : { ...x, ...fi, customerId:ref }; }));
+      const r = await wait;
+      if(!r || !r.ok){ setError(r && r.timeout ? 'The server has not confirmed the change yet — check the save status at the top before continuing.' : ('The server did not accept the change: '+((r&&r.error)||'unknown error'))); setBusy(false); return; }
+      onFinish({ ok:true });
+    } catch(e){
+      setError(describeSaveConflictError(e, 'customer change')+((e && e.status===409 && e.body && e.body.type==='stale_record') ? ' Showing the current documents again.' : ''));
+      setBusy(false);
+      if(e && e.status===409 && e.body && e.body.type==='stale_record') load(true);
+    }
+  }
+  const blocked = !preview || preview.conflicts.length>0;
+  return (
+    <Modal onClose={()=>!busy && onFinish({ ok:false, cancelled:true })}>
+      <ModalHeader title="🔁 Change customer" onClose={()=>!busy && onFinish({ ok:false, cancelled:true })}/>
+      <div className="px-6 py-4 space-y-3 text-sm" data-testid="reassign-modal">
+        <p>Move this transaction to <strong data-testid="reassign-target">{cust.companyName}</strong>{cust.contactPerson?' ('+cust.contactPerson+')':''}.</p>
+        <p className="text-xs text-gray-500">Every linked document below moves together. Lines, prices, totals, numbers, dates and payments are not changed; the payments move with their documents to the new customer's statement. Both customer records keep their own details. Cancelled invoices keep the details they were issued with and are linked to the new customer.</p>
+        {!preview&&!error&&<p className="text-xs text-gray-400">Checking the linked documents…</p>}
+        {preview&&(
+          <ul className="border border-gray-200 rounded-xl divide-y divide-gray-100" data-testid="reassign-members">
+            {preview.members.map(m=><li key={m.key} className="px-3 py-1.5 flex justify-between gap-3" data-testid="reassign-member"><span className="font-semibold">{m.label}{m.cancelled?' (cancelled)':''}</span><span className="text-xs text-gray-500">now: {m.from}</span></li>)}
+          </ul>
+        )}
+        {preview&&preview.conflicts.length>0&&(
+          <div className="bg-red-50 border border-red-200 rounded-xl px-3 py-2 text-xs text-red-800 space-y-1" data-testid="reassign-conflicts">
+            <p className="font-bold">The customer cannot be changed yet:</p>
+            {preview.conflicts.map((c,i)=><p key={i}>{c}</p>)}
+            <p>Your other edits are kept — close this box, resolve the item above, and try again.</p>
+          </div>
+        )}
+        {error&&<p className="bg-red-50 border border-red-200 rounded-xl px-3 py-2 text-xs text-red-800" data-testid="reassign-error">{error}</p>}
+        <div className="flex gap-2 pt-1">
+          <button type="button" disabled={busy} onClick={()=>onFinish({ ok:false, cancelled:true })} className="flex-1 border border-gray-200 rounded-xl py-2 text-sm font-semibold text-gray-600">Cancel</button>
+          <button type="button" disabled={blocked||busy} onClick={confirm} data-testid="reassign-confirm"
+            className="flex-1 rounded-xl py-2 text-sm font-bold text-white disabled:opacity-40" style={{background:'#06065c'}}>{busy?'Moving…':'Confirm — move '+(preview?preview.members.length:'')+' document'+(preview&&preview.members.length===1?'':'s')}</button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* The "Customer" box on a quote / job / invoice screen. */
+function CustomerLinkPanel({ type, doc, ctx }){
+  const [mode, setMode] = useState(null);
+  const [msg, setMsg] = useState('');
+  const customers = (ctx && ctx.customers) || [];
+  const link = sgrDocCustomerLink(type, doc, ctx);
+  const readOnly = sgrSessionIsReadOnly();
+  const c = link.customer;
+  const legacy = (!link.linked) ? (()=>{
+    const nm = type==='invoice' ? doc.contactName : doc.client;
+    const m = sgrMatchInvoiceCustomer(nm, customers);
+    return m;
+  })() : null;
+  const status = link.state==='matched' ? (link.inherited ? 'Linked through the '+link.via : 'Linked customer')
+    : link.state==='missing' ? 'Linked customer record not found'
+    : link.state==='duplicate-id' ? 'Linked id is shared by '+link.count+' customers'
+    : link.state==='conflict' ? 'Linked documents name different customers'
+    : 'Not linked to a customer';
+  async function reassign(cust){
+    setMode(null);
+    const r = await sgrRequestReassign({ type, rec:doc, customer:cust });
+    if(r && r.ok) setMsg('✓ Now belongs to '+cust.companyName);
+  }
+  return (
+    <div className="bg-white border border-gray-200 rounded-xl px-4 py-3 text-sm" data-testid="customer-link-panel">
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div className="min-w-0">
+          <p className="text-[10px] font-black uppercase tracking-widest text-gray-400">Customer · <span className={link.state==='matched'?'text-emerald-600':'text-amber-600'} data-testid="customer-link-status">{status}</span></p>
+          {c ? (
+            <>
+              <p className="font-bold text-gray-800" data-testid="customer-link-name">{c.companyName}</p>
+              <p className="text-xs text-gray-500" data-testid="customer-link-details">{[c.contactPerson, c.email, c.tel||c.phone, c.address, c.vatNumber?('VAT '+c.vatNumber):''].filter(Boolean).join(' · ')||'No contact details on the customer record'}</p>
+            </>
+          ) : (
+            <p className="text-xs text-gray-500">Stored on the document: <strong>{(type==='invoice'?doc.contactName:doc.client)||'—'}</strong>
+              {legacy&&legacy.state==='ambiguous'&&<span className="block text-amber-700" data-testid="customer-link-ambiguous">{legacy.count} customer records share this name — choose the right one.</span>}
+              {legacy&&legacy.state==='matched'&&<span className="block">Matches the saved customer “{legacy.customer.companyName}” by name — confirm by linking it.</span>}
+            </p>
+          )}
+          {msg&&<p className="text-xs font-semibold text-emerald-700 mt-1" data-testid="customer-link-msg">{msg}</p>}
+        </div>
+        {!readOnly&&(
+          <div className="flex gap-2 flex-wrap">
+            {c&&<button type="button" onClick={()=>{ setMsg(''); setMode('edit'); }} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50" data-testid="customer-link-edit">✏️ Edit customer details</button>}
+            {legacy&&legacy.state==='matched'&&<button type="button" onClick={()=>reassign(legacy.customer)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-emerald-300 bg-emerald-50 text-emerald-700" data-testid="customer-link-confirm-match">🔗 Link to {legacy.customer.companyName}</button>}
+            <button type="button" onClick={()=>{ setMsg(''); setMode('pick'); }} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50" data-testid="customer-link-change">{link.linked?'🔁 Change customer…':'🔗 Choose customer…'}</button>
+          </div>
+        )}
+      </div>
+      {mode==='edit'&&c&&<AddEditCustomerModal customer={c} customers={customers} onClose={()=>setMode(null)}
+        onSave={async next=>{ const r = await sgrSaveCustomerRecord(next); if(!r.ok){ alert(r.error); return false; } setMsg('✓ Customer record updated — every linked document now shows it'); return true; }}/>}
+      {mode==='pick'&&<CustomerPickerModal customers={customers} currentRef={link.linked?link.ref:null} title={link.linked?'Move this transaction to another customer':'Choose the customer for this transaction'} onClose={()=>setMode(null)} onPick={reassign}/>}
+    </div>
+  );
+}
+
+/* Customers page: transactions that are not linked to a customer record (or
+   whose link is broken) — listed for an explicit choice, one row per chain.
+   A unique name match is shown as a suggestion only; nothing is linked until
+   the user confirms it. */
+function UnlinkedDocumentsPanel({ quotes, jobs, accInvoices, customers }){
+  const [open, setOpen] = useState(false);
+  const [pick, setPick] = useState(null);
+  const [msg, setMsg] = useState('');
+  const ctx = { quotes:quotes||[], jobs:jobs||[], accInvoices:accInvoices||[], customers:customers||[] };
+  const rows = [];
+  const add = (type, rec, label, name) => {
+    const link = sgrDocCustomerLink(type, rec, ctx);
+    if(link.linked && link.state==='matched') return;
+    const why = !link.linked ? 'not linked' : link.state==='missing' ? 'linked customer no longer exists' : link.state==='duplicate-id' ? 'linked id is shared by '+link.count+' customers' : 'linked documents disagree';
+    const sug = !link.linked ? sgrMatchInvoiceCustomer(name, ctx.customers) : null;
+    rows.push({ type, rec, label, name, why, sug });
+  };
+  ctx.quotes.forEach(q=>{ if(q) add('quote', q, 'Quote '+(q.num||''), q.client); });
+  ctx.jobs.forEach(j=>{ if(j && !resolveQuoteForJob(j, ctx.quotes)) add('job', j, 'Job '+(j.num||''), j.client); });
+  ctx.accInvoices.forEach(i=>{
+    if(!i) return;
+    const L = findLinkedRecords({ invoice:{ ...i, jobNum:i.jobNum||i.reference||'' } }, ctx);
+    if(L.job || L.quote) return;
+    add('invoice', i, 'Invoice '+(i.number||'')+(i.status==='void'?' (cancelled)':''), i.contactName);
+  });
+  if(!rows.length) return null;
+  async function link(row, cust){
+    setPick(null);
+    const r = await sgrRequestReassign({ type:row.type, rec:row.rec, customer:cust });
+    if(r && r.ok) setMsg('✓ '+row.label+' now belongs to '+cust.companyName);
+  }
+  return (
+    <div className="bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 text-sm" data-testid="unlinked-panel">
+      <button type="button" onClick={()=>setOpen(o=>!o)} className="w-full flex items-center justify-between gap-2 text-left">
+        <span className="font-bold text-amber-800" data-testid="unlinked-count">🔗 {rows.length} transaction{rows.length===1?'':'s'} not linked to a customer record</span>
+        <span className="text-xs text-amber-700">{open?'Hide':'Review'}</span>
+      </button>
+      {msg&&<p className="text-xs font-semibold text-emerald-700 mt-1" data-testid="unlinked-msg">{msg}</p>}
+      {open&&(
+        <div className="mt-2 divide-y divide-amber-100">
+          <p className="text-xs text-amber-800 pb-2">Each transaction must belong to one customer. Choose it explicitly — a matching name is only a suggestion, and two customers with the same name are never chosen between automatically.</p>
+          {rows.map((r,i)=>(
+            <div key={r.type+':'+i} className="py-2 flex items-center justify-between gap-2 flex-wrap" data-testid="unlinked-row">
+              <div className="min-w-0">
+                <p className="font-semibold text-gray-800">{r.label} <span className="font-normal text-gray-500">— {r.name||'no name'}</span></p>
+                <p className="text-xs text-amber-700">{r.why}{r.sug&&r.sug.state==='ambiguous'?' · '+r.sug.count+' customers share this name':''}</p>
+              </div>
+              <div className="flex gap-2">
+                {r.sug&&r.sug.state==='matched'&&<button type="button" onClick={()=>link(r, r.sug.customer)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-emerald-300 bg-emerald-50 text-emerald-700" data-testid="unlinked-suggest">Link to {r.sug.customer.companyName}</button>}
+                <button type="button" onClick={()=>setPick(r)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 bg-white" data-testid="unlinked-choose">Choose customer…</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {pick&&<CustomerPickerModal customers={customers} currentRef={null} title={'Customer for '+pick.label} onClose={()=>setPick(null)} onPick={c=>link(pick, c)}/>}
+    </div>
+  );
+}
+
 function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
   // 2026-10-15: customer block = current linked Customer; money = untouched.
   job = sgrInvoiceWithCurrentCustomer(job, customers);
@@ -8101,6 +8675,7 @@ function sgrInvoiceRecordToPrintable(inv, ctx){
     // 2026-11-24: the record's own customer resolution (see
     // sgrInvoiceRecordCustomer) - consumed by sgrInvoiceWithCurrentCustomer.
     _sgrCustomer: _recCust.customer || null,
+    _sgrCustomerLinked: !!_recCust.linked,
     _sgrCustomerRetained: _recCust.state==='retained',
     notes: (src && src.notes) || '',
     lines: lines,
@@ -9508,7 +10083,10 @@ function NumInput({ value, onChange, placeholder, disabled, small }) {
    ADD JOB MODAL
 ═══════════════════════════════════════════ */
 function AddJobModal({ companies, onClose, onAdd }) {
-  const [client,setClient]=useState(''); const [desc,setDesc]=useState('');
+  // 2026-11-24: a job belongs to an existing customer (choose or create one).
+  const [cust,setCust]=useState(null); const [pickCust,setPickCust]=useState(false);
+  const client = cust ? String(cust.companyName||'') : '';
+  const [desc,setDesc]=useState('');
   // Default to the first company this user is allowed to create under
   // (companies is already scoped by creatableCompanies() at the call site —
   // Holdings users only ever see Holdings here, original users never see
@@ -9526,7 +10104,9 @@ function AddJobModal({ companies, onClose, onAdd }) {
   const [saveErr,setSaveErr]=useState('');
   async function submit(e) {
     e.preventDefault();
+    if (!cust) { setSaveErr('Choose the customer for this job first.'); return; }
     if (!client.trim() || saving) return;
+    const _cf = sgrCustomerFieldsFor('job', cust);
     setSaving(true); setSaveErr('');
     // ── POST-MIGRATION STABILIZATION (2026-08-24) — FRONTEND AUDIT (BUG 8) ──
     // This modal had no relational branch, so with "jobs" cut over a manually
@@ -9540,13 +10120,15 @@ function AddJobModal({ companies, onClose, onAdd }) {
       try {
         const result = await relationalApi.createJob({
           companyCode: String(parseInt(co)),
+          customerRef: String(cust.id),
           customerNameRaw: client.trim(),
+          contactPerson: _cf.contact||null, email: _cf.email||null, phone: _cf.tel||null, address: _cf.address||null, vatNumber: _cf.vatNum||null,
           description: desc.trim(),
           status, stage: STATUS_TO_STAGE[status] || 0,
           value: parseFloat(value) || 0,
           notes: notes.trim(),
         });
-        onAdd({ id: sgrRelRecordId(result.id), num: result.jobNumber, client: client.trim(), desc: desc.trim(), createdAt: new Date().toISOString(),
+        onAdd({ id: sgrRelRecordId(result.id), num: result.jobNumber, ..._cf, customerId: String(cust.id), client: client.trim(), desc: desc.trim(), createdAt: new Date().toISOString(),
                 status, co: parseInt(co), value: parseFloat(value)||0,
                 stage: STATUS_TO_STAGE[status]||0, breakdown: null, notes: notes.trim(),
                 payments: [], _relId: result.id, _relRowVersion: result.rowVersion });
@@ -9562,7 +10144,7 @@ function AddJobModal({ companies, onClose, onAdd }) {
       setSaveErr('A job number could not be reserved. The job was not created. Please check your connection and try again.');
       return;
     }
-    onAdd({ id:Date.now(), num:jobNum, client:client.trim(), desc:desc.trim(), status, co:parseInt(co),
+    onAdd({ id:Date.now(), num:jobNum, ..._cf, customerId:String(cust.id), client:client.trim(), desc:desc.trim(), status, co:parseInt(co),
              value:parseFloat(value)||0, stage:STATUS_TO_STAGE[status]||0, breakdown:null, notes:notes.trim() });
     onClose();
   }
@@ -9582,7 +10164,13 @@ function AddJobModal({ companies, onClose, onAdd }) {
             </select>
           </div>
         </div>
-        <div><label className="block text-xs font-semibold text-gray-500 mb-1.5">Client Name *</label><input value={client} onChange={e=>setClient(e.target.value)} required className={inputCls} placeholder="e.g. Woolworths George"/></div>
+        <div><label className="block text-xs font-semibold text-gray-500 mb-1.5">Customer *</label>
+          <div className="flex items-center gap-2">
+            <div className={inputCls+' flex-1 '+(cust?'':'text-gray-400')} data-testid="add-job-customer">{cust ? cust.companyName+(cust.contactPerson?' · '+cust.contactPerson:'') : 'No customer chosen'}</div>
+            <button type="button" onClick={()=>setPickCust(true)} className="text-xs font-bold px-3 py-2.5 rounded-xl border border-gray-200 whitespace-nowrap" data-testid="add-job-choose-customer">{cust?'Change…':'Choose…'}</button>
+          </div>
+          {pickCust&&<CustomerPickerModal customers={(sgrStoreRef.current||{}).customers||[]} currentRef={cust?cust.id:null} title="Customer for this job" onClose={()=>setPickCust(false)} onPick={c=>{ setCust(c); setPickCust(false); }}/>}
+        </div>
         <div><label className="block text-xs font-semibold text-gray-500 mb-1.5">Job Description</label><textarea value={desc} onChange={e=>setDesc(e.target.value)} rows={2} className={inputCls+' resize-none'} placeholder="Brief description of the work"/></div>
         <div><label className="block text-xs font-semibold text-gray-500 mb-1.5">Stage / Status</label>
           <select value={status} onChange={e=>setStatus(e.target.value)} className={inputCls}>
@@ -9828,9 +10416,12 @@ function AddEditCustomerModal({ customer, onClose, onSave, customers=[] }) {
       return;
     }
     setSaving(true);
-    onSave({ ...(customer||{}), id:customer?.id||Date.now(),
-      companyName:companyName.trim(), contactPerson, vatNumber, address, email, tel, notes });
-    onClose();
+    // 2026-11-24: onSave may be async and resolve false (the server did not
+    // accept the save) — the dialog then stays open with what was typed.
+    Promise.resolve(onSave({ ...(customer||{}), id:customer?.id||Date.now(),
+      companyName:companyName.trim(), contactPerson, vatNumber, address, email, tel, notes }))
+      .then(ok=>{ if(ok===false){ setSaving(false); return; } onClose(); })
+      .catch(err=>{ setSaving(false); alert((err && err.message) || 'The customer was not saved.'); });
   }
   return (
     <Modal onClose={onClose}>
@@ -10173,44 +10764,13 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
   // that demonstrates the architecture, not as a live production path. The
   // else branch is the original, unchanged JSON behaviour.
   async function handleSave(c) {
-    if (isRelationalAuthoritative('customers')) {
-      try {
-        const isNew = !customers.find(x=>x.id===c.id);
-        const patch = {
-          companyName: c.companyName, contactPerson: c.contactPerson,
-          email: c.email, phone: c.tel, address: c.address,
-          vatNumber: c.vatNumber, notes: c.notes,
-        };
-        if (isNew) {
-          const result = await relationalApi.createCustomer(patch);
-          // BUGFIX (Stage 3 follow-on): a freshly-created customer's source_id
-          // is set to its own new PK, so id === _relId here — but _relId must
-          // still be set explicitly, since every subsequent edit path (see the
-          // BUGFIX comment below) reads existing._relId, never existing.id.
-          // Without this, editing a customer immediately after creating it
-          // would call updateCustomer(undefined, ...) and fail.
-          setCustomers(prev => [{ ...c, id: result.id, _relId: result.id, _relRowVersion: result.rowVersion }, ...prev]);
-        } else {
-          const existing = customers.find(x=>x.id===c.id);
-          // BUGFIX (Stage 3): the relational PK is existing._relId, NOT
-          // c.id/existing.id — those are the RESTORED legacy JSON id
-          // (backend/src/relational/read.ts's restoreId(source_id)), which
-          // only happens to equal the relational PK for a customer created
-          // AFTER cutover via relationalApi.createCustomer (whose source_id
-          // is set to its own new PK). For any customer BACKFILLED from
-          // historical JSON, source_id is the ORIGINAL legacy id — a
-          // completely different number from the relational PK — so
-          // passing c.id here would update (or 404 against, or worse,
-          // silently corrupt) the wrong row entirely.
-          const result = await relationalApi.updateCustomer(existing && existing._relId, existing && existing._relRowVersion, patch);
-          setCustomers(prev => prev.map(x=>x.id===c.id ? { ...c, _relRowVersion: result.rowVersion } : x));
-        }
-      } catch (e) {
-        alert('Save failed — ' + e.message);
-      }
-      return;
-    }
-    setCustomers(prev => prev.find(x=>x.id===c.id) ? prev.map(x=>x.id===c.id?c:x) : [c,...prev]);
+    // 2026-11-24: ONE authoritative customer save for every entry point
+    // (sgrSaveCustomerRecord: relational when customers are cut over, else the
+    // platform_state autosave) — success only once the server confirmed it.
+    const isNew = !customers.find(x=>String(x.id)===String(c.id));
+    const r = await sgrSaveCustomerRecord(c, { isNew });
+    if(!r.ok){ alert('The customer was not saved — '+r.error); return false; }
+    return true;
   }
   function handleBulkImport(newCustomers) {
     // 2026-11-23: resolves with the result of the autosave that carries these
@@ -10227,16 +10787,26 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
     const cn = _norm(c.companyName); const cp = _norm(c.contactPerson);
     return (cn && (n===cn || n.includes(cn) || cn.includes(n))) || (cp && n===cp);
   }
-  function quotesFor(c){ return myQuotes.filter(q=>nameMatches(q.client,c)); }
-  function jobsFor(c){ return myJobs.filter(j=>nameMatches(j.client,c)); }
+  // 2026-11-24: a linked document belongs to its linked customer only; the
+  // name rule is kept for unlinked legacy documents.
+  const _custCtx = { quotes: myQuotes, jobs: myJobs, accInvoices: myAccInvoices, customers };
+  const _belongs = (type, d, nm, c) => {
+    const l = sgrDocCustomerLink(type, d, _custCtx);
+    if(l.linked) return l.customer===c;
+    // unlinked legacy document: never listed under two customers that share its exact name
+    if(sgrMatchInvoiceCustomer(nm, customers).state==='ambiguous') return false;
+    return nameMatches(nm, c);
+  };
+  function quotesFor(c){ return myQuotes.filter(q=>_belongs('quote', q, q.client, c)); }
+  function jobsFor(c){ return myJobs.filter(j=>_belongs('job', j, j.client, c)); }
   function invoicesFor(c){
     // Same dedup rule as Sales/Accounting (getManualInvoiceJobRefs): a job
     // whose invoice has already been superseded by a manual invoice
     // referencing it must not also show here as a second invoice.
     const _manualJobRefs = getManualInvoiceJobRefs(myAccInvoices, myJobs);
-    const jobInv = myJobs.filter(j=>j.invoiceNum && !_manualJobRefs.has(j.num) && nameMatches(j.client,c))
+    const jobInv = myJobs.filter(j=>j.invoiceNum && !_manualJobRefs.has(j.num) && _belongs('job', j, j.client, c))
       .map(j=>({id:j.id, num:j.invoiceNum, date:j.invoiceDate, status:j.invoiceStatus||'pending', manual:false}));
-    const manualInv = myAccInvoices.filter(i=>i.status!=='void' && nameMatches(i.contactName,c))
+    const manualInv = myAccInvoices.filter(i=>i.status!=='void' && _belongs('invoice', i, i.contactName, c))
       .map(i=>({id:i.id, num:i.number, date:i.date, status:i.status||'pending', manual:true}));
     return [...jobInv,...manualInv].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
   }
@@ -10342,7 +10912,7 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
                     to this customer. Uses the existing statement builder
                     unchanged; this only pre-fills the contact field. */}
                 {onOpenStatement&&(
-                  <button type="button" onClick={()=>{ setOpen(false); onOpenStatement(c.companyName); }}
+                  <button type="button" onClick={()=>{ setOpen(false); onOpenStatement(sgrCustomerLabel(c, customers)); }}
                     className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-brand-50 bg-gray-50 border-t border-gray-100">
                     <span className="text-xs font-bold text-gray-700">📄 View Statement</span>
                   </button>
@@ -10393,6 +10963,8 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
       <input value={search} onChange={e=>setSearch(e.target.value)}
         placeholder="Search by company, contact or email…"
         className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm bg-white focus:ring-2 focus:ring-brand-400 focus:border-brand-400"/>
+
+      <UnlinkedDocumentsPanel quotes={myQuotes} jobs={myJobs} accInvoices={myAccInvoices} customers={customers}/>
 
       {filtered.length===0?(
         <div className="bg-white rounded-2xl border border-gray-200 p-12 text-center">
@@ -10629,7 +11201,14 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   })();
 
   const id = initialData; // copy-source (no existingQuote when copying)
-  const [client,setClient]=useState(_draft?.client??eq?.client??id?.client??''); const [contact,setContact]=useState(_draft?.contact??eq?.contact??id?.contact??'');
+  const [client,setClient]=useState(_draft?.client??eq?.client??id?.client??'');
+  // 2026-11-24: the quote's customer link (the customer record's id).
+  const [customerId,setCustomerId]=useState(()=>{
+    const own = sgrCustRefOf(_draft?.customerId) || sgrCustRefOf(eq?.customerId) || sgrCustRefOf(id?.customerId);
+    if(own) return own;
+    if(eq){ const _st = sgrStoreRef.current||{}; const _l = sgrDocCustomerLink('quote', eq, { quotes:_st.quotes, jobs:_st.jobs, customers }); if(_l.linked && _l.ref) return _l.ref; }
+    return null;
+  }); const [contact,setContact]=useState(_draft?.contact??eq?.contact??id?.contact??'');
   const [email,setEmail]=useState(_draft?.email??eq?.email??id?.email??''); const [tel,setTel]=useState(_draft?.tel??eq?.tel??id?.tel??'');
   const [address,setAddress]=useState(_draft?.address??eq?.address??id?.address??''); const [vatNum,setVatNum]=useState(_draft?.vatNum??eq?.vatNum??id?.vatNum??'');
   // Default new quotes to the first company this user is allowed to create
@@ -10708,40 +11287,33 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   useEffect(()=>{
     const t = setTimeout(()=>{
       try {
-        const draft = { client, contact, email, tel, address, vatNum, co, date, valid, notes, salesperson, discount, setupFee, depositPct: depositPctValue, lines, poRef, reference, _draftAt: new Date().toISOString() };
+        const draft = { client, customerId, contact, email, tel, address, vatNum, co, date, valid, notes, salesperson, discount, setupFee, depositPct: depositPctValue, lines, poRef, reference, _draftAt: new Date().toISOString() };
         localStorage.setItem(_draftKey, JSON.stringify(draft));
       } catch(e){}
     }, 1200);
     return ()=>clearTimeout(t);
-  }, [lines, client, contact, email, tel, address, vatNum, co, date, valid, notes, salesperson, discount, setupFee, depositPctValue, poRef, reference]);
+  }, [lines, client, customerId, contact, email, tel, address, vatNum, co, date, valid, notes, salesperson, discount, setupFee, depositPctValue, poRef, reference]);
 
   const [saveAsCustomerMsg, setSaveAsCustomerMsg] = useState('');
-  function saveAsNewCustomer() {
+  // 2026-11-24: creates the customer through the authoritative save and LINKS
+  // this quote to it; an exact existing name links to that customer instead
+  // (two customers with that name: the user chooses one from the list).
+  async function saveAsNewCustomer() {
     if (!client.trim()) { setSaveAsCustomerMsg('⚠ Enter a company name first.'); setTimeout(()=>setSaveAsCustomerMsg(''),3000); return; }
-    const exists = customers.find(c=>c.companyName.trim().toLowerCase()===client.trim().toLowerCase());
-    if (exists) {
-      // Already a saved customer — still let a VAT number typed on this quote
-      // stick to that existing customer record (2026-08-07), instead of just
-      // reporting "already saved" and discarding it.
-      const vt = vatNum.trim();
-      if (vt && (exists.vatNumber||'').trim() !== vt) {
-        setCustomers(prev=>prev.map(c=>c.id===exists.id?{...c,vatNumber:vt}:c));
-        setSaveAsCustomerMsg('✓ VAT number updated on existing customer!');
-      } else {
-        setSaveAsCustomerMsg('ℹ Already saved as a customer.');
-      }
-      setTimeout(()=>setSaveAsCustomerMsg(''),3000);
-      return;
-    }
-    const nc = { id: Date.now()+Math.random(), companyName: client.trim(), contactPerson: contact.trim(), email: email.trim(), tel: tel.trim(), address: address.trim(), vatNumber: vatNum.trim() };
-    setCustomers(prev=>[...prev, nc]);
-    setSaveAsCustomerMsg('✓ Saved as new customer!');
+    const same = customers.filter(c=>sgrCustNorm(c.companyName)===sgrCustNorm(client));
+    if (same.length>1) { setSaveAsCustomerMsg('⚠ '+same.length+' customers have this name — choose one from “Load saved customer”.'); setTimeout(()=>setSaveAsCustomerMsg(''),5000); return; }
+    if (same.length===1) { loadCustomer(same[0].id); setSaveAsCustomerMsg('ℹ Linked to the existing customer.'); setTimeout(()=>setSaveAsCustomerMsg(''),3000); return; }
+    const r = await sgrSaveCustomerRecord({ companyName: client.trim(), contactPerson: contact.trim(), email: email.trim(), tel: tel.trim(), address: address.trim(), vatNumber: vatNum.trim(), notes:'' }, { isNew:true });
+    if (!r.ok) { setSaveAsCustomerMsg('⚠ '+r.error); setTimeout(()=>setSaveAsCustomerMsg(''),6000); return; }
+    setCustomerId(String(r.customer.id));
+    setSaveAsCustomerMsg('✓ Saved as new customer and linked!');
     setTimeout(()=>setSaveAsCustomerMsg(''),3000);
   }
   function loadCustomer(id) {
     // IDs can be integers or floats (Date.now()+Math.random()), so compare as strings
     const c = customers.find(x=>String(x.id)===String(id));
     if (!c) return;
+    setCustomerId(String(c.id));
     setClient(c.companyName||'');
     setContact(c.contactPerson||'');
     setEmail(c.email||'');
@@ -10919,9 +11491,32 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       }
     }
 
+    // ── 2026-11-24: CUSTOMER — must exist, is the source of truth ──────────
+    // Details typed here are saved to the customer RECORD (confirmed first);
+    // a different customer than the saved quote's moves the whole chain
+    // (preview + confirm). Either step cancelled or failed => nothing saved.
+    setSaving(true);
+    const _custStep = await sgrFormCustomerStep({ customerId, fields:{ client, contact, email, tel, address, vatNum }, docLabel:'quote' });
+    if(!_custStep.ok){ setSaving(false); if(_custStep.message) setSaveErr(_custStep.message); return; }
+    const _cust = _custStep.customer;
+    let _ownMoveVersion = null, _movedTo = false;
+    setCustomerId(String(_cust.id));
+    if(isEdit){
+      const _st = sgrStoreRef.current||{};
+      const _orig = sgrDocCustomerLink('quote', eq, { quotes:_st.quotes, jobs:_st.jobs, accInvoices:_st.accInvoices, customers:_st.customers });
+      if(!(_orig.linked && _orig.ref===String(_cust.id))){
+        const _rr = await sgrRequestReassign({ type:'quote', rec:eq, customer:_cust });
+        if(!_rr.ok){ setSaving(false); setSaveErr(_rr.cancelled ? 'The customer change was cancelled — nothing was saved. Your edits are still here.' : 'The customer was not changed — nothing was saved. Your edits are still here.'); return; }
+        _movedTo = true;
+        if(_rr.versions && eq._relId!=null && _rr.versions['quote:'+eq._relId]!=null) _ownMoveVersion = _rr.versions['quote:'+eq._relId];
+      }
+    }
+    setSaving(false);
+    const _cf = sgrCustomerFieldsFor('quote', _cust);
+
     // ── Fields this form intentionally edits ───────────────────────────────
     const formFields = {
-      client:client.trim(), contact, email, tel, address, vatNum,
+      ..._cf, customerId:String(_cust.id),
       co:parseInt(co), date, validUntil:valid, notes,
       lines, preparedBy, salesperson, discount, setupFee,
       // OPTIONAL custom deposit percentage — null means "standard"
@@ -10943,6 +11538,9 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
       // never clobbers a valid existing value.
       payload = {...eq};
       Object.keys(formFields).forEach(k=>{ if(formFields[k]!==undefined) payload[k]=formFields[k]; });
+      // The customer move above (if any) bumped this quote's row version.
+      if(_ownMoveVersion!=null) payload._relRowVersion = _ownMoveVersion;
+      if(_movedTo) payload._customerMove = { fields:_cf, customerId:String(_cust.id) };
       // These are never changed by editing the quote — reassert explicitly.
       payload.id = eq.id;
       payload.num = eq.num;
@@ -11009,9 +11607,9 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
           // a column since migration 008 but was dropped on create, so units
           // were lost until the first edit.
           const result = await relationalApi.createQuote({
-            companyCode: quoteCo, customerNameRaw: client.trim(),
-            contactPerson: contact||null, email: email||null, phone: tel||null,
-            address: address||null, vatNumber: vatNum||null,
+            companyCode: quoteCo, customerRef: String(_cust.id), customerNameRaw: _cf.client,
+            contactPerson: _cf.contact||null, email: _cf.email||null, phone: _cf.tel||null,
+            address: _cf.address||null, vatNumber: _cf.vatNum||null,
             salesperson: salesperson||null, preparedBy: preparedBy||null,
             poRef: poRef||null, reference: reference||null,
             quoteDate: date||null, validUntil: valid||null,
@@ -11088,19 +11686,9 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
     // edited quote's own id). Only now are the chosen files uploaded, against
     // that id. A failure is shown, and retried, in Email to Customer.
     if(pendingValid.length) sgrQuoteUploadQueue.enqueue(payload.id, pendingValid.map(p=>({ file:p.file, mime:p.mime })));
-    // ── Sync VAT number back to the matching saved customer (2026-08-07) ──
-    // If this quote's client already exists under Customers and the VAT
-    // number entered here is new or different from what's on file, update
-    // that customer record so the VAT sticks for future quotes/invoices.
-    // Only ever touches vatNumber — never creates a new customer here.
-    const _vatToSync = vatNum.trim();
-    if (_vatToSync && client.trim()) {
-      setCustomers(prev => {
-        const match = prev.find(c => (c.companyName||'').trim().toLowerCase() === client.trim().toLowerCase());
-        if (!match || (match.vatNumber||'').trim() === _vatToSync) return prev;
-        return prev.map(c => c.id === match.id ? {...c, vatNumber: _vatToSync} : c);
-      });
-    }
+    // (2026-11-24) The old name-based VAT write-back is gone: customer details
+    // typed on the form were already saved to the LINKED customer record by
+    // sgrFormCustomerStep above, confirmed, before the quote was saved.
     try { localStorage.removeItem(_draftKey); } catch(e){}
     onClose();
   }
@@ -11141,6 +11729,10 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
               Client Details
               {!clientOpen&&client&&<span className="ml-2 normal-case tracking-normal font-semibold text-gray-600">— {client}</span>}
             </button>
+            {(()=>{ const _lc = sgrResolveCustomerRef(customerId, customers); return (
+                <span data-testid="quote-customer-link" className={`text-xs font-semibold px-2 py-1 rounded-lg ${_lc.customer?'bg-emerald-50 text-emerald-700 border border-emerald-200':'bg-amber-50 text-amber-700 border border-amber-200'}`}>
+                  {_lc.customer ? '🔗 Customer: '+_lc.customer.companyName+' (details below update the customer record)' : (_lc.state==='unlinked' ? 'Not linked — load a saved customer or save as a new one' : 'Linked customer record '+(_lc.state==='missing'?'not found':'is ambiguous')+' — load the right customer')}
+                </span>); })()}
             <div className={`flex items-center gap-2 flex-wrap ${clientOpen?'':'hidden'}`}>
               {customers.length>0&&(
                 <select onChange={e=>loadCustomer(e.target.value)} defaultValue=""
@@ -12276,6 +12868,7 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
           </div>
         )}
 
+        <CustomerLinkPanel type="quote" doc={quote} ctx={{ quotes, jobs, accInvoices, customers }}/>
         {/* Client & Quote Details Grid */}
         <div className="grid grid-cols-2 gap-3">
           {/* Client Info */}
@@ -12821,7 +13414,8 @@ function EditInvoiceForm({ job, onSave, onClose, jobs=[], accInvoices=[], quotes
       )}
       {/* Header fields */}
       <div className="grid grid-cols-2 gap-3">
-        <div className="col-span-2"><label className="text-xs font-bold text-gray-500 block mb-1">Client / Customer</label><input value={client} onChange={e=>setClient(e.target.value)} className={iCls}/></div>
+        <div className="col-span-2"><label className="text-xs font-bold text-gray-500 block mb-1">Client / Customer</label><input value={client} readOnly className={iCls+' bg-gray-50 text-gray-600'} data-testid="edit-invoice-client"/>
+          <p className="text-[11px] text-gray-400 mt-1">The customer and their details are changed from the job's <strong>Customer</strong> box (Edit customer details / Change customer…), so the customer record stays the source of truth.</p></div>
         <div><label className="text-xs font-bold text-gray-500 block mb-1">Invoice Number</label><input value={invoiceNum} onChange={e=>setInvoiceNum(e.target.value)} className={iCls}/></div>
         <div><label className="text-xs font-bold text-gray-500 block mb-1">Status (set by payments)</label>
           {(()=>{
@@ -13486,6 +14080,12 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // instruction for THIS save, never a stored quote field.
     const _pullThroughReq = !!(q && q._pullThrough);
     if(q && Object.prototype.hasOwnProperty.call(q, '_pullThrough')) delete q._pullThrough;
+    // 2026-11-24: the editor moved this chain to another customer just before
+    // saving (one-shot, never stored). The JSON record base is advanced by
+    // exactly that move so the editor's own move is not reported as a
+    // conflict; any OTHER change to the record still is.
+    const _customerMove = q && q._customerMove;
+    if(q && Object.prototype.hasOwnProperty.call(q, '_customerMove')) delete q._customerMove;
     // ── 2026-11-10 (QUOTE SAVE DUPLICATE) — explicit intent, canonical identity.
     // The editor states whether this is a CREATE or an EDIT of a named record.
     // An edit is resolved in the live list with sgrSameRecord (id or relational
@@ -13613,7 +14213,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // updateQuoteWithJobSync) — never a global platform revision. Editing
       // Quote A while an unrelated Job B or Quote B changes elsewhere never
       // touches this call at all, so it can never be blocked by that.
-      if(linkedJob && linkedJob._relRowVersion !== undefined) patch.expectedJobVersion = linkedJob._relRowVersion;
+      if(linkedJob && linkedJob._relRowVersion !== undefined) patch.expectedJobVersion = sgrRelVersionHint('job', linkedJob);
       // ── ADMIN REVISION (2026-11-10) ─────────────────────────────────────
       // An admin who left "Pull changes through" ticked, on a quote that has a
       // linked job, goes through the admin-revise route — but ONLY when the
@@ -13712,7 +14312,9 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     let nextJobs = jobs, jobsChanged = false;
     if(isEdit){
       const mapped = jobs.map(j=>{
-        if(j.quoteNum!==q.num) return j;
+        // 2026-11-24: quote numbers repeat across companies (Signacore and
+        // Holdings both have SQ-01001) — never sync another company's job.
+        if(j.quoteNum!==q.num || !sameCompany(j, q)) return j;
         jobsChanged = true;
         const _sub      = (q.lines||[]).reduce((s,l)=>s+(l.subtotal||0),0);
         const _discPct  = parseFloat(q.discount)||0;
@@ -13759,9 +14361,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // anyway, so recordBase is simply omitted there.
     let recordBase;
     if(isEdit && editQuoteBaseRef.current){
-      recordBase = { quotes: { [String(live ? live.id : q.id)]: editQuoteBaseRef.current.quote } };
+      const _mv = r => (r && _customerMove) ? { ...r, ..._customerMove.fields, customerId:_customerMove.customerId } : r;
+      recordBase = { quotes: { [String(live ? live.id : q.id)]: _mv(editQuoteBaseRef.current.quote) } };
       if(jobsChanged && editQuoteBaseRef.current.job){
-        recordBase.jobs = { [String(editQuoteBaseRef.current.job.id)]: editQuoteBaseRef.current.job };
+        recordBase.jobs = { [String(editQuoteBaseRef.current.job.id)]: _mv(editQuoteBaseRef.current.job) };
       }
     }
     await forceSaveSections(overrides, recordBase); // throws on failure — nothing below runs
@@ -14101,6 +14704,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           salesperson: q.salesperson||'', preparedBy: q.preparedBy||'',
           poRef: q.poRef||'', reference: q.reference||'',
           desc: 'From Quote '+q.num, status: 'quote_approved', co: q.co,
+          customerId: q.customerId||null,
           lines: q.lines, quoteNum: q.num, notes: q.notes||'',
           setupFee: q.setupFee||'', discount: q.discount||'',
           // 2026-08-23 (production cutover repair): this stub previously had
@@ -14276,6 +14880,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       // expressions that disagreed by a cent.
       value: sgrRands(_qCanonC),
       stage: _depositPaid ? 5 : (STATUS_TO_STAGE['quote_approved']||4), breakdown:null,
+      customerId: q.customerId||null,
       lines: q.lines, quoteNum: q.num, notes: q.notes||'',
       setupFee: q.setupFee||'', discount: q.discount||'',
       salesperson: q.salesperson||'', preparedBy: q.preparedBy||'',
@@ -14725,7 +15330,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           date: new Date().toISOString().slice(0,10),
           contactName: quote.client||'', contactEmail: quote.email||'', contactAddress: quote.address||'',
           reference: quote.num||'', jobId:null, jobNum:'',
-          quoteId: quote.id, quoteNum: quote.num,
+          quoteId: quote.id, quoteNum: quote.num, customerId: quote.customerId||null,
           status:'sent',
           // JOB/QUOTE -> INVOICE FINANCIAL CONSISTENCY REPAIR (2026-08-25).
           // This stub used to price each line as qty x unitPrice and stop
@@ -14834,7 +15439,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       date: today, dueDate: due,
       contactName: quote.client||'', contactEmail: quote.email||'', contactAddress: quote.address||'',
       reference: '', jobId: null, jobNum: '', // set once this quote converts to a job (see handleConvertToJob)
-      quoteId: quote.id, quoteNum: quote.num,
+      quoteId: quote.id, quoteNum: quote.num, customerId: quote.customerId||null,
       status, lineItems, payments: carriedPayments,
     };
     const nextAccInvoices = [newInvoice, ...accInvoices];
@@ -15871,7 +16476,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                             what the one line summed to — the total does not move. */}
                         <button onClick={()=>{ const _ji = jobInvoiceLineItems(j); setViewInvoiceRow({
                             id:'job-'+j.id, number:j.invoiceNum, source:'job', jobNum:j.num,
-                            reference:j.num, contactName:j.client||'', contactEmail:j.email||'',
+                            reference:j.num, customerId:j.customerId||null, contactName:j.client||'', contactEmail:j.email||'',
                             contactAddress:j.address||'', date:j.invoiceDate||'', dueDate:j.invoiceDue||'',
                             status:j.invoiceStatus||'pending', payments:j.payments||[],
                             discount:_ji.discPct, discountAmount:_ji.discAmt,
@@ -15914,7 +16519,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         )}
       </>)}
 
-      {viewInvoiceRow&&<ViewInvoiceModal inv={viewInvoiceRow} onClose={()=>setViewInvoiceRow(null)}
+      {viewInvoiceRow&&<ViewInvoiceModal inv={sgrLiveDoc(accInvoices, viewInvoiceRow)} onClose={()=>setViewInvoiceRow(null)}
         onEdit={(viewInvoiceRow.source!=='job'&&viewInvoiceRow.status!=='void')?()=>{ const rec=myAccInvoices.find(i=>i.id===viewInvoiceRow.id)||viewInvoiceRow; setViewInvoiceRow(null); setEditManualInv(rec); setShowManualInvModal(true); }:null}
         quotes={myQuotes} jobs={myJobs} accInvoices={myAccInvoices} customers={customers}
         companies={companies} logoDataUrl={logoDataUrl} onOpenQuote={null} onOpenJob={onOpenJob}
@@ -16053,7 +16658,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       />}
       {/* ── View Quote modal ── */}
       {viewQuote&&<QuoteViewModal
-        quote={viewQuote} onClose={()=>setViewQuote(null)}
+        quote={sgrLiveDoc(quotes, viewQuote)} onClose={()=>setViewQuote(null)}
         onUpdate={q=>{ handleUpdate(q); setViewQuote(q); }}
         onUpdateConfirmed={saveQuotePayments}
         forceSaveSections={forceSaveSections}
@@ -20977,6 +21582,7 @@ function JobDetail({ jobId, jobs, setJobs, quotes, setQuotes, companies, onBack,
 
       {/* Linked records — read-only navigation, never edits/relinks/deletes anything */}
       <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
+      <CustomerLinkPanel type="job" doc={job} ctx={{ quotes, jobs, accInvoices, customers }}/>
 
       {/* 2026-08-21 PURCHASE ORDER MIGRATION POLICY CHANGE: manual, OPTIONAL
           "Create Purchase Order" action — the new primary PO workflow.
@@ -27611,12 +28217,20 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
     // A new invoice gets its number reserved atomically from the backend at
     // save time (see saveManualInvoice) — never pre-computed here client-side,
     // and never editable by the user (no input field for it exists below).
-    const [form, setForm] = useState(inv || {
-      id: Date.now(), number: '', date: new Date().toISOString().slice(0,10),
-      dueDate: new Date(Date.now()+30*864e5).toISOString().slice(0,10),
-      contactName:'', contactEmail:'', contactAddress:'', reference:'',
-      status:'draft', lineItems:[{description:'',qty:1,unitAmount:0,accountCode:'4000',taxType:'15%'}]
+    const [form, setForm] = useState(()=>{
+      const base = inv || {
+        id: Date.now(), number: '', date: new Date().toISOString().slice(0,10),
+        dueDate: new Date(Date.now()+30*864e5).toISOString().slice(0,10),
+        contactName:'', contactEmail:'', contactAddress:'', reference:'',
+        status:'draft', lineItems:[{description:'',qty:1,unitAmount:0,accountCode:'4000',taxType:'15%'}]
+      };
+      // 2026-11-24: the invoice's customer link (own, else its chain's).
+      const _st = sgrStoreRef.current||{};
+      const _l = inv ? sgrDocCustomerLink('invoice', inv, { quotes:_st.quotes, jobs:_st.jobs, accInvoices:_st.accInvoices, customers:_st.customers||customers }) : null;
+      return { ...base, customerId: sgrCustRefOf(base.customerId) || (_l && _l.linked ? _l.ref : null) };
     });
+    const [pickingCustomer, setPickingCustomer] = useState(false);
+    const _formCust = sgrResolveCustomerRef(form.customerId, customers);
     const [saving, setSaving] = useState(false);
     const upd = k => v => setForm(p=>({...p,[k]:v}));
     const updLine = (i,k,v) => setForm(p=>({...p,lineItems:p.lineItems.map((l,idx)=>idx===i?{...l,[k]:v}:l)}));
@@ -27629,7 +28243,25 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
       if(!form.contactName){ alert('Contact name is required.'); return; }
       if(saving) return; // guard against double-click firing two reservations
       setSaving(true);
-      try { await onSave(form); } finally { setSaving(false); }
+      try {
+        // 2026-11-24: the invoice's customer must exist; email / address typed
+        // here are saved to the customer RECORD (confirmed); choosing a
+        // different customer moves the whole chain (preview + confirm).
+        const step = await sgrFormCustomerStep({ customerId: form.customerId, fields:{ client: form.contactName, email: form.contactEmail, address: form.contactAddress }, docLabel:'invoice' });
+        if(!step.ok){ if(step.message) alert(step.message); return; }
+        const cust = step.customer;
+        let moveVersion = null;
+        if(inv){
+          const _st = sgrStoreRef.current||{};
+          const orig = sgrDocCustomerLink('invoice', inv, { quotes:_st.quotes, jobs:_st.jobs, accInvoices:_st.accInvoices, customers:_st.customers });
+          if(!(orig.linked && orig.ref===String(cust.id))){
+            const rr = await sgrRequestReassign({ type:'invoice', rec:inv, customer:cust });
+            if(!rr.ok){ alert(rr.cancelled ? 'The customer change was cancelled — the invoice was not saved. Your edits are still here.' : 'The customer was not changed — the invoice was not saved.'); return; }
+            if(rr.versions && inv._relId!=null && rr.versions['invoice:'+inv._relId]!=null) moveVersion = rr.versions['invoice:'+inv._relId];
+          }
+        }
+        await onSave({ ...form, ...sgrCustomerFieldsFor('invoice', cust), customerId:String(cust.id), ...(moveVersion!=null ? { _relRowVersion:moveVersion } : {}) });
+      } finally { setSaving(false); }
     }
     return (
       <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
@@ -27639,6 +28271,13 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
             <button onClick={onClose} className="text-white/60 hover:text-white text-xl">✕</button>
           </div>
           <div className="p-5 space-y-4">
+            {/* 2026-11-24: the customer this invoice belongs to */}
+            <div className="flex items-center justify-between gap-2 flex-wrap bg-gray-50 border border-gray-200 rounded-xl px-3 py-2" data-testid="invoice-form-customer">
+              <span className="text-xs">{_formCust.customer ? <>🔗 Customer: <strong>{_formCust.customer.companyName}</strong> <span className="text-gray-500">(name, email and address below update the customer record)</span></> : <span className="text-amber-700">Not linked to a saved customer — choose one (or type a new name to create it on save).</span>}</span>
+              <button type="button" onClick={()=>setPickingCustomer(true)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-200 bg-white" data-testid="invoice-form-choose-customer">{_formCust.customer?'Change customer…':'Choose customer…'}</button>
+            </div>
+            {pickingCustomer&&<CustomerPickerModal customers={customers} currentRef={form.customerId} title="Customer for this invoice" onClose={()=>setPickingCustomer(false)}
+              onPick={c=>{ setPickingCustomer(false); setForm(p=>({ ...p, customerId:String(c.id), ...sgrCustomerFieldsFor('invoice', c) })); }}/>}
             {/* Header fields */}
             <div className="grid grid-cols-2 gap-3">
               <div><label className="text-xs font-bold text-gray-500 block mb-1">Contact / Customer *</label><input value={form.contactName} onChange={e=>upd('contactName')(e.target.value)} className={iCls} placeholder="Company or person name" list="cust-list"/><datalist id="cust-list">{(customers||[]).map(c=><option key={c.id} value={c.name}/>)}</datalist></div>
@@ -28126,7 +28765,7 @@ async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll
         return true;
       } else {
         const result = await relationalApi.createInvoice({
-          companyCode: relCoCode, contactName: inv.contactName, contactEmail: inv.contactEmail||null, contactAddress: inv.contactAddress||null,
+          companyCode: relCoCode, customerRef: inv.customerId || null, contactName: inv.contactName, contactEmail: inv.contactEmail||null, contactAddress: inv.contactAddress||null,
           reference: inv.reference||null, status: inv.status||null,
           issueDate: inv.date||null, dueDate: inv.dueDate||null, lines,
         });
@@ -28208,7 +28847,7 @@ async function saveManualInvoice(inv, { user, jobsAll, accInvoicesAll, quotesAll
   return true;
 }
 
-function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices:accInvoicesAll, setAccInvoices, accBills:accBillsAll, setAccBills, creditNotes:creditNotesAll, setCreditNotes, suppliers, customers, companies, logoDataUrl, user, onOpenJob, onOpenQuote, onOpenCustomer, onOpenJobPayments, initialStatementContact, onInitialStatementHandled, forceSaveSections }) {
+function AccountingPage({ jobs:jobsAll, setJobs, quotes, rawCustomerSources, bankTxns:bankTxnsAll, setBankTxns, chartOfAccounts, setChartOfAccounts, accInvoices:accInvoicesAll, setAccInvoices, accBills:accBillsAll, setAccBills, creditNotes:creditNotesAll, setCreditNotes, suppliers, customers, companies, logoDataUrl, user, onOpenJob, onOpenQuote, onOpenCustomer, onOpenJobPayments, initialStatementContact, onInitialStatementHandled, forceSaveSections }) {
   // Company-context filter for DISPLAY, applied by shadowing the prop names
   // — every plain read of jobs/bankTxns/accInvoices/accBills/creditNotes
   // below this line is already company-scoped throughout this component.
@@ -28592,7 +29231,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
           // above is already the correct session-derived company (Holdings
           // user -> HOLDINGS_CO_ID, else the user's own company) — sent as
           // a string, matching every other section's companyCode convention.
-          const result = await relationalApi.createCreditNote({ companyCode: String(tagged.co), type: tagged.type, contactName: tagged.contactName, date: tagged.date, amount: tagged.amount, reason: tagged.reason, appliedTo: tagged.appliedTo, notes: tagged.notes, status: tagged.status });
+          const result = await relationalApi.createCreditNote({ companyCode: String(tagged.co), customerRef: tagged.customerId||null, type: tagged.type, contactName: tagged.contactName, date: tagged.date, amount: tagged.amount, reason: tagged.reason, appliedTo: tagged.appliedTo, notes: tagged.notes, status: tagged.status });
           // BUGFIX (Stage 3 follow-on, same class as customer/quote/job-
           // conversion creation stubs): _relId/_relRowVersion must be set
           // explicitly here so an immediately-following edit/delete never
@@ -28602,7 +29241,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
           syncRelationalBaseline('creditNotes', creditNotesUpdater);
         } else {
           const existing = cnotes.find(c=>c.id===tagged.id);
-          const result = await relationalApi.updateCreditNote(existing && existing._relId, existing && existing._relRowVersion, { contactName: tagged.contactName, date: tagged.date, amount: tagged.amount, reason: tagged.reason, appliedTo: tagged.appliedTo, notes: tagged.notes, status: tagged.status });
+          const result = await relationalApi.updateCreditNote(existing && existing._relId, existing && existing._relRowVersion, { customerRef: tagged.customerId||null, contactName: tagged.contactName, date: tagged.date, amount: tagged.amount, reason: tagged.reason, appliedTo: tagged.appliedTo, notes: tagged.notes, status: tagged.status });
           const creditNotesUpdater = prev => prev.map(c=>c.id===tagged.id ? { ...tagged, _relRowVersion: result.rowVersion } : c);
           setCreditNotes(creditNotesUpdater);
           syncRelationalBaseline('creditNotes', creditNotesUpdater);
@@ -28675,7 +29314,21 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
      and creditNotes are filtered by belongsToUserCompany above), cancelled
      invoices stay excluded, and no amount or record is changed. */
   const stmtCtx = { quotes, jobs, accInvoices, customers };
-  function stmtCustomerInfo(name){ return sgrMatchInvoiceCustomer(name, customers||[]); }
+  function stmtCustomerInfo(name){
+    // 2026-11-24: a disambiguated label ("Name [contact]") opens ONE of two
+    // customers that share a name; a plain duplicated name stays ambiguous.
+    const t = String(name||'').trim();
+    const byLabel = (customers||[]).filter(c=>c && sgrCustomerLabel(c, customers)===t && String(c.companyName||'').trim()!==t);
+    if(byLabel.length===1) return { state:'matched', customer:byLabel[0], count:1 };
+    return sgrMatchInvoiceCustomer(name, customers||[]);
+  }
+  // A credit note's own link decides first (it is never inherited).
+  function stmtCreditCustomer(cn){
+    const r = sgrResolveCustomerRef(cn && cn.customerId, customers||[]);
+    if(r.state==='matched') return { state:'matched', customer:r.customer };
+    if(r.state!=='unlinked') return { state:'unresolved-link', customer:null };
+    return stmtCustomerInfo(cn && cn.contactName);
+  }
   function stmtCustomerBelongs(txnName, resolved, target, name){
     if(target.state==='matched') return !!resolved.customer && resolved.customer===target.customer;
     return resolved.state!=='matched' && norm(txnName)===norm(name);
@@ -28714,7 +29367,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
     }
     const _cnTarget = type==='customer' ? stmtCustomerInfo(name) : null;
     cnotes.filter(c=>c.type===type && (type==='customer'
-        ? stmtCustomerBelongs(c.contactName, stmtCustomerInfo(c.contactName), _cnTarget, name)
+        ? stmtCustomerBelongs(c.contactName, stmtCreditCustomer(c), _cnTarget, name)
         : norm(c.contactName)===norm(name))).forEach(c=>{
       ev.push({date:c.date, sort:2, docType:'Credit Note', ref:c.number||'', desc:c.reason||'Credit note', debit:0, credit:parseFloat(c.amount)||0});
     });
@@ -28798,7 +29451,18 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
       // (both match by exact, case-insensitive name) — so warn before saving.
       const known = names.some(n=>cnNorm(n)===cnNorm(form.contactName));
       if(!known && !window.confirm(`"${form.contactName}" doesn't exactly match an existing ${form.type==='supplier'?'supplier':'customer'} name on file.\n\nIf the spelling doesn't match exactly, this credit will NOT show up on their statement or in Aged Debtors/Creditors.\n\nSave anyway?`)) return;
-      onSave({...form, amount:parseFloat(form.amount)});
+      // 2026-11-24: link the credit note to its customer record when the name
+      // resolves to exactly one customer (a credit note is never moved by a
+      // chain reassignment; its link is its own).
+      let _cnRef = form.customerId || null;
+      if(form.type==='customer'){
+        const _own = sgrResolveCustomerRef(_cnRef, customers||[]);
+        if(!(_own.state==='matched' && sgrCustNorm(_own.customer.companyName)===sgrCustNorm(form.contactName))){
+          const _m = stmtCustomerInfo(form.contactName);
+          _cnRef = _m.state==='matched' ? String(_m.customer.id) : null;
+        }
+      } else _cnRef = null;
+      onSave({...form, amount:parseFloat(form.amount), customerId:_cnRef});
     }
     return (
       <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
@@ -29161,6 +29825,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
         number: invNum,
         date: invDate,
         dueDate: dueDate,
+        customerId: j.customerId || null,
         contactName: j.client || j.customer || '—',
         reference: j.num || '',
         status: status,
@@ -29244,12 +29909,20 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   // amount. Once applied, `used`/the invoice's payments already reflect it
   // for real, so this naturally becomes a no-op on the next run — safe to
   // depend on data that changes every render.
+  // 2026-11-24: pages receive invoices whose customer fields show the LINKED
+  // customer. Automatic credit-note usage moves money, so it keeps pairing by
+  // the names exactly as stored (raw state) — its behaviour is unchanged.
+  const _storedInvName = (()=>{ const m = new Map(); const rs = rawCustomerSources || {};
+    (rs.accInvoices||[]).forEach(i=>{ if(i) m.set(String(i.id), i.contactName); });
+    (rs.jobs||[]).forEach(j=>{ if(j) m.set('job-'+j.id, j.client || j.customer || '—'); });
+    return m; })();
+  const allInvoicesStoredNames = allInvoices.map(i=> _storedInvName.has(String(i.id)) ? { ...i, contactName:_storedInvName.get(String(i.id)) } : i);
   const cnAutoDepKey = JSON.stringify([
     cnotes.map(c=>[c.id,cnNorm(c.contactName),c.date,c.amount,c.used]),
-    allInvoices.map(i=>[i.id,cnNorm(i.contactName),i.date,i.status,i.source,(i.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0)]),
+    allInvoicesStoredNames.map(i=>[i.id,cnNorm(i.contactName),i.date,i.status,i.source,(i.payments||[]).reduce((s,p)=>s+(parseFloat(p.amount)||0),0)]),
   ]);
   useEffect(()=>{
-    const links = autoCreditNoteUsage(cnotes, allInvoices);
+    const links = autoCreditNoteUsage(cnotes, allInvoicesStoredNames);
     const invoiceExtra = {}; // invoice id -> amount to add as a Credit payment
     const noteExtra = {};    // credit note id -> amount to add to `used`
     Object.keys(links).forEach(cnId=>{
@@ -29364,9 +30037,9 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   const stmtCustomerNames = (()=>{
     const seen = new Set(), out = [];
     const add = n=>{ const t=String(n||'').trim(); if(t && t!=='—' && !seen.has(norm(t))){ seen.add(norm(t)); out.push(t); } };
-    (customers||[]).forEach(c=>c && add(c.companyName));
-    allInvoices.forEach(i=>{ if(sgrInvoiceRecordCustomer(i, stmtCtx).state==='none') add(i.contactName); });
-    cnotes.forEach(c=>{ if(c && c.type==='customer' && stmtCustomerInfo(c.contactName).state==='none') add(c.contactName); });
+    (customers||[]).forEach(c=>c && add(sgrCustomerLabel(c, customers)));
+    allInvoices.forEach(i=>{ const st = sgrInvoiceRecordCustomer(i, stmtCtx).state; if(st==='none' || st==='ambiguous' || st==='unresolved-link') add(i.contactName); });
+    cnotes.forEach(c=>{ if(c && c.type==='customer'){ const st = stmtCreditCustomer(c).state; if(st==='none' || st==='ambiguous' || st==='unresolved-link') add(c.contactName); } });
     return out.sort((a,b)=>a.localeCompare(b));
   })();
   const supplierNames = Array.from(new Set([...(suppliers||[]).map(s=>s.name).filter(Boolean), ...accBills.map(b=>b.supplierName).filter(Boolean)])).sort((a,b)=>a.localeCompare(b));
@@ -29396,7 +30069,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
       {editTxn&&<AllocationModal txn={editTxn} onSave={saveAllocation} onClose={()=>setEditTxn(null)}/>}
       {showAddAccount&&<AddAccountModal onClose={()=>setShowAddAccount(false)}/>}
       {showInvModal&&<InvoiceModal inv={editInv} onSave={saveInvoice} onClose={()=>{setShowInvModal(false);setEditInv(null);}} customers={customers} fmtAmt={fmtAmt}/>}
-      {viewInv&&<ViewInvoiceModal inv={viewInv} onClose={()=>setViewInv(null)} onEdit={(viewInv.source!=='job'&&viewInv.status!=='void')?()=>{setEditInv(viewInv);setShowInvModal(true);setViewInv(null);}:null} quotes={quotes} jobs={jobs} accInvoices={accInvoices} customers={customers} companies={companies} logoDataUrl={logoDataUrl} onOpenQuote={onOpenQuote} onOpenJob={onOpenJob} onOpenCustomer={onOpenCustomer} onOpenJobPayments={onOpenJobPayments} onOpenInvoicePayments={(i)=>{setPayModalInv(i);setShowPayModal(true);}} fmtDate={fmtDate} fmtAmt={fmtAmt}/>}
+      {viewInv&&<ViewInvoiceModal inv={sgrLiveDoc(accInvoices, viewInv)} onClose={()=>setViewInv(null)} onEdit={(viewInv.source!=='job'&&viewInv.status!=='void')?()=>{setEditInv(viewInv);setShowInvModal(true);setViewInv(null);}:null} quotes={quotes} jobs={jobs} accInvoices={accInvoices} customers={customers} companies={companies} logoDataUrl={logoDataUrl} onOpenQuote={onOpenQuote} onOpenJob={onOpenJob} onOpenCustomer={onOpenCustomer} onOpenJobPayments={onOpenJobPayments} onOpenInvoicePayments={(i)=>{setPayModalInv(i);setShowPayModal(true);}} fmtDate={fmtDate} fmtAmt={fmtAmt}/>}
       {showBillModal&&<BillModal bill={editBill} onSave={saveBill} onClose={()=>{setShowBillModal(false);setEditBill(null);}}/>}
       {showPayModal&&payModalInv&&<PaymentHistoryModal inv={payModalInv} onClose={()=>{setShowPayModal(false);setPayModalInv(null);}}
         accInvoices={accInvoices} setAccInvoices={setAccInvoices} forceSaveSections={forceSaveSections}
@@ -31412,6 +32085,8 @@ function App() {
   // ticks). A plain JSON section; see MaterialOrderTable.
   const [materialOrders,   setMaterialOrders]   = useState(_saved && Array.isArray(_saved.materialOrders) ? _saved.materialOrders : undefined); // undefined until first used: an empty list must not look like a local change and trigger a save on every load
   const [creditNotes,      setCreditNotes]      = useState(_saved ? (_saved.creditNotes||[])         : []);
+  // 2026-11-24 CUSTOMER IDENTITY: host for the "change customer" preview/confirm.
+  const [custReassignReq, setCustReassignReq] = useState(null);
   // Login accounts — Admin-editable via the "User Roles" page (see
   // UserRolesPage/Sidebar). Seeded from INITIAL_USERS, merged the same way
   // `inventory` merges in newly-added default items so an admin's saved
@@ -32058,7 +32733,14 @@ function App() {
     // On the very first check this session has just hydrated everything, so
     // adopting the tokens without refetching is correct and saves a full
     // duplicate load right after login.
-    if (firstCheck) return;
+    // A post-MUTATION check can also be the first one (a write made within the
+    // first poll interval after login, before any focus event). Its tokens
+    // already include the write, so adopting them silently would leave this
+    // screen on its pre-write copy until some LATER change; read once instead.
+    if (firstCheck) {
+      if (afterMutation) await refreshRelationalSectionsNow(reason + ' (first freshness check)');
+      return;
+    }
 
     const toRefresh = expandFreshnessSections(changed);
     if (toRefresh.length > 0) {
@@ -33363,19 +34045,26 @@ function App() {
   const openCustomerRecord = (c)=>{ setOpenCustomerId(c.id); setPage('customers'); };
   const openStatementForContact = (contactName)=>{ setAccountingOpen({contact:contactName}); setPage('accounting'); };
 
+  // 2026-11-24 CUSTOMER IDENTITY: the live store the shared customer actions
+  // use, and the display overlay every page receives (linked documents show
+  // the LINKED customer's details; raw state and saves are untouched by it).
+  sgrStoreRef.current = { customers, setCustomers, quotes, jobs, accInvoices, creditNotes, setQuotes, setJobs, setAccInvoices, setCreditNotes, user };
+  sgrReassignHostRef.current = setCustReassignReq;
+  const _cv = sgrApplyCustomerOverlay({ quotes, jobs, accInvoices, customers });
+
   const pageMap = {
-    dashboard:   <DashboardPage   jobs={jobs} quotes={quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={accInvoices} creditNotes={creditNotes}/>,
-    sales:       <QuotesPage      quotes={quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} onOpenJob={openJobRecord} forceSaveSections={forceSaveSections}/>,
-    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={quotes} jobs={jobs} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
+    dashboard:   <DashboardPage   jobs={_cv.jobs} quotes={_cv.quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={_cv.accInvoices} creditNotes={creditNotes}/>,
+    sales:       <QuotesPage      quotes={_cv.quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={_cv.jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={_cv.accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} onOpenJob={openJobRecord} forceSaveSections={forceSaveSections}/>,
+    customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={_cv.quotes} jobs={_cv.jobs} accInvoices={_cv.accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets} forceSaveSections={forceSaveSections} companies={companies} employees={employees} suppliers={suppliers}/>,
-    jobs:        <JobsPage        jobs={jobs} setJobs={setJobs} quotes={quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} forceSaveSections={forceSaveSections} accInvoices={accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} inventory={inventory} completeProducts={completeProducts}/>,
+    jobs:        <JobsPage        jobs={_cv.jobs} setJobs={setJobs} quotes={_cv.quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} forceSaveSections={forceSaveSections} accInvoices={_cv.accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} inventory={inventory} completeProducts={completeProducts}/>,
     calculators:     <CalculatorsPage savedCalcs={savedCalcs} setSavedCalcs={setSavedCalcs} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} inventory={inventory} setInventory={setInventory}/>,
-    purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user} jobs={jobs} quotes={quotes} inventory={inventory} completeProducts={completeProducts} materialOrders={materialOrders} setMaterialOrders={setMaterialOrders}/>,
+    purchase_orders: <PurchaseOrdersPage purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} user={user} jobs={_cv.jobs} quotes={_cv.quotes} inventory={inventory} completeProducts={completeProducts} materialOrders={materialOrders} setMaterialOrders={setMaterialOrders}/>,
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
-    inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quotes={quotes} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
+    inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quotes={_cv.quotes} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
-    reports:     <ReportsPage     jobs={jobs} quotes={quotes} accInvoices={accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} customers={customers}/>,
-    accounting:  <AccountingPage jobs={jobs} setJobs={setJobs} quotes={quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user} onOpenJob={openJobRecord} onOpenQuote={openQuoteRecord} onOpenCustomer={openCustomerRecord} onOpenJobPayments={openJobPaymentsRecord} initialStatementContact={accountingOpen&&accountingOpen.contact} onInitialStatementHandled={()=>setAccountingOpen(null)} forceSaveSections={forceSaveSections}/>,
+    reports:     <ReportsPage     jobs={_cv.jobs} quotes={_cv.quotes} accInvoices={_cv.accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} customers={customers}/>,
+    accounting:  <AccountingPage rawCustomerSources={{ accInvoices, jobs }} jobs={_cv.jobs} setJobs={setJobs} quotes={_cv.quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={_cv.accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user} onOpenJob={openJobRecord} onOpenQuote={openQuoteRecord} onOpenCustomer={openCustomerRecord} onOpenJobPayments={openJobPaymentsRecord} initialStatementContact={accountingOpen&&accountingOpen.contact} onInitialStatementHandled={()=>setAccountingOpen(null)} forceSaveSections={forceSaveSections}/>,
     hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={brandingLogo} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
     // Admin-only (main Admin, never Holdings Admin) — guarded again here in
     // addition to the Sidebar link and safePage above, so this can never
@@ -33431,6 +34120,8 @@ function App() {
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
         <Header page={safePage} onMenu={()=>setSidebarOpen(true)} onLogout={handleLogout} user={user} onSave={saveFile} saveMsg={saveMsg} onShare={()=>setShowShare(true)} lastSaved={lastSaved} logoDataUrl={brandingLogo} onExportBackup={exportFullBackup}/>
         {showShare&&<ShareGuideModal onClose={()=>setShowShare(false)} lastSaved={lastSaved}/>}
+        {custReassignReq&&<div style={{position:'relative',zIndex:80}}><CustomerReassignModal key={custReassignReq.type+':'+(custReassignReq.rec&&custReassignReq.rec.id)+':'+custReassignReq.customer.id} req={custReassignReq}
+          onFinish={r=>{ const q = custReassignReq; setCustReassignReq(null); q.resolve(r); }}/></div>}
         <main className="flex-1 overflow-y-auto bg-gray-50 relative">
           {safePage!=='dashboard'&&(
             <div style={{

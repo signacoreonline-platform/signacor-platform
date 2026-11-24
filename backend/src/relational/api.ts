@@ -49,8 +49,9 @@ import {
   createPurchaseOrder, updatePurchaseOrder,
   createSupplier, updateSupplier, deleteSupplier,
   createInventoryItem, updateInventoryItem, adjustInventoryStock, deleteInventoryItem,
-  createManualInvoice, updateInvoice, cancelInvoice,
+  createManualInvoice, updateInvoice, cancelInvoice, normalizeCustomerRef,
 } from './services';
+import { previewCustomerReassignment, reassignCustomerChain, MemberType } from './customerLinks';
 
 const router = Router();
 router.use(authenticate);
@@ -142,7 +143,7 @@ router.post('/quotes', async (req: AuthRequest, res: Response): Promise<void> =>
     const {
       companyCode, customerId, customerNameRaw, lines, discountPct, setupFee, notes,
       contactPerson, email, phone, address, vatNumber, terms, salesperson, preparedBy,
-      poRef, reference, quoteDate, validUntil, status, depositPct,
+      poRef, reference, quoteDate, validUntil, status, depositPct, customerRef,
     } = req.body || {};
     if (!companyCode || !customerNameRaw || !Array.isArray(lines) || lines.length === 0) {
       res.status(400).json({ error: '"companyCode", "customerNameRaw" and a non-empty "lines" array are required' }); return;
@@ -150,7 +151,7 @@ router.post('/quotes', async (req: AuthRequest, res: Response): Promise<void> =>
     const result = await createQuote({
       companyCode, customerId, customerNameRaw, lines, discountPct, setupFee, notes,
       contactPerson, email, phone, address, vatNumber, terms, salesperson, preparedBy,
-      poRef, reference, quoteDate, validUntil, status, depositPct,
+      poRef, reference, quoteDate, validUntil, status, depositPct, customerRef: normalizeCustomerRef(customerRef),
     });
     res.status(201).json({ success: true, id: result.id, quoteNumber: result.quoteNumber, rowVersion: result.rowVersion });
   } catch (err) { handleServiceError(err, res); }
@@ -364,7 +365,7 @@ router.post('/jobs', async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const {
       companyCode, customerId, customerNameRaw, description, status, stage, value, notes,
-      contactPerson, email, phone, address, vatNumber, reference, salesperson, dueDate,
+      contactPerson, email, phone, address, vatNumber, reference, salesperson, dueDate, customerRef,
     } = req.body || {};
     if (!companyCode || typeof companyCode !== 'string') {
       res.status(400).json({ error: '"companyCode" is required' }); return;
@@ -374,7 +375,7 @@ router.post('/jobs', async (req: AuthRequest, res: Response): Promise<void> => {
     }
     const result = await createJob({
       companyCode, customerId, customerNameRaw, description, status, stage, value, notes,
-      contactPerson, email, phone, address, vatNumber, reference, salesperson, dueDate,
+      contactPerson, email, phone, address, vatNumber, reference, salesperson, dueDate, customerRef: normalizeCustomerRef(customerRef),
     });
     res.status(201).json({ success: true, id: result.id, jobNumber: result.jobNumber, rowVersion: result.rowVersion });
   } catch (err) { handleServiceError(err, res); }
@@ -497,7 +498,7 @@ router.post('/invoices', async (req: AuthRequest, res: Response): Promise<void> 
   try {
     const {
       companyCode, customerId, contactName, contactEmail, contactAddress,
-      reference, status, issueDate, dueDate, lines,
+      reference, status, issueDate, dueDate, lines, customerRef,
     } = req.body || {};
     if (!companyCode || typeof companyCode !== 'string') {
       res.status(400).json({ error: '"companyCode" is required' }); return;
@@ -507,7 +508,7 @@ router.post('/invoices', async (req: AuthRequest, res: Response): Promise<void> 
     }
     const result = await createManualInvoice({
       companyCode, customerId, contactName, contactEmail, contactAddress,
-      reference, status, issueDate, dueDate, lines,
+      reference, status, issueDate, dueDate, lines, customerRef: normalizeCustomerRef(customerRef),
     });
     res.status(201).json({ success: true, id: result.id, invoiceNumber: result.invoiceNumber, rowVersion: result.rowVersion });
   } catch (err) { handleServiceError(err, res); }
@@ -600,6 +601,64 @@ async function handleCancelInvoice(req: AuthRequest, res: Response, legacyDelete
 }
 router.post('/invoices/:id/cancel', (req: AuthRequest, res: Response): Promise<void> => handleCancelInvoice(req, res, false));
 router.delete('/invoices/:id', (req: AuthRequest, res: Response): Promise<void> => handleCancelInvoice(req, res, true));
+
+// ── CUSTOMER LINKS (021, 2026-11-24) ─────────────────────────────────────────
+// Change which customer owns a whole quote -> job -> invoice chain (or link an
+// unlinked one). GET previews the members, the target customer and any
+// conflict; POST applies it in ONE transaction, re-checking every member's
+// row version from the preview. See customerLinks.ts for the full contract.
+// Who may: any signed-in editor for a quote-only chain; once the chain holds a
+// job or an invoice (financial documents), admin or accounts only, matching
+// the existing "only an admin can edit a converted quote" rule. A company-bound
+// user (Holdings) can only act on their own company's chain.
+const CHAIN_SECTIONS: Record<MemberType, CutoverSection> = { quote: 'quotes', job: 'jobs', invoice: 'accInvoices' };
+function parseAnchor(src: any): { type: MemberType; id: number } | null {
+  const type = String(src?.anchorType || '') as MemberType;
+  const id = Number(src?.anchorId);
+  if (!['quote', 'job', 'invoice'].includes(type) || !Number.isFinite(id)) return null;
+  return { type, id };
+}
+async function chainGate(req: AuthRequest, res: Response, anchor: { type: MemberType; id: number }): Promise<boolean> {
+  for (const s of ['quotes', 'jobs', 'accInvoices'] as CutoverSection[]) { if (!(await requireCutOver(s, res))) return false; }
+  if (!CHAIN_SECTIONS[anchor.type]) { res.status(400).json({ error: 'Unknown document type.' }); return false; }
+  return true;
+}
+function chainAllowed(req: AuthRequest, res: Response, preview: { companyCode: string | null; members: Array<{ type: string }> }): boolean {
+  const actor = req.user;
+  if (!actor || actor.role === 'factory') { res.status(403).json({ conflict: false, type: 'forbidden', error: 'This login cannot change the customer on documents.' }); return false; }
+  const financial = preview.members.some((m) => m.type !== 'quote');
+  if (financial && !['admin', 'accounts'].includes(String(actor.role))) {
+    res.status(403).json({ conflict: false, type: 'forbidden', error: 'Only an admin or accounts login can change the customer of a quote that has a job or invoice. Nothing was changed.' }); return false;
+  }
+  if (actor.co !== undefined && actor.co !== null && String(preview.companyCode ?? '') !== String(actor.co)) {
+    res.status(403).json({ conflict: false, type: 'forbidden', error: 'These documents belong to another company. Nothing was changed.' }); return false;
+  }
+  return true;
+}
+router.get('/customer-links/preview', async (req: AuthRequest, res: Response): Promise<void> => {
+  const anchor = parseAnchor(req.query);
+  if (!anchor) { res.status(400).json({ error: '"anchorType" (quote/job/invoice) and a numeric "anchorId" are required' }); return; }
+  if (!(await chainGate(req, res, anchor))) return;
+  try {
+    const preview = await previewCustomerReassignment(anchor.type, anchor.id, req.query.customerRef);
+    if (!chainAllowed(req, res, preview)) return;
+    res.json({ success: true, preview });
+  } catch (err) { handleServiceError(err, res); }
+});
+router.post('/customer-links/reassign', async (req: AuthRequest, res: Response): Promise<void> => {
+  const anchor = parseAnchor(req.body);
+  if (!anchor) { res.status(400).json({ error: '"anchorType" (quote/job/invoice) and a numeric "anchorId" are required' }); return; }
+  const expected = req.body?.expectedVersions;
+  if (!expected || typeof expected !== 'object') { res.status(400).json({ error: '"expectedVersions" from the preview is required' }); return; }
+  if (!(await chainGate(req, res, anchor))) return;
+  try {
+    const preview = await previewCustomerReassignment(anchor.type, anchor.id, req.body?.customerRef);
+    if (!chainAllowed(req, res, preview)) return;
+    const result = await reassignCustomerChain(anchor.type, anchor.id, req.body?.customerRef, expected, req.user ? { id: req.user.id, email: req.user.email } : null);
+    console.log(`[customer-links] ${anchor.type} ${anchor.id}: ${result.members.length} document(s) now belong to customer ${result.target.ref} (${result.target.companyName}) — by ${req.user?.email || req.user?.id}`);
+    res.json({ success: true, result });
+  } catch (err) { handleServiceError(err, res); }
+});
 
 // ── PAYMENTS ────────────────────────────────────────────────────────────────
 // owner.type in {job, invoice, quote} — gated on that OWNER's section being
@@ -720,7 +779,7 @@ router.delete('/payments/:id', async (req: AuthRequest, res: Response): Promise<
 router.post('/credit-notes', async (req: AuthRequest, res: Response): Promise<void> => {
   if (!(await requireCutOver('creditNotes', res))) return;
   try {
-    const { companyCode, type, contactName, date, amount, reason, appliedTo, notes, status } = req.body || {};
+    const { companyCode, type, contactName, date, amount, reason, appliedTo, notes, status, customerRef } = req.body || {};
     // 2026-08-23 (credit note company-isolation repair): companyCode is now
     // required, matching createManualInvoice's own validation ("companyCode"
     // is required) — the same convention already used elsewhere, not a new
@@ -731,7 +790,7 @@ router.post('/credit-notes', async (req: AuthRequest, res: Response): Promise<vo
     if (!['customer', 'supplier'].includes(type) || !contactName || !Number.isFinite(Number(amount))) {
       res.status(400).json({ error: '"type" (customer/supplier), "contactName" and a numeric "amount" are required' }); return;
     }
-    const result = await createCreditNote({ companyCode, type, contactName, date, amount: Number(amount), reason, appliedTo, notes, status });
+    const result = await createCreditNote({ companyCode, type, contactName, date, amount: Number(amount), reason, appliedTo, notes, status, customerRef: normalizeCustomerRef(customerRef) });
     res.status(201).json({ success: true, id: result.id, creditNumber: result.creditNumber, rowVersion: result.rowVersion });
   } catch (err) { handleServiceError(err, res); }
 });
@@ -745,6 +804,7 @@ router.put('/credit-notes/:id', async (req: AuthRequest, res: Response): Promise
       res.status(400).json({ error: '"id" (path) and "expectedVersion" (body) must be numbers' }); return;
     }
     const { expectedVersion: _ev, ...patch } = req.body || {};
+    if (patch.customerRef !== undefined) patch.customerRef = normalizeCustomerRef(patch.customerRef);
     const result = await updateCreditNote(id, expectedVersion, patch);
     res.json({ success: true, rowVersion: result.rowVersion });
   } catch (err) { handleServiceError(err, res); }
