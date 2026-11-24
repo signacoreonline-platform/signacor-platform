@@ -5530,6 +5530,9 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
       : { icon:'🏢', label:'No matching customer record found' },
   ];
   const _invDiscountView = invoiceDiscountView(inv);
+  // 2026-11-24: customer details = current linked Customer (same resolver as
+  // the PDF and the Email button); a cancelled invoice shows them as issued.
+  const _cv = sgrInvoiceRecordContactView(inv, { quotes, jobs, accInvoices, customers });
   return (
     <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-3" onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[95vh] overflow-y-auto">
@@ -5552,9 +5555,22 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
             </div>
           )}
           <RecordLinksPanel links={linkPanelLinks} warnings={_links.warnings}/>
+          {_cv.state==='ambiguous'&&(
+            <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-2 text-xs text-amber-800" data-testid="invoice-customer-ambiguous">
+              ⚠ {_cv.count>1?_cv.count+' customer records':'More than one customer record'} match “{_cv.matchName}”, so the customer details below are shown as stored on this invoice. Merge or rename the duplicate under Customers to show the current details.
+            </div>
+          )}
+          {_cv.state==='none'&&_links.customer&&(
+            <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-2 text-xs text-gray-600" data-testid="invoice-customer-unmatched">
+              The name on this invoice does not exactly match one customer record, so its customer details are shown as stored on the invoice.
+            </div>
+          )}
+          {_cv.state==='retained'&&(
+            <p className="text-xs text-gray-500" data-testid="invoice-customer-retained">Customer details are shown as they were when this invoice was issued.</p>
+          )}
           <div className="grid grid-cols-2 gap-3 text-sm">
-            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">CONTACT</span><span className="font-semibold">{inv.contactName||'—'}</span></div>
-            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">EMAIL</span><span>{inv.contactEmail||'—'}</span></div>
+            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">CONTACT</span><span className="font-semibold" data-testid="invoice-view-contact-name">{_cv.name||'—'}</span>{_cv.person&&<span className="block text-xs text-gray-500 mt-0.5" data-testid="invoice-view-contact-person">Attn: {_cv.person}{_cv.tel?' · '+_cv.tel:''}</span>}</div>
+            <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">EMAIL</span><span data-testid="invoice-view-email">{_cv.email||'—'}</span></div>
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">INVOICE DATE</span><span>{fmtDate(inv.date)}</span></div>
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">DUE DATE</span><span>{fmtDate(inv.dueDate)}</span></div>
             <div className="bg-gray-50 rounded-xl p-3"><span className="text-xs font-bold text-gray-400 block mb-1">REFERENCE</span><span>{inv.reference||'—'}</span></div>
@@ -5565,7 +5581,7 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
                 that happen to carry a discount field. Both halves of the one
                 financial fact are always shown: the percentage AND the money. */}
             {_invDiscountView.pct>0&&<div className="bg-red-50 rounded-xl p-3"><span className="text-xs font-bold text-red-400 block mb-1">DISCOUNT</span><span className="font-semibold text-red-600">{_invDiscountView.pct}%{_invDiscountView.amt>0?' · − '+fmtAmt(_invDiscountView.amt):''}</span></div>}
-            {inv.contactAddress&&<div className="bg-gray-50 rounded-xl p-3 col-span-2"><span className="text-xs font-bold text-gray-400 block mb-1">ADDRESS</span><span className="whitespace-pre-wrap">{inv.contactAddress}</span></div>}
+            {_cv.address&&<div className="bg-gray-50 rounded-xl p-3 col-span-2"><span className="text-xs font-bold text-gray-400 block mb-1">ADDRESS</span><span className="whitespace-pre-wrap" data-testid="invoice-view-address">{_cv.address}</span></div>}
           </div>
           <div className="border border-gray-200 rounded-xl overflow-hidden">
             <table className="w-full text-xs">
@@ -5622,7 +5638,7 @@ function ViewInvoiceModal({ inv, onClose, onEdit, quotes, jobs, accInvoices, cus
                 className="px-5 py-2.5 text-white font-bold rounded-xl text-sm bg-brand-600 hover:bg-brand-700">🖨️ Print Invoice</button>
             )}
             {!isJob&&inv.status!=='void'&&(
-              <button onClick={()=>emailManualInvoiceViaOutlook(inv,companies)}
+              <button onClick={()=>emailManualInvoiceViaOutlook(inv,companies,{quotes,jobs,accInvoices,customers})}
                 className="px-5 py-2.5 text-white font-bold rounded-xl text-sm" style={{background:'#1e40af'}}>📧 Email Invoice</button>
             )}
             {onEdit&&<button onClick={onEdit} className="px-5 py-2.5 text-white font-bold rounded-xl text-sm" style={{background:'#06065c'}}>✏️ Edit Invoice</button>}
@@ -7083,30 +7099,48 @@ function sgrLegalNameBase(name){
   const base = stripped.replace(/['\u2019]/g, '').trim();
   return { norm: n, base: base, hadSuffix: hadSuffix };
 }
-function sgrResolveInvoiceCustomer(clientName, customers){
-  if(!clientName || !Array.isArray(customers)) return null;
+/* MATCH STATE (2026-11-24). The SAME rule as before, but it also says WHY it
+   found no customer: 'none' (no customer carries this name) or 'ambiguous'
+   (two or more customers share it - a legacy duplicate). It never guesses in
+   either case. sgrResolveInvoiceCustomer() below returns exactly what it
+   always returned. */
+function sgrMatchInvoiceCustomer(clientName, customers){
+  const none = { state:'none', customer:null, count:0 };
+  if(!clientName || !Array.isArray(customers)) return none;
   const norm = s=>(s==null?'':String(s)).trim().toLowerCase();
   const n = norm(clientName);
-  if(!n) return null;
+  if(!n) return none;
   // 1st choice - exact name, exactly one customer (unchanged rule).
   const hits = customers.filter(c=>c && norm(c.companyName)===n);
-  if(hits.length===1) return hits[0];
-  if(hits.length>1) return null;            // ambiguous exact name: never guess
+  if(hits.length===1) return { state:'matched', customer:hits[0], count:1 };
+  if(hits.length>1) return { state:'ambiguous', customer:null, count:hits.length }; // never guess
   // 2nd choice - ONLY when nothing matched exactly: the same name once a
   // trailing (Pty) Ltd-type suffix is set aside on either side. Still must
   // be exactly one customer.
   const inv = sgrLegalNameBase(clientName);
-  if(!inv.base) return null;
+  if(!inv.base) return none;
   const legal = customers.filter(c=>{
     if(!c) return false;
     const cn = sgrLegalNameBase(c.companyName);
     return cn.base && cn.base===inv.base && (cn.hadSuffix || inv.hadSuffix);
   });
-  return legal.length===1 ? legal[0] : null;
+  if(legal.length===1) return { state:'matched', customer:legal[0], count:1 };
+  if(legal.length>1) return { state:'ambiguous', customer:null, count:legal.length };
+  return none;
+}
+function sgrResolveInvoiceCustomer(clientName, customers){
+  return sgrMatchInvoiceCustomer(clientName, customers).customer;
 }
 function sgrInvoiceWithCurrentCustomer(doc, customers){
   if(!doc) return doc;
-  const cust = sgrResolveInvoiceCustomer(doc.client, customers);
+  // 2026-11-24: a document built from an invoice RECORD carries the record's
+  // own resolution (sgrInvoiceRecordCustomer, below): a cancelled invoice keeps
+  // the details it was issued with, and a customer found through the invoice's
+  // linked job/quote is handed down explicitly instead of re-matched by name.
+  if(doc._sgrCustomerRetained) return doc;
+  const cust = (doc._sgrCustomer && typeof doc._sgrCustomer==='object')
+    ? doc._sgrCustomer
+    : sgrResolveInvoiceCustomer(doc.client, customers);
   if(!cust) return doc;
   const has = v=>v!==undefined && v!==null && String(v).trim()!=='';
   const pick = (current, stored)=>has(current) ? current : stored;
@@ -7120,6 +7154,75 @@ function sgrInvoiceWithCurrentCustomer(doc, customers){
     // name. doc.client itself (the stored name, used in the payment Reference
     // row and as the lookup key) is left exactly as stored.
     _billToName: pick(has(cust.companyName) ? String(cust.companyName).trim() : '', doc.client),
+  };
+}
+/* ═══════════════════════════════════════════════════════════════════════════
+   INVOICE RECORD -> CURRENT CUSTOMER (2026-11-24)
+
+   THE BUG. A job's documents (Print, Preview/PDF, the Outlook .eml) all went
+   through sgrInvoiceWithCurrentCustomer above, so a customer edit showed on
+   them. An invoice RECORD (accInvoices / rel_invoices - job-sourced,
+   quote-sourced or manual) did not: its View screen and its Email button read
+   the stored contactName / contactEmail / contactAddress snapshot directly,
+   and its PDF only ever tried the invoice's own stored name.
+
+   THE RULE. One resolver for an invoice record, used by the View screen, the
+   PDF (sgrInvoiceRecordToPrintable) and the Email button:
+     1. the invoice's own name, by the unchanged unique-name rule above;
+     2. ONLY if that finds nobody - older records - the client named on the
+        invoice's linked Job, then its linked Quote, through findLinkedRecords
+        (company-scoped; an ambiguous link is not used). Both must agree.
+   'ambiguous' (two customers share the name, or the links disagree) and
+   'none' fall back to the stored snapshot and are SAID on the View screen.
+   A cancelled (void) invoice is 'retained': it keeps the details it was
+   issued with, like its lines and amounts (2026-11-19 retention rule).
+   Customers are shared by both companies, so a match applies to either.
+   Read-only: no invoice, job, quote, payment or customer record is written.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function sgrInvoiceRecordCustomer(inv, ctx){
+  ctx = ctx || {};
+  const customers = Array.isArray(ctx.customers) ? ctx.customers : [];
+  if(!inv) return { state:'none', customer:null, via:null, name:'' };
+  if(inv.status==='void') return { state:'retained', customer:null, via:null, name:inv.contactName||'' };
+  const own = sgrMatchInvoiceCustomer(inv.contactName, customers);
+  if(own.state==='matched') return { state:'matched', customer:own.customer, via:'invoice', name:inv.contactName };
+  if(own.state==='ambiguous') return { state:'ambiguous', customer:null, via:'invoice', name:inv.contactName, count:own.count };
+  const links = findLinkedRecords(
+    { invoice: { ...inv, jobNum: inv.jobNum || inv.reference || '' } },
+    { quotes: ctx.quotes||[], jobs: ctx.jobs||[], accInvoices: ctx.accInvoices||[], customers: customers }
+  );
+  if(links.warnings && links.warnings.length) return { state:'none', customer:null, via:null, name:inv.contactName||'' };
+  const sources = [];
+  if(links.job && links.job.client) sources.push({ via:'job', name:links.job.client });
+  if(links.quote && links.quote.client) sources.push({ via:'quote', name:links.quote.client });
+  let found = null;
+  for(const src of sources){
+    const m = sgrMatchInvoiceCustomer(src.name, customers);
+    if(m.state==='ambiguous') return { state:'ambiguous', customer:null, via:src.via, name:src.name, count:m.count };
+    if(m.state!=='matched') continue;
+    if(found && found.customer!==m.customer) return { state:'ambiguous', customer:null, via:src.via, name:src.name, count:2 };
+    if(!found) found = { state:'matched', customer:m.customer, via:src.via, name:src.name };
+  }
+  return found || { state:'none', customer:null, via:null, name:inv.contactName||'' };
+}
+// The customer details an invoice record shows / emails. A blank Customer
+// field keeps the stored value, exactly as sgrInvoiceWithCurrentCustomer does.
+function sgrInvoiceRecordContactView(inv, ctx){
+  const r = sgrInvoiceRecordCustomer(inv, ctx);
+  const has = v=>v!==undefined && v!==null && String(v).trim()!=='';
+  const pick = (current, stored)=>has(current) ? current : stored;
+  const stored = { name:(inv && inv.contactName)||'', person:'', email:(inv && inv.contactEmail)||'',
+                   address:(inv && inv.contactAddress)||'', tel:'', vatNum:'' };
+  const c = r.customer;
+  if(!c) return { ...stored, state:r.state, via:r.via, matchName:r.name, count:r.count||0, customer:null };
+  return {
+    name: pick(has(c.companyName) ? String(c.companyName).trim() : '', stored.name),
+    person: c.contactPerson || '',
+    email: pick(c.email, stored.email),
+    address: pick(c.address, stored.address),
+    tel: has(c.tel) ? c.tel : (c.phone || ''),
+    vatNum: c.vatNumber || '',
+    state: 'matched', via: r.via, matchName: r.name, count: 1, customer: c,
   };
 }
 function buildInvoiceHtml(job, companies, logoDataUrl, customers) {
@@ -7909,6 +8012,7 @@ function sgrInvoiceRecordToPrintable(inv, ctx){
   const srcQuote = unambiguous ? (links.quote || null) : null;
   const src      = srcJob || srcQuote || null;
   const jobNo    = (inv && inv.jobNum) || (srcJob ? srcJob.num : '') || '';
+  const _recCust = sgrInvoiceRecordCustomer(inv, ctx);
 
   /* PRESENTATION-ONLY LINE ENRICHMENT. The established Tax Invoice prints a
      dimension / pieces sub-line beneath each description and an "Item Qty"
@@ -7991,6 +8095,13 @@ function sgrInvoiceRecordToPrintable(inv, ctx){
     // number when the document carries none, so a manual invoice still shows
     // one when the customer is on file — and shows nothing when it is not.
     vatNum: (src && src.vatNum) || '',
+    // 2026-11-24: the invoice's own stored address is the fallback when no
+    // current customer applies (it was never passed through before).
+    address: (inv && inv.contactAddress) || (src && src.address) || '',
+    // 2026-11-24: the record's own customer resolution (see
+    // sgrInvoiceRecordCustomer) - consumed by sgrInvoiceWithCurrentCustomer.
+    _sgrCustomer: _recCust.customer || null,
+    _sgrCustomerRetained: _recCust.state==='retained',
     notes: (src && src.notes) || '',
     lines: lines,
     payments: (inv && Array.isArray(inv.payments)) ? inv.payments : [],
@@ -8034,17 +8145,20 @@ function printManualInvoice(inv, companies, logoDataUrl, ctx) {
 // above (same mailto-only pattern already used for job invoices — no PDF
 // attached automatically either way). Never creates/edits/duplicates the
 // accInvoices record itself.
-function emailManualInvoiceViaOutlook(inv, companies) {
+function emailManualInvoiceViaOutlook(inv, companies, ctx) {
   const invNum = inv.number||'';
+  // 2026-11-24: To: / greeting / subject use the current linked Customer
+  // (same resolver as the View screen and the PDF); stored details otherwise.
+  const cv = sgrInvoiceRecordContactView(inv, ctx);
   const body =
-'Dear '+(inv.contactName||'Sir/Madam')+',\r\n\r\n'+
+'Dear '+(cv.name||'Sir/Madam')+',\r\n\r\n'+
 'Thank you for your valued business. Please find attached our tax invoice '+invNum+' for your records.\r\n\r\n'+
 'Should you have any queries regarding this invoice, please do not hesitate to contact us.\r\n\r\n'+
 'Kind regards,\r\n'+
 'Signacore | Applied Graphics and Visual Displays\r\n'+
 'Tel: 040-940-5555 | orders@snsg.co.za';
-  const subject = 'Tax Invoice '+invNum+' - '+(inv.contactName||'');
-  const mailto = 'mailto:'+(inv.contactEmail?encodeURIComponent(inv.contactEmail):'')+'?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body);
+  const subject = 'Tax Invoice '+invNum+' - '+(cv.name||'');
+  const mailto = 'mailto:'+(cv.email?encodeURIComponent(cv.email):'')+'?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body);
   window.location.href = mailto;
 }
 
@@ -15718,7 +15832,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                             className="text-xs bg-gray-800 hover:bg-gray-900 text-white font-bold px-3 py-1.5 rounded-xl">
                             🧾 Print
                           </button>
-                          <button onClick={()=>emailManualInvoiceViaOutlook(manualRec,companies)}
+                          <button onClick={()=>emailManualInvoiceViaOutlook(manualRec,companies,{quotes:myQuotes,jobs:myJobs,accInvoices:myAccInvoices,customers})}
                             className="text-xs font-bold px-3 py-1.5 rounded-xl" style={{background:'#dbeafe',color:'#1e40af'}}>
                             📧 Email
                           </button>
@@ -29668,7 +29782,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
                               <button onClick={()=>{setPayModalInv(inv);setShowPayModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#ecfdf5',color:'#059669'}}>💳 Payments</button>
                               <button onClick={()=>{setEditInv(inv);setShowInvModal(true);}} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#e6e6ff',color:'#06065c'}}>Edit</button>
                               <button onClick={()=>printManualInvoice(inv,companies,logoDataUrl,{quotes,jobs,accInvoices,customers})} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#f3f4f6',color:'#1f2937'}}>🧾 Print</button>
-                              <button onClick={()=>emailManualInvoiceViaOutlook(inv,companies)} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dbeafe',color:'#1e40af'}}>📧 Email</button>
+                              <button onClick={()=>emailManualInvoiceViaOutlook(inv,companies,{quotes,jobs,accInvoices,customers})} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dbeafe',color:'#1e40af'}}>📧 Email</button>
                               {inv.status!=='paid'&&<button onClick={()=>guardAction('markInvPaid:'+relKey(inv), ()=>markInvPaid(inv))} className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:'#dcfce7',color:'#059669'}}>✓ Paid</button>}
                               {user?.role==='admin'&&<button onClick={()=>guardAction('cancelInvoice:'+inv.id, ()=>cancelInvoice(inv.id))} title="Admin only. The invoice is kept on record, greyed out as Cancelled by Admin — it is not deleted." className="text-xs font-bold px-2 py-1 rounded-lg border border-gray-200 text-gray-400 hover:text-red-500 hover:border-red-200 whitespace-nowrap">🚫 Cancel invoice</button>}
                             </div>

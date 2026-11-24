@@ -169,7 +169,9 @@ const FNS = [
   'normalizeQuoteDepositPct', 'fmtQuoteDepositPct', 'quoteDepositInfo', 'quoteDepositTermsInfo',
   // customer lookups (old + new)
   'sgrCustomerVatLookup', 'sgrCustomerAddressLookup',
-  'sgrLegalNameBase', 'sgrResolveInvoiceCustomer', 'sgrInvoiceWithCurrentCustomer',
+  'sgrLegalNameBase', 'sgrMatchInvoiceCustomer', 'sgrResolveInvoiceCustomer', 'sgrInvoiceWithCurrentCustomer',
+  // 2026-11-24: invoice RECORD -> current customer (View / PDF / Email button)
+  'sgrInvoiceRecordCustomer', 'sgrInvoiceRecordContactView',
   // linkage used by the accInvoices printable adapter
   'companyTagOf', 'sameCompany', 'jobHasId', 'findCustomerByName', 'invoiceBelongsToJob',
   'resolveJobsForQuote', 'resolveJobForQuote', 'resolveQuoteForJob', 'resolveQuoteForInvoice',
@@ -582,6 +584,94 @@ ok(/Voortrekker/.test(printBt), '[18] printInvoice (Print + Preview window + Dow
   const hwAccBt = billedTo(A.__rec.previews[0].html);
   ok(/Hennies Witbank \(PTY\) Ltd/.test(hwAccBt) && /Stand 12, Corridor Hill/.test(hwAccBt), '[P3/P4] Accounting invoice (curly apostrophe) prints current name + address');
   ok(JSON.stringify(hwAcc) === JSON.stringify(hwAccSnap), '[P10] stored accInvoices record not modified');
+
+
+  /* ══════════════════════════════════════════════════════════════════════
+     R1–R14 (2026-11-24): an invoice RECORD (accInvoices / rel_invoices) shows
+     the current customer on its View screen, PDF and Email button — the same
+     rule a job's documents already followed.
+     ══════════════════════════════════════════════════════════════════ */
+  section('R1–R14. Invoice records follow customer edits (View / PDF / Email)');
+  const EMAIL_FN = extractFunction(SRC, 'emailManualInvoiceViaOutlook');
+  const mailtoFor = (inv, ctx) => {
+    const win = { location: { href: '' } };
+    new Function('window', 'sgrInvoiceRecordContactView', EMAIL_FN + '\nreturn emailManualInvoiceViaOutlook;')(win, A.sgrInvoiceRecordContactView)(inv, COMPANIES, ctx);
+    const u = win.location.href; const q = u.indexOf('?');
+    const params = new URLSearchParams(u.slice(q + 1));
+    return { to: decodeURIComponent(u.slice('mailto:'.length, q)), subject: params.get('subject'), body: params.get('body') };
+  };
+  const printOf = (inv, ctx) => { A.__rec.previews.length = 0; A.printManualInvoice(inv, COMPANIES, null, ctx); return A.__rec.previews[0].html; };
+  // A job-derived invoice record as the read layer serves it: the customer
+  // snapshot taken when it was raised (old contact, old email, old address).
+  const RJOB = { ...deep(JOB), id: 41, num: 'SNS-00410', invoiceNum: 'INV-00410' };
+  const RINV = { id: 410, number: 'INV-00410', co: 2, date: '2026-09-01', dueDate: '2026-10-01',
+    contactName: 'Acme Signs CC', contactEmail: 'jan@acme.co.za', contactAddress: 'Old Street 1, Mossel Bay',
+    reference: 'SNS-00410', jobNum: 'SNS-00410', quoteNum: 'SQ-00150', status: 'partial',
+    lineItems: [ { description: 'Illuminated fascia sign', qty: 1, unitAmount: 8100, accountCode: '4000', taxType: '15%' } ],
+    payments: [ { date: '2026-09-02', method: 'EFT', amount: 5000 } ] };
+  const RSNAP = deep(RINV);
+  const ctxAfter = { quotes: [], jobs: [RJOB], accInvoices: [RINV], customers: [CUST_AFTER, CUST_SIMILAR] };
+  const v1 = A.sgrInvoiceRecordContactView(RINV, ctxAfter);
+  eq(v1.state, 'matched', '[R1] job-derived invoice record resolves to its customer');
+  ok(v1.email === 'accounts@acme.co.za' && v1.address === CUST_AFTER.address && v1.person === 'Thandi Mokoena' && v1.tel === '044 999 2222',
+     '[R1] View data = current email / address / contact / tel', v1);
+  const p1 = printOf(RINV, ctxAfter), bt1 = billedTo(p1);
+  ok(/12 Voortrekker Rd/.test(bt1) && /Thandi Mokoena/.test(bt1) && /accounts@acme\.co\.za/.test(bt1) && !/Old Street|jan@acme/.test(bt1),
+     '[R2] PDF Billed To = current customer', bt1);
+  const p1none = printOf(RINV, { ...ctxAfter, customers: [] });
+  ok(/Old Street 1, Mossel Bay/.test(billedTo(p1none)), '[R11] no customer on file -> the invoice\'s own stored address prints (was dropped before)');
+  eq(itemTable(p1), itemTable(p1none), '[R2] lines identical with and without the customer');
+  eq(moneyOnly(p1), moneyOnly(p1none), '[R2] totals / VAT / payments / numbers identical');
+  eq(invTitle(p1), 'INV-00410', '[R2] invoice number unchanged');
+  const m1 = mailtoFor(RINV, ctxAfter);
+  ok(m1.to === 'accounts@acme.co.za' && /Tax Invoice INV-00410 - Acme Signs CC/.test(m1.subject) && /^Dear Acme Signs CC,/.test(m1.body),
+     '[R3] Email button: To = current email, subject/greeting = current name', m1);
+  const m1old = mailtoFor(RINV, undefined);
+  eq(m1old.to, 'jan@acme.co.za', '[R3] called without context (old callers) -> stored email, no crash');
+  ok(JSON.stringify(RINV) === JSON.stringify(RSNAP), '[R10] invoice record not modified by View / PDF / Email');
+
+  // Older linkage: the stored invoice name never matched a customer, but its
+  // linked job (same company) names one exactly.
+  const OLD = { ...deep(RINV), id: 411, number: 'INV-00031', contactName: 'Acme (old name)', contactEmail: 'old@acme.co.za', contactAddress: '' };
+  const vOld = A.sgrInvoiceRecordContactView(OLD, ctxAfter);
+  ok(vOld.state === 'matched' && vOld.via === 'job' && vOld.email === 'accounts@acme.co.za', '[R4] older invoice resolves through its linked job', vOld);
+  ok(/12 Voortrekker Rd/.test(billedTo(printOf(OLD, ctxAfter))), '[R4] older invoice PDF prints current address');
+  ok(/<div class="nm">Acme Signs CC<\/div>/.test(billedTo(printOf(OLD, ctxAfter))), '[R4] older invoice prints the current customer name');
+  const OTHER_CO_JOB = { ...deep(RJOB), co: 1 };
+  eq(A.sgrInvoiceRecordContactView(OLD, { ...ctxAfter, jobs: [OTHER_CO_JOB] }).state, 'none', '[R5] a same-numbered job in the OTHER company is never used');
+  const quoteOnly = { id: 9, num: 'SQ-00150', co: 2, client: 'Acme Signs CC', lines: [] };
+  const vQ = A.sgrInvoiceRecordContactView({ ...OLD, jobNum: '', reference: '' }, { ...ctxAfter, jobs: [], quotes: [quoteOnly] });
+  ok(vQ.state === 'matched' && vQ.via === 'quote', '[R4] quote-sourced older invoice resolves through its linked quote', vQ);
+
+  // Ambiguity is explicit and never guessed.
+  const DUP = { ...CUST_AFTER, id: 1700000000009.5, email: 'dup@acme.co.za', address: 'Duplicate Address' };
+  const vAmb = A.sgrInvoiceRecordContactView(RINV, { ...ctxAfter, customers: [CUST_AFTER, DUP] });
+  ok(vAmb.state === 'ambiguous' && vAmb.count === 2 && vAmb.email === 'jan@acme.co.za' && vAmb.address === 'Old Street 1, Mossel Bay',
+     '[R6] two customers named alike -> ambiguous, stored details shown', vAmb);
+  ok(/Old Street 1/.test(billedTo(printOf(RINV, { ...ctxAfter, customers: [CUST_AFTER, DUP] }))), '[R6] ambiguous -> PDF prints stored details');
+  eq(mailtoFor(RINV, { ...ctxAfter, customers: [CUST_AFTER, DUP] }).to, 'jan@acme.co.za', '[R6] ambiguous -> Email uses stored address');
+  const OLD_AMB = { ...OLD, contactName: 'Acme Signs CC' };
+  eq(A.sgrInvoiceRecordCustomer(OLD_AMB, { ...ctxAfter, customers: [CUST_AFTER, DUP] }).state, 'ambiguous', '[R12] an ambiguous invoice name does not fall through to the job link');
+  const OTHER = { ...CUST_SIMILAR, id: 77, companyName: 'Other Client' };
+  const vDis = A.sgrInvoiceRecordCustomer({ ...OLD }, { ...ctxAfter, quotes: [{ ...quoteOnly, client: 'Other Client' }], customers: [CUST_AFTER, OTHER] });
+  eq(vDis.state, 'ambiguous', '[R7] linked job and linked quote name different customers -> ambiguous');
+  eq(A.sgrInvoiceRecordCustomer({ ...OLD, contactName: 'Acme Signs' }, ctxAfter).customer, CUST_SIMILAR,
+     '[R13] the invoice\'s own exact name outranks its links (similar names stay separate)');
+
+  // Cancelled invoices keep the details they were issued with.
+  const VOID = { ...deep(RINV), id: 412, status: 'void', originalDetailRetained: true };
+  const vVoid = A.sgrInvoiceRecordContactView(VOID, ctxAfter);
+  ok(vVoid.state === 'retained' && vVoid.email === 'jan@acme.co.za' && vVoid.address === 'Old Street 1, Mossel Bay', '[R8] void invoice -> details as issued', vVoid);
+  ok(/Old Street 1/.test(billedTo(printOf(VOID, ctxAfter))) && !/Voortrekker/.test(billedTo(printOf(VOID, ctxAfter))), '[R8] void invoice document is not refreshed');
+
+  // Both companies: customers are shared, so the same edit reaches either company's invoice.
+  const CO1 = { ...deep(RINV), id: 413, co: 1, number: 'INV-00005', jobNum: '', reference: '', quoteNum: '' };
+  const vCo1 = A.sgrInvoiceRecordContactView(CO1, { quotes: [], jobs: [], accInvoices: [CO1], customers: [CUST_AFTER] });
+  ok(vCo1.state === 'matched' && vCo1.email === 'accounts@acme.co.za', '[R9] Holdings (co 1) invoice gets the same current details', vCo1);
+
+  // The old single-answer function is unchanged.
+  eq(A.sgrResolveInvoiceCustomer('Acme Signs CC', [CUST_AFTER, DUP]), null, '[R14] sgrResolveInvoiceCustomer still returns null on duplicates');
+  eq(A.sgrResolveInvoiceCustomer('Acme Signs CC', [CUST_AFTER]), CUST_AFTER, '[R14] sgrResolveInvoiceCustomer still returns the unique match');
 
   console.log('\n' + (failures ? ('PASSED: ' + passed + '   FAILED: ' + failures) : ('ALL ' + passed + ' CHECKS PASSED')));
   process.exit(failures ? 1 : 0);
