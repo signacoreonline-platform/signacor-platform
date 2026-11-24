@@ -28655,6 +28655,31 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   // 2026-09-22: canonical cents, so a statement's running balance closes at
   // exactly R0.00 on a settled account.
   const inclTotal = li => sgrRands(sgrInvoiceCents(li).totalC);
+  /* CUSTOMER STATEMENT IDENTITY (2026-11-24). A customer statement used to
+     exact-match names, and its contact block / picker read `c.company`, a
+     field no customer record has - so the printed statement never showed the
+     customer's details and the picker only offered names seen on invoices.
+     It now uses the SAME canonical lookup as the invoice View / PDF / Email:
+       - the chosen name resolves through sgrMatchInvoiceCustomer (exact unique
+         name, then the (Pty) Ltd / apostrophe equivalence) to ONE customer;
+       - an invoice belongs to that customer when sgrInvoiceRecordCustomer
+         resolves it there (its own name, else its company-scoped linked job /
+         quote); a credit note when its name resolves there;
+       - a name shared by two or more customer records is 'ambiguous': the
+         statement keeps the old exact-name rule, shows no contact details and
+         says so (see stmtCustomerInfo) - it never guesses which record;
+       - a name with no customer record keeps the exact-name rule, minus any
+         transaction that resolves to a customer record (it is on that
+         customer's statement instead, never on two).
+     Every list here is already the logged-in company's own (accInvoices, jobs
+     and creditNotes are filtered by belongsToUserCompany above), cancelled
+     invoices stay excluded, and no amount or record is changed. */
+  const stmtCtx = { quotes, jobs, accInvoices, customers };
+  function stmtCustomerInfo(name){ return sgrMatchInvoiceCustomer(name, customers||[]); }
+  function stmtCustomerBelongs(txnName, resolved, target, name){
+    if(target.state==='matched') return !!resolved.customer && resolved.customer===target.customer;
+    return resolved.state!=='matched' && norm(txnName)===norm(name);
+  }
   function buildStatement(name, type, fromStr, toStr){
     const ev = [];
     const fromT = fromStr ? new Date(fromStr).getTime() : -Infinity;
@@ -28669,7 +28694,8 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
         }
       });
     } else {
-      allInvoices.filter(i=>i.status!=='void' && norm(i.contactName)===norm(name)).forEach(i=>{
+      const _target = stmtCustomerInfo(name);
+      allInvoices.filter(i=>i.status!=='void' && stmtCustomerBelongs(i.contactName, sgrInvoiceRecordCustomer(i, stmtCtx), _target, name)).forEach(i=>{
         ev.push({date:i.date, sort:0, docType:'Invoice', ref:i.number||'', desc:(i.lineItems&&i.lineItems[0]?.description)||'Invoice', debit:inclTotal(i.lineItems), credit:0});
         // Credit-note allocations (method exactly "Credit", or the old buggy
         // "Credit (R ... available)" display-string format) still display
@@ -28686,7 +28712,10 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
         });
       });
     }
-    cnotes.filter(c=>c.type===type && norm(c.contactName)===norm(name)).forEach(c=>{
+    const _cnTarget = type==='customer' ? stmtCustomerInfo(name) : null;
+    cnotes.filter(c=>c.type===type && (type==='customer'
+        ? stmtCustomerBelongs(c.contactName, stmtCustomerInfo(c.contactName), _cnTarget, name)
+        : norm(c.contactName)===norm(name))).forEach(c=>{
       ev.push({date:c.date, sort:2, docType:'Credit Note', ref:c.number||'', desc:c.reason||'Credit note', debit:0, credit:parseFloat(c.amount)||0});
     });
     ev.sort((a,b)=>{const d=new Date(a.date||0)-new Date(b.date||0); return d!==0?d:a.sort-b.sort;});
@@ -28723,10 +28752,14 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
   },[initialStatementContact]);
   function contactMetaFor(name, type){
     if(type==='supplier'){ const s=(suppliers||[]).find(s=>norm(s.name)===norm(name)); return s?{contactPerson:s.contactPerson, email:s.email, tel:s.phone, address:[s.address,s.city,s.postalCode].filter(Boolean).join(', '), vatNumber:s.vatNumber}:{}; }
-    const c=(customers||[]).find(c=>norm(c.company)===norm(name)); return c?{contactPerson:c.contactPerson, email:c.email, tel:c.tel, address:c.address, vatNumber:c.vatNumber}:{};
+    // 2026-11-24: canonical lookup + the customer record's real fields (was
+    // `c.company`, which no customer has, so this always returned {}).
+    const c=stmtCustomerInfo(name).customer; return c?{contactPerson:c.contactPerson, email:c.email, tel:(c.tel||c.phone), address:c.address, vatNumber:c.vatNumber}:{};
   }
   function doPrintStatement(){
     if(!stmtContact){alert('Please choose a '+(stmtType==='supplier'?'supplier':'customer')+' first.');return;}
+    const _who = stmtType==='customer' ? stmtCustomerInfo(stmtContact) : null;
+    if(_who && _who.state==='ambiguous' && !window.confirm(_who.count+' customer records are named "'+stmtContact+'". The statement lists every transaction under that name and prints no contact details.\n\nMerge or rename the duplicate under Customers for a statement with contact details. Print anyway?')) return;
     const st = buildStatement(stmtContact, stmtType, stmtFrom, stmtTo);
     const fmtD = d => new Date(d).toLocaleDateString('en-ZA',{day:'2-digit',month:'short',year:'numeric'});
     const todayLabel = fmtD(new Date().toISOString().slice(0,10));
@@ -28737,7 +28770,8 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
       ? 'All transactions'
       : (stmtFrom?fmtD(stmtFrom):'Earliest')+' – '+(stmtTo?fmtD(stmtTo):todayLabel);
     printStatement({
-      contactName: stmtContact, contactType: stmtType, contactMeta: contactMetaFor(stmtContact, stmtType),
+      contactName: (_who && _who.customer && String(_who.customer.companyName||'').trim()) || stmtContact,
+      contactType: stmtType, contactMeta: contactMetaFor(stmtContact, stmtType),
       periodLabel, asAtLabel: stmtTo?fmtD(stmtTo):todayLabel,
       openingBalance: st.openingBalance,
       rows: st.rows.map(r=>({...r, date:fmtD(r.date)})),
@@ -29323,7 +29357,18 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
     downloadCSV(rows, 'signacore-invoices-'+new Date().toISOString().slice(0,10)+'.csv');
   }
   // Contact-name lists for Statements & Credit Notes — declared after allInvoices so it is initialised first (fixes TDZ crash)
-  const customerNames = Array.from(new Set([...(customers||[]).map(c=>c.company).filter(Boolean), ...allInvoices.map(i=>i.contactName).filter(Boolean)])).sort((a,b)=>a.localeCompare(b));
+  const customerNames = Array.from(new Set([...(customers||[]).map(c=>c && c.companyName).filter(Boolean), ...allInvoices.map(i=>i.contactName).filter(Boolean)])).sort((a,b)=>a.localeCompare(b));
+  // 2026-11-24: the STATEMENT picker - every customer record once, plus any
+  // invoice / credit-note name that resolves to no customer record (a name
+  // that resolves to a customer is that customer's statement, not a second one).
+  const stmtCustomerNames = (()=>{
+    const seen = new Set(), out = [];
+    const add = n=>{ const t=String(n||'').trim(); if(t && t!=='—' && !seen.has(norm(t))){ seen.add(norm(t)); out.push(t); } };
+    (customers||[]).forEach(c=>c && add(c.companyName));
+    allInvoices.forEach(i=>{ if(sgrInvoiceRecordCustomer(i, stmtCtx).state==='none') add(i.contactName); });
+    cnotes.forEach(c=>{ if(c && c.type==='customer' && stmtCustomerInfo(c.contactName).state==='none') add(c.contactName); });
+    return out.sort((a,b)=>a.localeCompare(b));
+  })();
   const supplierNames = Array.from(new Set([...(suppliers||[]).map(s=>s.name).filter(Boolean), ...accBills.map(b=>b.supplierName).filter(Boolean)])).sort((a,b)=>a.localeCompare(b));
 
   const fullPL = getFullPL();
@@ -30352,7 +30397,9 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
       {/* ════ STATEMENTS ════ */}
       {accTab==='statements'&&(()=>{
         const st = stmtContact ? buildStatement(stmtContact, stmtType, stmtFrom, stmtTo) : {openingBalance:0, rows:[], closingBalance:0};
-        const names = stmtType==='supplier' ? supplierNames : customerNames;
+        const names = stmtType==='supplier' ? supplierNames : stmtCustomerNames;
+        const who = stmtType==='customer' && stmtContact ? stmtCustomerInfo(stmtContact) : null;
+        const whoMeta = who && who.customer ? contactMetaFor(stmtContact, 'customer') : null;
         const setMonth = off => {
           const d = new Date(); d.setMonth(d.getMonth()+off);
           setStmtFrom(new Date(d.getFullYear(),d.getMonth(),1).toISOString().slice(0,10));
@@ -30407,7 +30454,16 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, bankTxns:bankTxnsAll, s
             <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
               <div className="px-4 py-3 border-b flex items-center justify-between flex-wrap gap-2" style={{background:'#f8f9ff'}}>
                 <div>
-                  <p className="font-black text-gray-800">{stmtContact}</p>
+                  <p className="font-black text-gray-800" data-testid="stmt-name">{(who && who.customer && who.customer.companyName) || stmtContact}</p>
+                  {whoMeta&&(whoMeta.contactPerson||whoMeta.email||whoMeta.tel||whoMeta.address)&&(
+                    <p className="text-xs text-gray-500" data-testid="stmt-contact">{[whoMeta.contactPerson, whoMeta.email, whoMeta.tel, whoMeta.address].filter(Boolean).join(' · ')}</p>
+                  )}
+                  {who&&who.state==='ambiguous'&&(
+                    <p className="text-xs font-semibold text-amber-700" data-testid="stmt-ambiguous">⚠ {who.count} customer records are named “{stmtContact}” — this statement lists every transaction under that name and shows no contact details. Merge or rename the duplicate under Customers.</p>
+                  )}
+                  {who&&who.state==='none'&&(
+                    <p className="text-xs text-gray-400" data-testid="stmt-no-record">No customer record matches this name — transactions are matched by the name on them.</p>
+                  )}
                   <p className="text-xs text-gray-400">{stmtType==='supplier'?'Supplier account':'Customer account'} · {st.rows.length} transaction{st.rows.length===1?'':'s'} {(stmtFrom||stmtTo)?'in selected period':'(all time)'}</p>
                 </div>
                 <div className="text-right">
