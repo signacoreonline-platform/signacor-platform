@@ -7921,7 +7921,12 @@ function CustomerCreditRefundForm({ source, onDone, onCancel }){
   );
 }
 function CustomerCreditSection({ companyCode, customerRef, user, onChanged, customers }){
-  const [state, setState] = useState({ loading:true, data:null, error:'' });
+  // 2026-11-26: the loaded figures are tagged with the company + customer they
+  // belong to and only shown for that exact pair, so switching customer or
+  // company never shows the previous one's credit while the next loads, and a
+  // slower earlier response can never overwrite the current selection.
+  const viewKey = String(companyCode||'')+'|'+String(customerRef||'');
+  const [state, setState] = useState({ loading:true, data:null, error:'', key:null });
   const [receiving, setReceiving] = useState(false);
   const [tick, setTick] = useState(0);
   const [openHist, setOpenHist] = useState({});
@@ -7930,10 +7935,11 @@ function CustomerCreditSection({ companyCode, customerRef, user, onChanged, cust
   useEffect(()=>{
     if(!companyCode || !customerRef) return;
     let live = true;
-    setState(s=>({ ...s, loading:true }));
+    const k = viewKey;
+    setState(s=>s.key===k ? { ...s, loading:true } : { loading:true, data:null, error:'', key:k });
     relationalApi.getCustomerCredit(companyCode, customerRef)
-      .then(r=>{ if(live) setState({ loading:false, data:r.credit, error:'' }); })
-      .catch(e=>{ if(live) setState({ loading:false, data:null, error:(e&&e.message)||'Could not load customer credit.' }); });
+      .then(r=>{ if(live) setState({ loading:false, data:r.credit, error:'', key:k }); })
+      .catch(e=>{ if(live) setState({ loading:false, data:null, error:(e&&e.message)||'Could not load customer credit.', key:k }); });
     return ()=>{ live=false; };
   }, [companyCode, customerRef, tick]);
   const reload = ()=>{ setTick(t=>t+1); onChanged && onChanged(); };
@@ -7957,13 +7963,14 @@ function CustomerCreditSection({ companyCode, customerRef, user, onChanged, cust
       reload();
     } catch(e){ setMsg(describeSaveConflictError(e, h.kind==='allocation'?'credit allocation':'refund')); }
   }
-  if(state.loading && !state.data) return <p className="text-xs text-gray-400 py-3" data-testid="credit-loading">Loading customer credit…</p>;
+  if(state.key!==viewKey || (state.loading && !state.data)) return <p className="text-xs text-gray-400 py-3" data-testid="credit-loading">Loading customer credit…</p>;
   if(state.error) return <p className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{state.error}</p>;
   const d = state.data; if(!d) return null;
+  if(String(d.customer && d.customer.ref)!==String(customerRef) || String(d.companyCode)!==String(companyCode)) return <p className="text-xs text-gray-400 py-3" data-testid="credit-loading">Loading customer credit…</p>;
   const toggle = k=>setOpenHist(o=>({ ...o, [k]:!o[k] }));
   const th = "px-3 py-2 text-left text-gray-500 font-bold", thr = "px-3 py-2 text-right text-gray-500 font-bold";
   return (
-    <div className="space-y-3" data-testid="customer-credit-section">
+    <div className="space-y-3" data-testid="customer-credit-section" data-customer-ref={String(customerRef)} data-company={String(companyCode)}>
       <div className="grid grid-cols-3 gap-3">
         <div className="bg-white border border-gray-200 rounded-xl p-3 text-center"><p className="text-xs text-gray-500">Unallocated payment credit</p><p className="text-lg font-black text-emerald-700" data-testid="credit-total-payment">{sgrCreditZar(sgrToCents0(d.totals.paymentCredit))}</p></div>
         <div className="bg-white border border-gray-200 rounded-xl p-3 text-center"><p className="text-xs text-gray-500">Unused credit notes</p><p className="text-lg font-black text-emerald-700" data-testid="credit-total-notes">{sgrCreditZar(sgrToCents0(d.totals.creditNotes))}</p></div>
@@ -8045,7 +8052,10 @@ function CustomerCreditModal({ customer, user, onClose, customers }){
 function CustomerCreditsView({ user, customers }){
   const cos = sgrCreditCompaniesFor(user);
   const [co, setCo] = useState(String((cos.find(c=>c.id===2)||cos[0]||{id:2}).id));
-  const [q, setQ] = useState('');
+  // 2026-11-26: the customer filter is the customer's canonical id ('' = All
+  // customers), never its name, so same-named customers stay separate. The
+  // company filter still decides which company's credit is read.
+  const [custRef, setCustRef] = useState('');
   const [state, setState] = useState({ loading:true, data:null, error:'' });
   const [tick, setTick] = useState(0);
   const [sel, setSel] = useState(null);
@@ -8060,8 +8070,16 @@ function CustomerCreditsView({ user, customers }){
       .catch(e=>{ if(live) setState({ loading:false, data:null, error:(e&&e.message)||'Could not load customer credits.' }); });
     return ()=>{ live=false; };
   }, [co, tick]);
-  const rows = ((state.data&&state.data.customers)||[]).filter(r=>!q.trim() || String(r.name||'').toLowerCase().includes(q.trim().toLowerCase()));
-  const unresolved = (state.data&&state.data.unresolved)||[];
+  const allRows = (state.data&&state.data.customers)||[];
+  const rows = custRef ? allRows.filter(r=>String(r.ref)===custRef) : allRows;
+  // credit that belongs to no customer is listed only under "All customers"
+  const unresolved = custRef ? [] : ((state.data&&state.data.unresolved)||[]);
+  const custOptions = (customers||[]).filter(c=>c && c.id!=null)
+    .map(c=>({ ref:String(c.id), label:sgrCustomerLabel(c, customers) }))
+    .sort((a,b)=>a.label.localeCompare(b.label));
+  const custLabel = ref => { const o = custOptions.find(x=>x.ref===String(ref)); if(o) return o.label; const r = allRows.find(x=>String(x.ref)===String(ref)); return (r&&r.name)||String(ref); };
+  const shownRef = custRef || sel;
+  function chooseCustomer(ref){ setCustRef(ref ? String(ref) : ''); setSel(null); }
   async function linkNote(u, c){
     setPickFor(null); setMsg('');
     try { await relationalApi.updateCreditNote(u.sourceId, u.rowVersion, { customerRef: String(c.id) }); setTick(t=>t+1); }
@@ -8076,34 +8094,38 @@ function CustomerCreditsView({ user, customers }){
         </div>
         <div className="flex gap-2 items-end">
           {cos.length>1&&<div><label className="text-xs font-bold text-gray-500 block">Company</label><select value={co} onChange={e=>{ setCo(e.target.value); setSel(null); }} className="border border-gray-200 rounded-lg px-2 py-1.5 text-sm" data-testid="credits-company">{cos.map(c=><option key={c.id} value={String(c.id)}>{c.name}</option>)}</select></div>}
-          <div><label className="text-xs font-bold text-gray-500 block">Customer</label><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Filter by name…" className="border border-gray-200 rounded-lg px-2 py-1.5 text-sm" data-testid="credits-filter"/></div>
+          <div><label className="text-xs font-bold text-gray-500 block">Customer</label>
+            <select value={custRef} onChange={e=>chooseCustomer(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1.5 text-sm max-w-xs" data-testid="credits-customer">
+              <option value="">All customers</option>
+              {custOptions.map(o=><option key={o.ref} value={o.ref}>{o.label}</option>)}
+            </select></div>
         </div>
       </div>
       {msg&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2">{msg}</p>}
       {canManagePayments(user) && (receiving
         ? <AccountReceiptForm user={user} customers={customers} onCancel={()=>setReceiving(false)}
-            onDone={({ companyCode, customerRef })=>{ setReceiving(false); setCo(String(companyCode)); setSel(String(customerRef)); setTick(t=>t+1); }}/>
+            onDone={({ companyCode, customerRef })=>{ setReceiving(false); setCo(String(companyCode)); setCustRef(''); setSel(String(customerRef)); setTick(t=>t+1); }}/>
         : <div className="flex justify-end"><button onClick={()=>setReceiving(true)} className="text-xs font-bold text-white rounded-lg px-3 py-2" style={{background:'#047857'}} data-testid="account-receipt-open">＋ Receive Payment on Account</button></div>)}
       {state.error ? <p className="text-xs text-red-600">{state.error}</p> : state.loading && !state.data ? <p className="text-xs text-gray-400">Loading…</p> : (
         <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
           <table className="w-full text-sm" data-testid="credits-table">
             <thead className="bg-gray-50"><tr><th className="px-3 py-2 text-left text-xs text-gray-500">Customer</th><th className="px-3 py-2 text-right text-xs text-gray-500">Payment credit</th><th className="px-3 py-2 text-right text-xs text-gray-500">Credit notes</th><th className="px-3 py-2 text-right text-xs text-gray-500">Total available</th><th/></tr></thead>
             <tbody>
-              {rows.length===0 && <tr><td colSpan="5" className="px-3 py-6 text-center text-xs text-gray-400">No customer has available credit in {sgrCompanyName(co)}.</td></tr>}
+              {rows.length===0 && <tr><td colSpan="5" className="px-3 py-6 text-center text-xs text-gray-400" data-testid="credits-empty">{custRef ? (custLabel(custRef)+' has no available credit in '+sgrCompanyName(co)+'.') : ('No customer has available credit in '+sgrCompanyName(co)+'.')}</td></tr>}
               {rows.map(r=>(
-                <tr key={r.ref} className={`border-t border-gray-100 ${sel===r.ref?'bg-emerald-50':''}`} data-testid="credits-row">
+                <tr key={r.ref} className={`border-t border-gray-100 ${shownRef===r.ref?'bg-emerald-50':''}`} data-testid="credits-row" data-customer-ref={String(r.ref)}>
                   <td className="px-3 py-2 font-semibold">{(()=>{ const c=(customers||[]).find(x=>x&&String(x.id)===String(r.ref)); return c ? sgrCustomerLabel(c, customers) : (r.name||r.ref); })()}</td>
                   <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(r.paymentCredit))}</td>
                   <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(r.creditNotes))}</td>
                   <td className="px-3 py-2 text-right font-black text-emerald-700">{sgrCreditZar(sgrToCents0(r.total))}</td>
-                  <td className="px-3 py-2 text-right"><button onClick={()=>setSel(sel===r.ref?null:r.ref)} className="text-xs text-blue-600 hover:underline" data-testid="credits-open">{sel===r.ref?'Close':'Open'}</button></td>
+                  <td className="px-3 py-2 text-right">{custRef ? null : <button onClick={()=>setSel(sel===r.ref?null:r.ref)} className="text-xs text-blue-600 hover:underline" data-testid="credits-open">{sel===r.ref?'Close':'Open'}</button>}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       )}
-      {sel&&<div className="bg-white rounded-2xl border border-emerald-200 p-4"><CustomerCreditSection companyCode={co} customerRef={sel} user={user} customers={customers} onChanged={()=>setTick(t=>t+1)}/></div>}
+      {shownRef&&<div className="bg-white rounded-2xl border border-emerald-200 p-4" data-testid="credits-detail"><p className="text-sm font-black text-gray-800 mb-2">{custLabel(shownRef)} · {sgrCompanyName(co)}</p><CustomerCreditSection key={co+'|'+shownRef} companyCode={co} customerRef={shownRef} user={user} customers={customers} onChanged={()=>setTick(t=>t+1)}/></div>}
       {unresolved.length>0&&(
         <div className="bg-amber-50 rounded-2xl border border-amber-200 p-4 space-y-2" data-testid="credits-unresolved">
           <p className="text-sm font-black text-amber-800">Credit that cannot be attributed to a customer ({unresolved.length})</p>
