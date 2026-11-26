@@ -58,7 +58,7 @@ interface Doc {
   number: string; co: string; name: string; ref: string | null; status: string; customerType: string;
   relCustomerRef: string | null; storedRef: string | null; peers: string[];
 }
-interface PlanItem { key: string; section: Section; store: 'rel' | 'json'; relId: number | null; jsonIndex: number | null; jsonId: string | null; number: string; co: string; name: string; toRef: string; toName: string; evidence: string }
+interface PlanItem { key: string; section: Section; store: 'rel' | 'json'; relId: number | null; jsonIndex: number | null; jsonId: string | null; number: string; co: string; name: string; toRef: string; toName: string; evidence: string; nameMatch: string }
 interface Unresolved { key: string; section: Section; number: string; co: string; name: string; reason: string }
 interface Plan { items: PlanItem[]; unresolved: Unresolved[]; broken: Unresolved[]; fingerprint: string; confirm: string; dupIds: string[] }
 
@@ -155,7 +155,7 @@ async function readAll(client: Client, lock: boolean) {
   return { auth, customers, docs, psUpdatedAt: ps?.updated_at ? new Date(ps.updated_at).toISOString() : null, data };
 }
 
-function buildPlan(customers: Cust[], docs: Doc[]): Plan {
+function buildPlan(customers: Cust[], docs: Doc[], skip: Set<string> = new Set()): Plan {
   const count = new Map<string, number>();
   for (const c of customers) count.set(c.ref, (count.get(c.ref) || 0) + 1);
   const dupIds = Array.from(count.entries()).filter(([, n]) => n > 1).map(([r]) => r);
@@ -167,6 +167,19 @@ function buildPlan(customers: Cust[], docs: Doc[]): Plan {
     if (!hits.length) hits = customers.filter((c) => c.former.some((f) => norm(f) === n));
     if (hits.length === 1) return valid(hits[0].ref) ? { state: 'one', ref: hits[0].ref } : { state: 'many', n: 2 };
     return hits.length ? { state: 'many', n: hits.length } : { state: 'none' };
+  };
+  // How a document's OWN stored name relates to the customer it would be linked
+  // to. Once linked, an active document DISPLAYS the customer record, so a name
+  // that is neither the customer's current name nor one of its recorded former
+  // names would make an old document show a different name (and move it to that
+  // customer's statement). Those are never linked automatically.
+  const nameMatch = (d: Doc, ref: string): 'exact' | 'case' | 'former' | 'blank' | 'different' => {
+    const c = customers.find((x) => x.ref === ref); const nm = String(d.name || '').trim();
+    if (!nm) return 'blank';
+    if (c && c.name.trim() === nm) return 'exact';
+    if (c && norm(c.name) === norm(nm)) return 'case';
+    if (c && c.former.some((f) => norm(f) === norm(nm))) return 'former';
+    return 'different';
   };
   const byKey = new Map(docs.map((d) => [d.key, d]));
   const items: PlanItem[] = []; const unresolved: Unresolved[] = []; const broken: Unresolved[] = [];
@@ -206,8 +219,18 @@ function buildPlan(customers: Cust[], docs: Doc[]): Plan {
       else if (nameRefs.size === 1) { to = Array.from(nameRefs)[0]; evidence = 'name'; }
       else reason = `no customer record matches "${group[0].name || '(no name)'}"`;
     }
+    // Display guard (not for chain-link: an unlinked member of a linked chain
+    // already displays that customer through the chain, so linking it changes
+    // nothing on screen). The whole chain is held, never half of it.
+    if (to && evidence !== 'chain-link') {
+      const odd = todo.find((d) => nameMatch(d, to as string) === 'different');
+      if (odd) {
+        reason = `NEEDS REVIEW: ${LABEL[odd.section]} ${odd.number} is named "${odd.name}" but ${evidence === 'name' ? 'the matching' : 'the stored (original-migration) reference points at the'} customer record now named "${nameOf(to)}", and "${odd.name}" is not one of its recorded former names. Linking would make ${todo.length > 1 ? 'these documents' : 'it'} display "${nameOf(to)}". Choose explicitly in Customers -> "not linked" if it is the same customer.`;
+        to = null;
+      }
+    }
     for (const d of todo) {
-      if (to) items.push({ key: d.key, section: d.section, store: d.store, relId: d.relId, jsonIndex: d.jsonIndex, jsonId: d.jsonId, number: d.number, co: d.co, name: d.name, toRef: to, toName: nameOf(to), evidence });
+      if (to) items.push({ key: d.key, section: d.section, store: d.store, relId: d.relId, jsonIndex: d.jsonIndex, jsonId: d.jsonId, number: d.number, co: d.co, name: d.name, toRef: to, toName: nameOf(to), evidence, nameMatch: nameMatch(d, to) });
       else un(d, reason);
     }
   }
@@ -218,11 +241,26 @@ function buildPlan(customers: Cust[], docs: Doc[]): Plan {
     const m = byName(d.name);
     let to: string | null = null; let ev = ''; let reason = '';
     if (new Set(okStrong).size > 1) reason = 'stored customer references disagree';
-    else if (okStrong.length) { if (m.state === 'one' && m.ref !== okStrong[0]) reason = `the stored reference says ${nameOf(okStrong[0])} but the note is named ${nameOf(m.ref!)}`; else { to = okStrong[0]; ev = d.relCustomerRef === to ? 'rel-customer' : 'stored-id'; } }
+    else if (okStrong.length) {
+      if (m.state === 'one' && m.ref !== okStrong[0]) reason = `the stored reference says ${nameOf(okStrong[0])} but the note is named ${nameOf(m.ref!)}`;
+      else if (nameMatch(d, okStrong[0]) === 'different') reason = `NEEDS REVIEW: the note is named "${d.name}" but the stored (original-migration) reference points at the customer record now named "${nameOf(okStrong[0])}", and "${d.name}" is not one of its recorded former names. Choose explicitly if it is the same customer.`;
+      else { to = okStrong[0]; ev = d.relCustomerRef === to ? 'rel-customer' : 'stored-id'; }
+    }
     else if (m.state === 'one') { to = m.ref!; ev = 'name'; }
     else reason = m.state === 'many' ? `${m.n} customers are named "${d.name}" — choose one` : `no customer record matches "${d.name || '(no name)'}"`;
-    if (to) items.push({ key: d.key, section: d.section, store: d.store, relId: d.relId, jsonIndex: d.jsonIndex, jsonId: d.jsonId, number: d.number, co: d.co, name: d.name, toRef: to, toName: nameOf(to), evidence: ev });
+    if (to) items.push({ key: d.key, section: d.section, store: d.store, relId: d.relId, jsonIndex: d.jsonIndex, jsonId: d.jsonId, number: d.number, co: d.co, name: d.name, toRef: to, toName: nameOf(to), evidence: ev, nameMatch: nameMatch(d, to) });
     else un(d, reason);
+  }
+  // --skip-customer: documents that would link to an excluded customer record
+  // (e.g. a catch-all "CASH SALE" record shared by unrelated walk-in buyers)
+  // are left unlinked for an explicit choice. Applied before the fingerprint.
+  if (skip.size) {
+    for (let k = items.length - 1; k >= 0; k--) {
+      const i = items[k];
+      if (!skip.has(i.toRef)) continue;
+      unresolved.push({ key: i.key, section: i.section, number: i.number, co: i.co, name: i.name, reason: `SKIPPED: would link to ${i.toName} [${i.toRef}], which was excluded with --skip-customer — choose explicitly if needed` });
+      items.splice(k, 1);
+    }
   }
   items.sort((a, b) => a.key.localeCompare(b.key));
   const fp = crypto.createHash('sha256').update(JSON.stringify(items.map((i) => [i.key, i.toRef, i.evidence]))).digest('hex').slice(0, 16);
@@ -240,9 +278,11 @@ function printReport(auth: Record<string, boolean>, customers: Cust[], docs: Doc
     log(`           ${s.padEnd(12)} ${String(ds.filter((d) => d.ref).length - br).padStart(6)}  ${String(ds.filter((d) => !d.ref).length).padStart(10)}  ${String(br).padStart(11)}`);
   }
   const ev = new Map<string, number>(); plan.items.forEach((i) => ev.set(i.evidence, (ev.get(i.evidence) || 0) + 1));
+  const nmc = new Map<string, number>(); plan.items.forEach((i) => nmc.set(i.nameMatch, (nmc.get(i.nameMatch) || 0) + 1));
+  log(`NAMES      document name vs customer record: ${Array.from(nmc.entries()).map(([k, v]) => `${k}: ${v}`).join(', ') || 'none'} (exact/case = same name; former = a recorded former name; blank = no name on the document)`);
   log(`PLAN       ${plan.items.length} record(s) can be linked from reliable evidence (${Array.from(ev.entries()).map(([k, v]) => `${k}: ${v}`).join(', ') || 'none'}); ${plan.unresolved.length} unresolved; ${plan.broken.length} broken link(s).`);
   if (mode === 'diagnose') return;
-  if (plan.items.length) { log(''); log('TO LINK'); for (const i of plan.items) log(`   co ${i.co}  ${LABEL[i.section]} ${i.number || '(no number)'}  "${i.name}"  ->  ${i.toName} [${i.toRef}]  (${i.evidence})`); }
+  if (plan.items.length) { log(''); log('TO LINK'); for (const i of plan.items) log(`   co ${i.co}  ${LABEL[i.section]} ${i.number || '(no number)'}  "${i.name}"  ->  ${i.toName} [${i.toRef}]  (${i.evidence}${i.nameMatch === 'exact' ? '' : ', name: ' + i.nameMatch})`); }
   if (plan.unresolved.length) { log(''); log('UNRESOLVED — choose explicitly in Customers -> "not linked to a customer record"'); for (const u of plan.unresolved) log(`   co ${u.co}  ${LABEL[u.section]} ${u.number || '(no number)'}  "${u.name}"  — ${u.reason}`); }
   if (plan.broken.length) { log(''); log('BROKEN LINKS — never changed by this script; fix the customer id or choose again in the dashboard'); for (const b of plan.broken) log(`   co ${b.co}  ${LABEL[b.section]} ${b.number}  — ${b.reason}`); }
 }
@@ -250,8 +290,11 @@ function printReport(auth: Record<string, boolean>, customers: Cust[], docs: Doc
 async function applyPlan(client: Client, plan: Plan, anyJson: boolean, localFile: string): Promise<{ changed: number; backupId: string | null; planBackupId: string }> {
   const REASON = 'before-customer-link-backfill';
   const source = 'src/scripts/backfill-customer-links.ts (manual run)';
+  // platform_state is backed up on every apply (project rule), even when only
+  // relational rows are linked and platform_state itself is not changed.
+  void anyJson;
   let backupId: string | null = null;
-  if (anyJson) {
+  {
     backupId = (await client.query(
       `INSERT INTO platform_state_backups (data, reason, data_size_bytes, record_counts, source)
        SELECT data, $1, octet_length(data::text), '{}'::jsonb, $2 FROM platform_state WHERE id = 1 RETURNING id::text AS id`, [REASON, source])).rows[0].id;
@@ -303,6 +346,25 @@ async function connect(timeoutMs: number, attempts: number): Promise<Client> {
   throw new Error(`could not connect to the database after ${attempts} attempts (limit ${Math.round(timeoutMs / 1000)}s each).\n   ${scrub(describeConnectionError(last), url)}`);
 }
 
+/** --show-customer=<id> (dry run / diagnose only, read only): the customer record
+ *  next to the details STORED on every planned document that would link to it,
+ *  so a reviewer can see what each document would display instead once linked. */
+async function showCustomer(client: Client, ref: string, data: any, plan: Plan): Promise<void> {
+  const rec = (Array.isArray(data?.customers) ? data.customers : []).find((c: any) => c && String(c.id) === ref);
+  log(`CUSTOMER ${ref}: ${rec ? JSON.stringify({ companyName: rec.companyName, contactPerson: rec.contactPerson || '', email: rec.email || '', tel: rec.tel || '', address: rec.address || '', vatNumber: rec.vatNumber || '', formerNames: rec.formerNames || [] }) : '(not in platform_state customers)'}`);
+  const mine = plan.items.filter((i) => i.toRef === ref);
+  log(`         ${mine.length} planned document(s) would link to it and then display these record details. Stored on each document now:`);
+  for (const i of mine) {
+    if (i.store !== 'rel' || i.relId == null) { log(`   ${LABEL[i.section]} ${i.number}: (JSON record)`); continue; }
+    const q = i.section === 'accInvoices' ? `SELECT contact_name AS name, contact_email AS email, contact_address AS address, status FROM rel_invoices WHERE id = $1`
+      : i.section === 'creditNotes' ? `SELECT contact_name_raw AS name, status FROM rel_credit_notes WHERE id = $1`
+      : `SELECT customer_name_raw AS name, contact_person AS contact, email, phone, address, vat_number AS vat, status FROM ${REL[i.section].table} WHERE id = $1`;
+    const r = (await client.query(q, [i.relId])).rows[0] || {};
+    log(`   co ${i.co}  ${LABEL[i.section]} ${i.number}: ${JSON.stringify(r)}`);
+  }
+  log('');
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const arg = (n: string): string | undefined => { const a = argv.find((x) => x.startsWith(n + '=')); return a ? a.slice(n.length + 1) : undefined; };
@@ -324,10 +386,16 @@ async function main(): Promise<void> {
     const hasCol = (await client.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'rel_invoices' AND column_name = 'customer_ref'`)).rowCount;
     if (!hasCol) throw new Error('migration 021_customer_links has not run on this database yet (rel_invoices.customer_ref is missing). Deploy the backend first. Nothing was written.');
     log('');
-    const { auth, customers, docs } = await readAll(client, APPLY);
-    const plan = buildPlan(customers, docs);
+    const skipRaw = arg('--skip-customer');
+    const skip = new Set<string>((skipRaw || '').split(',').map((x) => x.trim()).filter(Boolean));
+    const showRef = t(arg('--show-customer'));
+    const { auth, customers, docs, data } = await readAll(client, APPLY);
+    for (const r of skip) if (!customers.some((c) => c.ref === r)) throw new Error(`--skip-customer ${r} is not a customer id. Nothing written.`);
+    if (skip.size) log(`SKIPPING   documents that would link to: ${Array.from(skip).map((r) => `${customers.find((c) => c.ref === r)?.name} [${r}]`).join(', ')}`);
+    const plan = buildPlan(customers, docs, skip);
     printReport(auth, customers, docs, plan, DIAG ? 'diagnose' : APPLY ? 'apply' : 'dry-run');
     log('');
+    if (showRef && !APPLY) await showCustomer(client, showRef, data, plan);
     if (!APPLY) {
       await client.query('ROLLBACK'); inTx = false;
       if (DIAG) { log('DIAGNOSE — nothing was written. Run without --diagnose for the full plan and the unresolved list.'); return; }
@@ -336,7 +404,7 @@ async function main(): Promise<void> {
       log(`DRY RUN — ${plan.items.length} record(s) to link, ${plan.unresolved.length} unresolved, ${plan.broken.length} broken. Nothing was written.`);
       log(`report:          ${rep}`);
       log(`plan fingerprint: ${plan.fingerprint}`);
-      if (plan.items.length) { log('To apply exactly this plan:'); log(`   npm run backfill:customer-links:compiled -- --apply --confirm="${plan.confirm}" --expect=${plan.fingerprint}`); }
+      if (plan.items.length) { log('To apply exactly this plan:'); log(`   node dist/scripts/backfill-customer-links.js --apply "--confirm=${plan.confirm}" --expect=${plan.fingerprint}${skip.size ? ' --skip-customer=' + Array.from(skip).join(',') : ''} --connect-timeout=60`); }
       return;
     }
     if (!plan.items.length) { await client.query('ROLLBACK'); inTx = false; log('Nothing to link — nothing written.'); return; }
@@ -345,12 +413,13 @@ async function main(): Promise<void> {
     localFile = path.resolve(process.cwd(), `customer-link-backfill-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
     const res = await applyPlan(client, plan, plan.items.some((i) => i.store === 'json'), localFile);
     // verify before commit
-    const again = buildPlan((await readAll(client, false)).customers, (await readAll(client, false)).docs);
+    const reread = await readAll(client, false);
+    const again = buildPlan(reread.customers, reread.docs, skip);
     const stillTodo = again.items.filter((i) => plan.items.some((p) => p.key === i.key));
     if (stillTodo.length) throw new Error(`verification failed: ${stillTodo.length} planned record(s) are still unlinked. Rolled back; nothing written.`);
     await client.query('COMMIT'); inTx = false;
     try { const d = JSON.parse(fs.readFileSync(localFile, 'utf8')); d.status = 'APPLIED (committed ' + new Date().toISOString() + ')'; fs.writeFileSync(localFile, JSON.stringify(d, null, 2), 'utf8'); } catch { /* already written */ }
-    if (res.backupId) log(`BACKUP   platform_state_backups id ${res.backupId} (whole platform_state row, before)`);
+    if (res.backupId) log(`BACKUP   platform_state_backups id ${res.backupId} (whole platform_state row, before; unchanged unless JSON sections were linked)`);
     log(`BACKUP   platform_state_backups id ${res.planBackupId} (plan) and one customer_link_audit row per record`);
     log(`LOCAL    ${localFile}   (keep it: the server keeps only the newest 100 backup rows)`);
     log(`APPLIED  ${res.changed} record(s) linked. ${plan.unresolved.length} unresolved and ${plan.broken.length} broken link(s) were left for an explicit choice. No other field changed.`);
