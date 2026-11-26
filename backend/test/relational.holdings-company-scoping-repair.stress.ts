@@ -68,6 +68,17 @@
 import fs from 'fs';
 import path from 'path';
 import pool from '../src/db/pool';
+
+// 2026-11-26: a new customer credit note must be linked to an existing customer
+// record — seeds one (platform_state.customers) per contact name and returns its id.
+async function seedCust(name: string): Promise<string> {
+  const id = 'T-CN-' + name.replace(/[^A-Za-z0-9]+/g, '-').toUpperCase();
+  await pool.query(`INSERT INTO platform_state (id, data) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`);
+  await pool.query(`UPDATE platform_state SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{customers}',
+    (SELECT COALESCE(jsonb_agg(c), '[]'::jsonb) FROM jsonb_array_elements(COALESCE(data->'customers', '[]'::jsonb)) c WHERE c->>'id' <> $2) || $1::jsonb) WHERE id = 1`,
+    [JSON.stringify([{ id, companyName: name }]), id]);
+  return id;
+}
 import * as services from '../src/relational/services';
 import * as read from '../src/relational/read';
 
@@ -192,7 +203,7 @@ async function main() {
   ok(belongsToUserCompany(freshRead, HOLDINGS_USER) && !belongsToUserCompany(freshRead, ORIGINAL_USER), 'the fresh Holdings quote is visible to a Holdings user and correctly hidden from an Original-company user on the very next read');
 
   console.log('\n[Holdings scoping repair] FOLLOW-UP CLOSED (2026-08-23 credit note company-isolation repair) — the credit-notes gap documented here is now fixed; see relational.credit-note-company-isolation-repair.stress.ts for full coverage');
-  const cnHoldings = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Holdings Credit Note Contact', amount: 100 });
+  const cnHoldings = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Holdings Credit Note Contact', customerRef: await seedCust('Holdings Credit Note Contact'), amount: 100 });
   const creditNotesAfter = await read.buildCreditNotesJson();
   const cnRead = creditNotesAfter.find((c: any) => c._relId === cnHoldings.id);
   ok(!!cnRead && typeof cnRead.co === 'number' && cnRead.co === 1, 'a brand-new credit note now hydrates co as a real number (1) after a read-refresh — migration 011 added company_code, services.ts/index.html now thread it through, closing the gap this suite previously only documented', cnRead && cnRead.co);

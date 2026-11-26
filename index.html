@@ -1489,9 +1489,22 @@ const relationalApi = {
   // (DELETE /payments/:id 400s without it) — matches deleteCreditNote/
   // deleteSupplier's existing (id, expectedVersion) shape below.
   deletePayment(id, expectedVersion, ownerSection) { return relationalFetch('/payments/' + id, { method: 'DELETE', body: JSON.stringify({ expectedVersion: expectedVersion, ownerSection: ownerSection }) }); },
+  // 2026-11-26: an older credit payment whose funding note the server could not
+  // establish on its own is deleted again with the credit note the user chose.
+  deletePaymentReleasingTo(id, expectedVersion, ownerSection, releaseToCreditNoteId) { return relationalFetch('/payments/' + id, { method: 'DELETE', body: JSON.stringify({ expectedVersion: expectedVersion, ownerSection: ownerSection, releaseToCreditNoteId: releaseToCreditNoteId }) }); },
   createCreditNote(data) { return relationalFetch('/credit-notes', { method: 'POST', body: JSON.stringify(data) }); },
   updateCreditNote(id, expectedVersion, patch) { return relationalFetch('/credit-notes/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
   deleteCreditNote(id, expectedVersion) { return relationalFetch('/credit-notes/' + id, { method: 'DELETE', body: JSON.stringify({ expectedVersion: expectedVersion }) }); },
+  // 2026-11-26 — CUSTOMER CREDIT (migration 022): payment credit from
+  // overpaid receipts, credit-note credit, allocations and recorded refunds.
+  // Every rule (company, customer, caps, locks, idempotency) is server-side.
+  getDocumentCredit(ownerType, ownerId) { return relationalFetch('/customer-credit/document?ownerType=' + encodeURIComponent(ownerType) + '&ownerId=' + encodeURIComponent(ownerId)); },
+  getCustomerCredit(companyCode, customerRef) { return relationalFetch('/customer-credit?companyCode=' + encodeURIComponent(companyCode) + '&customerRef=' + encodeURIComponent(customerRef)); },
+  getCreditSummary(companyCode) { return relationalFetch('/customer-credit/summary' + (companyCode ? '?companyCode=' + encodeURIComponent(companyCode) : '')); },
+  applyCredit(data) { return relationalFetch('/credit-allocations', { method: 'POST', body: JSON.stringify(data) }); },
+  reverseCreditAllocation(id, reason) { return relationalFetch('/credit-allocations/' + id + '/reverse', { method: 'POST', body: JSON.stringify({ reason: reason || null }) }); },
+  recordCreditRefund(data) { return relationalFetch('/credit-refunds', { method: 'POST', body: JSON.stringify(data) }); },
+  reverseCreditRefund(id, reason) { return relationalFetch('/credit-refunds/' + id + '/reverse', { method: 'POST', body: JSON.stringify({ reason: reason || null }) }); },
   createPurchaseOrder(data) { return relationalFetch('/purchase-orders', { method: 'POST', body: JSON.stringify(data) }); },
   updatePurchaseOrder(id, expectedVersion, patch) { return relationalFetch('/purchase-orders/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
   createSupplier(data) { return relationalFetch('/suppliers', { method: 'POST', body: JSON.stringify(data) }); },
@@ -1629,6 +1642,172 @@ function newPaymentRequestId() {
   return 'pay_' + Date.now().toString(36)
     + '_' + Math.random().toString(36).slice(2, 10)
     + Math.random().toString(36).slice(2, 10);
+}
+
+/* ═══════════════════════════════════════════
+   CUSTOMER CREDIT — shared helpers (2026-11-26, migration 022)
+
+   What a payment row IS. The server says so on every relational row
+   (`_entryKind`); a historical or JSON row derives it from its method exactly
+   as before ("credit…" = a credit-note payment, anything else = a receipt).
+     receipt             money received — counts once, moves every balance
+     credit_note         credit-note credit applied (balance-neutral on statements)
+     payment_credit_in   payment credit applied here (balance-neutral)
+     payment_credit_out  the same credit leaving the receipt's document (balance-neutral)
+     refund              a recorded refund of customer credit (money returned)
+═══════════════════════════════════════════ */
+// Money as the payment windows show it (en-ZA: "R 1 234,56").
+function sgrCreditZar(cents){
+  if(!Number.isFinite(cents)) return 'R —';
+  return 'R ' + (cents/100).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
+}
+function sgrPaymentKind(p){
+  if(!p) return 'receipt';
+  const k = p._entryKind;
+  if(k==='receipt'||k==='credit_note'||k==='payment_credit_in'||k==='payment_credit_out'||k==='refund') return k;
+  return String(p.method||'').trim().toLowerCase().startsWith('credit') ? 'credit_note' : 'receipt';
+}
+function sgrIsCreditLedgerRow(p){ const k = sgrPaymentKind(p); return k==='payment_credit_in'||k==='payment_credit_out'||k==='refund'; }
+function sgrIsBalanceNeutralCreditRow(p){ const k = sgrPaymentKind(p); return k==='credit_note'||k==='payment_credit_in'||k==='payment_credit_out'; }
+function sgrCompanyName(code){
+  const c = (INITIAL_COMPANIES||[]).find(x=>String(x.id)===String(code));
+  return c ? c.name : ('Company '+code);
+}
+// The payment window's view of the customer's credit for ONE document, read
+// from the server (the only authority for what is spendable).
+function useDocumentCredit(ownerType, ownerId, enabled){
+  const [state, setState] = useState({ loading:false, data:null, error:'' });
+  const [tick, setTick] = useState(0);
+  useEffect(()=>{
+    if(!enabled || ownerId==null || !ownerType){ setState({ loading:false, data:null, error:'' }); return; }
+    let live = true;
+    setState(s=>({ ...s, loading:true }));
+    relationalApi.getDocumentCredit(ownerType, ownerId)
+      .then(r=>{ if(live) setState({ loading:false, data:r, error:'' }); })
+      .catch(e=>{ if(live) setState({ loading:false, data:null, error:(e && e.message) || 'Could not load customer credit.' }); });
+    return ()=>{ live = false; };
+  }, [ownerType, ownerId, enabled, tick]);
+  return { ...state, reload: ()=>setTick(t=>t+1) };
+}
+// Shown before recording a receipt larger than what is still due: how much
+// settles the document and how much stays on the customer's account.
+function sgrConfirmOverpayment({ amount, balance, docLabel, docCredit }){
+  const amtC = sgrToCents0(amount), balC = Math.max(0, sgrToCents0(balance));
+  if(amtC <= balC) return true;
+  const excessC = amtC - balC;
+  const d = docCredit && docCredit.data;
+  const who = d && d.identity && d.identity.state==='matched' ? d.identity.name : null;
+  const co = d && d.companyCode ? sgrCompanyName(d.companyCode) : null;
+  const lines = [
+    'This payment of '+sgrCreditZar(amtC)+' is more than the '+sgrCreditZar(balC)+' still due on '+docLabel+'.', '',
+    sgrCreditZar(balC)+' will settle '+docLabel+'.',
+  ];
+  if(who) lines.push(sgrCreditZar(excessC)+' will remain as payment credit for '+who+(co?' in '+co:'')+'. It can be applied to another of their invoices, or a refund recorded, under Accounting → Customer Credits.');
+  else lines.push(sgrCreditZar(excessC)+' will be recorded as an overpayment. This document is not linked to a customer record'+(d&&d.identity&&d.identity.detail?' ('+d.identity.detail+')':'')+', so the excess cannot be used as customer credit until it is linked to its customer.');
+  lines.push('', 'No credit note is created. Record this payment?');
+  return window.confirm(lines.join('\n'));
+}
+
+function sgrIsPairedCreditRow(p, removed){
+  if(!p || !removed || p===removed) return false;
+  const a = p._creditLinkId, b = removed._creditLinkId;
+  return a!=null && b!=null && String(a)===String(b) && sgrIsCreditLedgerRow(p) && sgrIsCreditLedgerRow(removed);
+}
+function sgrPaymentDeleteConfirmText(p, docWord){
+  const k = sgrPaymentKind(p);
+  if(k==='payment_credit_in') return 'Reverse this applied payment credit? The '+sgrCreditZar(sgrToCents0(p&&p.amount))+' goes back to the customer\'s available credit and this '+docWord+' owes it again.';
+  if(k==='payment_credit_out') return 'Reverse the credit allocation this entry belongs to? The credit comes back to this receipt, and the document it was applied to owes that amount again.';
+  if(k==='refund') return 'Reverse this recorded refund? Use this only if the refund was recorded in error — the amount returns to the customer\'s available credit.';
+  if(k==='credit_note') return 'Delete this credit-note payment? The credit returns to the credit note that funded it and this '+docWord+' owes it again.';
+  return 'Delete this payment? This may change the '+docWord+' status.';
+}
+// After a refused delete: for an older credit payment whose funding note the
+// server cannot establish on its own, asks which credit note to return it to
+// and deletes again with that choice. Any other refusal is re-thrown.
+async function sgrRetryDeleteWithCreditChoice(e, p, section){
+  {
+    const c = e && e.body && Array.isArray(e.body.candidates) ? e.body.candidates : null;
+    if(!c || !c.length) throw e;
+    const pick = window.prompt((e.body.error||'Choose the credit note.')+'\n\n'+c.map((x,i)=>(i+1)+') '+x.number+' — used '+sgrCreditZar(sgrToCents0(x.used))).join('\n')+'\n\nType the number of the credit note to return this credit to:');
+    if(pick===null) throw new Error('Nothing was deleted.');
+    const ch = c[Number(pick)-1];
+    if(!ch) throw new Error('That is not one of the listed credit notes. Nothing was deleted.');
+    return relationalApi.deletePaymentReleasingTo(p._relPaymentId, p._relRowVersion, section, ch.id);
+  }
+}
+function SgrPaymentMethodBadge({ p }){
+  const k = sgrPaymentKind(p);
+  const cls = k==='receipt' ? 'bg-blue-50 text-blue-700' : k==='refund' ? 'bg-red-50 text-red-700' : 'bg-emerald-50 text-emerald-700';
+  const tip = { receipt:'Money received', credit_note:'Credit-note credit applied — not new money', payment_credit_in:'Payment credit applied from an earlier receipt — not new money',
+    payment_credit_out:'Payment credit from this receipt applied to another document', refund:'Recorded refund of customer credit (recording only)' }[k];
+  return <span title={tip} className={`${cls} rounded-full px-2 py-0.5 font-semibold text-xs`} data-entry-kind={k}>{p.method}</span>;
+}
+
+// Apply available customer credit (payment credit or a credit note) to the
+// document this payment window is showing. Limited to both the source's
+// available balance and what is still due; the server enforces both again.
+function CustomerCreditApplyPanel({ docCredit, ownerType, ownerId, outstanding, user, onApplied }){
+  const d = docCredit && docCredit.data;
+  const [sel, setSel] = useState('');
+  const [amount, setAmount] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const keyRef = useRef(null);
+  useEffect(()=>{ keyRef.current = null; }, [sel, amount]);
+  if(!d) return docCredit && docCredit.error ? <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" data-testid="credit-panel-error">{docCredit.error}</p> : null;
+  if(d.identity && d.identity.state!=='matched'){
+    return <div className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2" data-testid="credit-panel-unresolved">Customer credit is not available here: this document is not linked to a customer record ({d.identity.detail}). Link it to its customer first.</div>;
+  }
+  const credit = d.credit;
+  if(!credit) return null;
+  const sources = [
+    ...credit.paymentCredits.filter(p=>p.available>0.004).map(p=>({ key:'payment:'+p.sourceId, type:'payment', id:p.sourceId, available:p.available,
+      label:'Payment credit — receipt '+(p.date||'')+(p.reference?' · '+p.reference:'')+' on '+(p.document&&p.document.number||'')+' (received '+sgrCreditZar(sgrToCents0(p.original))+')' })),
+    ...credit.creditNotes.filter(n=>n.available>0.004).map(n=>({ key:'credit_note:'+n.sourceId, type:'credit_note', id:n.sourceId, available:n.available,
+      label:'Credit note '+(n.number||'')+(n.date?' · '+n.date:'')+(n.reason?' · '+n.reason:'') })),
+  ];
+  const due = Math.max(0, Number(outstanding)||0);
+  const src = sources.find(x=>x.key===sel) || null;
+  const maxC = src ? Math.min(sgrToCents0(src.available), sgrToCents0(due)) : 0;
+  const canApply = canManagePayments(user);
+  async function apply(){
+    if(!src) { setErr('Choose a credit source.'); return; }
+    const a = Number(amount);
+    if(!Number.isFinite(a) || a<=0){ setErr('Enter an amount greater than R0.00.'); return; }
+    if(Math.abs(a*100-Math.round(a*100))>1e-6){ setErr('Use whole cents (at most 2 decimals).'); return; }
+    if(sgrToCents0(a) > maxC){ setErr('At most '+sgrCreditZar(maxC)+' can be applied (the smaller of the credit available and the amount due).'); return; }
+    setBusy(true); setErr('');
+    if(!keyRef.current) keyRef.current = 'cred_' + newPaymentRequestId();
+    try {
+      const r = await relationalApi.applyCredit({ sourceType: src.type, sourceId: src.id, targetType: ownerType, targetId: ownerId, amount: a, clientRequestId: keyRef.current });
+      keyRef.current = null;
+      setAmount(''); setSel('');
+      onApplied && onApplied({ result:r, amount:a, sourceType:src.type });
+      docCredit.reload();
+    } catch(e){ setErr(describeSaveConflictError(e, 'credit allocation')); }
+    finally { setBusy(false); }
+  }
+  return (
+    <div className="border border-emerald-200 rounded-xl p-3 bg-emerald-50/50 space-y-2" data-testid="credit-panel">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <p className="text-xs font-black text-emerald-800 uppercase tracking-widest">Available credit — {d.identity.name} · {sgrCompanyName(d.companyCode)}</p>
+        <p className="text-xs text-emerald-800" data-testid="credit-panel-totals">Payment credit <strong>{sgrCreditZar(sgrToCents0(credit.totals.paymentCredit))}</strong> · Credit notes <strong>{sgrCreditZar(sgrToCents0(credit.totals.creditNotes))}</strong> · Total <strong>{sgrCreditZar(sgrToCents0(credit.totals.total))}</strong></p>
+      </div>
+      {sources.length===0 ? <p className="text-xs text-gray-500">No customer credit is available to apply.</p> : due<=0.004 ? <p className="text-xs text-gray-500">Nothing is due on this document.</p> : !canApply ? <p className="text-xs text-gray-500">Only an Admin or Accounts login can apply customer credit.</p> : (
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 items-end">
+          <div className="sm:col-span-2"><label className="text-xs font-bold text-gray-500 block mb-1">Credit source</label>
+            <select value={sel} onChange={e=>{ setSel(e.target.value); const s2 = sources.find(x=>x.key===e.target.value); setAmount(s2 ? sgrRands(Math.min(sgrToCents0(s2.available), sgrToCents0(due))).toFixed(2) : ''); }} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm" data-testid="credit-source">
+              <option value="">Choose…</option>
+              {sources.map(x=><option key={x.key} value={x.key}>{x.label} — {sgrCreditZar(sgrToCents0(x.available))} available</option>)}
+            </select></div>
+          <div><label className="text-xs font-bold text-gray-500 block mb-1">{src?('Amount (max '+sgrCreditZar(maxC)+')'):'Amount'}</label>
+            <input type="number" min="0.01" step="0.01" value={amount} onChange={e=>setAmount(e.target.value)} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm" data-testid="credit-amount"/></div>
+          <button onClick={apply} disabled={busy||!src} className="sm:col-span-3 text-white font-bold py-2 rounded-xl text-sm disabled:opacity-50" style={{background:'#047857'}} data-testid="credit-apply">{busy?'Applying…':'Apply credit'}</button>
+        </div>
+      )}
+      {err&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2" data-testid="credit-panel-err">{err}</p>}
+    </div>
+  );
 }
 
 function assertNoUnwiredRelationalSections(sectionNames, contextLabel) {
@@ -3698,8 +3877,11 @@ tr:nth-child(even) td{background:#f8f9ff}
 ═══════════════════════════════════════════ */
 function cnNorm(s){ return String(s||'').trim().toLowerCase(); }
 function creditNoteAvailable(creditNotes, contactName){
+  // JSON (non-relational) fallback only. In relational mode every payment
+  // window reads the server's company- and customer-scoped figure instead
+  // (useDocumentCredit). 2026-11-26: a recorded refund also reduces it.
   return (creditNotes||[]).filter(c=>c.type==='customer' && cnNorm(c.contactName)===cnNorm(contactName))
-    .reduce((s,c)=>s+Math.max(0,(parseFloat(c.amount)||0)-(parseFloat(c.used)||0)),0);
+    .reduce((s,c)=>s+Math.max(0,(parseFloat(c.amount)||0)-(parseFloat(c.used)||0)-(parseFloat(c.refunded)||0)),0);
 }
 function applyCreditNoteUsage(creditNotes, contactName, amount){
   let remaining = parseFloat(amount)||0;
@@ -6401,6 +6583,10 @@ function applyIfOwned(paymentsArr, paymentId, transform) {
 // JobPaymentHistoryModal, directing the user to delete + re-record instead.
 function promptEditPayment(p) {
   if (!p) return null;
+  if (p._entryKind === 'payment_credit_in' || p._entryKind === 'payment_credit_out' || p._entryKind === 'refund') {
+    alert('This is a customer-credit entry (applied payment credit or a recorded refund). It cannot be edited — reverse it and record it again.');
+    return null;
+  }
   if (p.method === 'Credit') {
     alert("Credit-funded payments can't be edited — delete and re-record instead, so the customer's available credit stays accurate.");
     return null;
@@ -7485,7 +7671,8 @@ function sgrChainCreditConflicts(chain, customer){
   const check = (label, rec, payments, currentName) => {
     const moves = sgrCustRefOf(rec.customerId)!==String(customer.id) || sgrCustNorm(currentName)!==sgrCustNorm(name);
     if(!moves) return;
-    const credit = (payments||[]).filter(p=>p && String(p.method||'').trim().toLowerCase().startsWith('credit') && Math.abs(parseFloat(p.amount)||0)>0.004);
+    // 2026-11-26: any customer-credit entry (credit-note payment, applied payment credit, its offset, a recorded refund)
+    const credit = (payments||[]).filter(p=>p && (String(p.method||'').trim().toLowerCase().startsWith('credit') || ['credit_note','payment_credit_in','payment_credit_out','refund'].includes(p._entryKind)) && Math.abs(parseFloat(p.amount)||0)>0.004);
     if(credit.length){ const tot = credit.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
       out.push(label+' has R'+tot.toFixed(2)+' paid from customer credit ("Credit" payment). Credit is returned to the credit note of the customer named on the document, so moving it would later return that credit to the wrong customer. Delete the Credit payment first (this gives the credit back to its own credit note), change the customer, then apply the new customer\'s credit if needed.'); }
   };
@@ -7574,6 +7761,265 @@ function CustomerPickerModal({ customers, currentRef, title, onPick, onClose }){
       {creating&&<AddEditCustomerModal customer={null} customers={customers} onClose={()=>setCreating(false)}
         onSave={async c=>{ const r = await sgrSaveCustomerRecord(c, { isNew:true }); if(!r.ok){ alert(r.error); return false; } onPick(r.customer); return true; }}/>}
     </Modal>
+  );
+}
+
+
+/* ═══════════════════════════════════════════
+   CUSTOMER CREDIT — account view (2026-11-26, migration 022)
+   One customer's available credit in ONE company: unallocated payment credit
+   (overpaid receipts recorded since customer credit was introduced) and
+   unused credit notes, each with its allocation and refund history. Applying,
+   reversing and recording refunds is for Admin / Accounts logins; the server
+   enforces every rule again.
+═══════════════════════════════════════════ */
+function sgrCreditCompaniesFor(user){
+  return (INITIAL_COMPANIES||[]).filter(c=>belongsToUserCompany({ co:c.id }, user));
+}
+function CustomerCreditHistory({ history, canAct, onReverse }){
+  if(!history || !history.length) return <p className="text-xs text-gray-400 px-3 py-2">No allocations or refunds yet.</p>;
+  return (
+    <table className="w-full text-xs" data-testid="credit-history">
+      <thead><tr className="text-gray-400"><th className="text-left px-3 py-1">When</th><th className="text-left px-3 py-1">What</th><th className="text-right px-3 py-1">Amount</th><th className="text-left px-3 py-1">Status</th><th/></tr></thead>
+      <tbody>
+        {history.map(h=>(
+          <tr key={h.kind+h.id} className="border-t border-gray-100" data-testid={'history-'+h.kind}>
+            <td className="px-3 py-1 text-gray-600">{String(h.date||h.createdAt||'').slice(0,10)}</td>
+            <td className="px-3 py-1 text-gray-700">{h.kind==='allocation' ? ('Applied to '+(h.targetNumber||h.targetType)+(h.legacy?' (historical release)':'')) : ('Refund recorded'+(h.reference?' · '+h.reference:'')+(h.method?' · '+h.method:''))}{h.createdBy?<span className="text-gray-400"> · {h.createdBy}</span>:null}</td>
+            <td className="px-3 py-1 text-right font-bold">{sgrCreditZar(sgrToCents0(h.amount))}</td>
+            <td className="px-3 py-1">{h.status==='active'?<span className="text-emerald-700 font-semibold">active</span>:<span className="text-gray-400" title={h.reversalReason||''}>reversed {String(h.reversedAt||'').slice(0,10)}</span>}</td>
+            <td className="px-2 py-1 text-right">{canAct && h.status==='active' && !h.legacy && <button onClick={()=>onReverse(h)} className="text-xs text-red-600 hover:underline" data-testid="credit-reverse">Reverse</button>}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+function CustomerCreditRefundForm({ source, onDone, onCancel }){
+  const [amount, setAmount] = useState(source.available ? Number(source.available).toFixed(2) : '');
+  const [date, setDate] = useState(new Date().toISOString().slice(0,10));
+  const [method, setMethod] = useState('EFT');
+  const [reference, setReference] = useState('');
+  const [notes, setNotes] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const keyRef = useRef(null);
+  useEffect(()=>{ keyRef.current = null; }, [amount, date, method, reference, notes]);
+  async function save(){
+    const a = Number(amount);
+    if(!Number.isFinite(a) || a<=0){ setErr('Enter an amount greater than R0.00.'); return; }
+    if(sgrToCents0(a) > sgrToCents0(source.available)){ setErr('At most '+sgrCreditZar(sgrToCents0(source.available))+' is available to refund.'); return; }
+    if(!reference.trim()){ setErr('Enter the refund reference (for example the bank transfer reference).'); return; }
+    if(!window.confirm('Record a refund of '+sgrCreditZar(sgrToCents0(a))+'?\n\nThis only RECORDS the refund in Signacore and reduces the customer\'s available credit. It does not send any money — pay the refund through your bank separately.')) return;
+    setBusy(true); setErr('');
+    if(!keyRef.current) keyRef.current = 'refund_' + newPaymentRequestId();
+    try {
+      await relationalApi.recordCreditRefund({ sourceType: source.sourceType, sourceId: source.sourceId, amount: a, date, method, reference: reference.trim(), notes: notes.trim() || null, clientRequestId: keyRef.current });
+      keyRef.current = null;
+      onDone && onDone();
+    } catch(e){ setErr(describeSaveConflictError(e, 'refund')); }
+    finally { setBusy(false); }
+  }
+  const iCls = "w-full border border-gray-200 rounded-lg px-2 py-1.5 text-xs";
+  return (
+    <div className="border border-red-200 bg-red-50/40 rounded-xl p-3 space-y-2" data-testid="refund-form">
+      <p className="text-xs font-bold text-red-800">Record a refund — records only; it does not send money through the bank.</p>
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+        <div><label className="text-[10px] font-bold text-gray-500 block">Amount (max {sgrCreditZar(sgrToCents0(source.available))})</label><input type="number" step="0.01" min="0.01" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} data-testid="refund-amount"/></div>
+        <div><label className="text-[10px] font-bold text-gray-500 block">Refund date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls}/></div>
+        <div><label className="text-[10px] font-bold text-gray-500 block">Method</label><select value={method} onChange={e=>setMethod(e.target.value)} className={iCls}>{['EFT','Cash','Card reversal','Cheque','Other'].map(m=><option key={m}>{m}</option>)}</select></div>
+        <div><label className="text-[10px] font-bold text-gray-500 block">Reference *</label><input value={reference} onChange={e=>setReference(e.target.value)} className={iCls} placeholder="Bank reference" data-testid="refund-reference"/></div>
+        <div><label className="text-[10px] font-bold text-gray-500 block">Notes</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls}/></div>
+      </div>
+      {err&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-1.5">{err}</p>}
+      <div className="flex gap-2"><button onClick={save} disabled={busy} className="text-xs font-bold text-white rounded-lg px-3 py-1.5 disabled:opacity-50" style={{background:'#b91c1c'}} data-testid="refund-save">{busy?'Recording…':'Record refund'}</button><button onClick={onCancel} className="text-xs border border-gray-200 rounded-lg px-3 py-1.5">Cancel</button></div>
+    </div>
+  );
+}
+function CustomerCreditSection({ companyCode, customerRef, user, onChanged }){
+  const [state, setState] = useState({ loading:true, data:null, error:'' });
+  const [tick, setTick] = useState(0);
+  const [openHist, setOpenHist] = useState({});
+  const [refundFor, setRefundFor] = useState(null);
+  const [msg, setMsg] = useState('');
+  useEffect(()=>{
+    if(!companyCode || !customerRef) return;
+    let live = true;
+    setState(s=>({ ...s, loading:true }));
+    relationalApi.getCustomerCredit(companyCode, customerRef)
+      .then(r=>{ if(live) setState({ loading:false, data:r.credit, error:'' }); })
+      .catch(e=>{ if(live) setState({ loading:false, data:null, error:(e&&e.message)||'Could not load customer credit.' }); });
+    return ()=>{ live=false; };
+  }, [companyCode, customerRef, tick]);
+  const reload = ()=>{ setTick(t=>t+1); onChanged && onChanged(); };
+  const canAct = canManagePayments(user);
+  async function reverse(h){
+    const reason = window.prompt(h.kind==='allocation'
+      ? 'Reverse this credit allocation of '+sgrCreditZar(sgrToCents0(h.amount))+' to '+(h.targetNumber||'the document')+'? The credit becomes available again and that document owes the amount again.\n\nReason (optional):'
+      : 'Reverse this recorded refund of '+sgrCreditZar(sgrToCents0(h.amount))+'? Only do this if the refund was recorded in error.\n\nReason (optional):', '');
+    if(reason===null) return;
+    setMsg('');
+    try {
+      if(h.kind==='allocation') await relationalApi.reverseCreditAllocation(h.id, reason || null);
+      else await relationalApi.reverseCreditRefund(h.id, reason || null);
+      reload();
+    } catch(e){ setMsg(describeSaveConflictError(e, h.kind==='allocation'?'credit allocation':'refund')); }
+  }
+  if(state.loading && !state.data) return <p className="text-xs text-gray-400 py-3" data-testid="credit-loading">Loading customer credit…</p>;
+  if(state.error) return <p className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{state.error}</p>;
+  const d = state.data; if(!d) return null;
+  const toggle = k=>setOpenHist(o=>({ ...o, [k]:!o[k] }));
+  const th = "px-3 py-2 text-left text-gray-500 font-bold", thr = "px-3 py-2 text-right text-gray-500 font-bold";
+  return (
+    <div className="space-y-3" data-testid="customer-credit-section">
+      <div className="grid grid-cols-3 gap-3">
+        <div className="bg-white border border-gray-200 rounded-xl p-3 text-center"><p className="text-xs text-gray-500">Unallocated payment credit</p><p className="text-lg font-black text-emerald-700" data-testid="credit-total-payment">{sgrCreditZar(sgrToCents0(d.totals.paymentCredit))}</p></div>
+        <div className="bg-white border border-gray-200 rounded-xl p-3 text-center"><p className="text-xs text-gray-500">Unused credit notes</p><p className="text-lg font-black text-emerald-700" data-testid="credit-total-notes">{sgrCreditZar(sgrToCents0(d.totals.creditNotes))}</p></div>
+        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center"><p className="text-xs text-emerald-700">Total available — {sgrCompanyName(d.companyCode)}</p><p className="text-lg font-black text-emerald-800" data-testid="credit-total">{sgrCreditZar(sgrToCents0(d.totals.total))}</p></div>
+      </div>
+      {msg&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2">{msg}</p>}
+      <div className="border border-gray-200 rounded-xl overflow-hidden">
+        <p className="px-3 py-2 bg-gray-50 text-xs font-black text-gray-600 uppercase tracking-wide">Payment credit (overpaid receipts)</p>
+        {d.paymentCredits.length===0 ? <p className="px-3 py-3 text-xs text-gray-400">No payment credit. Overpayments recorded before customer credit was introduced are not included.</p> : (
+          <table className="w-full text-xs" data-testid="payment-credit-table">
+            <thead className="bg-gray-50 border-t border-gray-100"><tr><th className={th}>Date</th><th className={th}>Receipt</th><th className={thr}>Original</th><th className={thr}>Settled here</th><th className={thr}>Allocated</th><th className={thr}>Refunded</th><th className={thr}>Available</th><th/></tr></thead>
+            <tbody>
+              {d.paymentCredits.map(p=>{ const k='p'+p.sourceId; return (
+                <React.Fragment key={k}>
+                  <tr className="border-t border-gray-100" data-testid="payment-credit-row">
+                    <td className="px-3 py-2">{p.date||'—'}</td>
+                    <td className="px-3 py-2">{p.method||'—'}{p.reference?' · '+p.reference:''}<span className="text-gray-400"> on {p.document&&p.document.number}</span></td>
+                    <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(p.original))}</td>
+                    <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(p.settledOnOwnDocument))}</td>
+                    <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(p.allocated))}</td>
+                    <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(p.refunded))}</td>
+                    <td className="px-3 py-2 text-right font-black text-emerald-700" data-testid="payment-credit-available">{sgrCreditZar(sgrToCents0(p.available))}</td>
+                    <td className="px-2 py-2 text-right whitespace-nowrap"><button onClick={()=>toggle(k)} className="text-xs text-blue-600 hover:underline mr-2" data-testid="credit-history-toggle">History</button>{canAct && p.available>0.004 && <button onClick={()=>setRefundFor(p)} className="text-xs text-red-600 hover:underline" data-testid="credit-refund-open">Refund</button>}</td>
+                  </tr>
+                  {openHist[k]&&<tr><td colSpan="8" className="bg-gray-50"><CustomerCreditHistory history={p.history} canAct={canAct} onReverse={reverse}/></td></tr>}
+                </React.Fragment>
+              ); })}
+            </tbody>
+          </table>
+        )}
+      </div>
+      <div className="border border-gray-200 rounded-xl overflow-hidden">
+        <p className="px-3 py-2 bg-gray-50 text-xs font-black text-gray-600 uppercase tracking-wide">Credit notes</p>
+        {d.creditNotes.length===0 ? <p className="px-3 py-3 text-xs text-gray-400">No credit notes for this customer in this company.</p> : (
+          <table className="w-full text-xs" data-testid="credit-note-table">
+            <thead className="bg-gray-50 border-t border-gray-100"><tr><th className={th}>Date</th><th className={th}>Credit note</th><th className={thr}>Original</th><th className={thr}>Used</th><th className={thr}>Refunded</th><th className={thr}>Available</th><th/></tr></thead>
+            <tbody>
+              {d.creditNotes.map(n=>{ const k='n'+n.sourceId; return (
+                <React.Fragment key={k}>
+                  <tr className="border-t border-gray-100" data-testid="credit-note-row">
+                    <td className="px-3 py-2">{n.date||'—'}</td>
+                    <td className="px-3 py-2">{n.number}{n.reason?<span className="text-gray-400"> · {n.reason}</span>:null}{!n.linked&&<span className="ml-1 text-[10px] text-amber-700" title="Matched by its exact, unique customer name">(by name)</span>}</td>
+                    <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(n.original))}</td>
+                    <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(n.used))}</td>
+                    <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(n.refunded))}</td>
+                    <td className="px-3 py-2 text-right font-black text-emerald-700" data-testid="credit-note-available">{sgrCreditZar(sgrToCents0(n.available))}</td>
+                    <td className="px-2 py-2 text-right whitespace-nowrap"><button onClick={()=>toggle(k)} className="text-xs text-blue-600 hover:underline mr-2">History</button>{canAct && n.available>0.004 && <button onClick={()=>setRefundFor(n)} className="text-xs text-red-600 hover:underline">Refund</button>}</td>
+                  </tr>
+                  {openHist[k]&&<tr><td colSpan="7" className="bg-gray-50"><CustomerCreditHistory history={n.history} canAct={canAct} onReverse={reverse}/></td></tr>}
+                </React.Fragment>
+              ); })}
+            </tbody>
+          </table>
+        )}
+      </div>
+      {refundFor&&<CustomerCreditRefundForm source={refundFor} onCancel={()=>setRefundFor(null)} onDone={()=>{ setRefundFor(null); reload(); }}/>}
+      <p className="text-[11px] text-gray-400">To use credit, open the invoice's Payments and choose “Apply credit”. Credit stays within its own company and customer.</p>
+    </div>
+  );
+}
+function CustomerCreditModal({ customer, user, onClose }){
+  const cos = sgrCreditCompaniesFor(user);
+  const [co, setCo] = useState(String((cos.find(c=>c.id===2)||cos[0]||{id:2}).id));
+  return (
+    <Modal onClose={onClose} wide>
+      <ModalHeader title={'Available credit — '+(customer.companyName||'')} onClose={onClose}/>
+      <div className="px-6 py-4 space-y-3" data-testid="customer-credit-modal">
+        {cos.length>1&&<div className="flex items-center gap-2"><label className="text-xs font-bold text-gray-500">Company</label><select value={co} onChange={e=>setCo(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1 text-sm" data-testid="credit-company">{cos.map(c=><option key={c.id} value={String(c.id)}>{c.name}</option>)}</select></div>}
+        {isRelationalAuthoritative('accInvoices')
+          ? <CustomerCreditSection companyCode={co} customerRef={String(customer.id)} user={user}/>
+          : <p className="text-xs text-gray-500">Customer credit is available once invoices are on the relational database.</p>}
+      </div>
+    </Modal>
+  );
+}
+function CustomerCreditsView({ user, customers }){
+  const cos = sgrCreditCompaniesFor(user);
+  const [co, setCo] = useState(String((cos.find(c=>c.id===2)||cos[0]||{id:2}).id));
+  const [q, setQ] = useState('');
+  const [state, setState] = useState({ loading:true, data:null, error:'' });
+  const [tick, setTick] = useState(0);
+  const [sel, setSel] = useState(null);
+  const [pickFor, setPickFor] = useState(null);
+  const [msg, setMsg] = useState('');
+  useEffect(()=>{
+    let live = true;
+    setState(s=>({ ...s, loading:true }));
+    relationalApi.getCreditSummary(co)
+      .then(r=>{ if(live) setState({ loading:false, data:r, error:'' }); })
+      .catch(e=>{ if(live) setState({ loading:false, data:null, error:(e&&e.message)||'Could not load customer credits.' }); });
+    return ()=>{ live=false; };
+  }, [co, tick]);
+  const rows = ((state.data&&state.data.customers)||[]).filter(r=>!q.trim() || String(r.name||'').toLowerCase().includes(q.trim().toLowerCase()));
+  const unresolved = (state.data&&state.data.unresolved)||[];
+  async function linkNote(u, c){
+    setPickFor(null); setMsg('');
+    try { await relationalApi.updateCreditNote(u.sourceId, u.rowVersion, { customerRef: String(c.id) }); setTick(t=>t+1); }
+    catch(e){ setMsg(describeSaveConflictError(e, 'credit note')); }
+  }
+  return (
+    <div className="space-y-4" data-testid="customer-credits-view">
+      <div className="bg-white rounded-2xl border border-gray-200 p-4 flex items-end justify-between flex-wrap gap-3">
+        <div>
+          <p className="font-black text-gray-800">💳 Customer Credits</p>
+          <p className="text-xs text-gray-500 mt-0.5">Payment credit from overpaid receipts and unused credit notes, per customer and company. Credit is applied from the invoice's Payments window.</p>
+        </div>
+        <div className="flex gap-2 items-end">
+          {cos.length>1&&<div><label className="text-xs font-bold text-gray-500 block">Company</label><select value={co} onChange={e=>{ setCo(e.target.value); setSel(null); }} className="border border-gray-200 rounded-lg px-2 py-1.5 text-sm" data-testid="credits-company">{cos.map(c=><option key={c.id} value={String(c.id)}>{c.name}</option>)}</select></div>}
+          <div><label className="text-xs font-bold text-gray-500 block">Customer</label><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Filter by name…" className="border border-gray-200 rounded-lg px-2 py-1.5 text-sm" data-testid="credits-filter"/></div>
+        </div>
+      </div>
+      {msg&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2">{msg}</p>}
+      {state.error ? <p className="text-xs text-red-600">{state.error}</p> : state.loading && !state.data ? <p className="text-xs text-gray-400">Loading…</p> : (
+        <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+          <table className="w-full text-sm" data-testid="credits-table">
+            <thead className="bg-gray-50"><tr><th className="px-3 py-2 text-left text-xs text-gray-500">Customer</th><th className="px-3 py-2 text-right text-xs text-gray-500">Payment credit</th><th className="px-3 py-2 text-right text-xs text-gray-500">Credit notes</th><th className="px-3 py-2 text-right text-xs text-gray-500">Total available</th><th/></tr></thead>
+            <tbody>
+              {rows.length===0 && <tr><td colSpan="5" className="px-3 py-6 text-center text-xs text-gray-400">No customer has available credit in {sgrCompanyName(co)}.</td></tr>}
+              {rows.map(r=>(
+                <tr key={r.ref} className={`border-t border-gray-100 ${sel===r.ref?'bg-emerald-50':''}`} data-testid="credits-row">
+                  <td className="px-3 py-2 font-semibold">{(()=>{ const c=(customers||[]).find(x=>x&&String(x.id)===String(r.ref)); return c ? sgrCustomerLabel(c, customers) : (r.name||r.ref); })()}</td>
+                  <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(r.paymentCredit))}</td>
+                  <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(r.creditNotes))}</td>
+                  <td className="px-3 py-2 text-right font-black text-emerald-700">{sgrCreditZar(sgrToCents0(r.total))}</td>
+                  <td className="px-3 py-2 text-right"><button onClick={()=>setSel(sel===r.ref?null:r.ref)} className="text-xs text-blue-600 hover:underline" data-testid="credits-open">{sel===r.ref?'Close':'Open'}</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {sel&&<div className="bg-white rounded-2xl border border-emerald-200 p-4"><CustomerCreditSection companyCode={co} customerRef={sel} user={user} onChanged={()=>setTick(t=>t+1)}/></div>}
+      {unresolved.length>0&&(
+        <div className="bg-amber-50 rounded-2xl border border-amber-200 p-4 space-y-2" data-testid="credits-unresolved">
+          <p className="text-sm font-black text-amber-800">Credit that cannot be attributed to a customer ({unresolved.length})</p>
+          <p className="text-xs text-amber-700">It stays unusable until its customer is chosen. Nothing here is spent or moved automatically.</p>
+          {unresolved.map(u=>(
+            <div key={u.sourceType+u.sourceId} className="flex items-center justify-between gap-2 bg-white border border-amber-100 rounded-xl px-3 py-2 text-xs" data-testid="credits-unresolved-row">
+              <span><strong>{u.sourceType==='credit_note'?('Credit note '+u.number):('Overpayment on '+(u.document&&u.document.number))}</strong> · {u.name||'—'} · {sgrCreditZar(sgrToCents0(u.available))} — <span className="text-amber-700">{u.reason}</span></span>
+              {u.sourceType==='credit_note' && canManagePayments(user)
+                ? <button onClick={()=>setPickFor(u)} className="text-xs font-bold text-blue-700 hover:underline whitespace-nowrap" data-testid="credits-choose-customer">Choose customer</button>
+                : <span className="text-gray-500 whitespace-nowrap">Link the document to its customer (open it → change customer)</span>}
+            </div>
+          ))}
+        </div>
+      )}
+      {pickFor&&<CustomerPickerModal customers={customers} title={'Which customer does '+pickFor.number+' belong to?'} onPick={c=>linkNote(pickFor, c)} onClose={()=>setPickFor(null)}/>}
+    </div>
   );
 }
 
@@ -10729,6 +11175,7 @@ function BulkImportCustomersModal({ onClose, onImport, existingCustomers }) {
 function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoices=[], companies=[], user, logoDataUrl, onOpenQuote, onOpenInvoice, onOpenJob, onOpenStatement, openCustomerId, onOpenCustomerHandled }) {
   const [showAdd,    setShowAdd]    = useState(false);
   const [editing,    setEditing]    = useState(null);
+  const [creditFor,  setCreditFor]  = useState(null); // 2026-11-26: Available Credit (customer account)
   const [search,     setSearch]     = useState('');
   const [showImport, setShowImport] = useState(false);
   // ── Jump to & filter down to a specific customer when navigated here from
@@ -10933,10 +11380,16 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
             <p className="text-xs text-gray-300 mt-1">{cQuotes.length} quote{cQuotes.length!==1?'s':''} · {cJobs.length} job{cJobs.length!==1?'s':''} · {cInvoices.length} invoice{cInvoices.length!==1?'s':''} — hover name, then click to open</p>
           )}
         </div>
-        <button onClick={()=>{setEditing(c);setShowAdd(true);}}
-          className="text-xs border border-gray-200 rounded-lg px-3 py-1.5 text-gray-500 hover:bg-gray-50 font-semibold flex-shrink-0">
-          Edit
-        </button>
+        <div className="flex flex-col gap-1 flex-shrink-0">
+          <button onClick={()=>{setEditing(c);setShowAdd(true);}}
+            className="text-xs border border-gray-200 rounded-lg px-3 py-1.5 text-gray-500 hover:bg-gray-50 font-semibold">
+            Edit
+          </button>
+          <button onClick={()=>setCreditFor(c)} title="Available credit: payment credit and credit notes" data-testid="customer-credit-open"
+            className="text-xs border border-emerald-200 rounded-lg px-3 py-1.5 text-emerald-700 hover:bg-emerald-50 font-semibold">
+            💳 Credit
+          </button>
+        </div>
       </div>
     );
   }
@@ -10978,6 +11431,7 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
         </div>
       )}
       {showAdd&&<AddEditCustomerModal customer={editing} customers={customers} onClose={()=>{setShowAdd(false);setEditing(null);}} onSave={handleSave}/>}
+      {creditFor&&<CustomerCreditModal customer={creditFor} user={user} onClose={()=>setCreditFor(null)}/>}
       {showImport&&<BulkImportCustomersModal
         existingCustomers={customers}
         onImport={handleBulkImport}
@@ -12304,7 +12758,17 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
   const _depInfo  = quoteDepositInfo(quote, total);   // custom % -> R5,000 rule -> 80%
   const depRate   = _depInfo.rate;
   const deposit   = _depInfo.amount;
-  const availableCredit = creditNoteAvailable(creditNotes, quote.client);
+  // 2026-11-26 (customer credit): server-authoritative in relational mode
+  // (same company, same linked customer). The JSON fallback keeps the legacy
+  // name rule but only ever counts this quote's own company's credit notes.
+  const _qCredOwner = paySource.kind==='invoice' ? { type:'invoice', id: paySource.record && paySource.record._relId, section:'accInvoices' }
+    : paySource.kind==='job' ? { type:'job', id: paySource.record && paySource.record._relId, section:'jobs' }
+    : { type:'quote', id: quote._relId, section:'quotes' };
+  const _relQCred = isRelationalAuthoritative(_qCredOwner.section) && _qCredOwner.id!=null;
+  const docCredit = useDocumentCredit(_qCredOwner.type, _qCredOwner.id, _relQCred);
+  const availableCredit = _relQCred
+    ? ((docCredit.data && docCredit.data.credit) ? docCredit.data.credit.totals.creditNotes : 0)
+    : creditNoteAvailable((creditNotes||[]).filter(c=>sameCompany(c, quote)), quote.client);
   // Confirmed-save-before-success (2026-08-06): disables Add/Edit/Delete
   // while a save is in flight (prevents double-submit/duplicate payments on
   // a repeated click) and surfaces a failed save clearly instead of ever
@@ -12478,11 +12942,17 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
         alert(`${quote.client} only has ${zr(availableCredit)} of available credit. Reduce the amount, issue another credit note first, or choose a different payment method.`);
         return;
       }
+      if(method==='Credit' && amt > balance + 0.005){
+        alert(`Credit of ${zr(amt)} is more than the ${zr(balance)} still due. Apply at most ${zr(balance)} — credit is never used to overpay.`);
+        return;
+      }
+      if(method!=='Credit' && !sgrConfirmOverpayment({ amount:amt, balance, docLabel:(paySource.record && (paySource.record.number||paySource.record.num)) || quote.num || 'this quote', docCredit })) return;
       setSaveErr('');
       setSaving(true);
       if(!paymentRequestIdRef.current) paymentRequestIdRef.current = newPaymentRequestId();
       try {
         const result = await relationalApi.recordPayment(addOwner.ownerType, addOwner.ownerId, amt, { date, method, notes: notes.trim(), clientRequestId: paymentRequestIdRef.current });
+        docCredit.reload();
         // The optimistic row carries the server's OWN payment id, not a local
         // Date.now() — read.ts hydrates a relationally-created payment's `id`
         // from its rel_payments primary key, so using anything else here would
@@ -12586,15 +13056,17 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
   }
   async function deletePayment__impl(pid){
     if(saving) return;
-    if(!window.confirm('Delete this payment record?')) return;
+    if(!window.confirm(sgrPaymentDeleteConfirmText(payments.find(p=>p.id===pid), 'quote'))) return;
     const removed = payments.find(p=>p.id===pid);
     const owner = removed && removed._relPaymentId!=null ? resolvePaymentOwner(pid) : null;
     if(owner && isRelationalAuthoritative(owner.relSection)){
       setSaveErr('');
       setSaving(true);
       try {
-        await relationalApi.deletePayment(removed._relPaymentId, removed._relRowVersion, owner.relSection);
-        setPayments(prev=>prev.filter(p=>p.id!==pid));
+        try { await relationalApi.deletePayment(removed._relPaymentId, removed._relRowVersion, owner.relSection); }
+        catch(e1){ await sgrRetryDeleteWithCreditChoice(e1, removed, owner.relSection); }
+        setPayments(prev=>prev.filter(p=>p.id!==pid && !sgrIsPairedCreditRow(p, removed)));
+        docCredit.reload();
       } catch(e){
         setSaveErr(describeSaveConflictError(e, 'payment'));
       } finally {
@@ -12693,8 +13165,8 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
                     {[...payments].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0)||(b.id||0)-(a.id||0)).map(p=>(
                       <tr key={p.id} className="border-t border-gray-100">
                         <td className="px-3 py-2 text-gray-700">{p.date}</td>
-                        <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold">{p.method}</span></td>
-                        <td className="px-3 py-2 text-right font-bold text-green-700">{zr(p.amount)}</td>
+                        <td className="px-3 py-2"><SgrPaymentMethodBadge p={p}/></td>
+                        <td className={`px-3 py-2 text-right font-bold ${Number(p.amount)<0?'text-red-600':'text-green-700'}`}>{zr(p.amount)}</td>
                         <td className="px-3 py-2 text-gray-400">{p.notes||'—'}</td>
                         <td className="px-1 text-center">
                           {(() => {
@@ -12709,7 +13181,7 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
                             if (blockReason) return <PaymentLockedBadge reason={blockReason}/>;
                             return (
                               <span className="flex gap-1 justify-center">
-                                <button onClick={()=>editPayment(p.id)} disabled={saving} title="Edit this payment" className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
+                                {!sgrIsCreditLedgerRow(p)&&<button onClick={()=>editPayment(p.id)} disabled={saving} title="Edit this payment" className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>}
                                 <button onClick={()=>deletePayment(p.id)} disabled={saving} title="Delete this payment" className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
                               </span>
                             );
@@ -15501,7 +15973,13 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
     // different payment and must be allowed through.
     const paymentRequestIdRef = useRef(null);
     useEffect(() => { paymentRequestIdRef.current = null; }, [amount, date, method, notes]);
-    const availableCredit = creditNoteAvailable(creditNotes, job.client);
+    // 2026-11-26 (customer credit): server-authoritative in relational mode.
+    const _jobCredOwner = paySource.kind==='invoice' ? { type:'invoice', id: paySource.record && paySource.record._relId, section:'accInvoices' } : { type:'job', id: job._relId, section:'jobs' };
+    const _relJobCred = isRelationalAuthoritative(_jobCredOwner.section) && _jobCredOwner.id!=null;
+    const docCredit = useDocumentCredit(_jobCredOwner.type, _jobCredOwner.id, _relJobCred);
+    const availableCredit = _relJobCred
+      ? ((docCredit.data && docCredit.data.credit) ? docCredit.data.credit.totals.creditNotes : 0)
+      : creditNoteAvailable(creditNotes, job.client);
     const zr = n => 'R '+Number(n).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2});
 
     // Writes `updated` to whichever record resolvePaymentSource() picked —
@@ -15626,6 +16104,11 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           alert(`${job.client} only has ${zr(availableCredit)} of available credit. Reduce the amount, issue another credit note first, or choose a different payment method.`);
           return;
         }
+        if(method==='Credit' && amt > balance + 0.005){
+          alert(`Credit of ${zr(amt)} is more than the ${zr(balance)} still due. Apply at most ${zr(balance)} — credit is never used to overpay.`);
+          return;
+        }
+        if(method!=='Credit' && !sgrConfirmOverpayment({ amount:amt, balance, docLabel:(paySource.kind==='invoice' && paySource.record.number) || job.num || 'this job', docCredit })) return;
         setSaveErr('');
         setSaving(true);
         try {
@@ -15639,6 +16122,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
           const ownerId = paySource.kind==='invoice' ? paySource.record._relId : job._relId;
           if(!paymentRequestIdRef.current) paymentRequestIdRef.current = newPaymentRequestId();
           const result = await relationalApi.recordPayment(ownerType, ownerId, amt, { date, method, notes: notes.trim(), clientRequestId: paymentRequestIdRef.current });
+          docCredit.reload();
           // BUGFIX (Stage 3 follow-on): a payment's real relational identity
           // is _relPaymentId (rel_payments.id — see read.ts's paymentsFor),
           // set here immediately from the response so an immediately-
@@ -15709,7 +16193,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
       if(saving) return;
       // 2026-08-24 BUG 7: one rule everywhere; refusals explain themselves.
       { const _b = paymentDeleteBlockReason(payments.find(x=>x.id===pid), user, (paySource.kind==='invoice' ? 'accInvoices' : 'jobs')); if(_b){ alert(_b); return; } }
-      if(!window.confirm('Delete this payment record? This may change the invoice status.'))return;
+      if(!window.confirm(sgrPaymentDeleteConfirmText(payments.find(x=>x.id===pid), 'job')))return;
       const removed = payments.find(p=>p.id===pid);
       // Stage 3 Phase 4: route through the relational REST API when this
       // payment is a genuine relational row (removed._relPaymentId set —
@@ -15731,8 +16215,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         setSaveErr('');
         setSaving(true);
         try {
-          await relationalApi.deletePayment(removed._relPaymentId, removed._relRowVersion, relSection);
-          setPayments(prev=>prev.filter(p=>p.id!==pid));
+          try { await relationalApi.deletePayment(removed._relPaymentId, removed._relRowVersion, relSection); }
+          catch(e1){ await sgrRetryDeleteWithCreditChoice(e1, removed, relSection); }
+          setPayments(prev=>prev.filter(p=>p.id!==pid && !sgrIsPairedCreditRow(p, removed)));
+          docCredit.reload();
         } catch(e){
           setSaveErr(describeSaveConflictError(e, 'payment'));
         } finally {
@@ -15857,10 +16343,10 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                 <p className="text-xs text-green-500 mt-0.5">{payments.length} payment{payments.length!==1?'s':''}</p>
               </div>
               {overpayment>0?(
-                <div className="bg-orange-50 border border-orange-200 rounded-xl p-3 text-center">
+                <div className="bg-orange-50 border border-orange-200 rounded-xl p-3 text-center" data-testid="overpayment-card">
                   <p className="text-xs text-orange-600 mb-1">Overpayment</p>
                   <p className="text-lg font-black text-orange-700">{zr(overpayment)}</p>
-                  <p className="text-xs text-orange-400 mt-0.5">Refund to client</p>
+                  <p className="text-xs text-orange-400 mt-0.5">{docCredit.data && docCredit.data.ownCredit>0.004 ? zr(docCredit.data.ownCredit)+' available as customer credit' : 'Not available as customer credit (recorded before customer credit, or customer not linked)'}</p>
                 </div>
               ):balance>0?(
                 <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-center">
@@ -15876,6 +16362,14 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                 </div>
               )}
             </div>
+            {_relJobCred && (
+              <CustomerCreditApplyPanel docCredit={docCredit} ownerType={_jobCredOwner.type} ownerId={_jobCredOwner.id} outstanding={balance} user={user}
+                onApplied={({ result, amount, sourceType })=>{
+                  const newP = { id:relPaymentDisplayId(result.targetPaymentId), date:new Date().toISOString().slice(0,10), method: sourceType==='credit_note'?'Credit':'Payment credit', amount,
+                    notes: sourceType==='credit_note'?'Credit note':'Payment credit', _relPaymentId:result.targetPaymentId, _relRowVersion:1, _relOwnerType:_jobCredOwner.type, _entryKind: sourceType==='credit_note'?'credit_note':'payment_credit_in', _creditLinkId: result.allocationId };
+                  setPayments(prev=>prev.some(p=>p&&String(p._relPaymentId)===String(result.targetPaymentId)) ? prev : [...prev,newP]);
+                }}/>
+            )}
             {/* Payment history table */}
             <div>
               <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Payment History</p>
@@ -15897,8 +16391,8 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                       {[...payments].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0)||(b.id||0)-(a.id||0)).map(p=>(
                         <tr key={p.id} className="border-t border-gray-100">
                           <td className="px-3 py-2 text-gray-700">{p.date}</td>
-                          <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold">{p.method}</span></td>
-                          <td className="px-3 py-2 text-right font-bold text-green-700">{zr(p.amount)}</td>
+                          <td className="px-3 py-2"><SgrPaymentMethodBadge p={p}/></td>
+                          <td className={`px-3 py-2 text-right font-bold ${Number(p.amount)<0?'text-red-600':'text-green-700'}`}>{zr(p.amount)}</td>
                           <td className="px-3 py-2 text-gray-400">{p.notes||'—'}</td>
                         <td className="px-1 text-center">
                             {(() => {
@@ -15913,7 +16407,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
                               if (blockReason) return <PaymentLockedBadge reason={blockReason}/>;
                               return (
                                 <span className="flex gap-1 justify-center">
-                                  <button onClick={()=>editPayment(p.id)} disabled={saving} title="Edit this payment" className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
+                                  {!sgrIsCreditLedgerRow(p)&&<button onClick={()=>editPayment(p.id)} disabled={saving} title="Edit this payment" className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>}
                                   <button onClick={()=>deletePayment(p.id)} disabled={saving} title="Delete this payment" className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
                                 </span>
                               );
@@ -28374,7 +28868,14 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
     // different payment and must be allowed through.
     const paymentRequestIdRef = useRef(null);
     useEffect(() => { paymentRequestIdRef.current = null; }, [amount, date, method, notes]);
-    const availableCredit = creditNoteAvailable(creditNotes, inv.contactName);
+    // 2026-11-26 (customer credit): in relational mode the server is the only
+    // authority for what this customer can spend (same company, same linked
+    // customer, never this transaction's own receipt).
+    const _relInv = isRelationalAuthoritative('accInvoices') && inv._relId!=null;
+    const docCredit = useDocumentCredit('invoice', inv._relId, _relInv && String(inv.status||'')!=='void');
+    const availableCredit = _relInv
+      ? ((docCredit.data && docCredit.data.credit) ? docCredit.data.credit.totals.creditNotes : 0)
+      : creditNoteAvailable(creditNotes, inv.contactName);
 
     // This IS the single source of truth for a manual/quote-created invoice
     // — no resolution needed here, always accInvoices. Kept as its own
@@ -28433,11 +28934,17 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
           alert(`${inv.contactName} only has ${fmtAmt(availableCredit)} of available credit. Reduce the amount, issue another credit note first, or choose a different payment method.`);
           return;
         }
+        if(method==='Credit' && amt > balance + 0.005){
+          alert(`Credit of ${fmtAmt(amt)} is more than the ${fmtAmt(balance)} still due. Apply at most ${fmtAmt(balance)} — credit is never used to overpay an invoice.`);
+          return;
+        }
+        if(method!=='Credit' && !sgrConfirmOverpayment({ amount:amt, balance, docLabel:inv.number||'this invoice', docCredit })) return;
         setSaveErr('');
         setSaving(true);
         try {
           if(!paymentRequestIdRef.current) paymentRequestIdRef.current = newPaymentRequestId();
           const result = await relationalApi.recordPayment('invoice', inv._relId, amt, { date, method, notes: notes.trim(), clientRequestId: paymentRequestIdRef.current });
+          docCredit.reload();
           // A recognised replay returns the payment the first attempt already
           // persisted, so it must never be appended a second time. The
           // optimistic row also carries the SERVER'S payment id rather than a
@@ -28484,7 +28991,7 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
       if(saving) return;
       // 2026-08-24 BUG 7: one rule everywhere; refusals explain themselves.
       { const _b = paymentDeleteBlockReason(payments.find(x=>x.id===pid), user, 'accInvoices'); if(_b){ alert(_b); return; } }
-      if(!window.confirm('Delete this payment? This may change the invoice status.'))return;
+      if(!window.confirm(sgrPaymentDeleteConfirmText(payments.find(x=>x.id===pid), 'invoice')))return;
       const removed = payments.find(p=>p.id===pid);
       // 2026-09-07: an invoice's `payments` array is now its whole transaction
       // chain's — its own, plus its job's, plus its quote's (read.ts's
@@ -28498,8 +29005,10 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
         setSaveErr('');
         setSaving(true);
         try {
-          await relationalApi.deletePayment(removed._relPaymentId, removed._relRowVersion, _delSection);
-          setPayments(prev=>prev.filter(p=>p.id!==pid));
+          try { await relationalApi.deletePayment(removed._relPaymentId, removed._relRowVersion, _delSection); }
+          catch(e1){ await sgrRetryDeleteWithCreditChoice(e1, removed, _delSection); }
+          setPayments(prev=>prev.filter(p=>p.id!==pid && !sgrIsPairedCreditRow(p, removed)));
+          docCredit.reload();
         } catch(e){
           setSaveErr(describeSaveConflictError(e, 'payment'));
         } finally {
@@ -28589,10 +29098,10 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
                 <p className="text-xs text-green-500 mt-0.5">{payments.length} payment{payments.length!==1?'s':''}</p>
               </div>
               {overpayment>0?(
-                <div className="bg-orange-50 border border-orange-200 rounded-xl p-3 text-center">
+                <div className="bg-orange-50 border border-orange-200 rounded-xl p-3 text-center" data-testid="overpayment-card">
                   <p className="text-xs text-orange-600 mb-1">Overpayment</p>
                   <p className="text-lg font-black text-orange-700">{fmtAmt(overpayment)}</p>
-                  <p className="text-xs text-orange-400 mt-0.5">Refund to client</p>
+                  <p className="text-xs text-orange-400 mt-0.5">{docCredit.data && docCredit.data.ownCredit>0.004 ? fmtAmt(docCredit.data.ownCredit)+' available as customer credit' : 'Not available as customer credit (recorded before customer credit, or customer not linked)'}</p>
                 </div>
               ):balance>0?(
                 <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-center">
@@ -28609,6 +29118,15 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
               )}
             </div>
 
+            {_relInv && String(inv.status||'')!=='void' && (
+              <CustomerCreditApplyPanel docCredit={docCredit} ownerType="invoice" ownerId={inv._relId} outstanding={balance} user={user}
+                onApplied={({ result, amount, sourceType })=>{
+                  const newP = { id:relPaymentDisplayId(result.targetPaymentId), date:new Date().toISOString().slice(0,10), method: sourceType==='credit_note'?'Credit':'Payment credit', amount,
+                    notes: sourceType==='credit_note'?'Credit note':'Payment credit', _relPaymentId:result.targetPaymentId, _relRowVersion:1, _relOwnerType:'invoice', _entryKind: sourceType==='credit_note'?'credit_note':'payment_credit_in', _creditLinkId: result.allocationId };
+                  setPayments(prev=>prev.some(p=>p&&String(p._relPaymentId)===String(result.targetPaymentId)) ? prev : [...prev,newP]);
+                  onSaved && onSaved({...inv, payments:[...payments,newP]});
+                }}/>
+            )}
             {/* Payment history */}
             <div>
               <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Payment History</p>
@@ -28630,8 +29148,8 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
                       {[...payments].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0)||(b.id||0)-(a.id||0)).map((p,idx)=>(
                         <tr key={p.id} className="border-t border-gray-100">
                           <td className="px-3 py-2 text-gray-700">{fmtDate(p.date)}</td>
-                          <td className="px-3 py-2"><span className="bg-blue-50 text-blue-700 rounded-full px-2 py-0.5 font-semibold text-xs">{p.method}</span></td>
-                          <td className="px-3 py-2 text-right font-bold text-green-700">{fmtAmt(p.amount)}</td>
+                          <td className="px-3 py-2"><SgrPaymentMethodBadge p={p}/></td>
+                          <td className={`px-3 py-2 text-right font-bold ${Number(p.amount)<0?'text-red-600':'text-green-700'}`}>{fmtAmt(p.amount)}</td>
                           <td className="px-3 py-2 text-gray-400">{p.notes||'—'}</td>
                         <td className="px-1 text-center">
                             {(() => {
@@ -28644,10 +29162,11 @@ function ImportsPage({ savedImports, setSavedImports, utLogoDataUrl, setUtLogoDa
                               // refusal states its reason.
                               const blockReason = paymentDeleteBlockReason(p, user, 'accInvoices');
                               if (blockReason) return <PaymentLockedBadge reason={blockReason}/>;
+                              const _ledger = sgrIsCreditLedgerRow(p);
                               return (
                                 <span className="flex gap-1 justify-center">
-                                  <button onClick={()=>editPayment(p.id)} disabled={saving} title="Edit this payment" className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>
-                                  <button onClick={()=>deletePayment(p.id)} disabled={saving} title="Delete this payment" className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
+                                  {!_ledger&&<button onClick={()=>editPayment(p.id)} disabled={saving} title="Edit this payment" className="text-blue-300 hover:text-blue-600 text-xs px-1 disabled:opacity-40 disabled:cursor-not-allowed">✏️</button>}
+                                  <button onClick={()=>deletePayment(p.id)} disabled={saving} title={_ledger?'Reverse this credit entry':'Delete this payment'} className="text-gray-300 hover:text-red-400 text-sm disabled:opacity-40 disabled:cursor-not-allowed">✕</button>
                                 </span>
                               );
                             })()}
@@ -29358,10 +29877,25 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, rawCustomerSources, ban
         // `credit` = what's shown on the statement row. `balanceCredit` = what
         // actually moves the running balance; when they differ (credit
         // allocations only), the row is informational and balance-neutral.
+        // 2026-11-26 (customer credit): each row by what it IS — a receipt
+        // moves the balance once; credit applied (credit note or payment
+        // credit) and its offset on the receipt's document are shown but are
+        // balance-neutral, because that money was already counted when it was
+        // received (or when the credit note was issued); a recorded refund is
+        // money returned, so it is a debit.
         (i.payments||[]).forEach(p=>{
-          const isCreditAlloc = String(p.method||'').trim().toLowerCase().startsWith('credit');
+          const kind = sgrPaymentKind(p);
           const amt = parseFloat(p.amount)||0;
-          ev.push({date:p.date||i.paidDate||i.date, sort:1, docType:'Payment', ref:i.number||'', desc:(p.method||'Payment received'), debit:0, credit:amt, balanceCredit:isCreditAlloc?0:amt});
+          if(kind==='refund'){
+            ev.push({date:p.date||i.date, sort:1, docType:'Refund', ref:i.number||'', desc:'Refund of customer credit'+(p.reference?' · '+p.reference:''), debit:Math.abs(amt), credit:0});
+            return;
+          }
+          if(kind==='payment_credit_out'){
+            ev.push({date:p.date||i.date, sort:1, docType:'Credit applied', ref:i.number||'', desc:(p.notes||'Payment credit applied elsewhere'), debit:Math.abs(amt), credit:0, balanceDebit:0});
+            return;
+          }
+          const neutral = kind==='credit_note' || kind==='payment_credit_in';
+          ev.push({date:p.date||i.paidDate||i.date, sort:1, docType: kind==='payment_credit_in'?'Credit applied':'Payment', ref:i.number||'', desc:(kind==='payment_credit_in'?(p.notes||'Payment credit'):(p.method||'Payment received')), debit:0, credit:amt, balanceCredit:neutral?0:amt});
         });
       });
     }
@@ -29370,6 +29904,8 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, rawCustomerSources, ban
         ? stmtCustomerBelongs(c.contactName, stmtCreditCustomer(c), _cnTarget, name)
         : norm(c.contactName)===norm(name))).forEach(c=>{
       ev.push({date:c.date, sort:2, docType:'Credit Note', ref:c.number||'', desc:c.reason||'Credit note', debit:0, credit:parseFloat(c.amount)||0});
+      // 2026-11-26: a recorded refund of credit-note credit is money returned.
+      (Array.isArray(c.refunds)?c.refunds:[]).forEach(f=>ev.push({date:f.date||c.date, sort:3, docType:'Refund', ref:c.number||'', desc:'Refund of credit-note credit'+(f.reference?' · '+f.reference:''), debit:parseFloat(f.amount)||0, credit:0}));
     });
     ev.sort((a,b)=>{const d=new Date(a.date||0)-new Date(b.date||0); return d!==0?d:a.sort-b.sort;});
     // balanceCredit/balanceDebit (when present on an event) are what actually
@@ -29449,19 +29985,34 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, rawCustomerSources, ban
       // Guard against typos: if the name doesn't exactly match an existing contact,
       // the credit won't be picked up by the Client Statement or Aged Debtors
       // (both match by exact, case-insensitive name) — so warn before saving.
-      const known = names.some(n=>cnNorm(n)===cnNorm(form.contactName));
-      if(!known && !window.confirm(`"${form.contactName}" doesn't exactly match an existing ${form.type==='supplier'?'supplier':'customer'} name on file.\n\nIf the spelling doesn't match exactly, this credit will NOT show up on their statement or in Aged Debtors/Creditors.\n\nSave anyway?`)) return;
       // 2026-11-24: link the credit note to its customer record when the name
       // resolves to exactly one customer (a credit note is never moved by a
       // chain reassignment; its link is its own).
+      // 2026-11-26: a customer credit note's owner is its link. Editing a note
+      // without changing its customer keeps the link it already has (a renamed
+      // customer's old name on the note must never re-point or clear it), and a
+      // NEW customer credit note must be linked to an existing customer record.
       let _cnRef = form.customerId || null;
+      const _nameChanged = !cn || cnNorm(form.contactName)!==cnNorm(cn.contactName||'');
       if(form.type==='customer'){
-        const _own = sgrResolveCustomerRef(_cnRef, customers||[]);
-        if(!(_own.state==='matched' && sgrCustNorm(_own.customer.companyName)===sgrCustNorm(form.contactName))){
-          const _m = stmtCustomerInfo(form.contactName);
-          _cnRef = _m.state==='matched' ? String(_m.customer.id) : null;
+        if(cn && !_nameChanged){
+          _cnRef = cn.customerId!=null && cn.customerId!=='' ? String(cn.customerId) : null;
+        } else {
+          const _own = sgrResolveCustomerRef(_cnRef, customers||[]);
+          if(!(_own.state==='matched' && sgrCustNorm(_own.customer.companyName)===sgrCustNorm(form.contactName))){
+            const _m = stmtCustomerInfo(form.contactName);
+            _cnRef = _m.state==='matched' ? String(_m.customer.id) : null;
+          }
+          if(!_cnRef){
+            alert(`"${form.contactName}" does not match exactly one customer on file.\n\nChoose an existing customer from the list — a customer credit note must be linked to its customer record.`);
+            return;
+          }
         }
-      } else _cnRef = null;
+      } else {
+        _cnRef = null;
+        const known = names.some(n=>cnNorm(n)===cnNorm(form.contactName));
+        if(!known && !window.confirm(`"${form.contactName}" doesn't exactly match an existing supplier name on file.\n\nIf the spelling doesn't match exactly, this credit will NOT show up on their statement or in Aged Debtors/Creditors.\n\nSave anyway?`)) return;
+      }
       onSave({...form, amount:parseFloat(form.amount), customerId:_cnRef});
     }
     return (
@@ -30058,6 +30609,7 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, rawCustomerSources, ban
     {id:'bills',     label:'🧾 Bills & Expenses'},
     {id:'statements',label:'📄 Statements'},
     {id:'creditnotes',label:'➖ Credit Notes'},
+    {id:'customercredits',label:'💳 Customer Credits'},
     {id:'bank',      label:'🏦 Bank'},
     {id:'accounts',  label:'📒 Chart of Accounts'},
     {id:'reports',   label:'📊 Reports'},
@@ -31186,12 +31738,17 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, rawCustomerSources, ban
       })()}
 
       {/* ════ CREDIT NOTES ════ */}
+      {accTab==='customercredits'&&(
+        isRelationalAuthoritative('accInvoices')
+          ? <CustomerCreditsView user={user} customers={customers}/>
+          : <div className="bg-white rounded-2xl border border-gray-200 p-6 text-sm text-gray-500">Customer credit is available once invoices are on the relational database.</div>
+      )}
       {accTab==='creditnotes'&&(
         <div className="space-y-4">
           <div className="bg-white rounded-2xl border border-gray-200 p-4 flex items-center justify-between flex-wrap gap-2">
             <div>
               <p className="font-black text-gray-800">➖ Credit Notes</p>
-              <p className="text-xs text-gray-500 mt-0.5">Record credits for overpayments, returns, damaged goods or goodwill adjustments. They flow straight onto the customer / supplier statement.</p>
+              <p className="text-xs text-gray-500 mt-0.5">Record credits for returns, damaged goods, price or goodwill adjustments. They flow straight onto the customer / supplier statement. An overpayment does not need a credit note — the excess stays on the receipt as payment credit (see Customer Credits).</p>
             </div>
             <button onClick={()=>{setEditCn(null);setShowCnModal(true);}} className="text-white font-bold px-4 py-2.5 rounded-xl text-sm" style={{background:'#06065c'}}>＋ New Credit Note</button>
           </div>
@@ -31437,6 +31994,10 @@ function sgrPaymentsReportModelScoped(scopedJobs, scopedQuotes, scopedInvoices){
       const k = sgrReportPaymentKey(p);
       if(k!==null){ if(seenKeys.has(k)) return; seenKeys.add(k); }
       seenObjs.add(p);
+      // 2026-11-26 (customer credit): applying payment credit moves money that
+      // was already received — its +/- entries are never cash received again.
+      const _k = p && p._entryKind;
+      if(_k==='payment_credit_in' || _k==='payment_credit_out' || _k==='refund') return;
       const c = sgrToCents0(p.amount);
       if(c <= 0) return;                                 // R0.00 is not money received
       totalPaidC += c;

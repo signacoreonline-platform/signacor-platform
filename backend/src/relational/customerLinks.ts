@@ -159,13 +159,20 @@ async function creditConflictsTx(client: PoolClient, members: ChainMember[], tar
   for (const m of members) {
     const moves = m.customerRef !== target.ref || norm(m.customerName) !== norm(target.companyName);
     if (!moves) continue;
+    // 2026-11-26 (customer credit): also any payment-credit allocation, recorded
+    // refund, or receipt whose credit was used — credit belongs to one customer.
     const p = await client.query(
-      `SELECT amount, payment_date FROM rel_payments WHERE owner_type = $1 AND owner_id = $2 AND LOWER(TRIM(COALESCE(method, ''))) LIKE 'credit%' AND amount <> 0`,
+      `SELECT amount, payment_date FROM rel_payments
+        WHERE owner_type = $1 AND owner_id = $2 AND amount <> 0
+          AND (LOWER(TRIM(COALESCE(method, ''))) LIKE 'credit%'
+               OR entry_kind IN ('credit_note','payment_credit_in','payment_credit_out','refund')
+               OR EXISTS (SELECT 1 FROM rel_credit_allocations a WHERE a.source_type = 'payment' AND a.source_payment_id = rel_payments.id AND a.status = 'active')
+               OR EXISTS (SELECT 1 FROM rel_credit_refunds f WHERE f.source_type = 'payment' AND f.source_payment_id = rel_payments.id AND f.status = 'active'))`,
       [m.type, m.id]);
     if (p.rowCount) {
       const total = p.rows.reduce((s: number, r: any) => s + Number(r.amount), 0);
       out.push({ type: m.type, id: m.id, number: m.number, code: 'CREDIT_ALLOCATION',
-        message: `${m.type === 'invoice' ? 'Invoice' : m.type === 'job' ? 'Job' : 'Quote'} ${m.number || m.id} has R${total.toFixed(2)} paid from customer credit (${p.rowCount} "Credit" payment${p.rowCount === 1 ? '' : 's'}). Credit is returned to the credit note of the customer named on the document, so moving it would later return that credit to the wrong customer. Delete the Credit payment first (this gives the credit back to its own credit note), change the customer, then apply the new customer's credit if needed.` });
+        message: `${m.type === 'invoice' ? 'Invoice' : m.type === 'job' ? 'Job' : 'Quote'} ${m.number || m.id} has R${Math.abs(total).toFixed(2)} of customer-credit activity (${p.rowCount} credit entr${p.rowCount === 1 ? 'y' : 'ies'}: credit applied, credit used elsewhere, or a recorded refund). Customer credit belongs to one customer, so moving this transaction would move that credit to the wrong customer. Reverse those credit entries first (Customer Credits), change the customer, then apply the new customer's credit if needed.` });
     }
   }
   return out;

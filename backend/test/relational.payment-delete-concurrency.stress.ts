@@ -157,7 +157,8 @@ async function main() {
   console.log('\n[Payment delete concurrency] E — deleting a Credit-funded payment (correct version) releases credit in the SAME transaction');
   await pool.query(`UPDATE relational_cutover SET enabled = true WHERE section = 'creditNotes'`);
   const jobE = await makeJob('Payment Delete Concurrency Co E');
-  const cnE = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Payment Delete Concurrency Co E', amount: 500 });
+  await pool.query(`UPDATE platform_state SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{customers}', COALESCE(data->'customers', '[]'::jsonb) || $1::jsonb) WHERE id = 1`, [JSON.stringify([{ id: 'T-PDC-E', companyName: 'Payment Delete Concurrency Co E' }])]); // 2026-11-26: credit is resolved through the customer record (customer credit, migration 022)
+  const cnE = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Payment Delete Concurrency Co E', customerRef: 'T-PDC-E', amount: 500 });
   const payE = await (await fetch(`${base}/api/relational/payments`, {
     method: 'POST', headers: H, body: JSON.stringify({ ownerType: 'job', ownerId: jobE, amount: 300, method: 'Credit' }),
   })).json();
@@ -173,7 +174,8 @@ async function main() {
   // ── F: Credit-funded delete with a STALE version — rejected, credit UNCHANGED ──
   console.log('\n[Payment delete concurrency] F — a STALE-version delete of a Credit-funded payment is rejected AND the credit note is completely untouched');
   const jobF = await makeJob('Payment Delete Concurrency Co F');
-  const cnF = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Payment Delete Concurrency Co F', amount: 500 });
+  await pool.query(`UPDATE platform_state SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{customers}', COALESCE(data->'customers', '[]'::jsonb) || $1::jsonb) WHERE id = 1`, [JSON.stringify([{ id: 'T-PDC-F', companyName: 'Payment Delete Concurrency Co F' }])]); // 2026-11-26: credit is resolved through the customer record (customer credit, migration 022)
+  const cnF = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Payment Delete Concurrency Co F', customerRef: 'T-PDC-F', amount: 500 });
   const payF = await (await fetch(`${base}/api/relational/payments`, {
     method: 'POST', headers: H, body: JSON.stringify({ ownerType: 'job', ownerId: jobF, amount: 200, method: 'Credit' }),
   })).json();
@@ -218,7 +220,8 @@ async function main() {
   // ── I: cutover_dependency block never consumes the version or the credit note ──
   console.log('\n[Payment delete concurrency] I — a Credit-delete blocked by cutover_dependency consumes NEITHER the row_version NOR the credit note; retrying the SAME version succeeds once creditNotes is re-enabled');
   const jobI = await makeJob('Payment Delete Concurrency Co I');
-  const cnI = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Payment Delete Concurrency Co I', amount: 500 });
+  await pool.query(`UPDATE platform_state SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{customers}', COALESCE(data->'customers', '[]'::jsonb) || $1::jsonb) WHERE id = 1`, [JSON.stringify([{ id: 'T-PDC-I', companyName: 'Payment Delete Concurrency Co I' }])]); // 2026-11-26: credit is resolved through the customer record (customer credit, migration 022)
+  const cnI = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Payment Delete Concurrency Co I', customerRef: 'T-PDC-I', amount: 500 });
   const payI = await (await fetch(`${base}/api/relational/payments`, {
     method: 'POST', headers: H, body: JSON.stringify({ ownerType: 'job', ownerId: jobI, amount: 250, method: 'Credit' }),
   })).json();

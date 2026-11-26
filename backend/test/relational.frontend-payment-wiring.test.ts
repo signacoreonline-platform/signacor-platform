@@ -160,7 +160,15 @@ async function runStatusRecomputeProof() {
     body: JSON.stringify({ expectedVersion: editBody.rowVersion, ownerSection: 'jobs', amount: 0 }),
   });
   const editZeroBody: any = await editZeroRes.json();
-  ok(editZeroRes.status === 200, 'edit to 0 succeeded', editZeroBody);
+  // 2026-11-26 (customer credit, migration 022): a payment amount must be a
+  // positive amount of whole cents, so editing one down to R0.00 is refused;
+  // removing the payment is the way to take the total paid back to zero.
+  ok(editZeroRes.status === 409 && editZeroBody.type === 'business_rule' && /greater than R0\.00/.test(editZeroBody.error || ''), 'edit to 0 is refused (amounts must be positive)', editZeroBody);
+  const delZeroRes = await fetch(`${base}/api/relational/payments/${pay1Body.paymentId}`, {
+    method: 'DELETE', headers: authHeaders,
+    body: JSON.stringify({ expectedVersion: editBody.rowVersion, ownerSection: 'jobs' }),
+  });
+  ok(delZeroRes.status === 200, 'deleting the remaining payment succeeded', await delZeroRes.text().catch(() => ''));
   jobAfter = await pool.query(`SELECT invoice_status FROM rel_jobs WHERE id = $1`, [jobRelId]);
   ok(jobAfter.rows[0].invoice_status === 'pending', 'invoice_status correctly reverted all the way to "pending" once total paid is exactly 0', jobAfter.rows[0]);
 
@@ -197,10 +205,14 @@ async function runCreditPaymentProof() {
 
   console.log('\n[Frontend payment wiring] enabling "creditNotes" lets the SAME Credit payment succeed and correctly apply credit-note usage');
   await pool.query(`UPDATE relational_cutover SET enabled = true WHERE section = 'creditNotes'`);
+  // 2026-11-26 (customer credit, migration 022): credit belongs to one company
+  // and one customer record, so the note carries the job's company and the
+  // customer exists (exact unique name).
+  await pool.query(`UPDATE platform_state SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{customers}', COALESCE(data->'customers', '[]'::jsonb) || $1::jsonb) WHERE id = 1`, [JSON.stringify([{ id: 'T-CREDIT-PAY', companyName: 'Credit Payment Test Co' }])]);
   await pool.query(
     `WITH new_id AS (SELECT nextval('rel_credit_notes_id_seq') AS id)
-     INSERT INTO rel_credit_notes (id, source_id, credit_number, note_type, contact_name_raw, amount, used_amount, note_date, legacy_data)
-     SELECT new_id.id, new_id.id::text, 'CN-TESTFIX-1', 'customer', 'Credit Payment Test Co', 200, 0, '2026-08-01', '{}'::jsonb FROM new_id`
+     INSERT INTO rel_credit_notes (id, source_id, credit_number, note_type, contact_name_raw, amount, used_amount, note_date, company_code, legacy_data)
+     SELECT new_id.id, new_id.id::text, 'CN-TESTFIX-1', 'customer', 'Credit Payment Test Co', 200, 0, '2026-08-01', '2', '{}'::jsonb FROM new_id`
   );
   const creditRes = await fetch(`${base}/api/relational/payments`, {
     method: 'POST', headers: authHeaders,

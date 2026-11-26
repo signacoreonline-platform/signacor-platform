@@ -45,6 +45,17 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import pool from '../src/db/pool';
+
+// 2026-11-26: a new customer credit note must be linked to an existing customer
+// record — seeds one (platform_state.customers) per contact name and returns its id.
+async function seedCust(name: string): Promise<string> {
+  const id = 'T-CN-' + name.replace(/[^A-Za-z0-9]+/g, '-').toUpperCase();
+  await pool.query(`INSERT INTO platform_state (id, data) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`);
+  await pool.query(`UPDATE platform_state SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{customers}',
+    (SELECT COALESCE(jsonb_agg(c), '[]'::jsonb) FROM jsonb_array_elements(COALESCE(data->'customers', '[]'::jsonb)) c WHERE c->>'id' <> $2) || $1::jsonb) WHERE id = 1`,
+    [JSON.stringify([{ id, companyName: name }]), id]);
+  return id;
+}
 import * as services from '../src/relational/services';
 import * as read from '../src/relational/read';
 import { runBackfill } from '../src/relational/backfill';
@@ -74,7 +85,7 @@ async function resetTables() {
 
 async function testAB_createBothCompanies() {
   console.log('\n[Credit note company isolation] TEST A — HOLDINGS CREATE');
-  const h = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Holdings CN Co', amount: 200 });
+  const h = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Holdings CN Co', customerRef: await seedCust('Holdings CN Co'), amount: 200 });
   const hRow = await pool.query(`SELECT company_code FROM rel_credit_notes WHERE id = $1`, [h.id]);
   ok(hRow.rows[0]?.company_code === '1', 'Holdings create persists company_code = "1"', hRow.rows[0]);
   let notes = await read.buildCreditNotesJson();
@@ -84,7 +95,7 @@ async function testAB_createBothCompanies() {
   ok(!belongsToUserCompany(hRead, ORIGINAL_USER), 'Original view excludes it');
 
   console.log('\n[Credit note company isolation] TEST B — ORIGINAL CREATE');
-  const o = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Original CN Co', amount: 150 });
+  const o = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Original CN Co', customerRef: await seedCust('Original CN Co'), amount: 150 });
   const oRow = await pool.query(`SELECT company_code FROM rel_credit_notes WHERE id = $1`, [o.id]);
   ok(oRow.rows[0]?.company_code === '2', 'Original create persists company_code = "2"', oRow.rows[0]);
   notes = await read.buildCreditNotesJson();
@@ -171,13 +182,13 @@ async function testD_historicalBackfill() {
 
 async function testE_update() {
   console.log('\n[Credit note company isolation] TEST E — UPDATE never reassigns company ownership');
-  const h = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Holdings Edit Co', amount: 300 });
+  const h = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Holdings Edit Co', customerRef: await seedCust('Holdings Edit Co'), amount: 300 });
   await services.updateCreditNote(h.id, 1, { amount: 350, notes: 'edited' });
   const hAfter = await pool.query(`SELECT company_code, amount, notes FROM rel_credit_notes WHERE id = $1`, [h.id]);
   ok(hAfter.rows[0]?.company_code === '1', 'editing a Holdings credit note leaves company_code = "1" unchanged', hAfter.rows[0]);
   ok(Number(hAfter.rows[0]?.amount) === 350 && hAfter.rows[0]?.notes === 'edited', 'the edit itself still applied correctly', hAfter.rows[0]);
 
-  const o = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Original Edit Co', amount: 300 });
+  const o = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Original Edit Co', customerRef: await seedCust('Original Edit Co'), amount: 300 });
   await services.updateCreditNote(o.id, 1, { amount: 375 });
   const oAfter = await pool.query(`SELECT company_code, amount FROM rel_credit_notes WHERE id = $1`, [o.id]);
   ok(oAfter.rows[0]?.company_code === '2', 'editing an Original credit note leaves company_code = "2" unchanged', oAfter.rows[0]);
@@ -194,7 +205,7 @@ async function testE_update() {
 
 async function testF_deleteAndFinancialBehaviour() {
   console.log('\n[Credit note company isolation] TEST F — DELETE / FINANCIAL BEHAVIOUR unaffected by company isolation');
-  const h = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Holdings Delete Co', amount: 500 });
+  const h = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Holdings Delete Co', customerRef: await seedCust('Holdings Delete Co'), amount: 500 });
   await pool.query(`UPDATE rel_credit_notes SET used_amount = 100 WHERE id = $1`, [h.id]);
   try {
     await services.deleteCreditNote(h.id, 1);
@@ -208,15 +219,15 @@ async function testF_deleteAndFinancialBehaviour() {
   const gone = await pool.query(`SELECT id FROM rel_credit_notes WHERE id = $1`, [h.id]);
   ok(gone.rowCount === 0, 'the Holdings note is actually gone');
 
-  const o = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Original Delete Co', amount: 500 });
+  const o = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Original Delete Co', customerRef: await seedCust('Original Delete Co'), amount: 500 });
   const delResultO = await services.deleteCreditNote(o.id, 1);
   ok(delResultO.deleted === true, 'an unused Original note deletes correctly too — company isolation applies symmetrically');
 }
 
 async function testG_concurrency() {
   console.log('\n[Credit note company isolation] TEST G — CONCURRENCY: stale writes/deletes stay protected; unrelated notes stay independent');
-  const h = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Holdings Concurrency Co', amount: 600 });
-  const o = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Original Concurrency Co', amount: 700 });
+  const h = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Holdings Concurrency Co', customerRef: await seedCust('Holdings Concurrency Co'), amount: 600 });
+  const o = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Original Concurrency Co', customerRef: await seedCust('Original Concurrency Co'), amount: 700 });
 
   await services.updateCreditNote(h.id, 1, { amount: 650 }); // h is now row_version 2
   try {
@@ -260,8 +271,8 @@ function extractNamedJson(buffer: Buffer, entryName: string): string {
 
 async function testFullBackupV2() {
   console.log('\n[Credit note company isolation] FULL BACKUP V2 — company_code is captured automatically (raw rel_credit_notes dump, no backup-code change needed)');
-  const h = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Backup Holdings Co', amount: 111 });
-  const o = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Backup Original Co', amount: 222 });
+  const h = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Backup Holdings Co', customerRef: await seedCust('Backup Holdings Co'), amount: 111 });
+  const o = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Backup Original Co', customerRef: await seedCust('Backup Original Co'), amount: 222 });
   const result = await buildFullBackupV2('admin');
   const rawJsonText = extractNamedJson(result.buffer, 'relational-raw.json');
   if (rawJsonText === '{}') {

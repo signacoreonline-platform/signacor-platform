@@ -344,7 +344,10 @@ async function testPaymentLifecycle() {
   const editRes = await services.updatePayment(eft.paymentId, 1, { amount: 120, notes: 'corrected amount' });
   ok(editRes.rowVersion === 2, 'editing a non-Credit payment succeeds and bumps row_version');
 
-  const cn = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Credit Test Co', amount: 300, reason: 'Overpayment refund credit' });
+  // 2026-11-26: the note is in the job's own company ('1'). Credit stays within its company (customer credit, migration 022);
+  // this test previously relied on a company-2 note funding a company-1 job, the cross-company defect now refused.
+  await pool.query(`UPDATE platform_state SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{customers}', COALESCE(data->'customers', '[]'::jsonb) || $1::jsonb) WHERE id = 1`, [JSON.stringify([{ id: 'T-CREDIT-TEST', companyName: 'Credit Test Co' }])]); // 2026-11-26: credit is resolved through the customer record (customer credit, migration 022)
+  const cn = await services.createCreditNote({ companyCode: '1', type: 'customer', contactName: 'Credit Test Co', customerRef: 'T-CREDIT-TEST', amount: 300, reason: 'Overpayment refund credit' });
   ok(/^CN-\d{4}$/.test(cn.creditNumber), 'credit note gets an atomically-reserved CN-#### number (4 digits, matching nextCnNum\'s real format)', cn.creditNumber);
 
   const creditPay = await services.recordPayment({ type: 'job', id: jobId }, 200, { method: 'Credit' });
@@ -379,7 +382,9 @@ async function testPaymentLifecycle() {
 
 async function testCreditNoteAndPOAndSupplierCrud() {
   console.log('\n[Credit notes / purchase orders / suppliers / inventory] CRUD, concurrency, atomic numbering');
-  const cn = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'CRUD Test Co', amount: 100, reason: 'test' });
+  // 2026-11-26: a new customer credit note must be linked to an existing customer record.
+  await pool.query(`UPDATE platform_state SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{customers}', COALESCE(data->'customers', '[]'::jsonb) || $1::jsonb) WHERE id = 1`, [JSON.stringify([{ id: 'T-CRUD-TEST', companyName: 'CRUD Test Co' }])]);
+  const cn = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'CRUD Test Co', customerRef: 'T-CRUD-TEST', amount: 100, reason: 'test' });
   const cnPatch = await services.updateCreditNote(cn.id, cn.rowVersion, { reason: 'updated reason' });
   ok(cnPatch.rowVersion === cn.rowVersion + 1, 'credit note edit bumps row_version');
   let deleteUsedBlocked = false;

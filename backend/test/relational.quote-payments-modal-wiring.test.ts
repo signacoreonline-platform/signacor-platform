@@ -202,7 +202,8 @@ async function main() {
       companyCode: '2', customerId: custC.id, customerNameRaw: 'Quote Credit Payment Co',
       lines: [{ description: 'Credit test', qty: 1, unitPrice: 1000 }],
     });
-    const cn = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Quote Credit Payment Co', amount: 600 });
+    await pool.query(`UPDATE platform_state SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{customers}', COALESCE(data->'customers', '[]'::jsonb) || $1::jsonb) WHERE id = 1`, [JSON.stringify([{ id: 'T-QUOTE-CREDIT', companyName: 'Quote Credit Payment Co' }])]); // 2026-11-26: credit is resolved through the customer record (customer credit, migration 022)
+    const cn = await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Quote Credit Payment Co', customerRef: 'T-QUOTE-CREDIT', amount: 600 });
     const creditPayRes = await fetch(`${base}/api/relational/payments`, {
       method: 'POST', headers: H, body: JSON.stringify({ ownerType: 'quote', ownerId: quoteC.id, amount: 400, method: 'Credit' }),
     });

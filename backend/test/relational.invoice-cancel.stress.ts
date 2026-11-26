@@ -227,7 +227,8 @@ async function main() {
   {
     await reset();
     const { inv } = await seedQuoteJobInvoice('2', 'Credit Client');
-    await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Credit Client', date: '2026-10-01', amount: 400 } as any);
+    await pool.query(`UPDATE platform_state SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{customers}', COALESCE(data->'customers', '[]'::jsonb) || $1::jsonb) WHERE id = 1`, [JSON.stringify([{ id: 'T-CREDIT-CLIENT', companyName: 'Credit Client' }])]); // 2026-11-26: credit is resolved through the customer record (customer credit, migration 022)
+    await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Credit Client', customerRef: 'T-CREDIT-CLIENT', date: '2026-10-01', amount: 400 } as any);
     await services.recordPayment({ type: 'invoice', id: Number(inv.invoiceId) }, 400, { date: '2026-11-03', method: 'Credit' });
     const snapCredit = await creditSnapshot(); const snapPay = await paymentsSnapshot();
     await refuses(async () => services.cancelInvoice(Number(inv.invoiceId), (await invRow(inv.invoiceId)).row_version, { reason: 'x', actor: ACTOR }),

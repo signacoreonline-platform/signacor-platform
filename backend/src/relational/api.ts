@@ -52,6 +52,10 @@ import {
   createManualInvoice, updateInvoice, cancelInvoice, normalizeCustomerRef,
 } from './services';
 import { previewCustomerReassignment, reassignCustomerChain, MemberType } from './customerLinks';
+import {
+  applyCredit, reverseCreditAllocation, recordCreditRefund, reverseCreditRefund,
+  getCustomerCredit, getCreditSummary, getDocumentCredit,
+} from './customerCredit';
 
 const router = Router();
 router.use(authenticate);
@@ -80,7 +84,9 @@ function handleServiceError(err: unknown, res: Response): void {
     return;
   }
   if (err instanceof BusinessRuleError) {
-    res.status(409).json({ conflict: false, type: 'business_rule', error: err.message });
+    // 2026-11-26: an ambiguous historical credit payment names its candidate notes so the user can choose.
+    const candidates = (err as any).candidates;
+    res.status(409).json({ conflict: false, type: 'business_rule', error: err.message, ...(Array.isArray(candidates) ? { candidates } : {}) });
     return;
   }
   console.error('[relational-api] unexpected error:', err);
@@ -684,13 +690,13 @@ router.post('/customer-links/reassign', async (req: AuthRequest, res: Response):
 // case that genuinely crosses into creditNotes' authority.
 router.post('/payments', async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { ownerType, ownerId, amount, date, method, reference, notes, clientRequestId } = req.body || {};
+    const { ownerType, ownerId, amount, date, method, reference, notes, clientRequestId, creditNoteId } = req.body || {};
     if (!['job', 'invoice', 'quote'].includes(ownerType)) {
       res.status(400).json({ error: '"ownerType" must be one of job, invoice, quote' }); return;
     }
     const ownerSection: CutoverSection = ownerType === 'job' ? 'jobs' : ownerType === 'invoice' ? 'accInvoices' : 'quotes';
     if (!(await requireCutOver(ownerSection, res))) return;
-    if (method === 'Credit' && !(await isSectionCutOver('creditNotes'))) {
+    if (String(method || '').trim().toLowerCase().startsWith('credit') && !(await isSectionCutOver('creditNotes'))) {
       res.status(409).json({
         conflict: true, type: 'cutover_dependency',
         error: `A Credit-method payment against "${ownerSection}" (relational-authoritative) would deduct from rel_credit_notes, but "creditNotes" is NOT cut over — its live JSON copy would silently go stale. Refusing to cross-write JSON and relational in one business operation. Enable "creditNotes" cutover first, then retry this Credit payment.`,
@@ -710,7 +716,11 @@ router.post('/payments', async (req: AuthRequest, res: Response): Promise<void> 
     // separate payments carry different keys and are both recorded, so the
     // legitimate "R5,000 twice on the same day" case is untouched. A caller that
     // sends no key behaves exactly as before.
-    const result = await recordPayment({ type: ownerType, id }, amt, { date, method, reference, notes, clientRequestId });
+    const result = await recordPayment({ type: ownerType, id }, amt, {
+      date, method, reference, notes, clientRequestId,
+      creditNoteId: creditNoteId == null || creditNoteId === '' ? null : Number(creditNoteId),
+      actor: req.user ? { id: req.user.id, email: req.user.email, role: req.user.role, co: req.user.co } : null,
+    });
     // 201 on a real create, 200 on a recognised replay — an honest distinction
     // the client can act on, while both are ordinary successes carrying the same
     // canonical payment id.
@@ -763,15 +773,157 @@ router.delete('/payments/:id', async (req: AuthRequest, res: Response): Promise<
     // onto rel_credit_notes (see services.ts deletePayment) — the SAME
     // cross-authority hazard as recording one. Check BEFORE deleting.
     const method = await getPaymentMethod(id);
-    if (method === 'Credit' && !(await isSectionCutOver('creditNotes'))) {
+    if (String(method || '').trim().toLowerCase().startsWith('credit') && !(await isSectionCutOver('creditNotes'))) {
       res.status(409).json({
         conflict: true, type: 'cutover_dependency',
         error: `Deleting this Credit-funded payment would release usage back onto rel_credit_notes, but "creditNotes" is NOT cut over — its live JSON copy would silently go stale. Refusing to cross-write JSON and relational in one business operation. Enable "creditNotes" cutover first, then retry this delete.`,
       });
       return;
     }
-    const result = await deletePayment(id, expectedVersion);
+    const releaseTo = req.body?.releaseToCreditNoteId;
+    const result = await deletePayment(id, expectedVersion, {
+      releaseToCreditNoteId: releaseTo == null || releaseTo === '' ? null : Number(releaseTo),
+      actor: req.user ? { id: req.user.id, email: req.user.email, role: req.user.role, co: req.user.co } : null,
+    });
     res.json({ success: true, deleted: result.deleted, creditReleased: result.creditReleased });
+  } catch (err) { handleServiceError(err, res); }
+});
+
+// ── CUSTOMER CREDIT (022, 2026-11-26) ───────────────────────────────────────
+// Payment credit (overpaid receipts), credit-note credit, allocations and
+// recorded refunds. See customerCredit.ts for every rule. Reads are open to any
+// signed-in login for its own company; applying, reversing and refunding credit
+// is for an admin or accounts login. A Holdings login sees and acts only on
+// Holdings (company 1); an original-company login never on Holdings.
+const CREDIT_SECTIONS: CutoverSection[] = ['quotes', 'jobs', 'accInvoices', 'creditNotes'];
+async function creditGate(res: Response): Promise<boolean> {
+  for (const s of CREDIT_SECTIONS) { if (!(await requireCutOver(s, res))) return false; }
+  return true;
+}
+function creditActor(req: AuthRequest) {
+  return req.user ? { id: req.user.id, email: req.user.email, role: req.user.role, co: req.user.co } : null;
+}
+function companyAllowed(req: AuthRequest, code: unknown): boolean {
+  const c = String(code ?? '');
+  if (!req.user) return false;
+  return Number(req.user.co) === 1 ? c === '1' : c !== '1';
+}
+function denyCompany(res: Response): void {
+  res.status(403).json({ conflict: false, type: 'forbidden', error: 'That customer credit belongs to another company.' });
+}
+function creditWriter(req: AuthRequest, res: Response): boolean {
+  if (!req.user || !['admin', 'accounts'].includes(String(req.user.role))) {
+    res.status(403).json({ conflict: false, type: 'forbidden', error: 'Only an admin or accounts login can apply, reverse or refund customer credit.' });
+    return false;
+  }
+  return true;
+}
+async function ownerCompany(type: string, id: number): Promise<string | null> {
+  const table = type === 'invoice' ? 'rel_invoices' : type === 'job' ? 'rel_jobs' : type === 'quote' ? 'rel_quotes' : null;
+  if (!table || !Number.isFinite(id)) return null;
+  const r = await pool.query(`SELECT company_code FROM ${table} WHERE id = $1`, [id]);
+  return r.rowCount ? String(r.rows[0].company_code ?? '') : null;
+}
+async function allowedCompanies(req: AuthRequest): Promise<string[]> {
+  if (Number(req.user?.co) === 1) return ['1'];
+  const r = await pool.query(
+    `SELECT DISTINCT company_code AS c FROM (
+       SELECT company_code FROM rel_invoices UNION SELECT company_code FROM rel_jobs UNION SELECT company_code FROM rel_quotes UNION SELECT company_code FROM rel_credit_notes
+     ) x WHERE company_code IS NOT NULL AND company_code <> '1'`);
+  return r.rows.map((x: any) => String(x.c));
+}
+
+router.get('/customer-credit/summary', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await creditGate(res))) return;
+  try {
+    const allowed = await allowedCompanies(req);
+    const want = req.query.companyCode ? [String(req.query.companyCode)] : allowed;
+    if (want.some((c) => !allowed.includes(c) && !companyAllowed(req, c))) { denyCompany(res); return; }
+    const summary = await getCreditSummary(want.filter((c) => companyAllowed(req, c)));
+    res.json({ success: true, companies: allowed, ...summary });
+  } catch (err) { handleServiceError(err, res); }
+});
+router.get('/customer-credit', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await creditGate(res))) return;
+  const companyCode = String(req.query.companyCode || '');
+  const customerRef = normalizeCustomerRef(req.query.customerRef);
+  if (!companyCode || !customerRef) { res.status(400).json({ error: '"companyCode" and "customerRef" are required' }); return; }
+  if (!companyAllowed(req, companyCode)) { denyCompany(res); return; }
+  try { res.json({ success: true, credit: await getCustomerCredit(companyCode, customerRef) }); }
+  catch (err) { handleServiceError(err, res); }
+});
+router.get('/customer-credit/document', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await creditGate(res))) return;
+  const ownerType = String(req.query.ownerType || '');
+  const ownerId = Number(req.query.ownerId);
+  if (!['invoice', 'job', 'quote'].includes(ownerType) || !Number.isFinite(ownerId)) { res.status(400).json({ error: '"ownerType" (invoice/job/quote) and a numeric "ownerId" are required' }); return; }
+  try {
+    const co = await ownerCompany(ownerType, ownerId);
+    if (co === null) { res.status(404).json({ error: 'Document not found' }); return; }
+    if (!companyAllowed(req, co)) { denyCompany(res); return; }
+    res.json({ success: true, ...(await getDocumentCredit(ownerType as any, ownerId)) });
+  } catch (err) { handleServiceError(err, res); }
+});
+router.post('/credit-allocations', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await creditGate(res))) return;
+  if (!creditWriter(req, res)) return;
+  const { sourceType, sourceId, targetType, targetId, amount, clientRequestId, notes } = req.body || {};
+  const tId = Number(targetId); const sId = Number(sourceId);
+  if (!['payment', 'credit_note'].includes(sourceType) || !Number.isFinite(sId) || !['invoice', 'job'].includes(targetType) || !Number.isFinite(tId)) {
+    res.status(400).json({ error: '"sourceType" (payment/credit_note), numeric "sourceId", "targetType" (invoice/job) and numeric "targetId" are required' }); return;
+  }
+  try {
+    const co = await ownerCompany(targetType, tId);
+    if (co === null) { res.status(404).json({ error: 'Document not found' }); return; }
+    if (!companyAllowed(req, co)) { denyCompany(res); return; }
+    const result = await applyCredit({ sourceType, sourceId: sId, targetType, targetId: tId, amount, clientRequestId, notes: notes ?? null, actor: creditActor(req) });
+    res.status(result.deduplicated ? 200 : 201).json({ success: true, ...result });
+  } catch (err) { handleServiceError(err, res); }
+});
+router.post('/credit-allocations/:id/reverse', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await creditGate(res))) return;
+  if (!creditWriter(req, res)) return;
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) { res.status(400).json({ error: 'numeric id required' }); return; }
+  try {
+    const r = await pool.query('SELECT company_code FROM rel_credit_allocations WHERE id = $1', [id]);
+    if (!r.rowCount) { res.status(404).json({ error: 'Allocation not found' }); return; }
+    if (!companyAllowed(req, r.rows[0].company_code)) { denyCompany(res); return; }
+    const ev = req.body?.expectedVersion;
+    res.json({ success: true, ...(await reverseCreditAllocation(id, { expectedVersion: ev == null ? null : Number(ev), reason: req.body?.reason ?? null, actor: creditActor(req) })) });
+  } catch (err) { handleServiceError(err, res); }
+});
+router.post('/credit-refunds', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await creditGate(res))) return;
+  if (!creditWriter(req, res)) return;
+  const { sourceType, sourceId, amount, date, method, reference, notes, clientRequestId } = req.body || {};
+  const sId = Number(sourceId);
+  if (!['payment', 'credit_note'].includes(sourceType) || !Number.isFinite(sId)) { res.status(400).json({ error: '"sourceType" (payment/credit_note) and numeric "sourceId" are required' }); return; }
+  try {
+    let co: string | null = null;
+    if (sourceType === 'payment') {
+      const p = await pool.query('SELECT owner_type, owner_id FROM rel_payments WHERE id = $1', [sId]);
+      if (p.rowCount) co = await ownerCompany(p.rows[0].owner_type, Number(p.rows[0].owner_id));
+    } else {
+      const n = await pool.query('SELECT company_code FROM rel_credit_notes WHERE id = $1', [sId]);
+      if (n.rowCount) co = String(n.rows[0].company_code ?? '');
+    }
+    if (co === null) { res.status(404).json({ error: 'Credit source not found' }); return; }
+    if (!companyAllowed(req, co)) { denyCompany(res); return; }
+    const result = await recordCreditRefund({ sourceType, sourceId: sId, amount, date, method: method ?? null, reference: reference ?? null, notes: notes ?? null, clientRequestId, actor: creditActor(req) });
+    res.status(result.deduplicated ? 200 : 201).json({ success: true, ...result });
+  } catch (err) { handleServiceError(err, res); }
+});
+router.post('/credit-refunds/:id/reverse', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await creditGate(res))) return;
+  if (!creditWriter(req, res)) return;
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) { res.status(400).json({ error: 'numeric id required' }); return; }
+  try {
+    const r = await pool.query('SELECT company_code FROM rel_credit_refunds WHERE id = $1', [id]);
+    if (!r.rowCount) { res.status(404).json({ error: 'Refund not found' }); return; }
+    if (!companyAllowed(req, r.rows[0].company_code)) { denyCompany(res); return; }
+    res.json({ success: true, ...(await reverseCreditRefund(id, { reason: req.body?.reason ?? null, actor: creditActor(req) })) });
   } catch (err) { handleServiceError(err, res); }
 });
 
@@ -805,7 +957,7 @@ router.put('/credit-notes/:id', async (req: AuthRequest, res: Response): Promise
     }
     const { expectedVersion: _ev, ...patch } = req.body || {};
     if (patch.customerRef !== undefined) patch.customerRef = normalizeCustomerRef(patch.customerRef);
-    const result = await updateCreditNote(id, expectedVersion, patch);
+    const result = await updateCreditNote(id, expectedVersion, patch, creditActor(req));
     res.json({ success: true, rowVersion: result.rowVersion });
   } catch (err) { handleServiceError(err, res); }
 });

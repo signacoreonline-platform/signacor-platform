@@ -126,7 +126,13 @@ function paymentView(p: any, ownerType: string, owner: { id: string; number: str
   return {
     id: str(p.id), relId: p._relPaymentId != null ? Number(p._relPaymentId) : null,
     amount: m.rands(m.sgrToCents0(p.amount)), date: dateOnly(p.date), method, reference: str(p.reference),
-    isCreditAllocation: String(method || '').trim().toLowerCase().startsWith('credit'),
+    // 2026-11-26 (022): entryKind says what the row is. A credit allocation —
+    // credit-note credit or payment credit applied, or its offset on the
+    // receipt's document — moves money already received, so it is never new money.
+    entryKind: str(p._entryKind) || (String(method || '').trim().toLowerCase().startsWith('credit') ? 'credit_note' : 'receipt'),
+    isCreditAllocation: ['credit_note', 'payment_credit_in', 'payment_credit_out'].includes(String(p._entryKind || ''))
+      || (!p._entryKind && String(method || '').trim().toLowerCase().startsWith('credit')),
+    isRefund: p._entryKind === 'refund',
     owner: { type: p._relOwnerType || ownerType, id: owner.id, number: owner.number }, companyCode: owner.company,
   };
 }
@@ -349,9 +355,10 @@ export function creditNoteView(cn: any, L: Loaded) {
   const c = companyOf(cn);
   const amountC = m.sgrToCents0(cn.amount);
   const usedC = m.sgrToCents0(cn.used);
+  const refundedC = m.sgrToCents0(cn.refunded || 0);
   return {
     id: String(cn.id), relId: cn._relId ?? null, number: str(cn.number), companyCode: c.code, companyTagged: c.tagged, type: str(cn.type),
-    contactName: str(cn.contactName), date: dateOnly(cn.date), amount: m.rands(amountC), used: m.rands(usedC), remaining: m.rands(Math.max(0, amountC - usedC)),
+    contactName: str(cn.contactName), date: dateOnly(cn.date), amount: m.rands(amountC), used: m.rands(usedC), refunded: m.rands(refundedC), remaining: m.rands(Math.max(0, amountC - usedC - refundedC)),
     reason: str(cn.reason), appliedTo: str(cn.appliedTo), status: str(cn.status), ...stamps(L, cn),
   };
 }

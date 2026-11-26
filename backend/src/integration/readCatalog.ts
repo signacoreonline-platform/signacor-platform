@@ -79,14 +79,14 @@ export const READ_TYPES: ReadType[] = [
     type: 'payments', label: 'Payments and deposits', scope: 'accounts:read', companyScoped: true, idField: 'id', numberField: null, updatedAtField: null,
     list: { path: '/read/payments', filters: ['page', 'limit', 'q', 'company', 'from', 'to'], paginated: true },
     fields: [f('id', 'string|null', 'Payment id'), f('relId', 'number|null', 'Relational id'), f('amount', 'number', 'Amount'), f('date', 'date|null', 'Date'), f('method', 'string|null', 'Method'), f('reference', 'string|null', 'Reference'),
-      f('isCreditAllocation', 'boolean', 'A credit note applied, not money received'), f('owner', 'object', 'The job, quote or invoice it was recorded on'), f('companyCode', 'string', 'Company'), f('invoiceNumber', 'string|null', 'Invoice it belongs to')],
+      f('entryKind', 'string', 'receipt, credit_note, payment_credit_in, payment_credit_out or refund'), f('isCreditAllocation', 'boolean', 'Credit applied (credit note or payment credit) or its offset — not money received'), f('isRefund', 'boolean', 'A recorded refund of customer credit'), f('owner', 'object', 'The job, quote or invoice it was recorded on'), f('companyCode', 'string', 'Company'), f('invoiceNumber', 'string|null', 'Invoice it belongs to')],
     relations: [{ field: 'owner.number', to: 'jobs|quotes|invoices', by: 'number' }],
   },
   {
     type: 'creditNotes', label: 'Credit notes', scope: 'accounts:read', companyScoped: true, idField: 'id', numberField: 'number', updatedAtField: 'updatedAt',
     list: { path: '/read/credit-notes', filters: [...COMMON_LIST, 'company', 'type', 'open', 'from', 'to'], paginated: true },
     fields: [f('id', 'string', 'Id'), f('relId', 'number|null', 'Relational id'), f('number', 'string|null', 'Number'), ...company, f('type', 'string|null', 'customer | supplier'), f('contactName', 'string|null', 'Contact'), f('date', 'date|null', 'Date'),
-      f('amount', 'number', 'Amount'), f('used', 'number', 'Used'), f('remaining', 'number', 'Remaining'), f('reason', 'string|null', 'Reason'), f('appliedTo', 'string|null', 'Applied to'), f('status', 'string|null', 'Status'), ...stampsF],
+      f('amount', 'number', 'Amount'), f('used', 'number', 'Used'), f('refunded', 'number', 'Refunded to the customer'), f('remaining', 'number', 'Remaining'), f('reason', 'string|null', 'Reason'), f('appliedTo', 'string|null', 'Applied to'), f('status', 'string|null', 'Status'), ...stampsF],
     relations: [],
   },
   {

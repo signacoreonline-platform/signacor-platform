@@ -221,6 +221,13 @@ function mapPaymentRow(p: any, ownerType: 'job' | 'quote' | 'invoice'): any {
     _relPaymentId: p.id,
     _relOwnerType: ownerType,
     _relRowVersion: p.row_version,
+    // 2026-11-26 (022): what this row is — receipt, credit_note,
+    // payment_credit_in / payment_credit_out, refund — and whether a receipt
+    // may become payment credit. A historical row (entry_kind NULL) derives
+    // its kind from its method exactly as before.
+    _entryKind: p.entry_kind ?? (String(p.method || '').trim().toLowerCase().startsWith('credit') ? 'credit_note' : 'receipt'),
+    _creditEligible: p.credit_eligible === true,
+    _creditLinkId: p.credit_link_id ?? null,
   };
 }
 
@@ -870,6 +877,12 @@ export async function buildInvoicesJson(): Promise<any[]> {
 // ── CREDIT NOTES ───────────────────────────────────────────────────────────
 export async function buildCreditNotesJson(): Promise<any[]> {
   const res = await pool.query('SELECT * FROM rel_credit_notes ORDER BY id');
+  // 022: recorded refunds of each note's credit (statements show them as debits).
+  const refunds = new Map<string, any[]>();
+  try {
+    const f = await pool.query(`SELECT source_credit_note_id AS n, id, amount, refund_date::text AS d, method, reference FROM rel_credit_refunds WHERE source_type = 'credit_note' AND status = 'active' ORDER BY id`);
+    for (const row of f.rows) { const k = String(row.n); (refunds.get(k) || refunds.set(k, []).get(k)!).push({ id: Number(row.id), amount: num(row.amount), date: row.d, method: row.method ?? null, reference: row.reference ?? null }); }
+  } catch { /* table absent before migration 022 */ }
   return res.rows.map((r) => ({
     ...legacyBase(r),
     id: restoreId(r.source_id),
@@ -892,6 +905,9 @@ export async function buildCreditNotesJson(): Promise<any[]> {
     date: dateStr(r.note_date) ?? legacyBase(r).date ?? null,
     amount: num(r.amount),
     used: num(r.used_amount),
+    // 022: credit-note credit refunded to the customer (recorded refunds).
+    refunded: num(r.refunded_amount ?? 0),
+    refunds: refunds.get(String(r.id)) || [],
     reason: r.reason ?? legacyBase(r).reason ?? null,
     appliedTo: r.applied_to ?? legacyBase(r).appliedTo ?? null,
     notes: r.notes ?? legacyBase(r).notes ?? null,

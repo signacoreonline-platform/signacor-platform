@@ -771,7 +771,14 @@ router.put('/', async (req: AuthRequest, res: Response): Promise<void> => {
     let strippedCutOverSections: string[] = [];
     if (cutOverSectionsNow.size > 0) {
       for (const key of Object.keys(data)) {
-        if (cutOverSectionsNow.has(key as CutoverSection) && Array.isArray(data[key])) {
+        // 2026-11-26: stripped whatever the value is. Only arrays were stripped
+        // before, so a non-array value (an object, null, a string) under a
+        // cut-over key slipped past this gate and was merged into
+        // platform_state over that section's frozen JSON copy (refused by the
+        // removal backstop only when the frozen copy happened to be non-empty).
+        // Relational rows were never reachable this way — this route writes only
+        // platform_state — but JSON must not write a cut-over section at all.
+        if (cutOverSectionsNow.has(key as CutoverSection) && data[key] !== undefined) {
           delete data[key];
           strippedCutOverSections.push(key);
         }

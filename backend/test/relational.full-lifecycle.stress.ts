@@ -148,9 +148,10 @@ async function main() {
 
   console.log('\n[Full lifecycle] STEP 8 — create a credit note for the same customer (exactly what saveCreditNote sends)');
   const cnAmount = jobValue - halfAmount + 50; // more than enough to cover the remainder
+  await pool.query(`UPDATE platform_state SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{customers}', COALESCE(data->'customers', '[]'::jsonb) || $1::jsonb) WHERE id = 1`, [JSON.stringify([{ id: 'T-LIFECYCLE', companyName: 'Lifecycle Test Customer' }])]); // 2026-11-26: credit is resolved through the customer record (customer credit, migration 022)
   const cnRes = await fetch(`${base}/api/relational/credit-notes`, {
     method: 'POST', headers: H,
-    body: JSON.stringify({ companyCode: '2', type: 'customer', contactName: 'Lifecycle Test Customer', date: '2026-08-21', amount: cnAmount, reason: 'Overpayment', appliedTo: '', notes: '', status: 'open' }),
+    body: JSON.stringify({ companyCode: '2', type: 'customer', contactName: 'Lifecycle Test Customer', customerRef: 'T-LIFECYCLE', date: '2026-08-21', amount: cnAmount, reason: 'Overpayment', appliedTo: '', notes: '', status: 'open' }),
   });
   const cn: any = await cnRes.json();
   ok(cnRes.status === 201 && /^CN-/i.test(cn.creditNumber || ''), 'credit note created with a real CN-##### number', cn);

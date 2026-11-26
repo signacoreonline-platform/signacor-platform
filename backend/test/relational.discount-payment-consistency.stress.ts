@@ -226,7 +226,7 @@ function checkSourceWiring() {
     'duplicate detection NEVER compares amount/date/method — two genuine same-value payments on one day stay two payments');
   ok(/clientRequestId: paymentRequestIdRef\.current/.test(html),
     'the browser sends the submission key on the payment POST');
-  ok(/const result = await recordPayment\(\{ type: ownerType, id \}, amt, \{ date, method, reference, notes, clientRequestId \}\);/.test(api),
+  ok(/const result = await recordPayment\(\{ type: ownerType, id \}, amt, \{\s*date, method, reference, notes, clientRequestId,/.test(api), // 2026-11-26: + creditNoteId/actor (migration 022)
     'the API route passes the submission key through to the service');
 
   console.log('\n[B · double-click] the synchronous guard, on every payment action');

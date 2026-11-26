@@ -129,7 +129,11 @@
     "test:sales-invoice-list-discount": "node test/sales-invoice-list-discount.render.test.js",
     "diagnose:job-invoice-discount": "node scripts/diagnose-job-invoice-discount.js",
     "test:inventory-persistence-frontend": "node test/inventory-persistence.frontend.test.js",
-    "test:inventory-persistence": "ts-node --transpile-only test/relational.inventory-persistence.stress.ts"
+    "test:inventory-persistence": "ts-node --transpile-only test/relational.inventory-persistence.stress.ts",
+    "test:customer-credit": "ts-node --transpile-only test/relational.customer-credit.stress.ts",
+    "test:customer-credit-frontend": "node test/customer-credit-frontend.test.js",
+    "test:platform-state-credit-isolation": "ts-node --transpile-only test/relational.platform-state-credit-isolation.stress.ts",
+    "test:credit-note-ownership": "ts-node --transpile-only test/relational.credit-note-ownership.stress.ts"
   },
   "dependencies": {
     "@types/archiver": "^6.0.4",

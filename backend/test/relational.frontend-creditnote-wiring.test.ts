@@ -84,9 +84,12 @@ async function runEndToEndProof() {
   const authHeaders = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
 
   console.log('\n[Frontend credit note wiring] end-to-end: exactly what saveCreditNote() now sends for a NEW credit note');
+  // 2026-11-26: a new customer credit note must be linked to an existing customer record.
+  await pool.query(`INSERT INTO platform_state (id, data) VALUES (1, $1::jsonb) ON CONFLICT (id) DO UPDATE SET data = jsonb_set(COALESCE(platform_state.data, '{}'::jsonb), '{customers}', $2::jsonb)`,
+    [JSON.stringify({ customers: [{ id: 'T-CN-FRONTEND-WIRING', companyName: 'Frontend CN Wiring Co' }] }), JSON.stringify([{ id: 'T-CN-FRONTEND-WIRING', companyName: 'Frontend CN Wiring Co' }])]);
   const createRes = await fetch(`${base}/api/relational/credit-notes`, {
     method: 'POST', headers: authHeaders,
-    body: JSON.stringify({ companyCode: '1', type: 'customer', contactName: 'Frontend CN Wiring Co', date: '2026-08-21', amount: 250, reason: 'Overpayment', appliedTo: '', notes: '', status: 'open' }),
+    body: JSON.stringify({ companyCode: '1', type: 'customer', contactName: 'Frontend CN Wiring Co', customerRef: 'T-CN-FRONTEND-WIRING', date: '2026-08-21', amount: 250, reason: 'Overpayment', appliedTo: '', notes: '', status: 'open' }),
   });
   const createBody: any = await createRes.json();
   ok(createRes.status === 201 && /^CN-/i.test(createBody.creditNumber || ''), 'credit note created with a real CN-##### number', createBody);

@@ -70,7 +70,8 @@ async function main() {
   });
   const conv = await services.convertQuoteToJob(quote.id);
   const jobId = conv.jobId;
-  await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Credit Dependency Test Co', amount: 500 });
+  await pool.query(`UPDATE platform_state SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{customers}', COALESCE(data->'customers', '[]'::jsonb) || $1::jsonb) WHERE id = 1`, [JSON.stringify([{ id: 'T-CREDIT-DEP', companyName: 'Credit Dependency Test Co' }])]); // 2026-11-26: credit is resolved through the customer record (customer credit, migration 022)
+  await services.createCreditNote({ companyCode: '2', type: 'customer', contactName: 'Credit Dependency Test Co', customerRef: 'T-CREDIT-DEP', amount: 500 });
 
   console.log('\n[Credit cutover dependency] "jobs" cut over, "creditNotes" NOT cut over — a Credit payment is BLOCKED');
   const blockedRes = await fetch(`${base}/api/relational/payments`, {

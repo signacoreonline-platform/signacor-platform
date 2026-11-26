@@ -30,6 +30,11 @@
  *     EXISTING quote_conversions UNIQUE(quote_id) table unchanged.
  */
 import { PoolClient } from 'pg';
+import {
+  parseMoneyCents, entryKindOf, planCreditNoteFundingTx, recordCreditNoteFundingTx, releaseCreditNotePaymentTx,
+  reverseLedgerRowTx, assertReceiptHasNoCreditUseTx, assertOwnerDeletableTx, lockCustomerCreditTx, loadCustomerIndex,
+  chainIdentityTx, creditNoteIdentity, Actor, resolveIdentity,
+} from './customerCredit';
 import pool from '../db/pool';
 import { reserveDocumentNumberWithClient } from '../routes/documentNumbers';
 import { restoreId } from './read';
@@ -2589,7 +2594,11 @@ export async function deleteInvoice(id: number, expectedVersion: number): Promis
       [id]
     );
     let creditReleased = 0;
-    for (const p of invPaysRes.rows) creditReleased += await releaseCreditForPaymentTx(client, p);
+    // 2026-11-26 (customer credit): never destroy a credit entry or a receipt
+    // that funded credit along with the invoice — they must be reversed first
+    // so the credit returns to its exact source.
+    await assertOwnerDeletableTx(client, 'invoice', id, `Invoice ${invoiceNumber}`);
+    // (Nothing to release: the guard above refuses any credit entry.)
     await client.query(`DELETE FROM rel_payments WHERE owner_type = 'invoice' AND owner_id = $1`, [id]);
     await client.query('DELETE FROM rel_invoices WHERE id = $1', [id]);
     // The second half of the same reversal. row_version is bumped so any
@@ -3457,6 +3466,39 @@ async function settleNewChainMemberPaymentStatusTx(
   await recomputeOwnerPaymentStatus(client, ownerType, ownerId);
 }
 
+/** THE CHAIN'S ONE PAYABLE, in cents (Option D, 2026-09-22) — shared by
+ *  recomputeOwnerPaymentStatus and the customer-credit rules (customerCredit.ts)
+ *  so "what is owed on this transaction" has exactly one definition:
+ *    an issued (non-void) invoice -> its own canonical cents (largest if several);
+ *    no invoice yet               -> rel_jobs.value;
+ *    neither                      -> null (a quote-only chain; the caller decides). */
+export async function chainPayableCentsTx(
+  client: PoolClient,
+  chain: TransactionChain
+): Promise<{ invoiceOwnTotalsC: Map<number, number>; chainPayableC: number | null; markerInvoiceId: number | null; source: 'invoice' | 'job' | null }> {
+  const invoiceOwnTotalsC = new Map<number, number>();
+  let chainPayableC: number | null = null;
+  let markerInvoiceId: number | null = null;
+  let source: 'invoice' | 'job' | null = null;
+  for (const invoiceId of chain.invoiceIds) {
+    const linesRes = await client.query(
+      `SELECT qty, unit_amount, tax_type FROM rel_invoice_line_items WHERE invoice_id = $1`,
+      [invoiceId]
+    );
+    const totalC = sgrInvoiceCentsFromRows(linesRes.rows as any[]).totalC;
+    invoiceOwnTotalsC.set(invoiceId, totalC);
+    // A chain normally holds exactly one invoice. Where more than one exists the
+    // largest issued total governs, so a job is never reported Paid off a
+    // smaller sibling.
+    if (chainPayableC === null || totalC > chainPayableC) { chainPayableC = totalC; markerInvoiceId = invoiceId; source = 'invoice'; }
+  }
+  if (chainPayableC === null && chain.jobId !== null) {
+    const jobRes = await client.query(`SELECT value FROM rel_jobs WHERE id = $1`, [chain.jobId]);
+    if ((jobRes.rowCount || 0) > 0) { chainPayableC = sgrToCents0(jobRes.rows[0].value); source = 'job'; }
+  }
+  return { invoiceOwnTotalsC, chainPayableC, markerInvoiceId, source };
+}
+
 export async function recomputeOwnerPaymentStatus(client: PoolClient, ownerType: 'job' | 'invoice' | 'quote', ownerId: number): Promise<void> {
   // 2026-09-07 — CHAIN-AWARE. Previously this summed only the owner's OWN
   // payments, which made the two representations of one transaction disagree:
@@ -3526,25 +3568,7 @@ export async function recomputeOwnerPaymentStatus(client: PoolClient, ownerType:
                             per-line VAT amounts);
        no invoice yet    -> rel_jobs.value.
      rel_job_line_items is never consulted. */
-  const invoiceOwnTotalsC = new Map<number, number>();
-  let chainPayableC: number | null = null;
-  let markerInvoiceId: number | null = null;
-  for (const invoiceId of chain.invoiceIds) {
-    const linesRes = await client.query(
-      `SELECT qty, unit_amount, tax_type FROM rel_invoice_line_items WHERE invoice_id = $1`,
-      [invoiceId]
-    );
-    const totalC = sgrInvoiceCentsFromRows(linesRes.rows as any[]).totalC;
-    invoiceOwnTotalsC.set(invoiceId, totalC);
-    // A chain normally holds exactly one invoice. Where more than one exists the
-    // largest issued total governs, so a job is never reported Paid off a
-    // smaller sibling.
-    if (chainPayableC === null || totalC > chainPayableC) { chainPayableC = totalC; markerInvoiceId = invoiceId; }
-  }
-  if (chainPayableC === null && chain.jobId !== null) {
-    const jobRes = await client.query(`SELECT value FROM rel_jobs WHERE id = $1`, [chain.jobId]);
-    if ((jobRes.rowCount || 0) > 0) chainPayableC = sgrToCents0(jobRes.rows[0].value);
-  }
+  const { invoiceOwnTotalsC, chainPayableC, markerInvoiceId } = await chainPayableCentsTx(client, chain);
 
   /* An AUDITED historical rounding settlement settles an invoice the OLD
      platform itself asked the exact captured amount for. Not a tolerance: the
@@ -3621,7 +3645,7 @@ export async function recomputeOwnerPaymentStatus(client: PoolClient, ownerType:
 export async function recordPayment(
   owner: { type: 'job' | 'invoice' | 'quote'; id: number },
   amount: number,
-  opts: { date?: string; method?: string; reference?: string; notes?: string; clientRequestId?: string | null } = {}
+  opts: { date?: string; method?: string; reference?: string; notes?: string; clientRequestId?: string | null; creditNoteId?: number | null; actor?: Actor | null } = {}
   // NOTE ON `paymentId`'s DECLARED TYPE. rel_payments.id is a BIGINT, which
   // node-postgres renders as a STRING, so what actually crosses this boundary
   // at runtime is a numeric string — and always has, on the create path, since
@@ -3637,9 +3661,27 @@ export async function recordPayment(
 ): Promise<{ paymentId: number; rowVersion: number; creditApplied?: number; deduplicated?: boolean }> {
   const table = owner.type === 'job' ? 'rel_jobs' : owner.type === 'invoice' ? 'rel_invoices' : 'rel_quotes';
   const nameCol = owner.type === 'invoice' ? 'contact_name' : 'customer_name_raw';
+  // 2026-11-26 (customer credit): every new payment amount is a positive
+  // amount of whole cents — zero, negative, malformed or sub-cent amounts are
+  // refused here, whichever route or integration sent them.
+  const amountC = parseMoneyCents(amount, 'Payment amount');
+  amount = sgrRands(amountC);
+  // Any "credit..." method (including the old "Credit (R … available)" text) is
+  // a credit-note payment and is recorded as the canonical 'Credit'.
+  const isCreditMethod = String(opts.method || '').trim().toLowerCase().startsWith('credit');
+  if (isCreditMethod) opts = { ...opts, method: 'Credit' };
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // A Credit payment takes the (company, customer) credit lock BEFORE any row
+    // lock — the same order every credit operation uses, so two of them can
+    // never deadlock or both spend the same balance.
+    if (isCreditMethod) {
+      const idx0 = await loadCustomerIndex(client);
+      const chain0 = await resolveTransactionChainTx(client, owner.type, owner.id);
+      const id0 = await chainIdentityTx(client, chain0, idx0);
+      if (id0.state === 'matched') await lockCustomerCreditTx(client, chain0.companyCode, id0.ref);
+    }
     const ownerRes = await client.query(`SELECT id, ${nameCol} AS contact_name FROM ${table} WHERE id = $1 FOR UPDATE`, [owner.id]);
     if (ownerRes.rowCount === 0) throw new BusinessRuleError(`${owner.type} ${owner.id} not found`);
     // 2026-11-19: no money is ever recorded against a cancelled invoice.
@@ -3672,41 +3714,16 @@ export async function recordPayment(
       }
     }
 
+    // 2026-11-26 (customer credit): a Credit payment is funded only by credit
+    // notes of the SAME company and the SAME customer (stable link, or an exact
+    // unique name for an older unlinked note), capped at what is still due, and
+    // every note it draws on is recorded in rel_credit_allocations so a later
+    // reversal returns the credit to exactly that note.
     let creditApplied: number | undefined;
-    if (opts.method === 'Credit') {
-      const contactName = (ownerRes.rows[0].contact_name || '').trim();
-      const norm = contactName.toLowerCase();
-      if (!norm) {
-        throw new BusinessRuleError(`cannot record a Credit payment — ${owner.type} ${owner.id} has no contact/customer name to match against credit notes`);
-      }
-      // Oldest-first (ascending note_date) consumption — matches applyCreditNoteUsage.
-      const notesRes = await client.query(
-        `SELECT id, amount, used_amount FROM rel_credit_notes
-         WHERE note_type = 'customer' AND LOWER(TRIM(contact_name_raw)) = $1
-         ORDER BY note_date ASC NULLS LAST, id ASC
-         FOR UPDATE`,
-        [norm]
-      );
-      let remaining = amount;
-      let applied = 0;
-      for (const note of notesRes.rows) {
-        if (remaining <= 0) break;
-        const available = Number(note.amount) - Number(note.used_amount);
-        if (available <= 0) continue;
-        const consume = Math.min(remaining, available);
-        await client.query(
-          `UPDATE rel_credit_notes SET used_amount = used_amount + $1, row_version = row_version + 1, updated_at = NOW() WHERE id = $2`,
-          [consume, note.id]
-        );
-        remaining -= consume;
-        applied += consume;
-      }
-      if (applied + 1e-9 < amount) {
-        throw new BusinessRuleError(
-          `insufficient available credit for "${contactName}": requested ${amount.toFixed(2)}, only ${applied.toFixed(2)} available across matching credit notes — refusing to record a partially-funded Credit payment`
-        );
-      }
-      creditApplied = applied;
+    let creditPlan: Awaited<ReturnType<typeof planCreditNoteFundingTx>> | null = null;
+    if (opts.method === 'Credit') { // (normalised above: every "credit..." method is 'Credit')
+      creditPlan = await planCreditNoteFundingTx(client, owner.type, owner.id, amountC, opts.creditNoteId ?? null);
+      creditApplied = amount;
     }
 
     const nextIdx = await client.query(
@@ -3719,10 +3736,14 @@ export async function recordPayment(
     try {
       res = await client.query(
         `WITH new_id AS (SELECT nextval('rel_payments_id_seq') AS id)
-         INSERT INTO rel_payments (id, source_id, owner_type, owner_id, line_index, amount, payment_date, method, reference, notes, client_request_id, legacy_data)
-         SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, $6, $7, $8, $9, '{}'::jsonb FROM new_id
+         INSERT INTO rel_payments (id, source_id, owner_type, owner_id, line_index, amount, payment_date, method, reference, notes, client_request_id, entry_kind, credit_eligible, legacy_data)
+         SELECT new_id.id, new_id.id::text, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '{}'::jsonb FROM new_id
          RETURNING id, row_version`,
-        [owner.type, owner.id, lineIndex, amount, opts.date || null, opts.method || null, opts.reference || null, opts.notes || null, requestKey]
+        // entry_kind / credit_eligible (022): a receipt recorded from now on is
+        // ELIGIBLE to become payment credit if it overpays; a Credit payment is
+        // a credit-note allocation and never is.
+        [owner.type, owner.id, lineIndex, amount, opts.date || null, opts.method || null, opts.reference || null, opts.notes || null, requestKey,
+         isCreditMethod ? 'credit_note' : 'receipt', !isCreditMethod]
       );
     } catch (err: any) {
       // THE AUTHORITATIVE HALF of the duplicate protection. Two copies of one
@@ -3742,6 +3763,15 @@ export async function recordPayment(
         }
       }
       throw err;
+    }
+    if (creditPlan) {
+      const numRes = await client.query(
+        owner.type === 'invoice' ? 'SELECT invoice_number AS n FROM rel_invoices WHERE id = $1' : owner.type === 'job' ? 'SELECT job_number AS n FROM rel_jobs WHERE id = $1' : 'SELECT quote_number AS n FROM rel_quotes WHERE id = $1',
+        [owner.id]);
+      await recordCreditNoteFundingTx(client, creditPlan, { ownerType: owner.type, ownerId: owner.id, paymentId: res.rows[0].id, number: numRes.rows[0]?.n ?? null }, opts.actor || null, requestKey);
+      if (creditPlan.parts.length === 1) {
+        await client.query(`UPDATE rel_payments SET credit_link_id = (SELECT id FROM rel_credit_allocations WHERE target_payment_id = $1 ORDER BY id LIMIT 1) WHERE id = $1`, [res.rows[0].id]);
+      }
     }
     await recomputeOwnerPaymentStatus(client, owner.type, owner.id);
     await client.query('COMMIT');
@@ -3777,7 +3807,20 @@ export async function updatePayment(
     const cur = curRes.rows[0];
     if (cur.owner_type === 'invoice') await assertInvoiceNotCancelledTx(client, Number(cur.owner_id), 'changed');
     if (cur.row_version !== expectedVersion) throw new ConcurrencyConflictError('rel_payments', id);
-    if (cur.method === 'Credit') {
+    // 2026-11-26 (customer credit): allocation, refund and credit-note entries
+    // are records of credit moving — they are reversed, never edited. A
+    // receipt that has funded credit cannot change amount until those are reversed.
+    const curKind = entryKindOf(cur);
+    if (curKind === 'payment_credit_in' || curKind === 'payment_credit_out' || curKind === 'refund') {
+      throw new BusinessRuleError(`This is a ${curKind === 'refund' ? 'recorded refund' : 'payment-credit'} entry and cannot be edited. Reverse it (delete it, or use Customer Credits) and record it again.`);
+    }
+    if (patch.amount !== undefined) {
+      const newC = parseMoneyCents(patch.amount, 'Payment amount');
+      patch = { ...patch, amount: sgrRands(newC) };
+      if (curKind === 'receipt' && newC !== sgrToCents0(cur.amount)) await assertReceiptHasNoCreditUseTx(client, id, 'changed');
+    }
+    if (patch.method !== undefined && patch.method !== null && String(patch.method).trim().toLowerCase().startsWith('credit')) patch = { ...patch, method: 'Credit' };
+    if (curKind === 'credit_note' || cur.method === 'Credit') {
       throw new BusinessRuleError(`payment ${id} was funded by a credit note and cannot be edited — delete and re-record instead (matches the existing JSON business rule)`);
     }
     if (patch.method === 'Credit') {
@@ -3889,17 +3932,50 @@ export async function releaseCreditForPaymentTx(
   return creditReleased;
 }
 
-export async function deletePayment(id: number, expectedVersion: number): Promise<{ deleted: true; creditReleased: number }> {
+export async function deletePayment(
+  id: number,
+  expectedVersion: number,
+  opts: { releaseToCreditNoteId?: number | null; actor?: Actor | null } = {}
+): Promise<{ deleted: true; creditReleased: number }> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // 2026-11-26 (customer credit): a credit entry takes the (company,
+    // customer) credit lock BEFORE its row lock, like every credit operation.
+    const peek = await client.query('SELECT id, owner_type, owner_id, method, entry_kind, credit_link_id FROM rel_payments WHERE id = $1', [id]);
+    if (peek.rowCount && entryKindOf(peek.rows[0]) !== 'receipt') {
+      const link = await client.query(
+        `SELECT company_code, customer_ref FROM rel_credit_allocations WHERE target_payment_id = $1 OR source_offset_payment_id = $1
+         UNION ALL SELECT company_code, customer_ref FROM rel_credit_refunds WHERE ledger_payment_id = $1 LIMIT 1`, [id]);
+      if (link.rowCount) await lockCustomerCreditTx(client, link.rows[0].company_code, link.rows[0].customer_ref);
+    }
     const curRes = await client.query('SELECT * FROM rel_payments WHERE id = $1 FOR UPDATE', [id]);
     if (curRes.rowCount === 0) throw new BusinessRuleError(`payment ${id} not found`);
     const payment = curRes.rows[0];
     if (payment.owner_type === 'invoice') await assertInvoiceNotCancelledTx(client, Number(payment.owner_id), 'changed');
     if (payment.row_version !== expectedVersion) throw new ConcurrencyConflictError('rel_payments', id);
-    const creditReleased = await releaseCreditForPaymentTx(client, payment);
-    await client.query('DELETE FROM rel_payments WHERE id = $1', [id]);
+    const kind = entryKindOf(payment);
+    let creditReleased = 0;
+    if (kind === 'receipt') {
+      await assertReceiptHasNoCreditUseTx(client, id, 'deleted');
+      await client.query('DELETE FROM rel_payments WHERE id = $1', [id]);
+    } else {
+      const hasRecord = await client.query(
+        `SELECT 1 FROM rel_credit_allocations WHERE (target_payment_id = $1 OR source_offset_payment_id = $1) AND status = 'active'
+         UNION ALL SELECT 1 FROM rel_credit_refunds WHERE ledger_payment_id = $1 AND status = 'active' LIMIT 1`, [id]);
+      if (hasRecord.rowCount) {
+        // New-model entry: reverse the whole allocation / refund it belongs to
+        // (both sides of a payment-credit pair; the exact funding note).
+        creditReleased = await reverseLedgerRowTx(client, payment, opts.actor || null);
+      } else if (kind === 'credit_note') {
+        // Historical Credit payment: return it to its funding note only when
+        // that note can be established reliably (or was chosen explicitly).
+        creditReleased = await releaseCreditNotePaymentTx(client, payment, { releaseToCreditNoteId: opts.releaseToCreditNoteId ?? null, actor: opts.actor || null });
+        await client.query('DELETE FROM rel_payments WHERE id = $1', [id]);
+      } else {
+        throw new BusinessRuleError('This credit entry has no allocation record. Nothing was deleted.');
+      }
+    }
     await recomputeOwnerPaymentStatus(client, payment.owner_type, payment.owner_id);
     await client.query('COMMIT');
     return { deleted: true, creditReleased };
@@ -4836,6 +4912,9 @@ export async function deleteJob(
       await client.query(`DELETE FROM quote_conversions WHERE quote_id = $1`, [`rel:${q.id}`]);
     }
 
+    // 2026-11-26 (customer credit): a job holding a credit entry, or a receipt
+    // that funded credit, is not deleted (its payments would vanish with it).
+    await assertOwnerDeletableTx(client, 'job', id, 'This job');
     await client.query(`DELETE FROM rel_payments WHERE owner_type = 'job' AND owner_id = $1`, [id]);
 
     try {
@@ -5304,9 +5383,22 @@ export interface CreditNoteInput {
   status?: string | null;
 }
 export async function createCreditNote(input: CreditNoteInput): Promise<{ id: number; creditNumber: string; rowVersion: number }> {
+  // 2026-11-26 (customer credit): a credit note is a positive amount of whole cents.
+  input = { ...input, amount: sgrRands(parseMoneyCents(input.amount, 'Credit note amount')) };
+  if (!input.companyCode || !String(input.companyCode).trim()) throw new BusinessRuleError('Choose the company this credit note belongs to.');
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // 2026-11-26 (customer credit): every NEW customer credit note is created
+    // linked to exactly one existing customer record — its owner is fixed by
+    // that link, never by its name. (Supplier notes are not customer credit.)
+    if (input.type === 'customer') {
+      const ref = normalizeCustomerRef(input.customerRef);
+      if (ref === null) throw new BusinessRuleError('Choose the customer this credit note is for — a customer credit note must be linked to a customer record.');
+      const ident = resolveIdentity(await loadCustomerIndex(client), ref, input.contactName);
+      if (ident.state !== 'matched') throw new BusinessRuleError(`The credit note cannot be created: ${ident.detail} Choose an existing customer.`);
+      input = { ...input, customerRef: ref };
+    }
     const creditNumber = await reserveDocumentNumberWithClient(client, 'ALL', 'creditNote' as any);
     const res = await client.query(
       `WITH new_id AS (SELECT nextval('rel_credit_notes_id_seq') AS id)
@@ -5331,7 +5423,7 @@ export interface CreditNotePatchInput {
   contactName?: string; date?: string | null; amount?: number; reason?: string | null;
   appliedTo?: string | null; notes?: string | null; status?: string | null;
 }
-export async function updateCreditNote(id: number, expectedVersion: number, patch: Partial<CreditNotePatchInput>): Promise<{ rowVersion: number }> {
+export async function updateCreditNote(id: number, expectedVersion: number, patch: Partial<CreditNotePatchInput>, actor: Actor | null = null): Promise<{ rowVersion: number }> {
   // 2026-08-23 (credit note company-isolation repair): companyCode is
   // deliberately NOT in colMap and CreditNotePatchInput has no companyCode
   // field at all — company ownership is set once at creation and is
@@ -5352,9 +5444,53 @@ export async function updateCreditNote(id: number, expectedVersion: number, patc
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const curRes = await client.query('SELECT row_version FROM rel_credit_notes WHERE id = $1 FOR UPDATE', [id]);
+    const curRes = await client.query('SELECT * FROM rel_credit_notes WHERE id = $1 FOR UPDATE', [id]);
     if (curRes.rowCount === 0) throw new BusinessRuleError(`credit note ${id} not found`);
     if (curRes.rows[0].row_version !== expectedVersion) throw new ConcurrencyConflictError('rel_credit_notes', id);
+    // 2026-11-26 (customer credit): a note that has funded or refunded credit
+    // keeps its customer and cannot drop below what it has already provided.
+    const cur = curRes.rows[0];
+    const usedC = sgrToCents0(cur.used_amount) + sgrToCents0(cur.refunded_amount || 0);
+    const activeAlloc = await client.query(`SELECT COUNT(*)::int AS n FROM rel_credit_allocations WHERE source_type = 'credit_note' AND source_credit_note_id = $1 AND status = 'active'`, [id]);
+    const inUse = usedC > 0 || Number(activeAlloc.rows[0].n) > 0;
+    // 2026-11-26: once a customer credit note is linked, the link can never be
+    // removed; once it has EVER provided credit (any allocation or refund, even
+    // reversed, or historical use) its owner is locked for good.
+    const curLink = normalizeCustomerRef(cur.customer_ref);
+    const toLink = patch.customerRef === undefined ? undefined : normalizeCustomerRef(patch.customerRef);
+    let linkChange: { from: string | null; to: string; locked: boolean } | null = null;
+    if (toLink !== undefined && toLink !== curLink && cur.note_type === 'customer') {
+      if (toLink === null) throw new BusinessRuleError(`Credit note ${cur.credit_number} is linked to its customer; the link cannot be removed. Nothing was saved.`);
+      const hist = await client.query(
+        `SELECT (SELECT COUNT(*) FROM rel_credit_allocations WHERE source_type = 'credit_note' AND source_credit_note_id = $1)
+              + (SELECT COUNT(*) FROM rel_credit_refunds WHERE source_type = 'credit_note' AND source_credit_note_id = $1) AS n`, [id]);
+      const everUsed = usedC > 0 || Number(hist.rows[0].n) > 0;
+      const idx = await loadCustomerIndex(client);
+      const target = resolveIdentity(idx, toLink, null);
+      if (target.state !== 'matched') throw new BusinessRuleError(`Customer ${toLink} cannot be linked: ${target.detail}`);
+      if (everUsed && curLink !== null) throw new BusinessRuleError(`Credit note ${cur.credit_number} has already provided credit to its customer, so its customer cannot be changed — even after its uses are reversed.`);
+      if (everUsed) {
+        // An UNLINKED note with historical use may be linked only to the customer
+        // its credit already went to; an unresolved one only by an explicit choice.
+        const was = await creditNoteIdentity(cur, idx);
+        if (was.state === 'matched' && was.ref !== toLink) throw new BusinessRuleError(`Credit note ${cur.credit_number} has already been used by ${was.name}, so it cannot be linked to another customer.`);
+      }
+      linkChange = { from: curLink ?? normalizeCustomerRef(cur.legacy_data?.customerId), to: toLink, locked: everUsed };
+      patch = { ...patch, customerRef: toLink };
+    } else if (toLink !== undefined) {
+      patch = { ...patch, customerRef: undefined } as any; // unchanged — not rewritten
+    }
+    if (patch.amount !== undefined) {
+      const newC = parseMoneyCents(patch.amount, 'Credit note amount');
+      patch = { ...patch, amount: sgrRands(newC) };
+      if (newC < usedC) throw new BusinessRuleError(`Credit note ${cur.credit_number} has already provided ${'R' + sgrRands(usedC).toFixed(2)} (used or refunded); its amount cannot be reduced below that. Reverse those uses first.`);
+    }
+    if (inUse) {
+      if (patch.contactName !== undefined && String(patch.contactName).trim().toLowerCase() !== String(cur.contact_name_raw || '').trim().toLowerCase()
+          && !(normalizeCustomerRef(cur.customer_ref) ?? normalizeCustomerRef(cur.legacy_data?.customerId)) && patch.customerRef === undefined) {
+        throw new BusinessRuleError(`Credit note ${cur.credit_number} has already been used or refunded and is identified by its customer name, so the name cannot be changed. Link it to its customer first.`);
+      }
+    }
     const sets: string[] = []; const vals: any[] = [];
     for (const [k, col] of Object.entries(colMap)) {
       if ((patch as any)[k] !== undefined) { vals.push(normalizeColumnValue(col, (patch as any)[k])); sets.push(`${col} = $${vals.length}`); }
@@ -5365,6 +5501,13 @@ export async function updateCreditNote(id: number, expectedVersion: number, patc
       `UPDATE rel_credit_notes SET ${sets.join(', ')}, row_version = row_version + 1, updated_at = NOW() WHERE id = $${idIdx} RETURNING row_version`,
       vals
     );
+    if (linkChange) {
+      await client.query(
+        `INSERT INTO customer_link_audit (actor, action, company_code, from_refs, to_ref, members, detail) VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7::jsonb)`,
+        [actor ? String(actor.email || actor.id || '') || null : null, linkChange.from === null ? 'link' : 'reassign', cur.company_code ?? null,
+         JSON.stringify([linkChange.from]), linkChange.to, JSON.stringify([{ type: 'credit_note', id: Number(id), number: cur.credit_number }]),
+         JSON.stringify({ source: 'credit-note-edit', ownershipLocked: linkChange.locked, contactName: cur.contact_name_raw ?? null })]);
+    }
     await client.query('COMMIT');
     return { rowVersion: res.rows[0].row_version };
   } catch (err) {
@@ -5388,9 +5531,15 @@ export async function deleteCreditNote(id: number, expectedVersion: number): Pro
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const curRes = await client.query('SELECT row_version, used_amount FROM rel_credit_notes WHERE id = $1 FOR UPDATE', [id]);
+    const curRes = await client.query('SELECT row_version, used_amount, refunded_amount FROM rel_credit_notes WHERE id = $1 FOR UPDATE', [id]);
     if (curRes.rowCount === 0) throw new BusinessRuleError(`credit note ${id} not found`);
     if (curRes.rows[0].row_version !== expectedVersion) throw new ConcurrencyConflictError('rel_credit_notes', id);
+    // 2026-11-26 (022): a note with an ACTIVE allocation or a recorded refund
+    // still stands behind money on another document — never deleted.
+    const histRes = await client.query(`SELECT COUNT(*)::int AS n FROM rel_credit_allocations WHERE source_type = 'credit_note' AND source_credit_note_id = $1 AND status = 'active'`, [id]);
+    if (Number(curRes.rows[0].refunded_amount || 0) > 0 || Number(histRes.rows[0].n) > 0) {
+      throw new BusinessRuleError(`credit note ${id} has an active allocation or a recorded refund — reverse it first; the credit note cannot be deleted while it funds credit.`);
+    }
     if (Number(curRes.rows[0].used_amount) > 0) {
       throw new BusinessRuleError(`credit note ${id} has ${curRes.rows[0].used_amount} already applied — refusing to delete a partially/fully-used credit note (see Stage 3 handoff)`);
     }
