@@ -524,14 +524,14 @@ export async function assertOwnerDeletableTx(client: PoolClient, ownerType: Owne
 
 // ── APPLY CREDIT ─────────────────────────────────────────────────────────────
 export interface ApplyCreditInput {
-  sourceType: 'payment' | 'credit_note'; sourceId: number;
+  sourceType: 'payment' | 'credit_note' | 'account_receipt'; sourceId: number;
   targetType: OwnerType; targetId: number; amount: unknown;
   clientRequestId?: unknown; notes?: string | null; actor?: Actor | null;
 }
 export async function applyCredit(input: ApplyCreditInput): Promise<{ allocationId: number; targetPaymentId: string; deduplicated?: boolean }> {
   const amountC = parseMoneyCents(input.amount, 'Credit amount');
-  if (!['payment', 'credit_note'].includes(input.sourceType)) throw new BusinessRuleError('Choose a credit source (a receipt or a credit note).');
-  if (!['invoice', 'job'].includes(input.targetType)) throw new BusinessRuleError('Credit can be applied to an invoice or a job.');
+  if (!['payment', 'credit_note', 'account_receipt'].includes(input.sourceType)) throw new BusinessRuleError('Choose a credit source (a receipt, a payment on account or a credit note).');
+  if (!['invoice', 'job', 'quote'].includes(input.targetType)) throw new BusinessRuleError('Credit can be applied to a quote, a job or an invoice.');
   const key = normalizeClientRequestId(input.clientRequestId);
   const client = await pool.connect();
   try {
@@ -553,12 +553,30 @@ export async function applyCredit(input: ApplyCreditInput): Promise<{ allocation
       if (prior.rowCount) { await client.query('COMMIT'); return { allocationId: Number(prior.rows[0].id), targetPaymentId: String(prior.rows[0].target_payment_id), deduplicated: true }; }
     }
     const tgt = await targetContextTx(client, idx, input.targetType, input.targetId);
-    if (tgt.ident.state !== 'matched' || tgt.ident.ref !== preIdent.ref) throw new ConcurrencyConflictError(input.targetType === 'invoice' ? 'rel_invoices' : 'rel_jobs', input.targetId);
+    if (tgt.ident.state !== 'matched' || tgt.ident.ref !== preIdent.ref) throw new ConcurrencyConflictError(input.targetType === 'invoice' ? 'rel_invoices' : input.targetType === 'job' ? 'rel_jobs' : 'rel_quotes', input.targetId);
     const co = tgt.state.companyCode;
     if (amountC > (tgt.state.outstandingC || 0)) throw new BusinessRuleError(`Credit of ${fmt(amountC)} is more than the ${fmt(tgt.state.outstandingC || 0)} still due on ${tgt.number}. Apply at most ${fmt(tgt.state.outstandingC || 0)}.`);
 
     let allocationId: number; let targetPaymentId: string;
-    if (input.sourceType === 'payment') {
+    if (input.sourceType === 'account_receipt') {
+      const rr = await client.query('SELECT *, receipt_date::text AS receipt_date_text FROM rel_account_receipts WHERE id = $1 FOR UPDATE', [input.sourceId]);
+      if (!rr.rowCount) throw new BusinessRuleError('That payment on account no longer exists.');
+      const rec = rr.rows[0];
+      if (rec.status !== 'active') throw new BusinessRuleError('That payment on account has been voided.');
+      if (String(rec.company_code) !== String(co ?? '')) throw new BusinessRuleError('That payment on account belongs to another company. Credit stays within its own company.');
+      if (rec.customer_ref !== tgt.ident.ref) throw new BusinessRuleError(`That payment on account was received from ${idx.nameOf(rec.customer_ref) || rec.customer_name || 'another customer'}, not ${tgt.ident.name}. Credit can only be used by the customer who paid it.`);
+      const availC = await accountReceiptAvailableTx(client, rec);
+      if (amountC > availC) throw new BusinessRuleError(`That payment on account has ${fmt(availC)} available — ${fmt(amountC)} was requested.`);
+      const alloc = await client.query(
+        `INSERT INTO rel_credit_allocations (company_code, customer_ref, source_type, source_account_receipt_id, target_owner_type, target_owner_id, target_number, amount, client_request_id, notes, created_by)
+         VALUES ($1, $2, 'account_receipt', $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+        [co ?? '', tgt.ident.ref, rec.id, input.targetType, input.targetId, tgt.number, sgrRands(amountC), key, input.notes ?? null, actorLabel(input.actor)]);
+      allocationId = Number(alloc.rows[0].id);
+      const inn = await insertLedgerRowTx(client, { ownerType: input.targetType, ownerId: input.targetId, amountC, date: today(), method: 'Payment credit',
+        reference: rec.reference, notes: `From payment on account received ${rec.receipt_date_text} (credit allocation #${allocationId})`, kind: 'payment_credit_in', linkId: allocationId });
+      await client.query('UPDATE rel_credit_allocations SET target_payment_id = $2 WHERE id = $1', [allocationId, inn.id]);
+      targetPaymentId = inn.id;
+    } else if (input.sourceType === 'payment') {
       const rec = await client.query('SELECT *, payment_date::text AS payment_date_text FROM rel_payments WHERE id = $1 FOR UPDATE', [input.sourceId]);
       if (!rec.rowCount) throw new BusinessRuleError('That receipt no longer exists.');
       const receipt = rec.rows[0];
@@ -697,7 +715,7 @@ export async function reverseLedgerRowTx(client: PoolClient, payment: any, actor
 
 // ── REFUNDS (recorded only — no money is sent) ──────────────────────────────
 export interface RefundInput {
-  sourceType: 'payment' | 'credit_note'; sourceId: number; amount: unknown;
+  sourceType: 'payment' | 'credit_note' | 'account_receipt'; sourceId: number; amount: unknown;
   date?: unknown; method?: string | null; reference?: string | null; notes?: string | null;
   clientRequestId?: unknown; actor?: Actor | null;
 }
@@ -715,7 +733,21 @@ export async function recordCreditRefund(input: RefundInput): Promise<{ refundId
     }
     const idx = await loadCustomerIndex(client);
     let refundId: number;
-    if (input.sourceType === 'payment') {
+    if (input.sourceType === 'account_receipt') {
+      const rec = await lockAccountReceiptTx(client, Number(input.sourceId));
+      if (key) {
+        const prior = await client.query('SELECT id FROM rel_credit_refunds WHERE client_request_id = $1', [key]);
+        if (prior.rowCount) { await client.query('COMMIT'); return { refundId: Number(prior.rows[0].id), deduplicated: true }; }
+      }
+      if (rec.status !== 'active') throw new BusinessRuleError('That payment on account has been voided.');
+      const availC = await accountReceiptAvailableTx(client, rec);
+      if (amountC > availC) throw new BusinessRuleError(`That payment on account has ${fmt(availC)} available to refund — ${fmt(amountC)} was requested.`);
+      const f = await client.query(
+        `INSERT INTO rel_credit_refunds (company_code, customer_ref, source_type, source_account_receipt_id, amount, refund_date, method, reference, notes, client_request_id, created_by)
+         VALUES ($1, $2, 'account_receipt', $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+        [rec.company_code, rec.customer_ref, rec.id, sgrRands(amountC), date, input.method || null, String(input.reference).trim(), input.notes || null, key, actorLabel(input.actor)]);
+      refundId = Number(f.rows[0].id);
+    } else if (input.sourceType === 'payment') {
       const pre = await client.query('SELECT * FROM rel_payments WHERE id = $1', [input.sourceId]);
       if (!pre.rowCount) throw new BusinessRuleError('That receipt no longer exists.');
       const st0 = await chainStateTx(client, pre.rows[0].owner_type, Number(pre.rows[0].owner_id));
@@ -782,7 +814,9 @@ export async function recordCreditRefund(input: RefundInput): Promise<{ refundId
 async function reverseRefundTx(client: PoolClient, f: any, actor: Actor | null, reason: string | null): Promise<void> {
   if (f.status !== 'active') return;
   await lockCustomerCreditTx(client, f.company_code, f.customer_ref);
-  if (f.source_type === 'payment') {
+  if (f.source_type === 'account_receipt') {
+    // recorded only — no ledger row on any document; availability is derived
+  } else if (f.source_type === 'payment') {
     const r = await client.query('SELECT id, owner_type, owner_id FROM rel_payments WHERE id = $1 FOR UPDATE', [f.ledger_payment_id]);
     if (r.rowCount) {
       await client.query('DELETE FROM rel_payments WHERE id = $1', [f.ledger_payment_id]);
@@ -806,6 +840,196 @@ export async function reverseCreditRefund(id: number, opts: { reason?: string | 
     await client.query('COMMIT');
     return { reversed: true };
   } catch (err) { await client.query('ROLLBACK').catch(() => undefined); throw err; } finally { client.release(); }
+}
+
+// ── PAYMENTS ON ACCOUNT (023) ────────────────────────────────────────────────
+// Money received from a customer before any quote, job or invoice needs it.
+// One rel_account_receipts row, recorded against the customer's stable link in
+// one company. No document of any kind is created. Its whole unallocated
+// amount is payment credit:
+//   available = amount − active allocations − active refunds.
+// It is spent with applyCredit (sourceType 'account_receipt'): a "Payment
+// credit" + row on the target document and a rel_credit_allocations record —
+// there is no − offset row, because the money was never counted on a document.
+// It is refunded (recorded only) with recordCreditRefund. Same per-customer
+// advisory lock, row lock, idempotency keys and audit trail as all other credit.
+export type AccountReceiptRow = any;
+async function accountReceiptUseTx(client: PoolClient | typeof pool, id: number | string): Promise<{ allocatedC: number; refundedC: number; everUsed: boolean }> {
+  const a = await client.query(
+    `SELECT COALESCE(SUM(amount) FILTER (WHERE status = 'active'), 0) AS act, COUNT(*)::int AS n FROM rel_credit_allocations WHERE source_type = 'account_receipt' AND source_account_receipt_id = $1`, [id]);
+  const f = await client.query(
+    `SELECT COALESCE(SUM(amount) FILTER (WHERE status = 'active'), 0) AS act, COUNT(*)::int AS n FROM rel_credit_refunds WHERE source_type = 'account_receipt' AND source_account_receipt_id = $1`, [id]);
+  return { allocatedC: sgrToCents0(a.rows[0].act), refundedC: sgrToCents0(f.rows[0].act), everUsed: Number(a.rows[0].n) + Number(f.rows[0].n) > 0 };
+}
+export async function accountReceiptAvailableTx(client: PoolClient | typeof pool, r: AccountReceiptRow): Promise<number> {
+  if (r.status !== 'active') return 0;
+  const u = await accountReceiptUseTx(client, r.id);
+  return Math.max(0, sgrToCents0(r.amount) - u.allocatedC - u.refundedC);
+}
+function companyCodeOf(v: unknown): string {
+  const c = String(v ?? '').trim();
+  if (!/^\d+$/.test(c)) throw new BusinessRuleError('Choose the company that received this payment.');
+  return c;
+}
+function requiredText(v: unknown, label: string, max = 200): string {
+  const t = String(v ?? '').trim();
+  if (!t) throw new BusinessRuleError(`Enter the ${label}.`);
+  if (t.length > max) throw new BusinessRuleError(`The ${label} is too long (at most ${max} characters).`);
+  return t;
+}
+export interface AccountReceiptInput {
+  companyCode: unknown; customerRef: unknown; amount: unknown; date: unknown;
+  method?: unknown; reference?: unknown; notes?: unknown; clientRequestId?: unknown; actor?: Actor | null;
+}
+export async function recordAccountReceipt(input: AccountReceiptInput): Promise<{ receiptId: number; rowVersion: number; deduplicated?: boolean }> {
+  const amountC = parseMoneyCents(input.amount, 'Amount received');
+  const co = companyCodeOf(input.companyCode);
+  const date = isoDateOrNull(input.date, 'Payment date');
+  if (!date) throw new BusinessRuleError('Enter the payment date.');
+  const method = requiredText(input.method, 'payment method', 40);
+  const reference = requiredText(input.reference, 'bank / payment reference');
+  const notes = input.notes == null ? null : String(input.notes).trim() || null;
+  const key = normalizeClientRequestId(input.clientRequestId);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (key) {
+      const prior = await client.query('SELECT id, row_version FROM rel_account_receipts WHERE client_request_id = $1', [key]);
+      if (prior.rowCount) { await client.query('COMMIT'); return { receiptId: Number(prior.rows[0].id), rowVersion: Number(prior.rows[0].row_version), deduplicated: true }; }
+    }
+    const idx = await loadCustomerIndex(client);
+    const ident = resolveIdentity(idx, input.customerRef, null);
+    if (normalizeCustomerRef(input.customerRef) === null) throw new BusinessRuleError('Choose the customer who made this payment.');
+    if (ident.state !== 'matched') throw new BusinessRuleError(`The payment cannot be recorded: ${ident.detail} Choose an existing customer.`);
+    await lockCustomerCreditTx(client, co, ident.ref);
+    if (key) {
+      const prior = await client.query('SELECT id, row_version FROM rel_account_receipts WHERE client_request_id = $1', [key]);
+      if (prior.rowCount) { await client.query('COMMIT'); return { receiptId: Number(prior.rows[0].id), rowVersion: Number(prior.rows[0].row_version), deduplicated: true }; }
+    }
+    const r = await client.query(
+      `INSERT INTO rel_account_receipts (company_code, customer_ref, customer_name, amount, receipt_date, method, reference, notes, client_request_id, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, row_version`,
+      [co, ident.ref, ident.name || null, sgrRands(amountC), date, method, reference, notes, key, actorLabel(input.actor)]);
+    await client.query('COMMIT');
+    return { receiptId: Number(r.rows[0].id), rowVersion: Number(r.rows[0].row_version) };
+  } catch (err: any) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    if (err && err.code === '23505' && key) {
+      const w = await pool.query('SELECT id, row_version FROM rel_account_receipts WHERE client_request_id = $1', [key]);
+      if (w.rowCount) return { receiptId: Number(w.rows[0].id), rowVersion: Number(w.rows[0].row_version), deduplicated: true };
+    }
+    throw err;
+  } finally { client.release(); }
+}
+async function lockAccountReceiptTx(client: PoolClient, id: number): Promise<AccountReceiptRow> {
+  const pre = await client.query('SELECT company_code, customer_ref FROM rel_account_receipts WHERE id = $1', [id]);
+  if (!pre.rowCount) throw new BusinessRuleError('That payment on account no longer exists.');
+  await lockCustomerCreditTx(client, pre.rows[0].company_code, pre.rows[0].customer_ref);
+  const r = await client.query('SELECT *, receipt_date::text AS receipt_date_text FROM rel_account_receipts WHERE id = $1 FOR UPDATE', [id]);
+  return r.rows[0];
+}
+export interface AccountReceiptPatch { amount?: unknown; date?: unknown; method?: unknown; reference?: unknown; notes?: unknown; customerRef?: unknown; companyCode?: unknown }
+/** Edits follow the existing receipt safeguards: the company never changes; the
+ *  amount and date only while nothing has been allocated or refunded from it;
+ *  the customer only while it has never provided credit (audited). */
+export async function updateAccountReceipt(id: number, expectedVersion: number, patch: AccountReceiptPatch, actor: Actor | null = null): Promise<{ rowVersion: number }> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const cur = await lockAccountReceiptTx(client, id);
+    if (Number(cur.row_version) !== Number(expectedVersion)) throw new ConcurrencyConflictError('rel_account_receipts', id);
+    if (cur.status !== 'active') throw new BusinessRuleError('This payment on account has been voided and cannot be changed.');
+    if (patch.companyCode !== undefined && String(patch.companyCode) !== String(cur.company_code)) throw new BusinessRuleError('The company of a payment on account cannot be changed. Void it and record it again in the right company.');
+    const use = await accountReceiptUseTx(client, id);
+    const sets: string[] = []; const vals: any[] = [];
+    const set = (col: string, v: any) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
+    if (patch.amount !== undefined) {
+      const c = parseMoneyCents(patch.amount, 'Amount received');
+      if (c !== sgrToCents0(cur.amount)) {
+        if (use.allocatedC + use.refundedC > 0) throw new BusinessRuleError(`This payment on account has ${fmt(use.allocatedC + use.refundedC)} allocated or refunded, so its amount cannot be changed. Reverse those first.`);
+        set('amount', sgrRands(c));
+      }
+    }
+    if (patch.date !== undefined) {
+      const d = isoDateOrNull(patch.date, 'Payment date');
+      if (!d) throw new BusinessRuleError('Enter the payment date.');
+      if (d !== cur.receipt_date_text) {
+        if (use.allocatedC + use.refundedC > 0) throw new BusinessRuleError('This payment on account has been allocated or refunded, so its date cannot be changed. Reverse those first.');
+        set('receipt_date', d);
+      }
+    }
+    if (patch.method !== undefined) set('method', requiredText(patch.method, 'payment method', 40));
+    if (patch.reference !== undefined) set('reference', requiredText(patch.reference, 'bank / payment reference'));
+    if (patch.notes !== undefined) set('notes', patch.notes == null ? null : String(patch.notes).trim() || null);
+    let moved: { from: string; to: string } | null = null;
+    if (patch.customerRef !== undefined) {
+      const to = normalizeCustomerRef(patch.customerRef);
+      if (to === null) throw new BusinessRuleError('A payment on account must stay linked to a customer.');
+      if (to !== cur.customer_ref) {
+        if (use.everUsed) throw new BusinessRuleError('This payment on account has already provided credit to its customer, so its customer cannot be changed — even after its uses are reversed.');
+        const ident = resolveIdentity(await loadCustomerIndex(client), to, null);
+        if (ident.state !== 'matched') throw new BusinessRuleError(`Customer ${to} cannot be chosen: ${ident.detail}`);
+        await lockCustomerCreditTx(client, cur.company_code, ident.ref);
+        set('customer_ref', ident.ref); set('customer_name', ident.name || null);
+        moved = { from: cur.customer_ref, to: ident.ref };
+      }
+    }
+    if (!sets.length) { await client.query('COMMIT'); return { rowVersion: Number(cur.row_version) }; }
+    vals.push(id);
+    const u = await client.query(`UPDATE rel_account_receipts SET ${sets.join(', ')}, row_version = row_version + 1, updated_at = NOW() WHERE id = $${vals.length} RETURNING row_version`, vals);
+    if (moved) {
+      await client.query(
+        `INSERT INTO customer_link_audit (actor, action, company_code, from_refs, to_ref, members, detail) VALUES ($1, 'reassign', $2, $3::jsonb, $4, $5::jsonb, $6::jsonb)`,
+        [actorLabel(actor), cur.company_code, JSON.stringify([moved.from]), moved.to, JSON.stringify([{ type: 'account_receipt', id: Number(id), reference: cur.reference }]),
+         JSON.stringify({ source: 'payment-on-account-edit', amount: Number(cur.amount) })]);
+    }
+    await client.query('COMMIT');
+    return { rowVersion: Number(u.rows[0].row_version) };
+  } catch (err) { await client.query('ROLLBACK').catch(() => undefined); throw err; } finally { client.release(); }
+}
+/** A payment on account is never deleted; with no active allocation or refund
+ *  it can be voided (kept, marked, excluded from credit and cash received). */
+export async function voidAccountReceipt(id: number, opts: { expectedVersion?: number | null; reason?: string | null; actor?: Actor | null } = {}): Promise<{ voided: true; alreadyVoided?: boolean }> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const cur = await lockAccountReceiptTx(client, id);
+    if (cur.status === 'voided') { await client.query('COMMIT'); return { voided: true, alreadyVoided: true }; }
+    if (opts.expectedVersion != null && Number(cur.row_version) !== Number(opts.expectedVersion)) throw new ConcurrencyConflictError('rel_account_receipts', id);
+    const use = await accountReceiptUseTx(client, id);
+    if (use.allocatedC + use.refundedC > 0) throw new BusinessRuleError(`This payment on account has ${fmt(use.allocatedC + use.refundedC)} allocated or refunded. Reverse those first, then void it.`);
+    await client.query(`UPDATE rel_account_receipts SET status = 'voided', voided_at = NOW(), voided_by = $2, void_reason = $3, row_version = row_version + 1, updated_at = NOW() WHERE id = $1`,
+      [id, actorLabel(opts.actor || null), opts.reason || null]);
+    await client.query('COMMIT');
+    return { voided: true };
+  } catch (err) { await client.query('ROLLBACK').catch(() => undefined); throw err; } finally { client.release(); }
+}
+async function accountReceiptView(client: PoolClient | typeof pool, r: AccountReceiptRow, withHistory: boolean, idx?: CustomerIndex) {
+  const use = await accountReceiptUseTx(client, r.id);
+  const availC = r.status === 'active' ? Math.max(0, sgrToCents0(r.amount) - use.allocatedC - use.refundedC) : 0;
+  return {
+    sourceType: 'account_receipt', sourceId: Number(r.id), onAccount: true, status: r.status,
+    date: r.receipt_date_text || null, method: r.method, reference: r.reference, notes: r.notes,
+    companyCode: String(r.company_code), customerRef: r.customer_ref, customerName: (idx && idx.nameOf(r.customer_ref)) || r.customer_name || null,
+    document: null, original: Number(r.amount), allocated: sgrRands(use.allocatedC), refunded: sgrRands(use.refundedC), settledOnOwnDocument: 0,
+    available: sgrRands(availC), rowVersion: Number(r.row_version), createdAt: r.created_at, createdBy: r.created_by,
+    history: withHistory ? [
+      ...(await allocationHistory(client, `source_type = 'account_receipt' AND source_account_receipt_id = $1`, [r.id])),
+      ...(await refundHistory(client, `source_type = 'account_receipt' AND source_account_receipt_id = $1`, [r.id])),
+    ] : [],
+  };
+}
+/** Active payments on account in the given companies (statements, cash received). */
+export async function listAccountReceipts(companyCodes: string[], opts: { customerRef?: string | null } = {}): Promise<any[]> {
+  if (!companyCodes.length) return [];
+  const idx = await loadCustomerIndex(pool);
+  const r = await pool.query(
+    `SELECT *, receipt_date::text AS receipt_date_text FROM rel_account_receipts
+      WHERE status = 'active' AND company_code = ANY($1::text[]) AND ($2::text IS NULL OR customer_ref = $2::text)
+      ORDER BY receipt_date, id`, [companyCodes, opts.customerRef ?? null]);
+  const out: any[] = [];
+  for (const row of r.rows) out.push(await accountReceiptView(pool, row, true, idx));
+  return out;
 }
 
 // ── READ: one customer's credit, and the per-company summary ─────────────────
@@ -883,6 +1107,11 @@ export async function customerCreditTx(client: PoolClient | typeof pool, company
       });
     }
   }
+  // 023: payments on account — recorded against this customer link directly.
+  const onAcc = await client.query(
+    `SELECT *, receipt_date::text AS receipt_date_text FROM rel_account_receipts WHERE status = 'active' AND company_code = $1 AND customer_ref = $2 ORDER BY receipt_date, id`,
+    [companyCode, customerRef]);
+  for (const r of onAcc.rows) paymentCredits.push(await accountReceiptView(client, r, withHistory, ix));
   const notes = await eligibleCreditNotesTx(client, ix, companyCode, customerRef, false);
   const creditNotes: any[] = [];
   for (const n of notes) {
@@ -935,6 +1164,14 @@ export async function getCreditSummary(companyCodes: string[]): Promise<{ custom
     if (ident.state === 'matched') add(String(st.companyCode ?? ''), ident.ref, 'paymentCredit', pc.poolC);
     else for (const r of pc.receipts.filter((x) => x.availableC > 0)) unresolved.push({ sourceType: 'payment', sourceId: r.paymentId, companyCode: st.companyCode, document: { type: r.ownerType, id: r.ownerId, number: r.ownerNumber }, date: r.date, available: sgrRands(r.availableC), name: ident.name, reason: ident.detail });
   }
+  const acc = await pool.query(`SELECT *, receipt_date::text AS receipt_date_text FROM rel_account_receipts WHERE status = 'active' AND company_code = ANY($1::text[]) ORDER BY id`, [companyCodes]);
+  for (const r of acc.rows) {
+    const availC = await accountReceiptAvailableTx(pool, r);
+    if (availC <= 0) continue;
+    const ident = resolveIdentity(idx, r.customer_ref, null);
+    if (ident.state === 'matched') add(String(r.company_code), ident.ref, 'paymentCredit', availC);
+    else unresolved.push({ sourceType: 'account_receipt', sourceId: Number(r.id), companyCode: r.company_code, date: r.receipt_date_text, reference: r.reference, available: sgrRands(availC), name: r.customer_name, reason: ident.detail, rowVersion: Number(r.row_version) });
+  }
   const notes = await pool.query(`SELECT *, note_date::text AS note_date_text FROM rel_credit_notes WHERE note_type = 'customer' AND company_code = ANY($1::text[]) ORDER BY id`, [companyCodes]);
   for (const n of notes.rows) {
     const availC = creditNoteAvailableC(n);
@@ -959,7 +1196,7 @@ export async function getDocumentCredit(ownerType: OwnerType, ownerId: number): 
   const ownPool = await chainPaymentCreditTx(pool, st);
   // Never offer a receipt of this same transaction as credit for it.
   const own = new Set(st.chain.owners.map((o) => `${o.type}:${o.id}`));
-  credit.paymentCredits = credit.paymentCredits.filter((p) => !own.has(`${p.document.type}:${p.document.id}`));
+  credit.paymentCredits = credit.paymentCredits.filter((p) => !p.document || !own.has(`${p.document.type}:${p.document.id}`));
   const pcT = credit.paymentCredits.reduce((s, x) => s + sgrToCents0(x.available), 0);
   const cnT = sgrToCents0(credit.totals.creditNotes);
   credit.totals = { paymentCredit: sgrRands(pcT), creditNotes: sgrRands(cnT), total: sgrRands(pcT + cnT) };

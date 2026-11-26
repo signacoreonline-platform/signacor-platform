@@ -93,7 +93,7 @@ const RAW_REL_TABLES = [
 // 2026-11-26 (migration 022): credit allocations and recorded refunds are the
 // audit records behind every payment-credit / credit-note ledger row in
 // rel_payments — a restore without them could not reverse or explain those rows.
-const RAW_SUPPORTING_TABLES = ['document_number_counters', 'quote_conversions', 'rel_credit_allocations', 'rel_credit_refunds'];
+const RAW_SUPPORTING_TABLES = ['document_number_counters', 'quote_conversions', 'rel_credit_allocations', 'rel_credit_refunds', 'rel_account_receipts'];
 
 function arr(v: unknown): any[] { return Array.isArray(v) ? v : []; }
 const CREDENTIAL_KEYS = new Set(['pw', 'password', 'passwordhash', 'password_hash', 'token', 'apikey', 'api_key', 'secret']);

@@ -133,7 +133,9 @@
     "test:customer-credit": "ts-node --transpile-only test/relational.customer-credit.stress.ts",
     "test:customer-credit-frontend": "node test/customer-credit-frontend.test.js",
     "test:platform-state-credit-isolation": "ts-node --transpile-only test/relational.platform-state-credit-isolation.stress.ts",
-    "test:credit-note-ownership": "ts-node --transpile-only test/relational.credit-note-ownership.stress.ts"
+    "test:credit-note-ownership": "ts-node --transpile-only test/relational.credit-note-ownership.stress.ts",
+    "test:account-receipts": "ts-node --transpile-only test/relational.account-receipts.stress.ts",
+    "test:customer-credit-reports": "node test/customer-credit-reports.test.js"
   },
   "dependencies": {
     "@types/archiver": "^6.0.4",

@@ -55,6 +55,7 @@ import { previewCustomerReassignment, reassignCustomerChain, MemberType } from '
 import {
   applyCredit, reverseCreditAllocation, recordCreditRefund, reverseCreditRefund,
   getCustomerCredit, getCreditSummary, getDocumentCredit,
+  recordAccountReceipt, updateAccountReceipt, voidAccountReceipt, listAccountReceipts,
 } from './customerCredit';
 
 const router = Router();
@@ -829,6 +830,7 @@ async function allowedCompanies(req: AuthRequest): Promise<string[]> {
   const r = await pool.query(
     `SELECT DISTINCT company_code AS c FROM (
        SELECT company_code FROM rel_invoices UNION SELECT company_code FROM rel_jobs UNION SELECT company_code FROM rel_quotes UNION SELECT company_code FROM rel_credit_notes
+       UNION SELECT company_code FROM rel_account_receipts
      ) x WHERE company_code IS NOT NULL AND company_code <> '1'`);
   return r.rows.map((x: any) => String(x.c));
 }
@@ -869,8 +871,8 @@ router.post('/credit-allocations', async (req: AuthRequest, res: Response): Prom
   if (!creditWriter(req, res)) return;
   const { sourceType, sourceId, targetType, targetId, amount, clientRequestId, notes } = req.body || {};
   const tId = Number(targetId); const sId = Number(sourceId);
-  if (!['payment', 'credit_note'].includes(sourceType) || !Number.isFinite(sId) || !['invoice', 'job'].includes(targetType) || !Number.isFinite(tId)) {
-    res.status(400).json({ error: '"sourceType" (payment/credit_note), numeric "sourceId", "targetType" (invoice/job) and numeric "targetId" are required' }); return;
+  if (!['payment', 'credit_note', 'account_receipt'].includes(sourceType) || !Number.isFinite(sId) || !['invoice', 'job', 'quote'].includes(targetType) || !Number.isFinite(tId)) {
+    res.status(400).json({ error: '"sourceType" (payment/credit_note/account_receipt), numeric "sourceId", "targetType" (invoice/job/quote) and numeric "targetId" are required' }); return;
   }
   try {
     const co = await ownerCompany(targetType, tId);
@@ -898,10 +900,13 @@ router.post('/credit-refunds', async (req: AuthRequest, res: Response): Promise<
   if (!creditWriter(req, res)) return;
   const { sourceType, sourceId, amount, date, method, reference, notes, clientRequestId } = req.body || {};
   const sId = Number(sourceId);
-  if (!['payment', 'credit_note'].includes(sourceType) || !Number.isFinite(sId)) { res.status(400).json({ error: '"sourceType" (payment/credit_note) and numeric "sourceId" are required' }); return; }
+  if (!['payment', 'credit_note', 'account_receipt'].includes(sourceType) || !Number.isFinite(sId)) { res.status(400).json({ error: '"sourceType" (payment/credit_note/account_receipt) and numeric "sourceId" are required' }); return; }
   try {
     let co: string | null = null;
-    if (sourceType === 'payment') {
+    if (sourceType === 'account_receipt') {
+      const a = await pool.query('SELECT company_code FROM rel_account_receipts WHERE id = $1', [sId]);
+      if (a.rowCount) co = String(a.rows[0].company_code);
+    } else if (sourceType === 'payment') {
       const p = await pool.query('SELECT owner_type, owner_id FROM rel_payments WHERE id = $1', [sId]);
       if (p.rowCount) co = await ownerCompany(p.rows[0].owner_type, Number(p.rows[0].owner_id));
     } else {
@@ -924,6 +929,60 @@ router.post('/credit-refunds/:id/reverse', async (req: AuthRequest, res: Respons
     if (!r.rowCount) { res.status(404).json({ error: 'Refund not found' }); return; }
     if (!companyAllowed(req, r.rows[0].company_code)) { denyCompany(res); return; }
     res.json({ success: true, ...(await reverseCreditRefund(id, { reason: req.body?.reason ?? null, actor: creditActor(req) })) });
+  } catch (err) { handleServiceError(err, res); }
+});
+
+// ── PAYMENTS ON ACCOUNT (023) ────────────────────────────────────────────
+// Money received from a customer with no quote, job or invoice. Recording,
+// editing and voiding is for an admin or accounts login, in a company that
+// login may act for; listing is for any login of that company.
+router.post('/account-receipts', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await creditGate(res))) return;
+  if (!creditWriter(req, res)) return;
+  const { companyCode, customerRef, amount, date, method, reference, notes, clientRequestId } = req.body || {};
+  if (!companyAllowed(req, companyCode)) { denyCompany(res); return; }
+  try {
+    const result = await recordAccountReceipt({ companyCode, customerRef, amount, date, method, reference, notes, clientRequestId, actor: creditActor(req) });
+    res.status(result.deduplicated ? 200 : 201).json({ success: true, ...result });
+  } catch (err) { handleServiceError(err, res); }
+});
+router.get('/account-receipts', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await creditGate(res))) return;
+  try {
+    const allowed = await allowedCompanies(req);
+    const want = req.query.companyCode ? [String(req.query.companyCode)] : allowed;
+    if (want.some((c) => !companyAllowed(req, c))) { denyCompany(res); return; }
+    const cref = req.query.customerRef ? normalizeCustomerRef(req.query.customerRef) : null;
+    res.json({ success: true, receipts: await listAccountReceipts(want, { customerRef: cref }) });
+  } catch (err) { handleServiceError(err, res); }
+});
+async function accountReceiptCompanyOr404(id: number, res: Response): Promise<string | null> {
+  const r = await pool.query('SELECT company_code FROM rel_account_receipts WHERE id = $1', [id]);
+  if (!r.rowCount) { res.status(404).json({ error: 'Payment on account not found' }); return null; }
+  return String(r.rows[0].company_code);
+}
+router.put('/account-receipts/:id', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await creditGate(res))) return;
+  if (!creditWriter(req, res)) return;
+  const id = Number(req.params.id); const ev = Number(req.body?.expectedVersion);
+  if (!Number.isFinite(id) || !Number.isFinite(ev)) { res.status(400).json({ error: '"id" (path) and "expectedVersion" (body) must be numbers' }); return; }
+  try {
+    const co = await accountReceiptCompanyOr404(id, res); if (co === null) return;
+    if (!companyAllowed(req, co)) { denyCompany(res); return; }
+    const { expectedVersion: _e, ...patch } = req.body || {};
+    res.json({ success: true, ...(await updateAccountReceipt(id, ev, patch, creditActor(req))) });
+  } catch (err) { handleServiceError(err, res); }
+});
+router.post('/account-receipts/:id/void', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await creditGate(res))) return;
+  if (!creditWriter(req, res)) return;
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) { res.status(400).json({ error: 'numeric id required' }); return; }
+  try {
+    const co = await accountReceiptCompanyOr404(id, res); if (co === null) return;
+    if (!companyAllowed(req, co)) { denyCompany(res); return; }
+    const ev = req.body?.expectedVersion;
+    res.json({ success: true, ...(await voidAccountReceipt(id, { expectedVersion: ev == null ? null : Number(ev), reason: req.body?.reason ?? null, actor: creditActor(req) })) });
   } catch (err) { handleServiceError(err, res); }
 });
 

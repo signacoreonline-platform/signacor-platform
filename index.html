@@ -1505,6 +1505,10 @@ const relationalApi = {
   reverseCreditAllocation(id, reason) { return relationalFetch('/credit-allocations/' + id + '/reverse', { method: 'POST', body: JSON.stringify({ reason: reason || null }) }); },
   recordCreditRefund(data) { return relationalFetch('/credit-refunds', { method: 'POST', body: JSON.stringify(data) }); },
   reverseCreditRefund(id, reason) { return relationalFetch('/credit-refunds/' + id + '/reverse', { method: 'POST', body: JSON.stringify({ reason: reason || null }) }); },
+  // 2026-11-26 (023): payments on account — money received with no quote, job or invoice.
+  recordAccountReceipt(data) { return relationalFetch('/account-receipts', { method: 'POST', body: JSON.stringify(data) }); },
+  listAccountReceipts(companyCode, customerRef) { const q = []; if (companyCode) q.push('companyCode=' + encodeURIComponent(companyCode)); if (customerRef) q.push('customerRef=' + encodeURIComponent(customerRef)); return relationalFetch('/account-receipts' + (q.length ? '?' + q.join('&') : '')); },
+  voidAccountReceipt(id, expectedVersion, reason) { return relationalFetch('/account-receipts/' + id + '/void', { method: 'POST', body: JSON.stringify({ expectedVersion: expectedVersion, reason: reason || null }) }); },
   createPurchaseOrder(data) { return relationalFetch('/purchase-orders', { method: 'POST', body: JSON.stringify(data) }); },
   updatePurchaseOrder(id, expectedVersion, patch) { return relationalFetch('/purchase-orders/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({ expectedVersion: expectedVersion }, patch)) }); },
   createSupplier(data) { return relationalFetch('/suppliers', { method: 'POST', body: JSON.stringify(data) }); },
@@ -1761,7 +1765,10 @@ function CustomerCreditApplyPanel({ docCredit, ownerType, ownerId, outstanding, 
   const credit = d.credit;
   if(!credit) return null;
   const sources = [
-    ...credit.paymentCredits.filter(p=>p.available>0.004).map(p=>({ key:'payment:'+p.sourceId, type:'payment', id:p.sourceId, available:p.available,
+    ...credit.paymentCredits.filter(p=>p.available>0.004).map(p=>p.sourceType==='account_receipt'
+      ? ({ key:'account_receipt:'+p.sourceId, type:'account_receipt', id:p.sourceId, available:p.available,
+           label:'Payment on account — received '+(p.date||'')+(p.reference?' · '+p.reference:'')+' ('+sgrCreditZar(sgrToCents0(p.original))+')' })
+      : ({ key:'payment:'+p.sourceId, type:'payment', id:p.sourceId, available:p.available,
       label:'Payment credit — receipt '+(p.date||'')+(p.reference?' · '+p.reference:'')+' on '+(p.document&&p.document.number||'')+' (received '+sgrCreditZar(sgrToCents0(p.original))+')' })),
     ...credit.creditNotes.filter(n=>n.available>0.004).map(n=>({ key:'credit_note:'+n.sourceId, type:'credit_note', id:n.sourceId, available:n.available,
       label:'Credit note '+(n.number||'')+(n.date?' · '+n.date:'')+(n.reason?' · '+n.reason:'') })),
@@ -7776,6 +7783,83 @@ function CustomerPickerModal({ customers, currentRef, title, onPick, onClose }){
 function sgrCreditCompaniesFor(user){
   return (INITIAL_COMPANIES||[]).filter(c=>belongsToUserCompany({ co:c.id }, user));
 }
+/* 2026-11-26 (migration 023) — RECEIVE PAYMENT ON ACCOUNT.
+   Money received from an existing customer before any quote, job or invoice
+   needs it. Recorded once against the customer's record (its id, never its
+   name) in one company; no document of any kind is created. The whole amount is
+   immediately available as payment credit and is applied from any quote, job or
+   invoice Payments window. Admin / Accounts only; the server checks it all again. */
+function AccountReceiptForm({ user, customers, companyCode, fixedCustomer, onDone, onCancel }){
+  const cos = sgrCreditCompaniesFor(user);
+  const [co, setCo] = useState(String(companyCode || (cos.find(c=>c.id===2)||cos[0]||{id:2}).id));
+  const [cust, setCust] = useState(fixedCustomer || null);
+  const [picking, setPicking] = useState(false);
+  const [amount, setAmount] = useState('');
+  const [date, setDate] = useState(new Date().toISOString().slice(0,10));
+  const [method, setMethod] = useState('EFT');
+  const [reference, setReference] = useState('');
+  const [notes, setNotes] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const keyRef = useRef(null);
+  useEffect(()=>{ keyRef.current = null; }, [co, cust && cust.id, amount, date, method, reference, notes]);
+  async function save(){
+    if(!cust){ setErr('Choose the customer who made this payment.'); return; }
+    const a = Number(amount);
+    if(!Number.isFinite(a) || a<=0){ setErr('Enter an amount greater than R0.00.'); return; }
+    if(Math.abs(a*100-Math.round(a*100))>1e-6){ setErr('Use whole cents (at most 2 decimals).'); return; }
+    if(!date){ setErr('Enter the payment date.'); return; }
+    if(!reference.trim()){ setErr('Enter the bank / payment reference so the receipt can be traced.'); return; }
+    if(!window.confirm('Record '+sgrCreditZar(sgrToCents0(a))+' received from '+(cust.companyName||cust.name||'this customer')+' in '+sgrCompanyName(co)+' as a payment on account?\n\nNo invoice, quote or job is created. The full amount becomes available customer credit, to be applied later from a document\'s Payments window.')) return;
+    setBusy(true); setErr('');
+    if(!keyRef.current) keyRef.current = 'acct_' + newPaymentRequestId();
+    try {
+      const r = await relationalApi.recordAccountReceipt({ companyCode: co, customerRef: String(cust.id), amount: a, date, method, reference: reference.trim(), notes: notes.trim() || null, clientRequestId: keyRef.current });
+      keyRef.current = null;
+      onDone && onDone({ receiptId: r.receiptId, companyCode: co, customerRef: String(cust.id) });
+    } catch(e){ setErr(describeSaveConflictError(e, 'payment on account')); }
+    finally { setBusy(false); }
+  }
+  const iCls = "w-full border border-gray-200 rounded-lg px-2 py-1.5 text-sm";
+  return (
+    <div className="border border-emerald-300 bg-emerald-50/50 rounded-xl p-3 space-y-2" data-testid="account-receipt-form">
+      <p className="text-xs font-black text-emerald-800 uppercase tracking-widest">Receive payment on account</p>
+      <p className="text-[11px] text-emerald-800">Money received before any invoice is needed. It is recorded against the customer only — no quote, job, invoice or credit note is created.</p>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+        <div className="col-span-2 sm:col-span-2"><label className="text-[10px] font-bold text-gray-500 block">Customer *</label>
+          {fixedCustomer
+            ? <p className="text-sm font-semibold py-1.5" data-testid="account-receipt-customer">{fixedCustomer.companyName||fixedCustomer.name}</p>
+            : <div className="flex gap-2 items-center"><span className="text-sm font-semibold flex-1 truncate" data-testid="account-receipt-customer">{cust ? sgrCustomerLabel(cust, customers) : <span className="text-gray-400 font-normal">No customer chosen</span>}</span>
+                <button type="button" onClick={()=>setPicking(true)} className="text-xs font-bold text-blue-700 border border-blue-200 rounded-lg px-2 py-1" data-testid="account-receipt-pick">{cust?'Change':'Choose customer'}</button></div>}
+        </div>
+        <div><label className="text-[10px] font-bold text-gray-500 block">Company *</label>
+          {cos.length>1 && !companyCode
+            ? <select value={co} onChange={e=>setCo(e.target.value)} className={iCls} data-testid="account-receipt-company">{cos.map(c=><option key={c.id} value={String(c.id)}>{c.name}</option>)}</select>
+            : <p className="text-sm py-1.5">{sgrCompanyName(co)}</p>}
+        </div>
+        <div><label className="text-[10px] font-bold text-gray-500 block">Amount received *</label><input type="number" step="0.01" min="0.01" value={amount} onChange={e=>setAmount(e.target.value)} className={iCls} data-testid="account-receipt-amount"/></div>
+        <div><label className="text-[10px] font-bold text-gray-500 block">Payment date *</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className={iCls} data-testid="account-receipt-date"/></div>
+        <div><label className="text-[10px] font-bold text-gray-500 block">Method *</label><select value={method} onChange={e=>setMethod(e.target.value)} className={iCls} data-testid="account-receipt-method">{['EFT','Cash','Card','Cheque','Other'].map(m=><option key={m}>{m}</option>)}</select></div>
+        <div><label className="text-[10px] font-bold text-gray-500 block">Bank / payment reference *</label><input value={reference} onChange={e=>setReference(e.target.value)} className={iCls} placeholder="Bank reference or receipt no." data-testid="account-receipt-reference"/></div>
+        <div className="col-span-2"><label className="text-[10px] font-bold text-gray-500 block">Notes</label><input value={notes} onChange={e=>setNotes(e.target.value)} className={iCls}/></div>
+      </div>
+      {err&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-1.5" data-testid="account-receipt-err">{err}</p>}
+      <div className="flex gap-2"><button onClick={save} disabled={busy} className="text-xs font-bold text-white rounded-lg px-3 py-1.5 disabled:opacity-50" style={{background:'#047857'}} data-testid="account-receipt-save">{busy?'Recording…':'Record payment on account'}</button>{onCancel&&<button onClick={onCancel} className="text-xs border border-gray-200 rounded-lg px-3 py-1.5">Cancel</button>}</div>
+      {picking&&<CustomerPickerModal customers={customers} title="Who made this payment?" onPick={c=>{ setCust(c); setPicking(false); }} onClose={()=>setPicking(false)}/>}
+    </div>
+  );
+}
+// Active payments on account visible to this login (statements, cash received).
+function useAccountReceipts(enabled, refreshKey){
+  const [list, setList] = useState([]);
+  useEffect(()=>{
+    if(!enabled){ setList([]); return; }
+    let live = true;
+    relationalApi.listAccountReceipts().then(r=>{ if(live) setList((r && r.receipts) || []); }).catch(()=>{ if(live) setList([]); });
+    return ()=>{ live = false; };
+  }, [enabled, refreshKey]);
+  return list;
+}
 function CustomerCreditHistory({ history, canAct, onReverse }){
   if(!history || !history.length) return <p className="text-xs text-gray-400 px-3 py-2">No allocations or refunds yet.</p>;
   return (
@@ -7836,8 +7920,9 @@ function CustomerCreditRefundForm({ source, onDone, onCancel }){
     </div>
   );
 }
-function CustomerCreditSection({ companyCode, customerRef, user, onChanged }){
+function CustomerCreditSection({ companyCode, customerRef, user, onChanged, customers }){
   const [state, setState] = useState({ loading:true, data:null, error:'' });
+  const [receiving, setReceiving] = useState(false);
   const [tick, setTick] = useState(0);
   const [openHist, setOpenHist] = useState({});
   const [refundFor, setRefundFor] = useState(null);
@@ -7853,6 +7938,13 @@ function CustomerCreditSection({ companyCode, customerRef, user, onChanged }){
   }, [companyCode, customerRef, tick]);
   const reload = ()=>{ setTick(t=>t+1); onChanged && onChanged(); };
   const canAct = canManagePayments(user);
+  async function voidReceipt(p){
+    const reason = window.prompt('Void this payment on account of '+sgrCreditZar(sgrToCents0(p.original))+' ('+(p.reference||'')+')?\n\nUse this only if it was recorded in error. It stays on record as voided and stops counting as credit or cash received.\n\nReason:', '');
+    if(reason===null) return;
+    setMsg('');
+    try { await relationalApi.voidAccountReceipt(p.sourceId, p.rowVersion, reason || null); reload(); }
+    catch(e){ setMsg(describeSaveConflictError(e, 'payment on account')); }
+  }
   async function reverse(h){
     const reason = window.prompt(h.kind==='allocation'
       ? 'Reverse this credit allocation of '+sgrCreditZar(sgrToCents0(h.amount))+' to '+(h.targetNumber||'the document')+'? The credit becomes available again and that document owes the amount again.\n\nReason (optional):'
@@ -7878,23 +7970,26 @@ function CustomerCreditSection({ companyCode, customerRef, user, onChanged }){
         <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center"><p className="text-xs text-emerald-700">Total available — {sgrCompanyName(d.companyCode)}</p><p className="text-lg font-black text-emerald-800" data-testid="credit-total">{sgrCreditZar(sgrToCents0(d.totals.total))}</p></div>
       </div>
       {msg&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2">{msg}</p>}
+      {canAct && (receiving
+        ? <AccountReceiptForm user={user} customers={customers} companyCode={d.companyCode} fixedCustomer={{ id:d.customer.ref, companyName:d.customer.name }} onCancel={()=>setReceiving(false)} onDone={()=>{ setReceiving(false); reload(); }}/>
+        : <div className="flex justify-end"><button onClick={()=>setReceiving(true)} className="text-xs font-bold text-white rounded-lg px-3 py-1.5" style={{background:'#047857'}} data-testid="account-receipt-open">＋ Receive Payment on Account</button></div>)}
       <div className="border border-gray-200 rounded-xl overflow-hidden">
-        <p className="px-3 py-2 bg-gray-50 text-xs font-black text-gray-600 uppercase tracking-wide">Payment credit (overpaid receipts)</p>
+        <p className="px-3 py-2 bg-gray-50 text-xs font-black text-gray-600 uppercase tracking-wide">Payment credit (payments on account and overpaid receipts)</p>
         {d.paymentCredits.length===0 ? <p className="px-3 py-3 text-xs text-gray-400">No payment credit. Overpayments recorded before customer credit was introduced are not included.</p> : (
           <table className="w-full text-xs" data-testid="payment-credit-table">
             <thead className="bg-gray-50 border-t border-gray-100"><tr><th className={th}>Date</th><th className={th}>Receipt</th><th className={thr}>Original</th><th className={thr}>Settled here</th><th className={thr}>Allocated</th><th className={thr}>Refunded</th><th className={thr}>Available</th><th/></tr></thead>
             <tbody>
-              {d.paymentCredits.map(p=>{ const k='p'+p.sourceId; return (
+              {d.paymentCredits.map(p=>{ const k=(p.sourceType==='account_receipt'?'a':'p')+p.sourceId; return (
                 <React.Fragment key={k}>
                   <tr className="border-t border-gray-100" data-testid="payment-credit-row">
                     <td className="px-3 py-2">{p.date||'—'}</td>
-                    <td className="px-3 py-2">{p.method||'—'}{p.reference?' · '+p.reference:''}<span className="text-gray-400"> on {p.document&&p.document.number}</span></td>
+                    <td className="px-3 py-2">{p.method||'—'}{p.reference?' · '+p.reference:''}{p.sourceType==='account_receipt' ? <span className="ml-1 text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-1" data-testid="payment-on-account-badge">payment on account</span> : <span className="text-gray-400"> on {p.document&&p.document.number}</span>}</td>
                     <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(p.original))}</td>
                     <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(p.settledOnOwnDocument))}</td>
                     <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(p.allocated))}</td>
                     <td className="px-3 py-2 text-right">{sgrCreditZar(sgrToCents0(p.refunded))}</td>
                     <td className="px-3 py-2 text-right font-black text-emerald-700" data-testid="payment-credit-available">{sgrCreditZar(sgrToCents0(p.available))}</td>
-                    <td className="px-2 py-2 text-right whitespace-nowrap"><button onClick={()=>toggle(k)} className="text-xs text-blue-600 hover:underline mr-2" data-testid="credit-history-toggle">History</button>{canAct && p.available>0.004 && <button onClick={()=>setRefundFor(p)} className="text-xs text-red-600 hover:underline" data-testid="credit-refund-open">Refund</button>}</td>
+                    <td className="px-2 py-2 text-right whitespace-nowrap"><button onClick={()=>toggle(k)} className="text-xs text-blue-600 hover:underline mr-2" data-testid="credit-history-toggle">History</button>{canAct && p.available>0.004 && <button onClick={()=>setRefundFor(p)} className="text-xs text-red-600 hover:underline" data-testid="credit-refund-open">Refund</button>}{canAct && p.sourceType==='account_receipt' && sgrToCents0(p.allocated)===0 && sgrToCents0(p.refunded)===0 && <button onClick={()=>voidReceipt(p)} className="text-xs text-gray-500 hover:underline ml-2" data-testid="account-receipt-void">Void</button>}</td>
                   </tr>
                   {openHist[k]&&<tr><td colSpan="8" className="bg-gray-50"><CustomerCreditHistory history={p.history} canAct={canAct} onReverse={reverse}/></td></tr>}
                 </React.Fragment>
@@ -7928,11 +8023,11 @@ function CustomerCreditSection({ companyCode, customerRef, user, onChanged }){
         )}
       </div>
       {refundFor&&<CustomerCreditRefundForm source={refundFor} onCancel={()=>setRefundFor(null)} onDone={()=>{ setRefundFor(null); reload(); }}/>}
-      <p className="text-[11px] text-gray-400">To use credit, open the invoice's Payments and choose “Apply credit”. Credit stays within its own company and customer.</p>
+      <p className="text-[11px] text-gray-400">To use credit, open the quote, job or invoice Payments window and choose “Apply credit”. Credit stays within its own company and customer.</p>
     </div>
   );
 }
-function CustomerCreditModal({ customer, user, onClose }){
+function CustomerCreditModal({ customer, user, onClose, customers }){
   const cos = sgrCreditCompaniesFor(user);
   const [co, setCo] = useState(String((cos.find(c=>c.id===2)||cos[0]||{id:2}).id));
   return (
@@ -7941,7 +8036,7 @@ function CustomerCreditModal({ customer, user, onClose }){
       <div className="px-6 py-4 space-y-3" data-testid="customer-credit-modal">
         {cos.length>1&&<div className="flex items-center gap-2"><label className="text-xs font-bold text-gray-500">Company</label><select value={co} onChange={e=>setCo(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1 text-sm" data-testid="credit-company">{cos.map(c=><option key={c.id} value={String(c.id)}>{c.name}</option>)}</select></div>}
         {isRelationalAuthoritative('accInvoices')
-          ? <CustomerCreditSection companyCode={co} customerRef={String(customer.id)} user={user}/>
+          ? <CustomerCreditSection companyCode={co} customerRef={String(customer.id)} user={user} customers={customers}/>
           : <p className="text-xs text-gray-500">Customer credit is available once invoices are on the relational database.</p>}
       </div>
     </Modal>
@@ -7956,6 +8051,7 @@ function CustomerCreditsView({ user, customers }){
   const [sel, setSel] = useState(null);
   const [pickFor, setPickFor] = useState(null);
   const [msg, setMsg] = useState('');
+  const [receiving, setReceiving] = useState(false);
   useEffect(()=>{
     let live = true;
     setState(s=>({ ...s, loading:true }));
@@ -7976,7 +8072,7 @@ function CustomerCreditsView({ user, customers }){
       <div className="bg-white rounded-2xl border border-gray-200 p-4 flex items-end justify-between flex-wrap gap-3">
         <div>
           <p className="font-black text-gray-800">💳 Customer Credits</p>
-          <p className="text-xs text-gray-500 mt-0.5">Payment credit from overpaid receipts and unused credit notes, per customer and company. Credit is applied from the invoice's Payments window.</p>
+          <p className="text-xs text-gray-500 mt-0.5">Payments on account, credit from overpaid receipts and unused credit notes, per customer and company. Credit is applied from a quote, job or invoice Payments window.</p>
         </div>
         <div className="flex gap-2 items-end">
           {cos.length>1&&<div><label className="text-xs font-bold text-gray-500 block">Company</label><select value={co} onChange={e=>{ setCo(e.target.value); setSel(null); }} className="border border-gray-200 rounded-lg px-2 py-1.5 text-sm" data-testid="credits-company">{cos.map(c=><option key={c.id} value={String(c.id)}>{c.name}</option>)}</select></div>}
@@ -7984,6 +8080,10 @@ function CustomerCreditsView({ user, customers }){
         </div>
       </div>
       {msg&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2">{msg}</p>}
+      {canManagePayments(user) && (receiving
+        ? <AccountReceiptForm user={user} customers={customers} onCancel={()=>setReceiving(false)}
+            onDone={({ companyCode, customerRef })=>{ setReceiving(false); setCo(String(companyCode)); setSel(String(customerRef)); setTick(t=>t+1); }}/>
+        : <div className="flex justify-end"><button onClick={()=>setReceiving(true)} className="text-xs font-bold text-white rounded-lg px-3 py-2" style={{background:'#047857'}} data-testid="account-receipt-open">＋ Receive Payment on Account</button></div>)}
       {state.error ? <p className="text-xs text-red-600">{state.error}</p> : state.loading && !state.data ? <p className="text-xs text-gray-400">Loading…</p> : (
         <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
           <table className="w-full text-sm" data-testid="credits-table">
@@ -8003,17 +8103,17 @@ function CustomerCreditsView({ user, customers }){
           </table>
         </div>
       )}
-      {sel&&<div className="bg-white rounded-2xl border border-emerald-200 p-4"><CustomerCreditSection companyCode={co} customerRef={sel} user={user} onChanged={()=>setTick(t=>t+1)}/></div>}
+      {sel&&<div className="bg-white rounded-2xl border border-emerald-200 p-4"><CustomerCreditSection companyCode={co} customerRef={sel} user={user} customers={customers} onChanged={()=>setTick(t=>t+1)}/></div>}
       {unresolved.length>0&&(
         <div className="bg-amber-50 rounded-2xl border border-amber-200 p-4 space-y-2" data-testid="credits-unresolved">
           <p className="text-sm font-black text-amber-800">Credit that cannot be attributed to a customer ({unresolved.length})</p>
           <p className="text-xs text-amber-700">It stays unusable until its customer is chosen. Nothing here is spent or moved automatically.</p>
           {unresolved.map(u=>(
             <div key={u.sourceType+u.sourceId} className="flex items-center justify-between gap-2 bg-white border border-amber-100 rounded-xl px-3 py-2 text-xs" data-testid="credits-unresolved-row">
-              <span><strong>{u.sourceType==='credit_note'?('Credit note '+u.number):('Overpayment on '+(u.document&&u.document.number))}</strong> · {u.name||'—'} · {sgrCreditZar(sgrToCents0(u.available))} — <span className="text-amber-700">{u.reason}</span></span>
+              <span><strong>{u.sourceType==='credit_note'?('Credit note '+u.number):u.sourceType==='account_receipt'?('Payment on account '+(u.reference||'')+' · '+(u.date||'')):('Overpayment on '+(u.document&&u.document.number))}</strong> · {u.name||'—'} · {sgrCreditZar(sgrToCents0(u.available))} — <span className="text-amber-700">{u.reason}</span></span>
               {u.sourceType==='credit_note' && canManagePayments(user)
                 ? <button onClick={()=>setPickFor(u)} className="text-xs font-bold text-blue-700 hover:underline whitespace-nowrap" data-testid="credits-choose-customer">Choose customer</button>
-                : <span className="text-gray-500 whitespace-nowrap">Link the document to its customer (open it → change customer)</span>}
+                : <span className="text-gray-500 whitespace-nowrap">{u.sourceType==='account_receipt' ? 'Its customer record no longer exists — restore the customer' : 'Link the document to its customer (open it → change customer)'}</span>}
             </div>
           ))}
         </div>
@@ -11431,7 +11531,7 @@ function CustomersPage({ customers, setCustomers, quotes=[], jobs=[], accInvoice
         </div>
       )}
       {showAdd&&<AddEditCustomerModal customer={editing} customers={customers} onClose={()=>{setShowAdd(false);setEditing(null);}} onSave={handleSave}/>}
-      {creditFor&&<CustomerCreditModal customer={creditFor} user={user} onClose={()=>setCreditFor(null)}/>}
+      {creditFor&&<CustomerCreditModal customer={creditFor} user={user} customers={customers} onClose={()=>setCreditFor(null)}/>}
       {showImport&&<BulkImportCustomersModal
         existingCustomers={customers}
         onImport={handleBulkImport}
@@ -13195,6 +13295,15 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
             )}
           </div>
           {saveErr&&<p className="text-xs bg-red-50 border border-red-200 text-red-600 rounded-lg px-3 py-2">{saveErr}</p>}
+          {/* 2026-11-26: customer credit (payments on account, payment credit, credit notes) — same panel as the job and invoice windows */}
+          {_relQCred && (
+            <CustomerCreditApplyPanel docCredit={docCredit} ownerType={_qCredOwner.type} ownerId={_qCredOwner.id} outstanding={balance} user={user}
+              onApplied={({ result, amount, sourceType })=>{
+                const newP = { id:relPaymentDisplayId(result.targetPaymentId), date:new Date().toISOString().slice(0,10), method: sourceType==='credit_note'?'Credit':'Payment credit', amount,
+                  notes: sourceType==='credit_note'?'Credit note':'Payment credit', _relPaymentId:result.targetPaymentId, _relRowVersion:1, _relOwnerType:_qCredOwner.type, _entryKind: sourceType==='credit_note'?'credit_note':'payment_credit_in', _creditLinkId: result.allocationId };
+                setPayments(prev=>prev.some(p=>p&&String(p._relPaymentId)===String(result.targetPaymentId)) ? prev : [...prev,newP]);
+              }}/>
+          )}
           {/* Record form */}
           <div className="border border-dashed border-green-300 rounded-xl p-4 bg-green-50/40">
             <p className="text-xs font-black text-green-700 uppercase tracking-widest mb-3">Record New Payment</p>
@@ -29695,6 +29804,8 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, rawCustomerSources, ban
 
   // ── Credit Notes ──────────────────────────────────────────────
   const cnotes = creditNotes || [];
+  // 2026-11-26 (023): payments on account (no document) for statements; reloaded when the tab changes.
+  const accountReceipts = useAccountReceipts(isRelationalAuthoritative('accInvoices'), accTab);
   const [showCnModal, setShowCnModal] = useState(false);
   const [editCn,      setEditCn]      = useState(null);
   function nextCnNum(){
@@ -29907,6 +30018,19 @@ function AccountingPage({ jobs:jobsAll, setJobs, quotes, rawCustomerSources, ban
       // 2026-11-26: a recorded refund of credit-note credit is money returned.
       (Array.isArray(c.refunds)?c.refunds:[]).forEach(f=>ev.push({date:f.date||c.date, sort:3, docType:'Refund', ref:c.number||'', desc:'Refund of credit-note credit'+(f.reference?' · '+f.reference:''), debit:parseFloat(f.amount)||0, credit:0}));
     });
+    // 2026-11-26 (023): a payment on account has no document. The receipt moves
+    // the balance once (credit); a refund recorded against it is money returned
+    // (debit). Its allocations appear on the documents they paid as "Credit
+    // applied", balance-neutral — so each rand is counted exactly once.
+    if(type==='customer'){
+      ((typeof accountReceipts!=='undefined' && accountReceipts) || []).forEach(r=>{
+        if(!r || (r.status && r.status!=='active')) return;
+        const who = stmtCreditCustomer({ customerId:r.customerRef, contactName:r.customerName });
+        if(!stmtCustomerBelongs(r.customerName, who, _cnTarget, name)) return;
+        ev.push({date:r.date, sort:1, docType:'Payment on account', ref:r.reference||'', desc:(r.method||'Payment')+' · received on account', debit:0, credit:Number(r.original)||0});
+        (r.history||[]).filter(h=>h && h.kind==='refund' && h.status==='active').forEach(f=>ev.push({date:f.date||r.date, sort:3, docType:'Refund', ref:r.reference||'', desc:'Refund of payment on account'+(f.reference?' · '+f.reference:''), debit:Number(f.amount)||0, credit:0}));
+      });
+    }
     ev.sort((a,b)=>{const d=new Date(a.date||0)-new Date(b.date||0); return d!==0?d:a.sort-b.sort;});
     // balanceCredit/balanceDebit (when present on an event) are what actually
     // move the running total; plain debit/credit are always what's displayed
@@ -31913,16 +32037,18 @@ function sgrReportPaymentDocument(p, ownerKind, ctx){
   if(invDoc && (!quoteDoc || (pd && invDate && pd >= invDate))) return invDoc;
   return quoteDoc || invDoc;
 }
-function sgrPaymentsReportModel(jobs, quotes, accInvoices, user){
+function sgrPaymentsReportModel(jobs, quotes, accInvoices, user, accountReceipts, creditNotes){
   // 2026-11-10: company scoping split from the model so the Dashboard and the
   // shared Quotes/Jobs/Invoices panel (whose inputs are already scoped) run the
   // identical rows. Same filters, same order — Reports is unchanged.
   return sgrPaymentsReportModelScoped(
     (jobs||[]).filter(j=>j && j.co!==UNIONTECH_ID && belongsToUserCompany(j,user)),
     (quotes||[]).filter(q=>q && belongsToUserCompany(q,user)),
-    (accInvoices||[]).filter(i=>i && belongsToUserCompany(i,user)));
+    (accInvoices||[]).filter(i=>i && belongsToUserCompany(i,user)),
+    (accountReceipts||[]).filter(r=>r && belongsToUserCompany({ co:Number(r.companyCode) }, user)),
+    (creditNotes||[]).filter(c=>c && belongsToUserCompany(c, user)));
 }
-function sgrPaymentsReportModelScoped(scopedJobs, scopedQuotes, scopedInvoices){
+function sgrPaymentsReportModelScoped(scopedJobs, scopedQuotes, scopedInvoices, accountReceipts, creditNotes){
   const myJobs   = (scopedJobs||[]).filter(j=>j && j.co!==UNIONTECH_ID);
   const myQuotes = (scopedQuotes||[]).filter(Boolean);
   const myInv    = (scopedInvoices||[]).filter(i=>i && i.status!=='void');
@@ -31985,6 +32111,10 @@ function sgrPaymentsReportModelScoped(scopedJobs, scopedQuotes, scopedInvoices){
   // own date, labelled with its customer-facing document.
   const seenKeys = new Set(), seenObjs = new Set();
   const byDate = {}, receipts = []; let totalPaidC = 0, invoiceCollectedC = 0, undatedReceipts = 0;
+  // 2026-11-26: refunds are money returned — listed and totalled on their own,
+  // never netted into (or counted as) cash received.
+  const refunds = []; let totalRefundedC = 0;
+  const addRefund = (c, date, reference, client, source)=>{ if(c<=0) return; totalRefundedC += c; refunds.push({ _refundCents:c, _refundAmt:sgrRands(c), _refundDate:date||null, reference:reference||null, client:client||'', source }); };
   // Invoice chains are walked first, so a payment that belongs to an issued
   // invoice's chain is always attributed to it — Collection Rate counts it;
   // a deposit on a quote / proforma with no issued invoice yet does not.
@@ -31994,10 +32124,14 @@ function sgrPaymentsReportModelScoped(scopedJobs, scopedQuotes, scopedInvoices){
       const k = sgrReportPaymentKey(p);
       if(k!==null){ if(seenKeys.has(k)) return; seenKeys.add(k); }
       seenObjs.add(p);
-      // 2026-11-26 (customer credit): applying payment credit moves money that
-      // was already received — its +/- entries are never cash received again.
-      const _k = p && p._entryKind;
-      if(_k==='payment_credit_in' || _k==='payment_credit_out' || _k==='refund') return;
+      // 2026-11-26 (customer credit): only a RECEIPT is cash received. Applying
+      // payment credit (its +/- entries) or a credit note ("Credit" payment) moves
+      // money that was already received or never was cash, and a refund is money
+      // returned (listed separately below). Older rows carry no entry kind: a
+      // method beginning "Credit" is a credit-note payment (same rule as the server).
+      const _k = (p && p._entryKind) || (String((p && p.method) || '').trim().toLowerCase().startsWith('credit') ? 'credit_note' : 'receipt');
+      if(_k==='refund'){ addRefund(Math.abs(sgrToCents0(p.amount)), sgrReportPaymentDate(p), p.reference, client, 'payment credit'); return; }
+      if(_k!=='receipt') return;
       const c = sgrToCents0(p.amount);
       if(c <= 0) return;                                 // R0.00 is not money received
       totalPaidC += c;
@@ -32011,12 +32145,32 @@ function sgrPaymentsReportModelScoped(scopedJobs, scopedQuotes, scopedInvoices){
       (byDate[d] = byDate[d] || []).push(rec);
     });
   });
+  // 2026-11-26 (023): a payment on account is cash received ONCE, on its own
+  // date, even while none of it is allocated. Applying it later adds only a
+  // "Payment credit" entry on the document, which is skipped above.
+  (accountReceipts||[]).forEach(r=>{
+    if(!r || (r.status && r.status!=='active')) return;
+    const c = sgrToCents0(r.original);
+    if(c <= 0) return;
+    totalPaidC += c;
+    const d = r.date || null;
+    const rec = { _payAmt: sgrRands(c), _payCents: c, _payDate: d, _payment: { amount: sgrRands(c), date: d, method: r.method, reference: r.reference, _onAccount: true },
+                  client: r.customerName || '', _docKind: 'account', _docRef: r.reference || 'On account' };
+    receipts.push(rec);
+    (r.history||[]).filter(h=>h && h.kind==='refund' && h.status==='active').forEach(h=>addRefund(sgrToCents0(h.amount), h.date, h.reference, r.customerName, 'payment on account'));
+    if(!d){ undatedReceipts++; return; }
+    (byDate[d] = byDate[d] || []).push(rec);
+  });
+  (creditNotes||[]).forEach(cn=>{
+    if(!cn || cn.type!=='customer') return;
+    (Array.isArray(cn.refunds)?cn.refunds:[]).forEach(f=>addRefund(sgrToCents0(f.amount), f.date, f.reference, cn.contactName, 'credit note '+(cn.number||'')));
+  });
   const paidRows = rows.filter(r=>r._paidC>0)
     .sort((a,b)=>String(b._lastPaid||'').localeCompare(String(a._lastPaid||'')));
   const pendingRows = rows.filter(r=>r._outstandingC>0)
     .sort((a,b)=>new Date(b.invoiceDate||0)-new Date(a.invoiceDate||0));
   const totalPendingC = rows.reduce((s,r)=>s+r._outstandingC,0);
-  return { rows, paidRows, pendingRows, byDate, receipts, totalPaidC, invoiceCollectedC, totalPendingC, undatedReceipts };
+  return { rows, paidRows, pendingRows, byDate, receipts, totalPaidC, invoiceCollectedC, totalPendingC, undatedReceipts, refunds, totalRefundedC };
 }
 
 /* BEGIN SGR-DASHBOARD-METRICS (2026-11-10) ─────────────────────────────────
@@ -32252,7 +32406,7 @@ function sgrRecentJobs(jobs, limit){
 /* ═══════════════════════════════════════════
    REPORTS
 ═══════════════════════════════════════════ */
-function ReportsPage({ jobs, quotes, accInvoices, companies, user, logoDataUrl, customers }) {
+function ReportsPage({ jobs, quotes, accInvoices, companies, user, logoDataUrl, customers, creditNotes }) {
   const isAdmin = user.role !== 'assistant';
   // Invoice hover-preview (Payments tab) — {job, x, y} while hovering a blue invoice no.
   const [hoverInv, setHoverInv] = useState(null);
@@ -32271,7 +32425,8 @@ function ReportsPage({ jobs, quotes, accInvoices, companies, user, logoDataUrl, 
   // (sgrPaymentsReportModel above): chain-resolved rel_payments, each counted
   // once, settled against the canonical payable. Company-scoped inside the
   // model with the same belongsToUserCompany rule as before.
-  const payModel = useMemo(()=>sgrPaymentsReportModel(jobs, quotes, accInvoices, user),[jobs, quotes, accInvoices, user]);
+  const accountReceipts = useAccountReceipts(isRelationalAuthoritative('accInvoices'), reportTab);
+  const payModel = useMemo(()=>sgrPaymentsReportModel(jobs, quotes, accInvoices, user, accountReceipts, creditNotes),[jobs, quotes, accInvoices, user, accountReceipts, creditNotes]);
   const _jobPaid = j => sgrRands(j._paidC||0);
   const _jobBalance = j => sgrRands(j._outstandingC||0);
   const _lastPayDate = j => j._lastPaid||null;
@@ -32388,6 +32543,11 @@ function ReportsPage({ jobs, quotes, accInvoices, companies, user, logoDataUrl, 
             <p className="text-xs text-emerald-600">Total Paid</p>
             <p className="text-xl font-black text-emerald-700 mt-1">{zar(totalPaid)}</p>
             <p className="text-xs text-emerald-500 mt-0.5">cash received incl. deposits · {paidJobs.length} invoice{paidJobs.length!==1?'s':''}</p>
+          </div>
+          <div className="bg-red-50 border border-red-200 rounded-2xl p-4" data-testid="report-refunds">
+            <p className="text-xs text-red-600">Refunds recorded</p>
+            <p className="text-xl font-black text-red-700 mt-1">{zar(sgrRands(payModel.totalRefundedC||0))}</p>
+            <p className="text-xs text-red-500 mt-0.5">money returned · {(payModel.refunds||[]).length} refund{(payModel.refunds||[]).length!==1?'s':''} · not deducted from Total Paid</p>
           </div>
           <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4">
             <p className="text-xs text-amber-600">Outstanding</p>
@@ -34624,7 +34784,7 @@ function App() {
     suppliers:   <SuppliersPage   suppliers={suppliers} setSuppliers={setSuppliers}/>,
     inventory:   <InventoryPage   inventory={inventory} setInventory={setInventory} suppliers={suppliers} user={user} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quotes={_cv.quotes} setQuotes={setQuotes} companies={companies} logoDataUrl={brandingLogo} quickRates={quickRates} setQuickRates={setQuickRates}/>,
     imports:     <ImportsPage savedImports={savedImports} setSavedImports={setSavedImports} utLogoDataUrl={utLogoDataUrl} setUtLogoDataUrl={setUtLogoDataUrl}/>,
-    reports:     <ReportsPage     jobs={_cv.jobs} quotes={_cv.quotes} accInvoices={_cv.accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} customers={customers}/>,
+    reports:     <ReportsPage     jobs={_cv.jobs} quotes={_cv.quotes} accInvoices={_cv.accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} customers={customers} creditNotes={creditNotes}/>,
     accounting:  <AccountingPage rawCustomerSources={{ accInvoices, jobs }} jobs={_cv.jobs} setJobs={setJobs} quotes={_cv.quotes} bankTxns={bankTxns} setBankTxns={setBankTxns} chartOfAccounts={chartOfAccounts} setChartOfAccounts={setChartOfAccounts} accInvoices={_cv.accInvoices} setAccInvoices={setAccInvoices} accBills={accBills} setAccBills={setAccBills} creditNotes={creditNotes} setCreditNotes={setCreditNotes} suppliers={suppliers} customers={customers} companies={companies} logoDataUrl={brandingLogo} user={user} onOpenJob={openJobRecord} onOpenQuote={openQuoteRecord} onOpenCustomer={openCustomerRecord} onOpenJobPayments={openJobPaymentsRecord} initialStatementContact={accountingOpen&&accountingOpen.contact} onInitialStatementHandled={()=>setAccountingOpen(null)} forceSaveSections={forceSaveSections}/>,
     hr:          <HRPage employees={employees} setEmployees={setEmployees} leaveRequests={leaveRequests} setLeaveRequests={setLeaveRequests} disciplinary={disciplinary} setDisciplinary={setDisciplinary} payrollRecords={payrollRecords} setPayrollRecords={setPayrollRecords} logoDataUrl={brandingLogo} sigOTSmit={sigOTSmit} setSigOTSmit={setSigOTSmit}/>,
     // Admin-only (main Admin, never Holdings Admin) — guarded again here in

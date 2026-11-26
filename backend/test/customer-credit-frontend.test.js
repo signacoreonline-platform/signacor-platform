@@ -52,7 +52,7 @@ ok((html.match(/useDocumentCredit\('invoice', inv\._relId/g) || []).length === 1
 ok((html.match(/sgrConfirmOverpayment\(\{ amount:amt/g) || []).length === 3, 'all three payment windows confirm an overpayment');
 ok((html.match(/credit is never used to overpay/g) || []).length === 3, 'all three payment windows refuse Credit above the balance');
 ok(/kind==='refund'[\s\S]{0,200}debit:Math\.abs\(amt\)/.test(html) && /balanceCredit:neutral\?0:amt/.test(html), 'statement: refunds are debits, applied credit is balance-neutral, receipts count once');
-ok(/_k==='payment_credit_in' \|\| _k==='payment_credit_out' \|\| _k==='refund'\) return;/.test(html), 'reports: applied payment credit is never cash received again');
+ok(/if\(_k!=='receipt'\) return;/.test(html) && /addRefund\(/.test(html), 'reports: only receipts are cash received; refunds are listed separately (behaviour: customer-credit-reports.test.js)');
 ok(/<CustomerCreditsView user=\{user\} customers=\{customers\}\/>/.test(html) && /\{id:'customercredits',label:'💳 Customer Credits'\}/.test(html), 'Accounting → Customer Credits tab');
 ok(/<CustomerCreditModal customer=\{creditFor\}/.test(html), 'customer account → Available Credit');
 ok(!/Record credits for overpayments/.test(html), 'Credit Notes no longer suggests a credit note for an overpayment (it would double-count)');
