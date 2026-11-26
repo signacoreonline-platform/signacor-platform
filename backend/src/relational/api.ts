@@ -819,6 +819,23 @@ function creditWriter(req: AuthRequest, res: Response): boolean {
   }
   return true;
 }
+// 2026-11-26: an ASSISTANT may also APPLY existing payment credit (a receipt's
+// overpayment credit or a payment on account) to a quote, job or invoice.
+// applyCredit still enforces same customer, same company, the credit available
+// and the document's outstanding balance. Credit notes, reversals, refunds and
+// payments on account themselves keep their existing permissions.
+export const ASSISTANT_CREDIT_NOTE_APPLY = 'Only an admin or accounts login can apply a credit note here. An assistant can apply payment credit or a payment on account.';
+function creditApplier(req: AuthRequest, res: Response, sourceType: unknown): boolean {
+  const role = String(req.user?.role ?? '').trim().toLowerCase();
+  if (role === 'admin' || role === 'accounts') return true;
+  if (role === 'assistant') {
+    if (sourceType === 'payment' || sourceType === 'account_receipt') return true;
+    if (sourceType === 'credit_note') { res.status(403).json({ conflict: false, type: 'forbidden', error: ASSISTANT_CREDIT_NOTE_APPLY }); return false; }
+    return true; // anything else is rejected as invalid input (400) below
+  }
+  res.status(403).json({ conflict: false, type: 'forbidden', error: 'Only an admin, accounts or assistant login can apply customer credit.' });
+  return false;
+}
 async function ownerCompany(type: string, id: number): Promise<string | null> {
   const table = type === 'invoice' ? 'rel_invoices' : type === 'job' ? 'rel_jobs' : type === 'quote' ? 'rel_quotes' : null;
   if (!table || !Number.isFinite(id)) return null;
@@ -868,7 +885,7 @@ router.get('/customer-credit/document', async (req: AuthRequest, res: Response):
 });
 router.post('/credit-allocations', async (req: AuthRequest, res: Response): Promise<void> => {
   if (!(await creditGate(res))) return;
-  if (!creditWriter(req, res)) return;
+  if (!creditApplier(req, res, req.body?.sourceType)) return;
   const { sourceType, sourceId, targetType, targetId, amount, clientRequestId, notes } = req.body || {};
   const tId = Number(targetId); const sId = Number(sourceId);
   if (!['payment', 'credit_note', 'account_receipt'].includes(sourceType) || !Number.isFinite(sId) || !['invoice', 'job', 'quote'].includes(targetType) || !Number.isFinite(tId)) {
@@ -936,9 +953,20 @@ router.post('/credit-refunds/:id/reverse', async (req: AuthRequest, res: Respons
 // Money received from a customer with no quote, job or invoice. Recording,
 // editing and voiding is for an admin or accounts login, in a company that
 // login may act for; listing is for any login of that company.
+// 2026-11-26: recording money directly against a customer (no quote, job or
+// invoice) is for an ADMIN login only, within the companies it may act for.
+// Every other credit action keeps its existing permission.
+export const ACCOUNT_RECEIPT_ADMIN_ONLY = 'Admin only — contact an administrator to record a payment on account.';
+function accountReceiptRecorder(req: AuthRequest, res: Response): boolean {
+  if (!req.user || String(req.user.role || '').trim().toLowerCase() !== 'admin') {
+    res.status(403).json({ conflict: false, type: 'forbidden', error: ACCOUNT_RECEIPT_ADMIN_ONLY });
+    return false;
+  }
+  return true;
+}
 router.post('/account-receipts', async (req: AuthRequest, res: Response): Promise<void> => {
   if (!(await creditGate(res))) return;
-  if (!creditWriter(req, res)) return;
+  if (!accountReceiptRecorder(req, res)) return;
   const { companyCode, customerRef, amount, date, method, reference, notes, clientRequestId } = req.body || {};
   if (!companyAllowed(req, companyCode)) { denyCompany(res); return; }
   try {

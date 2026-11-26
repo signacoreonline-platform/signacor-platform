@@ -16,3 +16,6 @@ dist/
 # 2026-11-24: reports/plans written by src/scripts/backfill-customer-links.ts (customer names) — keep local, never commit
 /customer-link-dry-run-*.json
 /customer-link-backfill-*.json
+
+# Local backups written by the historical-credit repair script (contain customer data)
+/historical-credit-repair-*.json

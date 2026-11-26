@@ -95,6 +95,10 @@ export interface CustomerIndex {
   nameOf: (ref: string) => string | null;
 }
 export async function loadCustomerIndex(client: PoolClient | typeof pool): Promise<CustomerIndex> {
+  return buildCustomerIndex(await loadCustomerListTx(client));
+}
+/** The customer records (id, name, former names) the index is built from. */
+export async function loadCustomerListTx(client: PoolClient | typeof pool): Promise<Array<{ ref: string; name: string; former: string[] }>> {
   let list: Array<{ ref: string; name: string; former: string[] }> = [];
   if (await isSectionCutOver('customers')) {
     const r = await client.query('SELECT source_id, company_name FROM rel_customers');
@@ -106,6 +110,11 @@ export async function loadCustomerIndex(client: PoolClient | typeof pool): Promi
       ref: String(c.id), name: String(c.companyName || ''), former: Array.isArray(c.formerNames) ? c.formerNames.map(String) : [],
     }));
   }
+  return list;
+}
+/** 2026-11-26: the same index from an already-read customer list (used by the
+ *  manual repair script, which reads customers on its own dedicated connection). */
+export function buildCustomerIndex(list: Array<{ ref: string; name: string; former: string[] }>): CustomerIndex {
   const byRef = new Map<string, Array<{ ref: string; name: string }>>();
   const byName = new Map<string, string[]>();
   const byFormer = new Map<string, string[]>();

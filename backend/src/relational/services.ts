@@ -2766,166 +2766,178 @@ export async function cancelInvoice(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const identRes = await client.query(
-      'SELECT company_code, invoice_number, job_id FROM rel_invoices WHERE id = $1', [id]
-    );
-    if (identRes.rowCount === 0) throw new BusinessRuleError(`invoice ${id} not found`);
-    const companyCode: string = identRes.rows[0].company_code;
-    const invoiceNumber: string = identRes.rows[0].invoice_number;
-    const identJobId: number | null = identRes.rows[0].job_id === null ? null : Number(identRes.rows[0].job_id);
-
-    // Same job resolution, and the same refusal to guess, as deleteInvoice.
-    let targetJobIds: number[] = [];
-    let ambiguousJobs: Array<{ id: number; jobNumber: string }> = [];
-    if (identJobId !== null) {
-      targetJobIds = [identJobId];
-    } else {
-      const matchRes = await client.query(
-        `SELECT id, job_number FROM rel_jobs
-          WHERE company_code = $1 AND UPPER(BTRIM(invoice_num)) = UPPER(BTRIM($2)) ORDER BY id`,
-        [companyCode, invoiceNumber]
-      );
-      if (matchRes.rowCount === 1) targetJobIds = [Number(matchRes.rows[0].id)];
-      else if ((matchRes.rowCount ?? 0) > 1) {
-        ambiguousJobs = matchRes.rows.map((r) => ({ id: Number(r.id), jobNumber: r.job_number }));
-      }
-    }
-    if (targetJobIds.length > 0) {
-      await client.query('SELECT id FROM rel_jobs WHERE id = ANY($1::bigint[]) ORDER BY id FOR UPDATE', [targetJobIds]);
-    }
-
-    const curRes = await client.query('SELECT * FROM rel_invoices WHERE id = $1 FOR UPDATE', [id]);
-    if (curRes.rowCount === 0) throw new BusinessRuleError(`invoice ${id} not found`);
-    const inv = curRes.rows[0];
-
-    // IDEMPOTENT: already cancelled -> nothing is written, by anyone, ever again.
-    if (String(inv.status ?? '') === 'void') {
-      await client.query('COMMIT');
-      return {
-        cancelled: true, alreadyCancelled: true, invoiceId: Number(inv.id), invoiceNumber,
-        rowVersion: Number(inv.row_version), status: 'void', marker: pickCancelMarker(inv.legacy_data),
-        clearedJobs: [], ambiguousJobs: [],
-      };
-    }
-    if (expectedVersion !== null && Number(inv.row_version) !== expectedVersion) throw new ConcurrencyConflictError('rel_invoices', id);
-    const lockedJobId: number | null = inv.job_id === null ? null : Number(inv.job_id);
-    if (lockedJobId !== identJobId) throw new ConcurrencyConflictError('rel_invoices', id);
-
-    // Money recorded directly on the invoice stops the cancellation (see above).
-    const invPaysRes = await client.query(
-      `SELECT id, amount, method FROM rel_payments WHERE owner_type = 'invoice' AND owner_id = $1 ORDER BY id FOR UPDATE`,
-      [id]
-    );
-    let ownPaidC = 0; let ownMoneyRows = 0; let ownCreditRows = 0;
-    for (const p of invPaysRes.rows) {
-      const c = sgrToCents0(p.amount);
-      if (c === 0) continue;
-      ownPaidC += c; ownMoneyRows += 1;
-      if (String(p.method ?? '') === 'Credit') ownCreditRows += 1;
-    }
-    if (ownMoneyRows > 0) {
-      throw new BusinessRuleError(
-        `Invoice ${invoiceNumber} was NOT cancelled: it has ${ownMoneyRows} payment${ownMoneyRows === 1 ? '' : 's'} totalling ` +
-        `R${sgrRands(ownPaidC).toFixed(2)} recorded directly on it` +
-        (ownCreditRows > 0 ? ` (${ownCreditRows} of them applied customer credit)` : '') +
-        `. Cancelling it would take that money out of every total. Open the invoice's Payments, remove ` +
-        `${ownMoneyRows === 1 ? 'that payment' : 'those payments'} and record the money against the job instead ` +
-        `(or credit the customer), then cancel the invoice. Nothing was changed.`
-      );
-    }
-
-    // Where the invoice pointed, kept as facts on the record before the ids go.
-    let jobRow: any = null;
-    if (lockedJobId !== null) {
-      jobRow = (await client.query('SELECT id, job_number, quote_id FROM rel_jobs WHERE id = $1', [lockedJobId])).rows[0] || null;
-    }
-    const quoteIdForMarker: number | null =
-      inv.quote_id !== null && inv.quote_id !== undefined ? Number(inv.quote_id)
-      : (jobRow && jobRow.quote_id !== null && jobRow.quote_id !== undefined ? Number(jobRow.quote_id) : null);
-    let quoteRow: any = null;
-    if (quoteIdForMarker !== null) {
-      quoteRow = (await client.query('SELECT id, quote_number, company_code FROM rel_quotes WHERE id = $1', [quoteIdForMarker])).rows[0] || null;
-      if (quoteRow && !sameCompany(quoteRow.company_code, companyCode)) quoteRow = null;
-    }
-    const jobNumberText: string | null = (jobRow && jobRow.job_number) || inv.job_number_raw || null;
-    const quoteNumberText: string | null = (quoteRow && quoteRow.quote_number) || inv.quote_number_raw || null;
-
-    // An explicitly supplied replacement must be a real, active invoice of the
-    // same company. (Normally none is supplied: the next invoice raised for the
-    // same job/quote stamps itself — linkCancelledInvoiceReplacementsTx.)
-    let replacedBy: string | null = null; let replacedById: number | null = null;
-    const wantRepl = (opts.replacedBy == null ? '' : String(opts.replacedBy)).trim();
-    if (wantRepl) {
-      const r = await client.query(
-        `SELECT id, invoice_number, status FROM rel_invoices
-          WHERE company_code = $1 AND UPPER(BTRIM(invoice_number)) = UPPER(BTRIM($2))`,
-        [companyCode, wantRepl]
-      );
-      if (r.rowCount === 0) throw new BusinessRuleError(`Replacement invoice ${wantRepl} was not found in this company. Nothing was changed.`);
-      if (Number(r.rows[0].id) === Number(id)) throw new BusinessRuleError(`An invoice cannot replace itself. Nothing was changed.`);
-      if (String(r.rows[0].status ?? '') === 'void') throw new BusinessRuleError(`Replacement invoice ${r.rows[0].invoice_number} is itself cancelled. Nothing was changed.`);
-      replacedBy = r.rows[0].invoice_number; replacedById = Number(r.rows[0].id);
-    }
-
-    const actor = opts.actor || {};
-    const marker = buildInvoiceCancellationMarker({
-      cancelledBy: actor.name || actor.email || (actor.id != null ? String(actor.id) : null),
-      cancelledById: actor.id != null ? String(actor.id) : null,
-      reason: opts.reason, via: opts.via || 'api:cancel-invoice',
-      statusBeforeCancel: inv.status ?? null,
-      originalJobId: lockedJobId, originalJobNum: jobNumberText,
-      originalQuoteId: quoteRow ? Number(quoteRow.id) : null, originalQuoteNum: quoteNumberText,
-      originalDetailRetained: true, replacedBy, replacedById,
-    });
-    const updRes = await client.query(
-      `UPDATE rel_invoices
-          SET status = 'void', job_id = NULL, quote_id = NULL,
-              job_number_raw = COALESCE(NULLIF(BTRIM(job_number_raw), ''), $2),
-              quote_number_raw = COALESCE(NULLIF(BTRIM(quote_number_raw), ''), $3),
-              legacy_data = COALESCE(legacy_data, '{}'::jsonb) || $4::jsonb,
-              row_version = row_version + 1, updated_at = NOW()
-        WHERE id = $1 RETURNING row_version`,
-      [id, jobNumberText, quoteNumberText, JSON.stringify(marker)]
-    );
-
-    // The job goes back to "not yet invoiced" — byte for byte the reversal
-    // deleteInvoice performed, restricted to the ids locked above.
-    const clearedRes = targetJobIds.length > 0
-      ? await client.query(
-          `UPDATE rel_jobs
-              SET invoice_num = NULL, invoice_date = NULL, invoice_due = NULL,
-                  invoice_created = false, invoice_status = NULL,
-                  row_version = row_version + 1, updated_at = NOW()
-            WHERE id = ANY($1::bigint[])
-              AND (invoice_num IS NULL OR UPPER(BTRIM(invoice_num)) = UPPER(BTRIM($2)))
-              AND (invoice_num IS NOT NULL OR invoice_created OR invoice_status IS NOT NULL
-                   OR invoice_date IS NOT NULL OR invoice_due IS NOT NULL)
-            RETURNING id, source_id, job_number, row_version`,
-          [targetJobIds, invoiceNumber]
-        )
-      : { rows: [] as any[] };
-    for (const r of clearedRes.rows) {
-      const paidRes = await client.query(
-        `SELECT COALESCE(SUM(amount), 0) AS total FROM rel_payments WHERE owner_type = 'job' AND owner_id = $1`,
-        [Number(r.id)]
-      );
-      if (Number(paidRes.rows[0].total) > 0) await recomputeOwnerPaymentStatus(client, 'job', Number(r.id));
-    }
+    const result = await cancelInvoiceTx(client, id, expectedVersion, opts);
     await client.query('COMMIT');
-    return {
-      cancelled: true, alreadyCancelled: false, invoiceId: Number(id), invoiceNumber,
-      rowVersion: Number(updRes.rows[0].row_version), status: 'void', marker,
-      clearedJobs: clearedRes.rows.map((r) => ({
-        id: Number(r.id), sourceId: String(r.source_id), jobNumber: r.job_number, rowVersion: r.row_version,
-      })),
-      ambiguousJobs,
-    };
+    return result;
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw err;
   } finally {
     client.release();
   }
+}
+/** 2026-11-26: the cancellation itself, inside the CALLER's transaction (the
+ *  caller BEGINs, COMMITs and ROLLs BACK). cancelInvoice above is exactly this
+ *  in its own transaction; scripts/repair-historical-credit.ts uses it so a
+ *  repair and its cancellation are one atomic change. */
+export async function cancelInvoiceTx(
+  client: PoolClient,
+  id: number,
+  expectedVersion: number | null,
+  opts: { reason?: string | null; actor?: CancelInvoiceActor | null; replacedBy?: string | null; via?: string | null } = {}
+): Promise<CancelInvoiceResult> {
+  const identRes = await client.query(
+    'SELECT company_code, invoice_number, job_id FROM rel_invoices WHERE id = $1', [id]
+  );
+  if (identRes.rowCount === 0) throw new BusinessRuleError(`invoice ${id} not found`);
+  const companyCode: string = identRes.rows[0].company_code;
+  const invoiceNumber: string = identRes.rows[0].invoice_number;
+  const identJobId: number | null = identRes.rows[0].job_id === null ? null : Number(identRes.rows[0].job_id);
+
+  // Same job resolution, and the same refusal to guess, as deleteInvoice.
+  let targetJobIds: number[] = [];
+  let ambiguousJobs: Array<{ id: number; jobNumber: string }> = [];
+  if (identJobId !== null) {
+    targetJobIds = [identJobId];
+  } else {
+    const matchRes = await client.query(
+      `SELECT id, job_number FROM rel_jobs
+        WHERE company_code = $1 AND UPPER(BTRIM(invoice_num)) = UPPER(BTRIM($2)) ORDER BY id`,
+      [companyCode, invoiceNumber]
+    );
+    if (matchRes.rowCount === 1) targetJobIds = [Number(matchRes.rows[0].id)];
+    else if ((matchRes.rowCount ?? 0) > 1) {
+      ambiguousJobs = matchRes.rows.map((r) => ({ id: Number(r.id), jobNumber: r.job_number }));
+    }
+  }
+  if (targetJobIds.length > 0) {
+    await client.query('SELECT id FROM rel_jobs WHERE id = ANY($1::bigint[]) ORDER BY id FOR UPDATE', [targetJobIds]);
+  }
+
+  const curRes = await client.query('SELECT * FROM rel_invoices WHERE id = $1 FOR UPDATE', [id]);
+  if (curRes.rowCount === 0) throw new BusinessRuleError(`invoice ${id} not found`);
+  const inv = curRes.rows[0];
+
+  // IDEMPOTENT: already cancelled -> nothing is written, by anyone, ever again.
+  if (String(inv.status ?? '') === 'void') {
+    return {
+      cancelled: true, alreadyCancelled: true, invoiceId: Number(inv.id), invoiceNumber,
+      rowVersion: Number(inv.row_version), status: 'void', marker: pickCancelMarker(inv.legacy_data),
+      clearedJobs: [], ambiguousJobs: [],
+    };
+  }
+  if (expectedVersion !== null && Number(inv.row_version) !== expectedVersion) throw new ConcurrencyConflictError('rel_invoices', id);
+  const lockedJobId: number | null = inv.job_id === null ? null : Number(inv.job_id);
+  if (lockedJobId !== identJobId) throw new ConcurrencyConflictError('rel_invoices', id);
+
+  // Money recorded directly on the invoice stops the cancellation (see above).
+  const invPaysRes = await client.query(
+    `SELECT id, amount, method FROM rel_payments WHERE owner_type = 'invoice' AND owner_id = $1 ORDER BY id FOR UPDATE`,
+    [id]
+  );
+  let ownPaidC = 0; let ownMoneyRows = 0; let ownCreditRows = 0;
+  for (const p of invPaysRes.rows) {
+    const c = sgrToCents0(p.amount);
+    if (c === 0) continue;
+    ownPaidC += c; ownMoneyRows += 1;
+    if (String(p.method ?? '') === 'Credit') ownCreditRows += 1;
+  }
+  if (ownMoneyRows > 0) {
+    throw new BusinessRuleError(
+      `Invoice ${invoiceNumber} was NOT cancelled: it has ${ownMoneyRows} payment${ownMoneyRows === 1 ? '' : 's'} totalling ` +
+      `R${sgrRands(ownPaidC).toFixed(2)} recorded directly on it` +
+      (ownCreditRows > 0 ? ` (${ownCreditRows} of them applied customer credit)` : '') +
+      `. Cancelling it would take that money out of every total. Open the invoice's Payments, remove ` +
+      `${ownMoneyRows === 1 ? 'that payment' : 'those payments'} and record the money against the job instead ` +
+      `(or credit the customer), then cancel the invoice. Nothing was changed.`
+    );
+  }
+
+  // Where the invoice pointed, kept as facts on the record before the ids go.
+  let jobRow: any = null;
+  if (lockedJobId !== null) {
+    jobRow = (await client.query('SELECT id, job_number, quote_id FROM rel_jobs WHERE id = $1', [lockedJobId])).rows[0] || null;
+  }
+  const quoteIdForMarker: number | null =
+    inv.quote_id !== null && inv.quote_id !== undefined ? Number(inv.quote_id)
+    : (jobRow && jobRow.quote_id !== null && jobRow.quote_id !== undefined ? Number(jobRow.quote_id) : null);
+  let quoteRow: any = null;
+  if (quoteIdForMarker !== null) {
+    quoteRow = (await client.query('SELECT id, quote_number, company_code FROM rel_quotes WHERE id = $1', [quoteIdForMarker])).rows[0] || null;
+    if (quoteRow && !sameCompany(quoteRow.company_code, companyCode)) quoteRow = null;
+  }
+  const jobNumberText: string | null = (jobRow && jobRow.job_number) || inv.job_number_raw || null;
+  const quoteNumberText: string | null = (quoteRow && quoteRow.quote_number) || inv.quote_number_raw || null;
+
+  // An explicitly supplied replacement must be a real, active invoice of the
+  // same company. (Normally none is supplied: the next invoice raised for the
+  // same job/quote stamps itself — linkCancelledInvoiceReplacementsTx.)
+  let replacedBy: string | null = null; let replacedById: number | null = null;
+  const wantRepl = (opts.replacedBy == null ? '' : String(opts.replacedBy)).trim();
+  if (wantRepl) {
+    const r = await client.query(
+      `SELECT id, invoice_number, status FROM rel_invoices
+        WHERE company_code = $1 AND UPPER(BTRIM(invoice_number)) = UPPER(BTRIM($2))`,
+      [companyCode, wantRepl]
+    );
+    if (r.rowCount === 0) throw new BusinessRuleError(`Replacement invoice ${wantRepl} was not found in this company. Nothing was changed.`);
+    if (Number(r.rows[0].id) === Number(id)) throw new BusinessRuleError(`An invoice cannot replace itself. Nothing was changed.`);
+    if (String(r.rows[0].status ?? '') === 'void') throw new BusinessRuleError(`Replacement invoice ${r.rows[0].invoice_number} is itself cancelled. Nothing was changed.`);
+    replacedBy = r.rows[0].invoice_number; replacedById = Number(r.rows[0].id);
+  }
+
+  const actor = opts.actor || {};
+  const marker = buildInvoiceCancellationMarker({
+    cancelledBy: actor.name || actor.email || (actor.id != null ? String(actor.id) : null),
+    cancelledById: actor.id != null ? String(actor.id) : null,
+    reason: opts.reason, via: opts.via || 'api:cancel-invoice',
+    statusBeforeCancel: inv.status ?? null,
+    originalJobId: lockedJobId, originalJobNum: jobNumberText,
+    originalQuoteId: quoteRow ? Number(quoteRow.id) : null, originalQuoteNum: quoteNumberText,
+    originalDetailRetained: true, replacedBy, replacedById,
+  });
+  const updRes = await client.query(
+    `UPDATE rel_invoices
+        SET status = 'void', job_id = NULL, quote_id = NULL,
+            job_number_raw = COALESCE(NULLIF(BTRIM(job_number_raw), ''), $2),
+            quote_number_raw = COALESCE(NULLIF(BTRIM(quote_number_raw), ''), $3),
+            legacy_data = COALESCE(legacy_data, '{}'::jsonb) || $4::jsonb,
+            row_version = row_version + 1, updated_at = NOW()
+      WHERE id = $1 RETURNING row_version`,
+    [id, jobNumberText, quoteNumberText, JSON.stringify(marker)]
+  );
+
+  // The job goes back to "not yet invoiced" — byte for byte the reversal
+  // deleteInvoice performed, restricted to the ids locked above.
+  const clearedRes = targetJobIds.length > 0
+    ? await client.query(
+        `UPDATE rel_jobs
+            SET invoice_num = NULL, invoice_date = NULL, invoice_due = NULL,
+                invoice_created = false, invoice_status = NULL,
+                row_version = row_version + 1, updated_at = NOW()
+          WHERE id = ANY($1::bigint[])
+            AND (invoice_num IS NULL OR UPPER(BTRIM(invoice_num)) = UPPER(BTRIM($2)))
+            AND (invoice_num IS NOT NULL OR invoice_created OR invoice_status IS NOT NULL
+                 OR invoice_date IS NOT NULL OR invoice_due IS NOT NULL)
+          RETURNING id, source_id, job_number, row_version`,
+        [targetJobIds, invoiceNumber]
+      )
+    : { rows: [] as any[] };
+  for (const r of clearedRes.rows) {
+    const paidRes = await client.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total FROM rel_payments WHERE owner_type = 'job' AND owner_id = $1`,
+      [Number(r.id)]
+    );
+    if (Number(paidRes.rows[0].total) > 0) await recomputeOwnerPaymentStatus(client, 'job', Number(r.id));
+  }
+  return {
+    cancelled: true, alreadyCancelled: false, invoiceId: Number(id), invoiceNumber,
+    rowVersion: Number(updRes.rows[0].row_version), status: 'void', marker,
+    clearedJobs: clearedRes.rows.map((r) => ({
+      id: Number(r.id), sourceId: String(r.source_id), jobNumber: r.job_number, rowVersion: r.row_version,
+    })),
+    ambiguousJobs,
+  };
 }
 
 /** REPLACEMENT CHAIN. Called beside settleNewChainMemberPaymentStatusTx on
