@@ -11763,6 +11763,11 @@ function SaveAsInventoryModal({ line, inventory, setInventory, onClose, onSaved 
 // their behaviour would change how 100+ existing inventory items behave.
 const UNIT_TYPE_OPTIONS = ['each','unit','m','m (linear)','m²','sheet','roll','panel','pack','box','litre','kg','set','hour','day','item','job','visit'];
 
+/* 2026-11-27: minimum Design & Setup Fee on quotes. New and copied quotes
+   open at this amount and the quote form refuses a lower fee. A quote saved
+   BEFORE this rule with a lower fee keeps its saved fee (so documents already
+   sent/invoiced never change total) unless the fee field itself is edited. */
+const SGR_SETUP_FEE_MIN = 100;
 function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies, nextNum, preparedBy, customers, setCustomers, savedCalcs, completeProducts, existingQuote, quickRates, initialData, quotes, accInvoices, jobs, canAdminRevise }) {
   const eq = existingQuote;
   // 2026-11-10 ADMIN REVISION: an existing quote that has already become a job.
@@ -11824,7 +11829,15 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
   const spDropVal = SALESPEOPLE.includes(salesperson) ? salesperson : (salesperson ? 'custom' : '');
   const UNIT_OPTIONS = UNIT_TYPE_OPTIONS;
   const [discount,setDiscount]=useState(_draft?.discount??eq?.discount??id?.discount??'');
-  const [setupFee,setSetupFee]=useState(_draft?.setupFee??eq?.setupFee??id?.setupFee??'');
+  const [setupFee,setSetupFee]=useState(()=>{
+    const v = _draft?.setupFee??eq?.setupFee??id?.setupFee??'';
+    if(eq) return v; // existing quote: open with exactly what was saved
+    const n = parseFloat(v);
+    return (isFinite(n) && n >= SGR_SETUP_FEE_MIN) ? v : String(SGR_SETUP_FEE_MIN);
+  });
+  // Legacy quote saved below the minimum whose fee field is untouched -> kept as saved.
+  const _setupFeeLegacyKept = !!eq && !((parseFloat(eq.setupFee)||0) >= SGR_SETUP_FEE_MIN) && String(setupFee??'') === String(eq.setupFee??'');
+  const setupFeeBelowMin = !((parseFloat(setupFee)||0) >= SGR_SETUP_FEE_MIN) && !_setupFeeLegacyKept;
   /* ── DEPOSIT REQUIRED (2026-09-21) ───────────────────────────────
      A quote may carry an OPTIONAL custom deposit percentage. Absent (the
      default, and the state of every quote that predates this) means the
@@ -12060,6 +12073,11 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
     // than silently falling back to the standard rate on a typo.
     if(depositPctInvalid){
       alert('Enter a valid custom deposit percentage between 0 and 100, or select "Standard 80%".');
+      return;
+    }
+    // 2026-11-27: minimum Design & Setup Fee (see SGR_SETUP_FEE_MIN).
+    if(setupFeeBelowMin){
+      alert('The Design & Setup Fee cannot be less than '+zar(SGR_SETUP_FEE_MIN)+'.\n\nPlease enter '+zar(SGR_SETUP_FEE_MIN)+' or more. The quote has not been saved.');
       return;
     }
     if(saving) return; // guard against a double-click firing two submits/reservations
@@ -12723,8 +12741,11 @@ function CreateQuoteModal({ onClose, onSave, inventory, setInventory, companies,
             </div>
             <div>
               <label className="block text-xs font-semibold text-gray-500 mb-1">🎨 Design &amp; Setup Fee (R)</label>
-              <input type="number" min="0" step="0.01" value={setupFee} onChange={e=>setSetupFee(e.target.value)}
-                placeholder="0.00" className="w-32 border border-gray-300 rounded-xl px-2 py-2 text-sm text-right focus:ring-2 focus:ring-brand-400 bg-white"/>
+              <input type="number" min={SGR_SETUP_FEE_MIN} step="0.01" value={setupFee} onChange={e=>setSetupFee(e.target.value)}
+                onBlur={()=>{ if(setupFeeBelowMin) setSetupFee(String(SGR_SETUP_FEE_MIN)); }}
+                placeholder={SGR_SETUP_FEE_MIN+'.00'} className={`w-32 border rounded-xl px-2 py-2 text-sm text-right focus:ring-2 focus:ring-brand-400 bg-white ${setupFeeBelowMin?'border-red-400':'border-gray-300'}`}/>
+              <p className="text-[10px] text-gray-400 mt-0.5">Minimum {zar(SGR_SETUP_FEE_MIN)}</p>
+              {_setupFeeLegacyKept&&<p className="text-[10px] text-amber-600 mt-0.5" style={{maxWidth:'10rem'}}>Saved before the minimum — kept unless you change it</p>}
             </div>
             {/* Deposit Required — payment term only, never part of the total */}
             <div>
@@ -13374,8 +13395,193 @@ function QuotePaymentsModal({ quote, total, onUpdate, onUpdateConfirmed, onClose
   );
 }
 
-function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvertToJob, companies, logoDataUrl, onEdit, jobs, setJobs, quotes, setQuotes, creditNotes, setCreditNotes, isAdmin, user, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob, customers, onOpenCustomer, accInvoices, setAccInvoices, onCreateInvoiceFromQuote, onOpenQuoteInvoice, forceSaveSections }) {
+/* ═══════════════════════════════════════════
+   QUOTE FOLLOW-UPS (2026-11-27)
+   A sales person's follow-up log per quote: date, who, short description,
+   shown on a month calendar. Stored in its OWN platform_state section
+   `quoteFollowUps` (quotes themselves are relational, so nothing is written
+   onto the quote record). One record per follow-up:
+     { id, quoteKey, quoteNum, co, client, date:'YYYY-MM-DD', salesperson,
+       note, createdAt, createdBy }
+   Records are never deleted: "Remove" only sets removed/removedAt/removedBy,
+   and removed records are hidden everywhere.
+═══════════════════════════════════════════ */
+const SGR_FU_SALESPEOPLE = ['Ockert Smit','Reinhart Smit','Janique Bettini'];
+const SGR_FU_NOTE_MAX = 200;
+function sgrFuYmd(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function sgrFuFmt(ymd){
+  if(!ymd || typeof ymd!=='string') return '';
+  const p = ymd.split('-').map(Number);
+  if(p.length!==3 || p.some(isNaN)) return ymd;
+  return new Date(p[0],p[1]-1,p[2]).toLocaleDateString('en-ZA',{day:'numeric',month:'short',year:'numeric'});
+}
+// Stable per-quote key: the relational PK when there is one, else the JSON id.
+function sgrQuoteFollowUpKey(q){ return q ? String(q._relId!=null ? q._relId : q.id) : ''; }
+// Active (not removed) follow-ups for one quote — by key, or by number + company.
+function sgrFollowUpsForQuote(list, q){
+  if(!q || !Array.isArray(list)) return [];
+  const key = sgrQuoteFollowUpKey(q);
+  return list.filter(f=>f && !f.removed && (
+    (f.quoteKey!=null && String(f.quoteKey)===key) ||
+    (f.quoteNum && q.num && f.quoteNum===q.num && String(f.co)===String(q.co))
+  ));
+}
+
+function QuoteFollowUpsModal({ quote, followUps, setFollowUps, user, isAdmin, onClose }){
+  const todayYmd = sgrFuYmd(new Date());
+  const userName = (user && user.name) || '';
+  const items = useMemo(()=>sgrFollowUpsForQuote(followUps, quote).slice().sort((a,b)=>
+    String(b.date||'').localeCompare(String(a.date||'')) || String(b.createdAt||'').localeCompare(String(a.createdAt||''))
+  ), [followUps, quote]);
+  const byDay = useMemo(()=>{ const m = {}; items.forEach(f=>{ if(f.date){ (m[f.date] = m[f.date] || []).push(f); } }); return m; }, [items]);
+
+  const [month, setMonth] = useState(()=>{ const d = new Date(); return { y:d.getFullYear(), m:d.getMonth() }; });
+  const [selDay, setSelDay] = useState('');
+  const _defSp = quote.salesperson || userName || '';
+  const [spSel, setSpSel] = useState(SGR_FU_SALESPEOPLE.includes(_defSp) ? _defSp : (_defSp ? '__other' : ''));
+  const [spOther, setSpOther] = useState(SGR_FU_SALESPEOPLE.includes(_defSp) ? '' : _defSp);
+  const [fDate, setFDate] = useState(todayYmd);
+  const [fNote, setFNote] = useState('');
+  const [err, setErr] = useState('');
+
+  const first = new Date(month.y, month.m, 1);
+  const lead = (first.getDay()+6)%7; // Monday-first grid
+  const daysIn = new Date(month.y, month.m+1, 0).getDate();
+  const cells = [];
+  for(let i=0;i<lead;i++) cells.push(null);
+  for(let d=1; d<=daysIn; d++) cells.push(d);
+  while(cells.length%7) cells.push(null);
+  const monthLabel = first.toLocaleDateString('en-ZA',{month:'long',year:'numeric'});
+  const monthPrefix = month.y+'-'+String(month.m+1).padStart(2,'0')+'-';
+  const monthCount = items.filter(f=>f.date && f.date.indexOf(monthPrefix)===0).length;
+  function shiftMonth(n){ setMonth(p=>{ const d = new Date(p.y, p.m+n, 1); return { y:d.getFullYear(), m:d.getMonth() }; }); }
+
+  function addFollowUp(){
+    setErr('');
+    const sp = (spSel==='__other' ? spOther : spSel).trim();
+    const note = fNote.trim();
+    if(!fDate){ setErr('Choose the date of the follow-up.'); return; }
+    if(!sp){ setErr('Choose the sales person who made the follow-up.'); return; }
+    if(!note){ setErr('Add a short description of the follow-up.'); return; }
+    const rec = {
+      id: 'fu-'+Date.now()+'-'+Math.random().toString(36).slice(2,8),
+      quoteKey: sgrQuoteFollowUpKey(quote), quoteNum: quote.num||'', co: quote.co, client: quote.client||'',
+      date: fDate, salesperson: sp, note: note.slice(0, SGR_FU_NOTE_MAX),
+      createdAt: new Date().toISOString(), createdBy: userName,
+    };
+    setFollowUps(prev=>[...(Array.isArray(prev)?prev:[]), rec]);
+    setFNote('');
+    setSelDay(fDate);
+    const p = fDate.split('-').map(Number);
+    if(p.length===3 && !p.some(isNaN)) setMonth({ y:p[0], m:p[1]-1 });
+  }
+  const canRemove = f => !!isAdmin || (!!userName && f.createdBy===userName);
+  function removeFollowUp(f){
+    if(!window.confirm('Remove this follow-up from the list?\n\n'+sgrFuFmt(f.date)+' — '+f.salesperson+'\n'+f.note)) return;
+    const now = new Date().toISOString();
+    setFollowUps(prev=>(Array.isArray(prev)?prev:[]).map(x=>x && x.id===f.id ? { ...x, removed:true, removedAt:now, removedBy:userName } : x));
+  }
+  const shown = selDay ? (byDay[selDay]||[]) : items;
+  const iCls = "w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-brand-400 bg-white";
+
+  return (
+    <Modal onClose={onClose} wide>
+      <ModalHeader title={`📞 Follow-ups — ${quote.num} — ${quote.client}`} onClose={onClose}/>
+      <div className="px-6 py-5 space-y-5 overflow-y-auto max-h-[82vh]">
+        <div className="grid md:grid-cols-2 gap-5">
+          {/* ── Calendar ── */}
+          <div className="border border-gray-200 rounded-2xl p-3">
+            <div className="flex items-center justify-between mb-2">
+              <button type="button" onClick={()=>shiftMonth(-1)} className="w-8 h-8 rounded-lg hover:bg-gray-100 text-gray-600 font-bold" title="Previous month">‹</button>
+              <div className="text-center">
+                <p className="text-sm font-bold text-gray-800">{monthLabel}</p>
+                <p className="text-[11px] text-gray-400">{monthCount} follow-up{monthCount===1?'':'s'} this month</p>
+              </div>
+              <button type="button" onClick={()=>shiftMonth(1)} className="w-8 h-8 rounded-lg hover:bg-gray-100 text-gray-600 font-bold" title="Next month">›</button>
+            </div>
+            <div className="grid grid-cols-7 gap-1 text-center">
+              {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(d=><div key={d} className="text-[10px] font-semibold text-gray-400 uppercase py-1">{d}</div>)}
+              {cells.map((d,i)=>{
+                if(!d) return <div key={'e'+i}/>;
+                const ymd = monthPrefix+String(d).padStart(2,'0');
+                const n = (byDay[ymd]||[]).length;
+                const isSel = selDay===ymd, isToday = ymd===todayYmd;
+                return (
+                  <button type="button" key={ymd} onClick={()=>{ setSelDay(isSel?'':ymd); setFDate(ymd); }}
+                    title={n ? `${n} follow-up${n===1?'':'s'} — click to view` : 'No follow-ups — click to log one on this day'}
+                    className={`relative h-9 rounded-lg text-xs font-semibold transition ${isSel?'bg-brand-600 text-white':n?'bg-amber-100 text-amber-900 hover:bg-amber-200':'text-gray-700 hover:bg-gray-100'} ${isToday&&!isSel?'ring-2 ring-brand-400':''}`}>
+                    {d}
+                    {n>0&&<span className={`absolute -top-1 -right-1 h-4 px-1 rounded-full text-[9px] leading-4 font-black ${isSel?'bg-white text-brand-700':'bg-amber-500 text-white'}`} style={{minWidth:'16px'}}>{n}</span>}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="flex justify-between mt-2">
+              <button type="button" onClick={()=>{ const d = new Date(); setMonth({ y:d.getFullYear(), m:d.getMonth() }); }} className="text-[11px] text-brand-600 hover:underline">This month</button>
+              {selDay&&<button type="button" onClick={()=>setSelDay('')} className="text-[11px] text-gray-500 hover:underline">Show all follow-ups</button>}
+            </div>
+          </div>
+
+          {/* ── Log a follow-up ── */}
+          <div className="border border-gray-200 rounded-2xl p-4 space-y-3">
+            <p className="text-sm font-bold text-gray-800">+ Log a follow-up</p>
+            <div>
+              <label className="block text-xs font-semibold text-gray-500 mb-1">Date</label>
+              <input type="date" value={fDate} onChange={e=>setFDate(e.target.value)} className={iCls}/>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-gray-500 mb-1">Sales person</label>
+              <select value={spSel} onChange={e=>setSpSel(e.target.value)} className={iCls}>
+                <option value="">— Select —</option>
+                {SGR_FU_SALESPEOPLE.map(s=><option key={s} value={s}>{s}</option>)}
+                <option value="__other">Other…</option>
+              </select>
+              {spSel==='__other'&&<input type="text" value={spOther} onChange={e=>setSpOther(e.target.value)} placeholder="Name" className={iCls+' mt-2'}/>}
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-gray-500 mb-1">Short description</label>
+              <textarea rows={3} maxLength={SGR_FU_NOTE_MAX} value={fNote} onChange={e=>setFNote(e.target.value)}
+                placeholder="e.g. Called client — waiting on landlord approval, call back Friday"
+                className={iCls+' resize-none'}/>
+              <p className="text-[10px] text-gray-400 text-right">{fNote.length}/{SGR_FU_NOTE_MAX}</p>
+            </div>
+            {err&&<p className="text-xs text-red-600 font-semibold">{err}</p>}
+            <button type="button" onClick={addFollowUp} className="w-full text-sm font-bold text-white rounded-xl px-4 py-2.5" style={{background:'#06065c'}}>Save follow-up</button>
+          </div>
+        </div>
+
+        {/* ── Follow-up list ── */}
+        <div>
+          <p className="text-sm font-bold text-gray-800 mb-2">{selDay ? `Follow-ups on ${sgrFuFmt(selDay)}` : `All follow-ups (${items.length})`}</p>
+          {shown.length===0 ? (
+            <div className="text-sm text-gray-400 border border-dashed border-gray-200 rounded-xl px-4 py-6 text-center">
+              {selDay ? 'No follow-ups on this day.' : 'No follow-ups logged for this quote yet.'}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {shown.map(f=>(
+                <div key={f.id} className="flex items-start gap-3 border border-gray-100 rounded-xl px-4 py-3 bg-gray-50">
+                  <span className="text-[11px] font-bold text-amber-800 bg-amber-100 rounded-lg px-2 py-1 whitespace-nowrap">{sgrFuFmt(f.date)}</span>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold text-gray-800">{f.salesperson}</p>
+                    <p className="text-sm text-gray-600 whitespace-pre-wrap break-words">{f.note}</p>
+                    {(f.createdBy||f.createdAt)&&<p className="text-[10px] text-gray-400 mt-1">Logged{f.createdBy?` by ${f.createdBy}`:''}{f.createdAt?` · ${new Date(f.createdAt).toLocaleString('en-ZA',{day:'numeric',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'})}`:''}</p>}
+                  </div>
+                  {canRemove(f)&&<button type="button" onClick={()=>removeFollowUp(f)} className="text-[11px] text-red-500 hover:text-red-700 hover:underline whitespace-nowrap">Remove</button>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <p className="text-[10px] text-gray-400">Follow-ups save automatically with the dashboard data.</p>
+      </div>
+    </Modal>
+  );
+}
+
+function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvertToJob, companies, logoDataUrl, onEdit, jobs, setJobs, quotes, setQuotes, creditNotes, setCreditNotes, isAdmin, user, companyJobs, onOpenJob, onCreateInvoice, onOpenInvoice, onRelinkJob, customers, onOpenCustomer, accInvoices, setAccInvoices, onCreateInvoiceFromQuote, onOpenQuoteInvoice, forceSaveSections, quoteFollowUps, setQuoteFollowUps }) {
   const [showEmailFlow, setShowEmailFlow] = useState(false);
+  const [showFollowUps, setShowFollowUps] = useState(false); // 2026-11-27: follow-up list + calendar
   const [showProformaEmail, setShowProformaEmail] = useState(false);
   const [showPayments, setShowPayments] = useState(false);
   const [showRelink, setShowRelink] = useState(false);
@@ -13488,6 +13694,13 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
           {multipleJobsLinked&&(
             <span className="text-xs font-semibold text-red-700 bg-red-50 border border-red-200 rounded-full px-2.5 py-0.5">⚠ Linked to {matchingJobs.length} jobs — review below</span>
           )}
+          {/* 2026-11-27: Follow-up pill — opens the follow-up list + calendar */}
+          {setQuoteFollowUps&&(()=>{ const _fu = sgrFollowUpsForQuote(quoteFollowUps, quote); const _last = _fu.reduce((m,f)=>(f.date||'')>m?f.date:m,''); return (
+            <button type="button" onClick={()=>setShowFollowUps(true)} title="Open the follow-up list and calendar"
+              className="text-xs font-semibold text-amber-800 bg-amber-50 border border-amber-300 hover:bg-amber-100 rounded-full px-2.5 py-0.5">
+              📞 Follow-ups{_fu.length?` · ${_fu.length}`:''}{_last?` · last ${sgrFuFmt(_last)}`:''}
+            </button>
+          ); })()}
         </div>
 
         {multipleJobsLinked&&(
@@ -13844,6 +14057,10 @@ function QuoteViewModal({ quote, onClose, onUpdate, onUpdateConfirmed, onConvert
           companies={companies} logoDataUrl={logoDataUrl}
           onClose={()=>setShowProformaEmail(false)}
         />
+      )}
+      {showFollowUps&&setQuoteFollowUps&&(
+        <QuoteFollowUpsModal quote={quote} followUps={quoteFollowUps} setFollowUps={setQuoteFollowUps}
+          user={user} isAdmin={isAdmin} onClose={()=>setShowFollowUps(false)}/>
       )}
       {showPayments&&(
         <QuotePaymentsModal
@@ -14428,7 +14645,7 @@ function reconcileJobInvoice(job, quotes, ctx){
 /* ═══════════════════════════════════════════
    QUOTES PAGE
 ═══════════════════════════════════════════ */
-function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, setAccInvoices, onJobCreated, initialOpen, onInitialOpenHandled, onJobPaymentsClosed, creditNotes, setCreditNotes, onOpenCustomer, onOpenJob, forceSaveSections }) {
+function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, user, jobs, setJobs, customers, setCustomers, logoDataUrl, setLogoDataUrl, savedCalcs, purchaseOrders, setPurchaseOrders, completeProducts, setCompleteProducts, quickRates, accInvoices, setAccInvoices, onJobCreated, initialOpen, onInitialOpenHandled, onJobPaymentsClosed, creditNotes, setCreditNotes, onOpenCustomer, onOpenJob, forceSaveSections, quoteFollowUps, setQuoteFollowUps }) {
   const [subTab,    setSubTab]    = useState('quotes'); // 'quotes' | 'invoices'
   // INVOICE LIST CONSISTENCY (2026-08-24): Sales now presents the SAME
   // read-only invoice view Accounting does, from the same record — see the
@@ -17329,6 +17546,7 @@ function QuotesPage({ quotes, setQuotes, inventory, setInventory, companies, use
         accInvoices={accInvoices} setAccInvoices={setAccInvoices}
         onCreateInvoiceFromQuote={createInvoiceFromQuote}
         onOpenQuoteInvoice={(inv)=>revealJobInvoice({id:inv.id})}
+        quoteFollowUps={quoteFollowUps} setQuoteFollowUps={setQuoteFollowUps}
       />}
       {/* ── Edit Invoice modal ── */}
       {editInvoice&&(
@@ -32852,6 +33070,7 @@ function App() {
   // 2026-11-22: Purchase Orders -> Materials to Order (supplier, edits, ordered
   // ticks). A plain JSON section; see MaterialOrderTable.
   const [materialOrders,   setMaterialOrders]   = useState(_saved && Array.isArray(_saved.materialOrders) ? _saved.materialOrders : undefined); // undefined until first used: an empty list must not look like a local change and trigger a save on every load
+  const [quoteFollowUps,   setQuoteFollowUps]   = useState(_saved && Array.isArray(_saved.quoteFollowUps) ? _saved.quoteFollowUps : undefined); // 2026-11-27: quote follow-up log (QuoteFollowUpsModal) — undefined until first used, same rule as materialOrders
   const [creditNotes,      setCreditNotes]      = useState(_saved ? (_saved.creditNotes||[])         : []);
   // 2026-11-24 CUSTOMER IDENTITY: host for the "change customer" preview/confirm.
   const [custReassignReq, setCustReassignReq] = useState(null);
@@ -33129,7 +33348,7 @@ function App() {
   // All array/object sections stored in platform_state
   const STATE_SECTIONS = ['jobs','inventory','quotes','customers','suppliers','assets',
     'employees','leaveRequests','disciplinary','savedCalcs','purchaseOrders','savedImports',
-    'bankTxns','chartOfAccounts','accInvoices','accBills','completeProducts','payrollRecords','quickRates','proposedProjects','creditNotes','userAccounts','materialOrders'];
+    'bankTxns','chartOfAccounts','accInvoices','accBills','completeProducts','payrollRecords','quickRates','proposedProjects','creditNotes','userAccounts','materialOrders','quoteFollowUps'];
 
   // Fetch latest state from the backend.
   // 2026-08-20 hardening: the returned object now also carries
@@ -33285,6 +33504,7 @@ function App() {
     if (Array.isArray(dbData.quickRates))       setQuickRates(dbData.quickRates);
     if (Array.isArray(dbData.proposedProjects)) setProposedProjects(dbData.proposedProjects);
     if (Array.isArray(dbData.materialOrders))   setMaterialOrders(dbData.materialOrders);
+    if (Array.isArray(dbData.quoteFollowUps))   setQuoteFollowUps(dbData.quoteFollowUps);
     if (Array.isArray(dbData.creditNotes))      setCreditNotes(dbData.creditNotes);
     if (Array.isArray(dbData.userAccounts) && dbData.userAccounts.length) setUserAccounts(dbData.userAccounts);
     if (typeof dbData.logo === 'string')        setLogoDataUrl(dbData.logo);
@@ -33786,7 +34006,7 @@ function App() {
       // from a ref at some later, possibly-advanced moment.
       const BACKEND_MERGE_SECTIONS = ['quotes','jobs','customers','suppliers','inventory',
         'accInvoices','accBills','purchaseOrders','quickRates','employees','leaveRequests',
-        'disciplinary','creditNotes','proposedProjects','userAccounts','materialOrders'];
+        'disciplinary','creditNotes','proposedProjects','userAccounts','materialOrders','quoteFollowUps'];
       payload._deletedIds = {};
       BACKEND_MERGE_SECTIONS.forEach(k=>{
         const baseList = ownBaseline && Array.isArray(ownBaseline[k]) ? ownBaseline[k] : [];
@@ -34497,7 +34717,7 @@ function App() {
   //    Merges locally-changed sections onto the server baseline before writing,
   //    so two users editing different sections never overwrite each other.
   useEffect(()=>{
-    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, materialOrders, logo:logoDataUrl, utLogo:utLogoDataUrl, holdingsLogo:holdingsLogoDataUrl, sigOTSmit, savedAt:lastSaved};
+    const snapshot = {v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, materialOrders, quoteFollowUps, logo:logoDataUrl, utLogo:utLogoDataUrl, holdingsLogo:holdingsLogoDataUrl, sigOTSmit, savedAt:lastSaved};
     // Always kept current (even pre-hydration) so it's immediately available
     // the instant hydration completes — purely in-memory, never written
     // anywhere, so this alone can't leak fallback data anywhere.
@@ -34574,7 +34794,7 @@ function App() {
       }
       setTimeout(() => setApiMsg(''), 2500);
     }, 800);
-  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, materialOrders, logoDataUrl, utLogoDataUrl, sigOTSmit, hydrationStatus]);
+  }, [jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, userAccounts, materialOrders, quoteFollowUps, logoDataUrl, utLogoDataUrl, sigOTSmit, hydrationStatus]);
 
   // `token` is the backend-issued JWT from POST /api/auth/login (audit
   // finding B1) — stored the same way `user` already was, so a page refresh
@@ -34605,7 +34825,7 @@ function App() {
       });
       // Date-stamped filename so Drive folder shows version order clearly
       const dateTag = now.toISOString().slice(0,10); // e.g. 2026-04-10
-      const payload = JSON.stringify({v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, materialOrders, logo:logoDataUrl, utLogo:utLogoDataUrl, savedAt: stamp});
+      const payload = JSON.stringify({v:DATA_VERSION, jobs, inventory, quotes, customers, suppliers, assets, employees, leaveRequests, disciplinary, savedCalcs, purchaseOrders, savedImports, bankTxns, chartOfAccounts, accInvoices, accBills, completeProducts, payrollRecords, quickRates, proposedProjects, creditNotes, materialOrders, quoteFollowUps, logo:logoDataUrl, utLogo:utLogoDataUrl, savedAt: stamp});
       // outerHTML preserves the original <script type="text/babel"> source intact.
       // outerHTML omits the DOCTYPE; without it the saved file loads in quirks mode,
       // which broke startup. Prepend it so saved files stay in standards mode.
@@ -34822,7 +35042,7 @@ function App() {
 
   const pageMap = {
     dashboard:   <DashboardPage   jobs={_cv.jobs} quotes={_cv.quotes} inventory={inventory} companies={companies} user={user} logoDataUrl={brandingLogo} accInvoices={_cv.accInvoices} creditNotes={creditNotes}/>,
-    sales:       <QuotesPage      quotes={_cv.quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={_cv.jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={_cv.accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} onOpenJob={openJobRecord} forceSaveSections={forceSaveSections}/>,
+    sales:       <QuotesPage      quoteFollowUps={quoteFollowUps} setQuoteFollowUps={setQuoteFollowUps} quotes={_cv.quotes} setQuotes={setQuotes} inventory={inventory} setInventory={setInventory} companies={companies} user={user} jobs={_cv.jobs} setJobs={setJobs} customers={customers} setCustomers={setCustomers} logoDataUrl={brandingLogo} setLogoDataUrl={brandingLogoSetter} savedCalcs={savedCalcs} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} completeProducts={completeProducts} setCompleteProducts={setCompleteProducts} quickRates={quickRates} accInvoices={_cv.accInvoices} setAccInvoices={setAccInvoices} onJobCreated={(jobId)=>{ setHighlightJobId(jobId); setPage('jobs'); }} initialOpen={salesOpen} onInitialOpenHandled={()=>setSalesOpen(null)} onJobPaymentsClosed={returnFromJobPayments} creditNotes={creditNotes} setCreditNotes={setCreditNotes} onOpenCustomer={openCustomerRecord} onOpenJob={openJobRecord} forceSaveSections={forceSaveSections}/>,
     customers:   <CustomersPage   customers={customers} setCustomers={setCustomers} quotes={_cv.quotes} jobs={_cv.jobs} accInvoices={_cv.accInvoices} companies={companies} user={user} logoDataUrl={brandingLogo} onOpenQuote={openQuoteRecord} onOpenInvoice={openManualInvoiceRecord} onOpenJob={openJobRecord} onOpenStatement={openStatementForContact} openCustomerId={openCustomerId} onOpenCustomerHandled={()=>setOpenCustomerId(null)}/>,
     assets:      <AssetsPage      assets={assets} setAssets={setAssets} forceSaveSections={forceSaveSections} companies={companies} employees={employees} suppliers={suppliers}/>,
     jobs:        <JobsPage        jobs={_cv.jobs} setJobs={setJobs} quotes={_cv.quotes} setQuotes={setQuotes} companies={companies} user={user} entityFilter={entityFilter} setEntityFilter={setEntityFilter} logoDataUrl={brandingLogo} highlightJobId={highlightJobId} onHighlightCleared={()=>setHighlightJobId(null)} proposedProjects={proposedProjects} setProposedProjects={setProposedProjects} forceSaveSections={forceSaveSections} accInvoices={_cv.accInvoices} customers={customers} onOpenQuote={openQuoteRecord} onOpenInvoice={openJobInvoiceRecord} onOpenJobPayments={openJobPaymentsRecord} onOpenCustomer={openCustomerRecord} purchaseOrders={purchaseOrders} setPurchaseOrders={setPurchaseOrders} suppliers={suppliers} inventory={inventory} completeProducts={completeProducts}/>,

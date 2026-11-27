@@ -110,6 +110,10 @@ const STATE_ARRAY_KEYS = [
   // 2026-11-23: Materials to Order (Purchase Orders page, added 2026-11-22). The frontend's STATE_SECTIONS already
   // saves it; without it here it was missing from the record counts and the "no data sections at all" check.
   'materialOrders',
+  // 2026-11-27: Quote follow-ups (quote view -> Follow-ups pill). Same treatment as materialOrders: listed for the
+  // record counts and given the stable-id merge, so one user's save never drops another user's follow-up. Records are
+  // only ever soft-removed (a `removed` flag), never deleted. Mirrored in index.html STATE_SECTIONS / BACKEND_MERGE_SECTIONS.
+  'quoteFollowUps',
 ];
 
 // Sections whose sudden loss is most consequential for the business — used
@@ -136,6 +140,10 @@ const PROTECTED_SECTIONS = [
   // updated in place by the dashboard (an "Ordered" tick, supplier, adjustment, a manual line's `removed` flag), never
   // deleted, so no deletion path changes. Mirrored in index.html BACKEND_MERGE_SECTIONS.
   'materialOrders',
+  // 2026-11-27: Quote follow-ups (quote view -> Follow-ups pill). Same treatment as materialOrders: listed for the
+  // record counts and given the stable-id merge, so one user's save never drops another user's follow-up. Records are
+  // only ever soft-removed (a `removed` flag), never deleted. Mirrored in index.html STATE_SECTIONS / BACKEND_MERGE_SECTIONS.
+  'quoteFollowUps',
 ];
 
 function arr(v: unknown): any[] {
